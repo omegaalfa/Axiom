@@ -1,0 +1,3029 @@
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, RwLock,
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    thread,
+};
+
+use axiom_app::commands::Keymap;
+use axiom_app::shell_state::{
+    RecentProjects, StartupTarget, recent_projects_path, unix_timestamp_now,
+};
+use axiom_editor::Document;
+use axiom_index::ProjectSymbolIndex;
+use axiom_lsp::{ServerStatus, uri_to_path};
+use axiom_php::{RuntimeSymbolIndex, StubProvider};
+use axiom_project::{EntryKind, FileContent, Project, read_file_content};
+use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSession};
+use gpui::{
+    Action, App, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
+    LayoutId, MouseButton, SharedString, Style, Timer, UTF16Selection, Window, actions, div,
+    prelude::*, px, relative,
+};
+
+use crate::{
+    editor_view::EditorView,
+    lsp_bridge::{IdeLspEvent, LspBridge},
+    terminal_view::TerminalView,
+    ui::{
+        components::tooltip,
+        icons::{ActivityIcon, activity_icon, file_icon},
+        metrics, theme,
+    },
+};
+
+actions!(
+    workspace,
+    [
+        OpenProject,
+        OpenFile,
+        SaveAll,
+        CloseFile,
+        CloseProject,
+        Exit,
+        ShowAbout,
+        Find,
+        ToggleProject,
+        ToggleTerminal,
+        OpenInTerminal,
+        CommandPalette,
+        Settings,
+        PaletteUp,
+        PaletteDown,
+        PaletteConfirm,
+        PaletteEscape,
+        NavigateBack,
+        NavigateForward,
+        GoToClass,
+        GoToSymbol,
+    ]
+);
+
+pub fn key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("secondary-shift-o", OpenProject, None),
+        KeyBinding::new("secondary-o", OpenFile, None),
+        KeyBinding::new("secondary-f", Find, None),
+        KeyBinding::new("secondary-`", ToggleTerminal, None),
+        KeyBinding::new("ctrl-shift-p", CommandPalette, None),
+        KeyBinding::new("up", PaletteUp, Some("CommandPalette")),
+        KeyBinding::new("down", PaletteDown, Some("CommandPalette")),
+        KeyBinding::new("enter", PaletteConfirm, Some("CommandPalette")),
+        KeyBinding::new("escape", PaletteEscape, Some("CommandPalette")),
+        KeyBinding::new("alt-left", NavigateBack, None),
+        KeyBinding::new("alt-right", NavigateForward, None),
+    ]
+}
+
+struct OpenTab {
+    path: PathBuf,
+    editor: Entity<EditorView>,
+}
+
+#[derive(Clone)]
+struct NavigationLocation {
+    path: PathBuf,
+    position: lsp_types::Position,
+}
+
+#[derive(Clone)]
+struct DefinitionTarget {
+    path: PathBuf,
+    position: lsp_types::Position,
+}
+
+#[derive(Clone)]
+struct ExplorerItem {
+    path: PathBuf,
+    name: String,
+    kind: EntryKind,
+    depth: usize,
+}
+
+#[derive(Clone)]
+struct ExplorerContext {
+    path: PathBuf,
+    kind: EntryKind,
+}
+
+enum RuntimeStubStatus {
+    Loaded { files: usize, symbols: usize },
+    NotFound,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuKind {
+    File,
+    Edit,
+    Code,
+    View,
+    Navigate,
+    Help,
+}
+
+enum PendingOperation {
+    OpenProject(PathBuf),
+    CloseProject,
+    Exit,
+}
+
+impl RuntimeStubStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::Loaded { files, symbols } => {
+                format!("Loaded ({files} files, {symbols} symbols)")
+            }
+            Self::NotFound => "Not Found".to_owned(),
+        }
+    }
+}
+
+pub struct WorkspaceView {
+    project: Option<Project>,
+    explorer: Vec<ExplorerItem>,
+    expanded: HashSet<PathBuf>,
+    tabs: Vec<OpenTab>,
+    active: Option<usize>,
+    focus: FocusHandle,
+    status: SharedString,
+    lsp: Option<std::sync::Arc<LspBridge>>,
+    runtime_stubs: RuntimeStubStatus,
+    // Retained independently from the editor/LSP; native completion is deliberately out of scope.
+    _runtime_symbols: Option<std::sync::Arc<RuntimeSymbolIndex>>,
+    recent_projects: RecentProjects,
+    recent_path: Option<PathBuf>,
+    open_menu: Option<MenuKind>,
+    pending_operation: Option<PendingOperation>,
+    show_about: bool,
+    startup_file: Option<PathBuf>,
+    explorer_context: Option<ExplorerContext>,
+    pending_delete: Option<PathBuf>,
+    project_panel_visible: bool,
+    terminal_session: Option<std::sync::Arc<TerminalSession>>,
+    terminal_view: Option<Entity<TerminalView>>,
+    terminal_visible: bool,
+    navigation_back: Vec<NavigationLocation>,
+    navigation_forward: Vec<NavigationLocation>,
+    definition_targets: Vec<DefinitionTarget>,
+    project_index: Option<Arc<RwLock<ProjectSymbolIndex>>>,
+    index_generation: u64,
+    index_results: Option<Receiver<(u64, Result<ProjectSymbolIndex, String>)>>,
+    keymap: Keymap,
+    command_palette_visible: bool,
+    command_palette_query: String,
+    command_palette_selected: usize,
+    command_palette_mode: Option<String>,
+    settings_visible: bool,
+    settings_selected: Option<String>,
+    shortcut_capture: bool,
+    captured_shortcut: Option<String>,
+    shortcut_conflict: Option<String>,
+}
+
+impl WorkspaceView {
+    fn render_command_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let commands = self.palette_commands();
+        let workspace = cx.entity();
+        div()
+            .absolute()
+            .top(px(70.))
+            .left(px(240.))
+            .w(px(620.))
+            .max_h(px(430.))
+            .flex()
+            .flex_col()
+            .bg(t.popup_background)
+            .border_1()
+            .border_color(t.border)
+            .rounded(m.border_radius_medium)
+            .shadow_lg()
+            .on_key_down(cx.listener(Self::handle_workspace_keydown))
+            .key_context("CommandPalette")
+            .child(
+                div()
+                    .h(px(38.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .child(WorkspaceInputElement { workspace }),
+            )
+            .children(commands.iter().enumerate().map(|(index, command)| {
+                let selected = index == self.command_palette_selected;
+                let workspace = cx.entity();
+                div()
+                    .id(SharedString::from(format!(
+                        "palette-command-{}",
+                        command.id
+                    )))
+                    .h(m.toolbar_height)
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .bg(if selected {
+                        t.selection
+                    } else {
+                        t.popup_background
+                    })
+                    .text_color(t.text_primary)
+                    .on_click(move |_, window, cx| {
+                        workspace.update(cx, |this, cx| {
+                            this.command_palette_selected = index;
+                            this.palette_confirm(&PaletteConfirm, window, cx);
+                        });
+                    })
+                    .child(command.title.clone())
+                    .child(
+                        div().ml_auto().text_color(t.text_muted).child(
+                            self.keymap
+                                .shortcut(&command.id)
+                                .unwrap_or("None")
+                                .to_owned(),
+                        ),
+                    )
+            }))
+    }
+
+    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        div()
+            .absolute()
+            .top(px(42.))
+            .left(px(180.))
+            .right(px(24.))
+            .bottom(px(24.))
+            .flex()
+            .flex_col()
+            .bg(t.window_background)
+            .border_1()
+            .border_color(t.border)
+            .rounded(m.border_radius_medium)
+            .shadow_lg()
+            .child(
+                div()
+                    .h(px(42.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(t.border_subtle)
+                    .child("Settings")
+                    .child(div().id("close-settings").px_2().child("×").on_click(
+                        move |_, window, cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.settings_visible = false;
+                                this.restore_editor_focus(window, cx);
+                                cx.notify();
+                            });
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .child(
+                        div()
+                            .w(px(180.))
+                            .p_3()
+                            .bg(t.panel_background)
+                            .child("Keymap")
+                            .child(div().mt_2().text_color(t.text_muted).child("PHP"))
+                            .child(div().text_color(t.text_muted).child("Formatter")),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .p_4()
+                            .child("Search actions...")
+                            .children(self.keymap.commands().iter().map(|command| {
+                                let workspace = cx.entity();
+                                let selected =
+                                    self.settings_selected.as_deref() == Some(command.id.as_str());
+                                let command_id = command.id.clone();
+                                div()
+                                    .id(SharedString::from(format!("keymap-{}", command.id)))
+                                    .h(m.toolbar_height)
+                                    .flex()
+                                    .items_center()
+                                    .px_2()
+                                    .bg(if selected {
+                                        t.selection
+                                    } else {
+                                        t.window_background
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        workspace.update(cx, |this, cx| {
+                                            this.select_setting_command(command_id.clone(), cx)
+                                        })
+                                    })
+                                    .child(command.title.clone())
+                                    .child(
+                                        div().ml_auto().text_color(t.text_muted).child(
+                                            self.keymap
+                                                .shortcut(&command.id)
+                                                .unwrap_or("None")
+                                                .to_owned(),
+                                        ),
+                                    )
+                            }))
+                            .when_some(
+                                self.settings_selected.as_ref().and_then(|id| {
+                                    self.keymap
+                                        .commands()
+                                        .iter()
+                                        .find(|command| &command.id == id)
+                                }),
+                                |this, command| this.child(self.render_keymap_details(command, cx)),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_keymap_details(
+        &self,
+        command: &axiom_app::commands::CommandDescriptor,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = theme();
+        let workspace = cx.entity();
+        div()
+            .mt_4()
+            .p_3()
+            .bg(t.panel_background)
+            .child(command.title.clone())
+            .child(
+                div()
+                    .text_color(t.text_muted)
+                    .child(command.description.clone()),
+            )
+            .child(format!("Category: {}", command.category))
+            .child(format!(
+                "Current Shortcut: {}",
+                self.keymap.shortcut(&command.id).unwrap_or("None")
+            ))
+            .child(format!(
+                "Default Shortcut: {}",
+                command.default_shortcut.as_deref().unwrap_or("None")
+            ))
+            .child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("edit-shortcut")
+                            .px_2()
+                            .child("Edit Shortcut")
+                            .on_click({
+                                let workspace = workspace.clone();
+                                move |_, _, cx| {
+                                    workspace.update(cx, |this, cx| this.begin_shortcut_capture(cx))
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("remove-shortcut")
+                            .px_2()
+                            .child("Remove Shortcut")
+                            .on_click({
+                                let workspace = workspace.clone();
+                                move |_, _, cx| {
+                                    workspace
+                                        .update(cx, |this, cx| this.remove_selected_shortcut(cx))
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("reset-shortcut")
+                            .px_2()
+                            .child("Reset to Default")
+                            .on_click(move |_, _, cx| {
+                                workspace.update(cx, |this, cx| this.reset_selected_shortcut(cx))
+                            }),
+                    ),
+            )
+            .when(self.shortcut_capture, |this| {
+                this.child(format!(
+                    "Press new keyboard shortcut: {}",
+                    self.captured_shortcut.as_deref().unwrap_or("…")
+                ))
+            })
+            .when_some(self.captured_shortcut.as_ref(), |this, _| {
+                this.child(div().id("apply-shortcut").px_2().child("Apply").on_click({
+                    let workspace = cx.entity();
+                    move |_, _, cx| {
+                        workspace.update(cx, |this, cx| this.apply_captured_shortcut(cx))
+                    }
+                }))
+            })
+            .when_some(self.shortcut_conflict.as_ref(), |this, conflict| {
+                let workspace = cx.entity();
+                this.child(div().text_color(t.error).child(conflict.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("replace-shortcut-conflict")
+                                    .px_2()
+                                    .child("Replace")
+                                    .on_click({
+                                        let workspace = workspace.clone();
+                                        move |_, _, cx| {
+                                            workspace.update(cx, |this, cx| {
+                                                this.replace_conflicting_shortcut(cx)
+                                            })
+                                        }
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("cancel-shortcut-conflict")
+                                    .px_2()
+                                    .child("Cancel")
+                                    .on_click(move |_, _, cx| {
+                                        workspace.update(cx, |this, cx| {
+                                            this.cancel_shortcut_conflict(cx)
+                                        })
+                                    }),
+                            ),
+                    )
+            })
+    }
+
+    pub fn new(startup: StartupTarget, cx: &mut Context<Self>) -> Self {
+        let (runtime_stubs, runtime_symbols) = Self::load_runtime_stubs();
+        let recent_path = recent_projects_path();
+        let recent_projects = recent_path
+            .as_deref()
+            .map(RecentProjects::load)
+            .unwrap_or_default();
+        let mut workspace = Self {
+            project: None,
+            explorer: Vec::new(),
+            expanded: HashSet::new(),
+            tabs: Vec::new(),
+            active: None,
+            focus: cx.focus_handle(),
+            status: "Abra um arquivo no painel Project".into(),
+            lsp: None,
+            runtime_stubs,
+            _runtime_symbols: runtime_symbols,
+            recent_projects,
+            recent_path,
+            open_menu: None,
+            pending_operation: None,
+            show_about: false,
+            startup_file: None,
+            explorer_context: None,
+            pending_delete: None,
+            project_panel_visible: true,
+            terminal_session: None,
+            terminal_view: None,
+            terminal_visible: false,
+            navigation_back: Vec::new(),
+            navigation_forward: Vec::new(),
+            definition_targets: Vec::new(),
+            project_index: None,
+            index_generation: 0,
+            index_results: None,
+            keymap: Keymap::load_user(),
+            command_palette_visible: false,
+            command_palette_query: String::new(),
+            command_palette_selected: 0,
+            command_palette_mode: None,
+            settings_visible: false,
+            settings_selected: None,
+            shortcut_capture: false,
+            captured_shortcut: None,
+            shortcut_conflict: None,
+        };
+        if let StartupTarget::Project { root, initial_file } = startup {
+            workspace.open_project_path(root);
+            workspace.startup_file = initial_file;
+        }
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(std::time::Duration::from_millis(100)).await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.poll_lsp(cx);
+                        this.poll_index(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        workspace
+    }
+
+    fn load_runtime_stubs() -> (
+        RuntimeStubStatus,
+        Option<std::sync::Arc<RuntimeSymbolIndex>>,
+    ) {
+        let Some(provider) = StubProvider::from_env() else {
+            return (RuntimeStubStatus::NotFound, None);
+        };
+        match provider.load() {
+            Ok((index, report)) => (
+                RuntimeStubStatus::Loaded {
+                    files: report.files_parsed,
+                    symbols: report.symbols_indexed,
+                },
+                Some(std::sync::Arc::new(index)),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "PHP runtime stubs unavailable");
+                (RuntimeStubStatus::NotFound, None)
+            }
+        }
+    }
+
+    fn open_project_path(&mut self, path: PathBuf) {
+        match Project::open(path).map_err(|error| error.to_string()) {
+            Ok(project) => self.set_project(project),
+            Err(error) => self.status = format!("Falha ao abrir projeto: {error}").into(),
+        }
+    }
+
+    fn set_project(&mut self, project: Project) {
+        self.navigation_back.clear();
+        self.navigation_forward.clear();
+        let root = project.root_path().to_path_buf();
+        self.index_generation = self.index_generation.wrapping_add(1);
+        let generation = self.index_generation;
+        let (sender, receiver) = mpsc::channel();
+        self.index_results = Some(receiver);
+        self.project_index = None;
+        self.status = "PHP Indexing...".into();
+        let index_root = root.clone();
+        thread::spawn(move || {
+            let mut index = ProjectSymbolIndex::new();
+            let result = index
+                .index_project(&index_root)
+                .map(|_| index)
+                .map_err(|error| error.to_string());
+            let _ = sender.send((generation, result));
+        });
+        match project.read_directory(&root) {
+            Ok(entries) => {
+                self.explorer = entries
+                    .into_iter()
+                    .map(|entry| ExplorerItem {
+                        path: entry.path,
+                        name: entry.name,
+                        kind: entry.kind,
+                        depth: 0,
+                    })
+                    .collect();
+                self.expanded.clear();
+                self.status = if project.composer().is_some() {
+                    "PHP Project • Composer".into()
+                } else if let Some(error) = project.composer_error() {
+                    format!("PHP Project • composer.json inválido: {error}").into()
+                } else {
+                    "PHP Project".into()
+                };
+                self.project = Some(project);
+                self.recent_projects.add(&root, unix_timestamp_now());
+                if let Some(path) = &self.recent_path
+                    && let Err(error) = self.recent_projects.save(path)
+                {
+                    tracing::warn!("failed to persist recent projects: {error}");
+                }
+                self.lsp = self
+                    .project
+                    .as_ref()
+                    .map(|project| LspBridge::start(project.root_path()));
+            }
+            Err(error) => self.status = format!("Falha ao ler projeto: {error}").into(),
+        }
+    }
+
+    fn poll_index(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = self.index_results.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.index_results = None;
+                return;
+            }
+        };
+        self.index_results = None;
+        let (generation, result) = result;
+        if generation != self.index_generation || self.project.is_none() {
+            return;
+        }
+        match result {
+            Ok(index) => {
+                let report = index.report();
+                let shared = Arc::new(RwLock::new(index));
+                self.project_index = Some(shared.clone());
+                for tab in &self.tabs {
+                    tab.editor
+                        .update(cx, |editor, _| editor.set_project_symbols(shared.clone()));
+                }
+                self.status = format!("PHP • {} symbols", report.symbols).into();
+            }
+            Err(error) => self.status = format!("PHP Index Failed: {error}").into(),
+        }
+        cx.notify();
+    }
+
+    fn has_dirty_tabs(&self, cx: &App) -> bool {
+        self.tabs.iter().any(|tab| tab.editor.read(cx).is_dirty())
+    }
+
+    fn request_operation(&mut self, operation: PendingOperation, cx: &mut Context<Self>) {
+        if self.has_dirty_tabs(cx) {
+            self.pending_operation = Some(operation);
+            self.status = "You have unsaved changes".into();
+        } else {
+            self.perform_operation(operation, cx);
+        }
+        cx.notify();
+    }
+
+    fn perform_operation(&mut self, operation: PendingOperation, cx: &mut Context<Self>) {
+        match operation {
+            PendingOperation::OpenProject(path) => {
+                self.clear_project(cx);
+                self.open_project_path(path);
+            }
+            PendingOperation::CloseProject => self.clear_project(cx),
+            PendingOperation::Exit => {
+                self.clear_project(cx);
+                cx.quit();
+            }
+        }
+    }
+
+    fn clear_project(&mut self, cx: &mut Context<Self>) {
+        self.navigation_back.clear();
+        self.navigation_forward.clear();
+        for tab in &self.tabs {
+            tab.editor.read(cx).close_lsp_document();
+        }
+        self.tabs.clear();
+        self.active = None;
+        self.explorer.clear();
+        self.expanded.clear();
+        self.project = None;
+        self.project_index = None;
+        self.lsp = None;
+        if let Some(session) = self.terminal_session.take() {
+            let _ = session.terminate();
+        }
+        self.terminal_view = None;
+        self.terminal_visible = false;
+        self.status = "No project".into();
+    }
+
+    fn open_project(&mut self, _: &OpenProject, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.request_operation(PendingOperation::OpenProject(path), cx);
+        }
+    }
+
+    fn open_file_dialog(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(project) = &self.project {
+            dialog = dialog.set_directory(project.root_path());
+        }
+        if let Some(path) = dialog.pick_file() {
+            if self.project.is_none()
+                && let Some(parent) = path.parent()
+            {
+                self.open_project_path(parent.to_path_buf());
+            }
+            self.open_file(path, window, cx);
+        }
+    }
+
+    fn save_all(&mut self, _: &SaveAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        self.save_all_now(cx);
+    }
+
+    fn save_all_now(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut errors = Vec::new();
+        for tab in &self.tabs {
+            tab.editor.update(cx, |editor, _| {
+                if editor.is_dirty()
+                    && let Err(error) = editor.save_now()
+                {
+                    errors.push(format!("{}: {error}", editor.title()));
+                }
+            });
+            if let Some(index) = &self.project_index {
+                let editor = tab.editor.read(cx);
+                if let Some(path) = editor.document_path() {
+                    if let Ok(mut index) = index.write() {
+                        let _ = index.index_file_text(path, editor.document_text());
+                    }
+                }
+            }
+        }
+        self.status = if errors.is_empty() {
+            "All files saved".into()
+        } else {
+            format!("Save All failed: {}", errors.join("; ")).into()
+        };
+        cx.notify();
+        errors.is_empty()
+    }
+
+    fn close_active_file(&mut self, _: &CloseFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        if let Some(index) = self.active {
+            self.close_tab(index, cx);
+        }
+    }
+
+    fn close_project_action(&mut self, _: &CloseProject, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        self.request_operation(PendingOperation::CloseProject, cx);
+    }
+
+    fn exit(&mut self, _: &Exit, _: &mut Window, cx: &mut Context<Self>) {
+        self.request_operation(PendingOperation::Exit, cx);
+    }
+
+    fn show_about(&mut self, _: &ShowAbout, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        self.show_about = true;
+        cx.notify();
+    }
+
+    fn find(&mut self, _: &Find, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        self.status = "Find UI is deferred; editor text search is not implemented yet".into();
+        cx.notify();
+    }
+
+    fn command_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_palette_visible = true;
+        self.command_palette_query.clear();
+        self.command_palette_selected = 0;
+        self.command_palette_mode = None;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn palette_commands(&self) -> Vec<axiom_app::commands::CommandDescriptor> {
+        if let Some(mode) = &self.command_palette_mode {
+            let query = self.command_palette_query.to_ascii_lowercase();
+            if let Some(index) = &self.project_index
+                && let Ok(index) = index.read()
+            {
+                return index
+                    .symbols()
+                    .iter()
+                    .filter(|symbol| {
+                        let is_class = matches!(
+                            symbol.kind,
+                            axiom_index::ProjectSymbolKind::Class
+                                | axiom_index::ProjectSymbolKind::Interface
+                                | axiom_index::ProjectSymbolKind::Trait
+                                | axiom_index::ProjectSymbolKind::Enum
+                        );
+                        (mode == "class" && is_class || mode == "symbol")
+                            && (query.is_empty()
+                                || symbol.name.to_ascii_lowercase().contains(&query)
+                                || symbol
+                                    .fully_qualified_name
+                                    .to_ascii_lowercase()
+                                    .contains(&query))
+                    })
+                    .take(80)
+                    .map(|symbol| axiom_app::commands::CommandDescriptor {
+                        id: format!(
+                            "{}:{}:{}:{}",
+                            mode,
+                            symbol.file.display(),
+                            symbol.range.start,
+                            symbol.range.end
+                        ),
+                        title: symbol.name.clone(),
+                        description: format!(
+                            "{} • {}",
+                            symbol.fully_qualified_name,
+                            symbol.file.display()
+                        ),
+                        category: "Navigate".into(),
+                        default_shortcut: None,
+                        context: "project".into(),
+                    })
+                    .collect();
+            }
+            return Vec::new();
+        }
+        self.keymap
+            .search(&self.command_palette_query)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    fn palette_up(&mut self, _: &PaletteUp, _: &mut Window, cx: &mut Context<Self>) {
+        let count = self.palette_commands().len();
+        if count > 0 {
+            self.command_palette_selected = self.command_palette_selected.saturating_sub(1);
+        }
+        cx.notify();
+    }
+
+    fn palette_down(&mut self, _: &PaletteDown, _: &mut Window, cx: &mut Context<Self>) {
+        let count = self.palette_commands().len();
+        if count > 0 {
+            self.command_palette_selected = (self.command_palette_selected + 1).min(count - 1);
+        }
+        cx.notify();
+    }
+
+    fn palette_escape(&mut self, _: &PaletteEscape, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_palette_visible = false;
+        self.restore_editor_focus(window, cx);
+        cx.notify();
+    }
+
+    fn palette_confirm(&mut self, _: &PaletteConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(command) = self
+            .palette_commands()
+            .into_iter()
+            .nth(self.command_palette_selected)
+        else {
+            return;
+        };
+        self.command_palette_visible = false;
+        self.execute_command(&command.id, window, cx);
+        cx.notify();
+    }
+
+    fn execute_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match id {
+            "terminal.toggle" => self.toggle_terminal(&ToggleTerminal, window, cx),
+            "project.open" => self.open_project(&OpenProject, window, cx),
+            "project.open_file" => self.open_file_dialog(&OpenFile, window, cx),
+            "navigate.back" => self.navigate_back(&NavigateBack, window, cx),
+            "navigate.forward" => self.navigate_forward(&NavigateForward, window, cx),
+            "editor.reformat" => {
+                self.dispatch_editor_action(crate::editor_view::Reformat, window, cx)
+            }
+            "code.completion" => {
+                self.dispatch_editor_action(crate::editor_view::Complete, window, cx)
+            }
+            "navigate.definition" => {
+                let has_lsp = self
+                    .active
+                    .and_then(|index| self.tabs.get(index))
+                    .and_then(|tab| tab.editor.read(cx).lsp_uri())
+                    .is_some();
+                if has_lsp {
+                    self.dispatch_editor_action(crate::editor_view::Definition, window, cx)
+                } else {
+                    self.navigate_native_definition(cx);
+                }
+            }
+            "navigate.class" => {
+                self.command_palette_mode = Some("class".into());
+                self.command_palette_query.clear();
+                self.command_palette_selected = 0;
+                self.command_palette_visible = true;
+            }
+            "navigate.symbol" => {
+                self.command_palette_mode = Some("symbol".into());
+                self.command_palette_query.clear();
+                self.command_palette_selected = 0;
+                self.command_palette_visible = true;
+            }
+            id if id.starts_with("class:") || id.starts_with("symbol:") => {
+                let mut parts = id.rsplitn(3, ':');
+                let end = parts.next().and_then(|value| value.parse::<usize>().ok());
+                let start = parts.next().and_then(|value| value.parse::<usize>().ok());
+                let path = parts.next();
+                if let (Some(end), Some(start), Some(path)) = (end, start, path) {
+                    self.command_palette_mode = None;
+                    self.open_file(PathBuf::from(path), window, cx);
+                    if let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) {
+                        tab.editor
+                            .update(cx, |editor, cx| editor.reveal_byte_range(start..end, cx));
+                    }
+                }
+            }
+            "editor.copy" => self.dispatch_editor_action(crate::editor_view::Copy, window, cx),
+            "editor.cut" => self.dispatch_editor_action(crate::editor_view::Cut, window, cx),
+            "editor.paste" => self.dispatch_editor_action(crate::editor_view::Paste, window, cx),
+            _ => self.status = format!("Command {id} is not available in this context").into(),
+        }
+    }
+
+    fn go_to_class(&mut self, _: &GoToClass, window: &mut Window, cx: &mut Context<Self>) {
+        self.execute_command("navigate.class", window, cx);
+    }
+
+    fn go_to_symbol(&mut self, _: &GoToSymbol, window: &mut Window, cx: &mut Context<Self>) {
+        self.execute_command("navigate.symbol", window, cx);
+    }
+
+    fn navigate_native_definition(&mut self, cx: &mut Context<Self>) {
+        let native = self
+            .active
+            .and_then(|index| self.tabs.get(index))
+            .and_then(|tab| tab.editor.read(cx).native_definition_location());
+        if let Some((path, position)) = native {
+            self.navigate_to_definition(DefinitionTarget { path, position }, cx);
+        } else {
+            self.status = "Definition não encontrada".into();
+        }
+    }
+
+    fn dispatch_editor_action<A: Action + Clone + 'static>(
+        &mut self,
+        action: A,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) {
+            window.focus(&tab.editor.read(cx).focus_handle(cx));
+            window.dispatch_action(action.boxed_clone(), cx);
+        } else {
+            self.status = "No editor document is active".into();
+        }
+    }
+
+    fn restore_editor_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) {
+            window.focus(&tab.editor.read(cx).focus_handle(cx));
+        } else {
+            window.focus(&self.focus);
+        }
+    }
+
+    fn settings(&mut self, _: &Settings, _: &mut Window, cx: &mut Context<Self>) {
+        self.settings_visible = true;
+        self.settings_selected = None;
+        cx.notify();
+    }
+
+    fn select_setting_command(&mut self, id: String, cx: &mut Context<Self>) {
+        self.settings_selected = Some(id);
+        cx.notify();
+    }
+
+    fn remove_selected_shortcut(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.settings_selected.clone() {
+            let _ = self.keymap.set_shortcut(&id, None);
+            let _ = self.keymap.persist_user();
+        }
+        cx.notify();
+    }
+
+    fn reset_selected_shortcut(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.settings_selected.clone() {
+            self.keymap.reset(&id);
+            let _ = self.keymap.persist_user();
+        }
+        cx.notify();
+    }
+
+    fn begin_shortcut_capture(&mut self, cx: &mut Context<Self>) {
+        self.shortcut_capture = true;
+        self.captured_shortcut = None;
+        self.shortcut_conflict = None;
+        cx.notify();
+    }
+
+    fn capture_shortcut(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.shortcut_capture {
+            return;
+        }
+        if event.keystroke.modifiers.control
+            && event.keystroke.modifiers.alt
+            && event.keystroke.key_char.is_some()
+        {
+            return;
+        }
+        let key = event.keystroke.key.to_ascii_lowercase();
+        if key == "escape" {
+            self.shortcut_capture = false;
+            self.captured_shortcut = None;
+            cx.notify();
+            return;
+        }
+        if matches!(
+            key.as_str(),
+            "control" | "shift" | "alt" | "command" | "super"
+        ) {
+            return;
+        }
+        let modifiers = event.keystroke.modifiers;
+        let mut value = String::new();
+        if modifiers.control {
+            value.push_str("ctrl-");
+        }
+        if modifiers.shift {
+            value.push_str("shift-");
+        }
+        if modifiers.alt {
+            value.push_str("alt-");
+        }
+        value.push_str(&key);
+        self.captured_shortcut = Some(value);
+        cx.notify();
+    }
+
+    fn handle_workspace_keydown(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shortcut_capture {
+            self.capture_shortcut(event, window, cx);
+            return;
+        }
+        if event.keystroke.modifiers.control
+            && event.keystroke.modifiers.alt
+            && event.keystroke.key_char.is_some()
+        {
+            return;
+        }
+        let key = event.keystroke.key.to_ascii_lowercase();
+        let modifiers = event.keystroke.modifiers;
+        let mut stroke = String::new();
+        if modifiers.control {
+            stroke.push_str("ctrl-");
+        }
+        if modifiers.shift {
+            stroke.push_str("shift-");
+        }
+        if modifiers.alt {
+            stroke.push_str("alt-");
+        }
+        stroke.push_str(&key);
+        if let Some(command) = self
+            .keymap
+            .commands()
+            .iter()
+            .find(|command| self.keymap.shortcut(&command.id) == Some(stroke.as_str()))
+        {
+            let id = command.id.clone();
+            self.execute_command(&id, window, cx);
+        }
+    }
+
+    fn apply_captured_shortcut(&mut self, cx: &mut Context<Self>) {
+        let (Some(id), Some(shortcut)) = (
+            self.settings_selected.clone(),
+            self.captured_shortcut.clone(),
+        ) else {
+            return;
+        };
+        if let Err(conflict) = self.keymap.set_shortcut(&id, Some(shortcut.clone())) {
+            self.shortcut_conflict = Some(conflict);
+            cx.notify();
+            return;
+        }
+        let _ = self.keymap.persist_user();
+        self.shortcut_capture = false;
+        cx.notify();
+    }
+
+    fn replace_conflicting_shortcut(&mut self, cx: &mut Context<Self>) {
+        let (Some(id), Some(shortcut)) = (
+            self.settings_selected.clone(),
+            self.captured_shortcut.clone(),
+        ) else {
+            return;
+        };
+        self.keymap.replace_shortcut(&id, Some(shortcut));
+        let _ = self.keymap.persist_user();
+        self.shortcut_conflict = None;
+        self.shortcut_capture = false;
+        cx.notify();
+    }
+
+    fn cancel_shortcut_conflict(&mut self, cx: &mut Context<Self>) {
+        self.shortcut_conflict = None;
+        self.captured_shortcut = None;
+        cx.notify();
+    }
+
+    fn toggle_project(&mut self, _: &ToggleProject, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        self.project_panel_visible = !self.project_panel_visible;
+        cx.notify();
+    }
+
+    fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        if self.terminal_visible {
+            self.terminal_visible = false;
+            cx.notify();
+            return;
+        }
+        if self.terminal_view.is_none() {
+            let Some(project) = &self.project else {
+                self.status = "Open a project before starting a terminal".into();
+                cx.notify();
+                return;
+            };
+            match TerminalSession::spawn(project.root_path(), TerminalProfile::platform_default()) {
+                Ok(session) => {
+                    let session = std::sync::Arc::new(session);
+                    let workspace = cx.entity().downgrade();
+                    let view = cx.new(|cx| TerminalView::new(session.clone(), workspace, cx));
+                    self.terminal_session = Some(session);
+                    self.terminal_view = Some(view);
+                }
+                Err(error) => {
+                    self.status = format!("Terminal failed to start: {error}").into();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        self.terminal_visible = true;
+        if let Some(terminal) = &self.terminal_view {
+            window.focus(&terminal.read(cx).focus_handle());
+        }
+        cx.notify();
+    }
+
+    fn open_in_terminal(
+        &mut self,
+        _: &OpenInTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(context) = self.explorer_context.take() else {
+            return;
+        };
+        let directory = Self::context_directory(&context.path, context.kind).to_path_buf();
+        match TerminalSession::spawn(&directory, TerminalProfile::platform_default()) {
+            Ok(session) => {
+                let session = std::sync::Arc::new(session);
+                let workspace = cx.entity().downgrade();
+                let view = cx.new(|cx| TerminalView::new(session.clone(), workspace, cx));
+                self.terminal_session = Some(session);
+                self.terminal_view = Some(view);
+                self.terminal_visible = true;
+                self.status = format!("Terminal opened in {}", directory.display()).into();
+                if let Some(terminal) = &self.terminal_view {
+                    window.focus(&terminal.read(cx).focus_handle());
+                }
+            }
+            Err(error) => self.status = format!("Terminal failed to start: {error}").into(),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_terminal_link(
+        &mut self,
+        link: TerminalLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match link.kind {
+            TerminalLinkKind::Url => {
+                if link.target.starts_with("http://") || link.target.starts_with("https://") {
+                    if let Err(error) = open::that(&link.target) {
+                        self.status = format!("Unable to open link: {error}").into();
+                    }
+                }
+            }
+            TerminalLinkKind::File | TerminalLinkKind::FileLine { .. } => {
+                let Some(path) = link.path else { return };
+                if !path.is_file() {
+                    self.status = format!("File not found: {}", path.display()).into();
+                    cx.notify();
+                    return;
+                }
+                self.open_file(path.clone(), window, cx);
+                if let Some(line) = match link.kind {
+                    TerminalLinkKind::FileLine { line, .. } => Some(line),
+                    TerminalLinkKind::File => None,
+                    TerminalLinkKind::Url => None,
+                } {
+                    let column = match link.kind {
+                        TerminalLinkKind::FileLine { column, .. } => column,
+                        _ => None,
+                    };
+                    if let Some(index) = self.active.and_then(|index| self.tabs.get(index)) {
+                        index.editor.update(cx, |editor, cx| {
+                            editor.reveal_lsp_position(
+                                lsp_types::Position {
+                                    line: line.saturating_sub(1),
+                                    character: column.unwrap_or(1).saturating_sub(1),
+                                },
+                                cx,
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_directory(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(item) = self.explorer.get(index).cloned() else {
+            return;
+        };
+        if item.kind != EntryKind::Directory {
+            return;
+        }
+        if self.expanded.remove(&item.path) {
+            let prefix = item.path;
+            self.explorer.retain(|candidate| {
+                candidate.path == prefix || !candidate.path.starts_with(&prefix)
+            });
+        } else if let Some(project) = &self.project {
+            match project.read_directory(&item.path) {
+                Ok(entries) => {
+                    let children = entries.into_iter().map(|entry| ExplorerItem {
+                        path: entry.path,
+                        name: entry.name,
+                        kind: entry.kind,
+                        depth: item.depth + 1,
+                    });
+                    self.explorer.splice(index + 1..index + 1, children);
+                    self.expanded.insert(item.path);
+                }
+                Err(error) => self.status = format!("Falha ao abrir pasta: {error}").into(),
+            }
+        }
+        cx.notify();
+    }
+
+    fn refresh_explorer(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = &self.project else { return };
+        match project.read_directory(project.root_path()) {
+            Ok(entries) => {
+                self.explorer = entries
+                    .into_iter()
+                    .map(|entry| ExplorerItem {
+                        path: entry.path,
+                        name: entry.name,
+                        kind: entry.kind,
+                        depth: 0,
+                    })
+                    .collect();
+                self.expanded.clear();
+                self.status = "Project Explorer refreshed".into();
+            }
+            Err(error) => self.status = format!("Falha ao atualizar projeto: {error}").into(),
+        }
+        self.explorer_context = None;
+        cx.notify();
+    }
+
+    fn context_directory(path: &Path, kind: EntryKind) -> &Path {
+        if kind == EntryKind::Directory {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        }
+    }
+
+    fn new_file(&mut self, directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.explorer_context = None;
+        let Some(chosen) = rfd::FileDialog::new()
+            .set_title("New File")
+            .set_directory(&directory)
+            .set_file_name("untitled")
+            .save_file()
+        else {
+            return;
+        };
+        let Some(name) = chosen.file_name().and_then(|name| name.to_str()) else {
+            self.status = "Invalid file name".into();
+            cx.notify();
+            return;
+        };
+        let result = self
+            .project
+            .as_ref()
+            .expect("project is open")
+            .create_file(&directory, name);
+        match result {
+            Ok(path) => {
+                self.refresh_explorer(cx);
+                self.open_file(path, window, cx);
+            }
+            Err(error) => {
+                self.status = format!("Falha ao criar arquivo: {error}").into();
+                cx.notify();
+            }
+        }
+    }
+
+    fn new_directory(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
+        self.explorer_context = None;
+        let Some(chosen) = rfd::FileDialog::new()
+            .set_title("New Directory")
+            .set_directory(&directory)
+            .set_file_name("New Folder")
+            .save_file()
+        else {
+            return;
+        };
+        let Some(name) = chosen.file_name().and_then(|name| name.to_str()) else {
+            self.status = "Invalid directory name".into();
+            cx.notify();
+            return;
+        };
+        match self
+            .project
+            .as_ref()
+            .expect("project is open")
+            .create_directory(&directory, name)
+        {
+            Ok(_) => self.refresh_explorer(cx),
+            Err(error) => {
+                self.status = format!("Falha ao criar diretório: {error}").into();
+                cx.notify();
+            }
+        }
+    }
+
+    fn rename_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.explorer_context = None;
+        let Some(parent) = path.parent() else { return };
+        let Some(current_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let Some(chosen) = rfd::FileDialog::new()
+            .set_title("Rename")
+            .set_directory(parent)
+            .set_file_name(current_name)
+            .save_file()
+        else {
+            return;
+        };
+        let Some(new_name) = chosen.file_name().and_then(|name| name.to_str()) else {
+            self.status = "Invalid name".into();
+            cx.notify();
+            return;
+        };
+        let result = self
+            .project
+            .as_ref()
+            .expect("project is open")
+            .rename(&path, new_name);
+        match result {
+            Ok(destination) => {
+                for tab in &mut self.tabs {
+                    if let Ok(relative) = tab.path.strip_prefix(&path) {
+                        tab.path = destination.join(relative);
+                        tab.editor
+                            .update(cx, |editor, _| editor.relocate_path(&path, &destination));
+                    }
+                }
+                self.refresh_explorer(cx);
+            }
+            Err(error) => {
+                self.status = format!("Falha ao renomear: {error}").into();
+                cx.notify();
+            }
+        }
+    }
+
+    fn request_delete(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.explorer_context = None;
+        if self
+            .tabs
+            .iter()
+            .any(|tab| tab.path.starts_with(&path) && tab.editor.read(cx).is_dirty())
+        {
+            self.status = "Save or close modified files before deleting".into();
+        } else {
+            self.pending_delete = Some(path);
+            self.status = "Confirm deletion".into();
+        }
+        cx.notify();
+    }
+
+    fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.pending_delete.take() else {
+            return;
+        };
+        match self
+            .project
+            .as_ref()
+            .expect("project is open")
+            .delete(&path)
+        {
+            Ok(()) => {
+                for tab in self.tabs.iter().filter(|tab| tab.path.starts_with(&path)) {
+                    tab.editor.read(cx).close_lsp_document();
+                }
+                self.tabs.retain(|tab| !tab.path.starts_with(&path));
+                self.active = if self.tabs.is_empty() {
+                    None
+                } else {
+                    Some(self.active.unwrap_or(0).min(self.tabs.len() - 1))
+                };
+                self.refresh_explorer(cx);
+                self.status = "Entry deleted".into();
+            }
+            Err(error) => {
+                self.status = format!("Falha ao excluir: {error}").into();
+                cx.notify();
+            }
+        }
+    }
+
+    fn copy_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+        self.explorer_context = None;
+        self.status = "Path copied".into();
+        cx.notify();
+    }
+
+    fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(message) = match read_file_content(&path) {
+            Ok(FileContent::Text(_)) => Ok(()),
+            Ok(FileContent::Binary) => Err("Binary file — preview not supported".to_owned()),
+            Ok(FileContent::UnsupportedEncoding) => {
+                Err("Unsupported text encoding — file not opened".to_owned())
+            }
+            Err(error) => Err(format!("Falha ao ler arquivo: {error}")),
+        } {
+            self.status = message.into();
+            cx.notify();
+            return;
+        }
+        let path = match fs::canonicalize(path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = format!("Falha ao normalizar arquivo: {error}").into();
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+            self.activate(index, window, cx);
+            return;
+        }
+        let document = match Document::from_file(&path) {
+            Ok(document) => document,
+            Err(error) => {
+                self.status = format!("Falha ao abrir arquivo: {error}").into();
+                cx.notify();
+                return;
+            }
+        };
+        let lsp = self.lsp.clone();
+        let editor = cx.new(|cx| EditorView::from_document(path.clone(), document, lsp, cx));
+        if let Some(symbols) = &self._runtime_symbols {
+            editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
+        }
+        if let Some(index) = &self.project_index {
+            editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+        }
+        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+        self.tabs.push(OpenTab { path, editor });
+        self.activate(self.tabs.len() - 1, window, cx);
+    }
+
+    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let started = std::time::Instant::now();
+        if let Some(tab) = self.tabs.get(index) {
+            let title = tab.editor.read(cx).title();
+            self.active = Some(index);
+            window.focus(&tab.editor.read(cx).focus_handle(cx));
+            cx.notify();
+            let activation = started.elapsed();
+            window.on_next_frame(move |_, _| {
+                tracing::debug!(
+                    target: "axiom::tab_switch",
+                    file = %title,
+                    activation_us = activation.as_micros(),
+                    first_frame_us = started.elapsed().as_micros(),
+                    syntax_us = 0_u64,
+                    lsp_us = 0_u64,
+                    "resident tab activated"
+                );
+            });
+        }
+    }
+
+    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.editor.read(cx).is_dirty() {
+            self.status = format!(
+                "{} possui alterações; salve antes de fechar",
+                tab.editor.read(cx).title()
+            )
+            .into();
+            cx.notify();
+            return;
+        }
+        tab.editor.read(cx).close_lsp_document();
+        self.tabs.remove(index);
+        self.active = match self.active {
+            None => None,
+            Some(_) if self.tabs.is_empty() => None,
+            Some(active) if active > index => Some(active - 1),
+            Some(active) if active == index => Some(index.min(self.tabs.len() - 1)),
+            active => active,
+        };
+        cx.notify();
+    }
+
+    fn poll_lsp(&mut self, cx: &mut Context<Self>) {
+        let Some(lsp) = self.lsp.clone() else { return };
+        let events = lsp.drain_events();
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            match event {
+                IdeLspEvent::Diagnostics(params) => {
+                    if let Some(tab) = self
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.editor.read(cx).lsp_uri() == Some(&params.uri))
+                    {
+                        tab.editor.update(cx, |editor, cx| {
+                            editor.set_diagnostics(params.version, params.diagnostics, cx)
+                        });
+                    }
+                }
+                IdeLspEvent::Completion { uri, items } => {
+                    if let Some(tab) = self
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.editor.read(cx).lsp_uri() == Some(&uri))
+                    {
+                        tab.editor
+                            .update(cx, |editor, cx| editor.set_completions(items, cx));
+                    }
+                }
+                IdeLspEvent::Formatting { uri, edits } => {
+                    if let Some(tab) = self
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.editor.read(cx).lsp_uri() == Some(&uri))
+                    {
+                        tab.editor
+                            .update(cx, |editor, cx| editor.apply_formatting(&edits, cx));
+                    }
+                }
+                IdeLspEvent::SignatureHelp { uri, text } => {
+                    if let Some(tab) = self
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.editor.read(cx).lsp_uri() == Some(&uri))
+                    {
+                        tab.editor
+                            .update(cx, |editor, cx| editor.set_signature_help(text, cx));
+                    }
+                }
+                IdeLspEvent::Hover { uri, text } => {
+                    if let Some(tab) = self
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.editor.read(cx).lsp_uri() == Some(&uri))
+                    {
+                        tab.editor
+                            .update(cx, |editor, cx| editor.set_hover(text, cx));
+                    }
+                }
+                IdeLspEvent::Definition { locations } => {
+                    self.definition_targets = locations
+                        .iter()
+                        .filter_map(|location| {
+                            uri_to_path(&location.uri)
+                                .ok()
+                                .map(|path| DefinitionTarget {
+                                    path,
+                                    position: location.range.start,
+                                })
+                        })
+                        .collect();
+                    if let Some(location) = locations.into_iter().next() {
+                        match uri_to_path(&location.uri) {
+                            Ok(path) => self.navigate_to_definition(
+                                DefinitionTarget {
+                                    path,
+                                    position: location.range.start,
+                                },
+                                cx,
+                            ),
+                            Err(error) => {
+                                self.status = format!("Definition inválida: {error}").into()
+                            }
+                        }
+                    } else {
+                        let native = self
+                            .active
+                            .and_then(|index| self.tabs.get(index))
+                            .and_then(|tab| tab.editor.read(cx).native_definition_location());
+                        if let Some((path, position)) = native {
+                            self.navigate_to_definition(DefinitionTarget { path, position }, cx);
+                        } else {
+                            self.status = "Definition não encontrada".into();
+                        }
+                    }
+                }
+                IdeLspEvent::References { count } => {
+                    self.status = format!("{count} referência(s) encontrada(s)").into();
+                }
+                IdeLspEvent::Error(error) => {
+                    self.status = format!("Language Server: {error}").into();
+                }
+                IdeLspEvent::Stopped => self.status = "Language Server: Stopped".into(),
+            }
+        }
+        cx.notify();
+    }
+
+    fn navigate_to_definition(&mut self, target: DefinitionTarget, cx: &mut Context<Self>) {
+        let path = match fs::canonicalize(&target.path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = format!("Falha ao abrir definition: {error}").into();
+                return;
+            }
+        };
+        let origin = self
+            .active
+            .and_then(|index| self.tabs.get(index))
+            .and_then(|tab| {
+                tab.editor
+                    .read(cx)
+                    .current_lsp_position()
+                    .map(|position| NavigationLocation {
+                        path: tab.path.clone(),
+                        position,
+                    })
+            });
+        let same_location = origin.as_ref().is_some_and(|origin| {
+            fs::canonicalize(&origin.path).ok().as_ref() == Some(&path)
+                && origin.position == target.position
+        });
+        if let Some(origin) = origin
+            && !same_location
+        {
+            self.navigation_back.push(origin);
+            self.navigation_forward.clear();
+        }
+        let index = if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+            index
+        } else {
+            let document = match Document::from_file(&path) {
+                Ok(document) => document,
+                Err(error) => {
+                    self.status = format!("Falha ao abrir definition: {error}").into();
+                    return;
+                }
+            };
+            let lsp = self.lsp.clone();
+            let editor = cx.new(|cx| EditorView::from_document(path.clone(), document, lsp, cx));
+            if let Some(symbols) = &self._runtime_symbols {
+                editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
+            }
+            if let Some(index) = &self.project_index {
+                editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+            }
+            cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+            self.tabs.push(OpenTab { path, editor });
+            self.tabs.len() - 1
+        };
+        self.active = Some(index);
+        self.tabs[index].editor.update(cx, |editor, cx| {
+            editor.reveal_lsp_position(target.position, cx)
+        });
+    }
+
+    fn navigate_back(&mut self, _: &NavigateBack, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(location) = self.navigation_back.pop() else {
+            self.status = "No earlier navigation location".into();
+            cx.notify();
+            return;
+        };
+        if let Some(active) = self.active.and_then(|index| self.tabs.get(index)) {
+            if let Some(position) = active.editor.read(cx).current_lsp_position() {
+                self.navigation_forward.push(NavigationLocation {
+                    path: active.path.clone(),
+                    position,
+                });
+            }
+        }
+        self.open_definition_without_history(location.path, location.position, cx);
+    }
+
+    fn navigate_forward(&mut self, _: &NavigateForward, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(location) = self.navigation_forward.pop() else {
+            self.status = "No later navigation location".into();
+            cx.notify();
+            return;
+        };
+        if let Some(active) = self.active.and_then(|index| self.tabs.get(index)) {
+            if let Some(position) = active.editor.read(cx).current_lsp_position() {
+                self.navigation_back.push(NavigationLocation {
+                    path: active.path.clone(),
+                    position,
+                });
+            }
+        }
+        self.open_definition_without_history(location.path, location.position, cx);
+    }
+
+    fn open_definition_without_history(
+        &mut self,
+        path: PathBuf,
+        position: lsp_types::Position,
+        cx: &mut Context<Self>,
+    ) {
+        let path = match fs::canonicalize(path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = format!("Navigation target unavailable: {error}").into();
+                return;
+            }
+        };
+        let index = if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+            index
+        } else {
+            let Ok(document) = Document::from_file(&path) else {
+                self.status = "Navigation target could not be opened".into();
+                return;
+            };
+            let editor = cx
+                .new(|cx| EditorView::from_document(path.clone(), document, self.lsp.clone(), cx));
+            if let Some(symbols) = &self._runtime_symbols {
+                editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
+            }
+            if let Some(index) = &self.project_index {
+                editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+            }
+            cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+            self.tabs.push(OpenTab { path, editor });
+            self.tabs.len() - 1
+        };
+        self.active = Some(index);
+        self.tabs[index]
+            .editor
+            .update(cx, |editor, cx| editor.reveal_lsp_position(position, cx));
+        cx.notify();
+    }
+
+    fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        let project_workspace = workspace.clone();
+        div()
+            .w(m.activity_bar_width)
+            .h_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .py_1()
+            .gap_1()
+            .bg(t.window_background)
+            .border_r_1()
+            .border_color(t.border_subtle)
+            .child(
+                div()
+                    .id("activity-project")
+                    .relative()
+                    .w(m.activity_bar_width)
+                    .h(px(36.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(|_, cx| tooltip("Project", cx))
+                    .hover(move |style| style.bg(t.hover))
+                    .on_click(move |_, _, cx| {
+                        project_workspace.update(cx, |this, cx| {
+                            this.project_panel_visible = true;
+                            this.status = "Project tool window".into();
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(0.))
+                            .h(px(20.))
+                            .w(px(2.))
+                            .rounded_r(m.border_radius_small)
+                            .bg(t.accent),
+                    )
+                    .child(activity_icon(ActivityIcon::Project, t.accent)),
+            )
+            .child(
+                div()
+                    .id("activity-search-disabled")
+                    .w(m.toolbar_height)
+                    .h(px(36.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(|_, cx| tooltip("Search — not available yet", cx))
+                    .child(activity_icon(ActivityIcon::Search, t.text_muted)),
+            )
+            .child(
+                div()
+                    .id("activity-problems-disabled")
+                    .w(m.toolbar_height)
+                    .h(px(36.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(|_, cx| tooltip("Problems — not available yet", cx))
+                    .child(activity_icon(ActivityIcon::Problems, t.text_muted)),
+            )
+            .child({
+                let workspace = workspace.clone();
+                let active = self.terminal_visible;
+                div()
+                    .id("activity-terminal")
+                    .relative()
+                    .w(m.activity_bar_width)
+                    .h(px(36.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(|_, cx| tooltip("Terminal (Ctrl+`)", cx))
+                    .hover(move |style| style.bg(t.hover))
+                    .on_click(move |_, window, cx| {
+                        workspace.update(cx, |this, cx| {
+                            this.toggle_terminal(&ToggleTerminal, window, cx);
+                        });
+                    })
+                    .when(active, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .left(px(0.))
+                                .h(px(20.))
+                                .w(px(2.))
+                                .rounded_r(m.border_radius_small)
+                                .bg(t.accent),
+                        )
+                    })
+                    .child(activity_icon(
+                        ActivityIcon::Terminal,
+                        if active { t.accent } else { t.text_secondary },
+                    ))
+            })
+            .child(div().flex_1())
+    }
+
+    fn render_explorer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        let project_root = self
+            .project
+            .as_ref()
+            .map(|project| project.root_path().to_path_buf());
+        let root_name = self
+            .project
+            .as_ref()
+            .map(Project::name)
+            .unwrap_or("No project");
+        let active_path = self
+            .active
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.path.clone());
+        div()
+            .w(m.sidebar_default_width)
+            .min_w(px(180.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(t.sidebar_background)
+            .border_r_1()
+            .border_color(t.border_subtle)
+            .child(
+                div()
+                    .h(m.panel_header_height)
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(m.ui_font_size)
+                    .text_color(t.text_secondary)
+                    .child("PROJECT")
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .when_some(project_root.clone(), |this, root| {
+                                let new_file_workspace = workspace.clone();
+                                let new_directory_workspace = workspace.clone();
+                                let refresh_workspace = workspace.clone();
+                                this.child(
+                                    div()
+                                        .id("explorer-new-file")
+                                        .tooltip(|_, cx| tooltip("New File", cx))
+                                        .px_1()
+                                        .w(m.toolbar_height)
+                                        .h(m.toolbar_height)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(m.border_radius_small)
+                                        .hover(move |s| s.bg(t.hover))
+                                        .on_click({
+                                            let root = root.clone();
+                                            move |_, window, cx| {
+                                                new_file_workspace.update(cx, |this, cx| {
+                                                    this.new_file(root.clone(), window, cx)
+                                                })
+                                            }
+                                        })
+                                        .child("+"),
+                                )
+                                .child(
+                                    div()
+                                        .id("explorer-new-directory")
+                                        .tooltip(|_, cx| tooltip("New Directory", cx))
+                                        .px_1()
+                                        .w(m.toolbar_height)
+                                        .h(m.toolbar_height)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(m.border_radius_small)
+                                        .hover(move |s| s.bg(t.hover))
+                                        .on_click({
+                                            let root = root.clone();
+                                            move |_, _, cx| {
+                                                new_directory_workspace.update(cx, |this, cx| {
+                                                    this.new_directory(root.clone(), cx)
+                                                })
+                                            }
+                                        })
+                                        .child("□+"),
+                                )
+                                .child(
+                                    div()
+                                        .id("explorer-refresh")
+                                        .tooltip(|_, cx| tooltip("Refresh", cx))
+                                        .px_1()
+                                        .w(m.toolbar_height)
+                                        .h(m.toolbar_height)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(m.border_radius_small)
+                                        .hover(move |s| s.bg(t.hover))
+                                        .on_click(move |_, _, cx| {
+                                            refresh_workspace
+                                                .update(cx, |this, cx| this.refresh_explorer(cx));
+                                        })
+                                        .child("↻"),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .h(m.toolbar_height)
+                    .px_2()
+                    .text_color(t.text_primary)
+                    .when_some(project_root.clone(), |this, root| {
+                        let workspace = workspace.clone();
+                        this.on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.explorer_context = Some(ExplorerContext {
+                                    path: root.clone(),
+                                    kind: EntryKind::Directory,
+                                });
+                                cx.notify();
+                            });
+                            cx.stop_propagation();
+                        })
+                    })
+                    .child(format!("▾ {root_name}")),
+            )
+            .when(self.explorer_context.is_some(), |this| {
+                this.child(self.render_explorer_context(cx))
+            })
+            .child(
+                div()
+                    .id("explorer-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .children(self.explorer.iter().enumerate().map(|(index, item)| {
+                        let item = item.clone();
+                        let workspace = workspace.clone();
+                        let context_workspace = workspace.clone();
+                        let context_item = item.clone();
+                        let is_expanded = self.expanded.contains(&item.path);
+                        let is_active = active_path.as_ref() == Some(&item.path);
+                        let icon =
+                            file_icon(&item.path, item.kind == EntryKind::Directory, is_expanded)
+                                .glyph();
+                        div()
+                            .id(("explorer", index))
+                            .h(px(24.))
+                            .pl(px(12. + item.depth as f32 * 16.))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(m.ui_font_size)
+                            .text_color(if is_active {
+                                t.text_primary
+                            } else {
+                                t.text_secondary
+                            })
+                            .bg(if is_active {
+                                t.pressed
+                            } else {
+                                t.sidebar_background
+                            })
+                            .hover(move |style| style.bg(t.hover))
+                            .on_click(move |_, window, cx| {
+                                workspace.update(cx, |this, cx| {
+                                    if item.kind == EntryKind::Directory {
+                                        this.toggle_directory(index, cx);
+                                    } else {
+                                        this.open_file(item.path.clone(), window, cx);
+                                    }
+                                });
+                            })
+                            .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                                context_workspace.update(cx, |this, cx| {
+                                    this.explorer_context = Some(ExplorerContext {
+                                        path: context_item.path.clone(),
+                                        kind: context_item.kind,
+                                    });
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .w(m.icon_size)
+                                    .text_color(if is_active { t.accent } else { t.text_muted })
+                                    .child(icon),
+                            )
+                            .child(item.name)
+                    })),
+            )
+    }
+
+    fn render_explorer_context(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        let context = self
+            .explorer_context
+            .clone()
+            .expect("context menu is visible");
+        let root = self
+            .project
+            .as_ref()
+            .expect("project is open")
+            .root_path()
+            .to_path_buf();
+        let directory = Self::context_directory(&context.path, context.kind).to_path_buf();
+        let is_root = context.path == root;
+        div()
+            .mx_2()
+            .mb_1()
+            .p_1()
+            .rounded(m.border_radius_medium)
+            .border_1()
+            .border_color(t.border)
+            .flex()
+            .flex_col()
+            .bg(t.menu_background)
+            .text_color(t.text_primary)
+            .when(context.kind == EntryKind::File, |this| {
+                let open_workspace = workspace.clone();
+                let path = context.path.clone();
+                this.child(Self::explorer_menu_item("Open", move |window, cx| {
+                    open_workspace.update(cx, |this, cx| this.open_file(path.clone(), window, cx));
+                }))
+                .child({
+                    let workspace = workspace.clone();
+                    Self::explorer_menu_item(
+                        "Open Containing Folder in Terminal",
+                        move |window, cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.open_in_terminal(&OpenInTerminal, window, cx)
+                            });
+                        },
+                    )
+                })
+            })
+            .when(context.kind == EntryKind::Directory, |this| {
+                let workspace = workspace.clone();
+                this.child(Self::explorer_menu_item(
+                    "Open in Terminal",
+                    move |window, cx| {
+                        workspace.update(cx, |this, cx| {
+                            this.open_in_terminal(&OpenInTerminal, window, cx)
+                        });
+                    },
+                ))
+            })
+            .child({
+                let workspace = workspace.clone();
+                let directory = directory.clone();
+                Self::explorer_menu_item("New File", move |window, cx| {
+                    workspace.update(cx, |this, cx| this.new_file(directory.clone(), window, cx));
+                })
+            })
+            .child({
+                let workspace = workspace.clone();
+                let directory = directory.clone();
+                Self::explorer_menu_item("New Directory", move |_, cx| {
+                    workspace.update(cx, |this, cx| this.new_directory(directory.clone(), cx));
+                })
+            })
+            .when(!is_root, |this| {
+                let rename_workspace = workspace.clone();
+                let delete_workspace = workspace.clone();
+                let rename_path = context.path.clone();
+                let delete_path = context.path.clone();
+                this.child(Self::explorer_menu_item("Rename", move |_, cx| {
+                    rename_workspace
+                        .update(cx, |this, cx| this.rename_entry(rename_path.clone(), cx));
+                }))
+                .child(Self::explorer_menu_item("Delete", move |_, cx| {
+                    delete_workspace
+                        .update(cx, |this, cx| this.request_delete(delete_path.clone(), cx));
+                }))
+            })
+            .child({
+                let workspace = workspace.clone();
+                let path = context.path.clone();
+                Self::explorer_menu_item("Copy Path", move |_, cx| {
+                    workspace.update(cx, |this, cx| this.copy_path(&path, cx));
+                })
+            })
+            .child({
+                let workspace = workspace.clone();
+                Self::explorer_menu_item("Refresh", move |_, cx| {
+                    workspace.update(cx, |this, cx| this.refresh_explorer(cx));
+                })
+            })
+    }
+
+    fn explorer_menu_item(
+        label: &'static str,
+        handler: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        div()
+            .id(label)
+            .h(m.toolbar_height)
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded(m.border_radius_small)
+            .hover(move |style| style.bg(t.hover))
+            .on_click(move |_, window, cx| handler(window, cx))
+            .child(label)
+    }
+
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        div()
+            .h(m.tab_height)
+            .flex()
+            .bg(t.panel_background)
+            .border_b_1()
+            .border_color(t.border_subtle)
+            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
+                let editor = tab.editor.read(cx);
+                let title = editor.title();
+                let dirty = editor.is_dirty();
+                let icon = file_icon(&tab.path, false, false).glyph();
+                let activate_workspace = workspace.clone();
+                let close_workspace = workspace.clone();
+                div()
+                    .id(("tab", index))
+                    .h_full()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .bg(if self.active == Some(index) {
+                        t.editor_background
+                    } else {
+                        t.panel_background
+                    })
+                    .border_b_2()
+                    .border_color(if self.active == Some(index) {
+                        t.accent
+                    } else {
+                        t.panel_background
+                    })
+                    .text_color(if self.active == Some(index) {
+                        t.text_primary
+                    } else {
+                        t.text_secondary
+                    })
+                    .hover(move |style| style.bg(t.hover))
+                    .on_click(move |_, window, cx| {
+                        activate_workspace.update(cx, |this, cx| this.activate(index, window, cx));
+                    })
+                    .child(
+                        div()
+                            .text_color(t.accent)
+                            .text_size(m.ui_font_size)
+                            .child(icon),
+                    )
+                    .child(title)
+                    .when(dirty, |this| {
+                        this.child(div().text_color(t.warning).child("●"))
+                    })
+                    .child(
+                        div()
+                            .id(("close-tab", index))
+                            .px_1()
+                            .rounded(m.border_radius_small)
+                            .text_color(t.text_muted)
+                            .hover(move |style| style.bg(t.pressed).text_color(t.text_primary))
+                            .on_click(move |_, _, cx| {
+                                close_workspace.update(cx, |this, cx| this.close_tab(index, cx));
+                            })
+                            .child("×"),
+                    )
+            }))
+    }
+
+    fn action_item(label: &'static str, action: impl Action) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        div()
+            .id(label)
+            .px_3()
+            .h(m.toolbar_height)
+            .flex()
+            .items_center()
+            .rounded(m.border_radius_small)
+            .text_color(t.text_primary)
+            .hover(move |style| style.bg(t.hover))
+            .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+            .child(label)
+    }
+
+    fn render_menu_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        let menu = self.open_menu;
+        let labels = [
+            ("File", MenuKind::File),
+            ("Edit", MenuKind::Edit),
+            ("Code", MenuKind::Code),
+            ("View", MenuKind::View),
+            ("Navigate", MenuKind::Navigate),
+            ("Help", MenuKind::Help),
+        ];
+        let dropdown = div()
+            .absolute()
+            .top(m.menu_height)
+            .left(px(0.))
+            .w(px(230.))
+            .py_1()
+            .flex()
+            .flex_col()
+            .bg(t.menu_background)
+            .border_1()
+            .border_color(t.border)
+            .rounded_b(m.border_radius_medium)
+            .shadow_lg()
+            .occlude()
+            .when(menu == Some(MenuKind::File), |this| {
+                this.child(Self::action_item("Open Project…", OpenProject))
+                    .child(Self::action_item("Open File…", OpenFile))
+                    .child(Self::action_item("Save", crate::editor_view::Save))
+                    .child(Self::action_item("Save All", SaveAll))
+                    .child(Self::action_item("Close File", CloseFile))
+                    .child(Self::action_item("Close Project", CloseProject))
+                    .child(Self::action_item("Settings", Settings))
+                    .child(Self::action_item("Exit", Exit))
+            })
+            .when(menu == Some(MenuKind::Edit), |this| {
+                this.child(Self::action_item("Undo", crate::editor_view::Undo))
+                    .child(Self::action_item("Redo", crate::editor_view::Redo))
+                    .child(Self::action_item("Cut", crate::editor_view::Cut))
+                    .child(Self::action_item("Copy", crate::editor_view::Copy))
+                    .child(Self::action_item("Paste", crate::editor_view::Paste))
+                    .child(Self::action_item(
+                        "Select All",
+                        crate::editor_view::SelectAll,
+                    ))
+                    .child(Self::action_item("Find", Find))
+            })
+            .when(menu == Some(MenuKind::View), |this| {
+                this.child(Self::action_item("Project Tool Window", ToggleProject))
+                    .child(Self::action_item("Terminal", ToggleTerminal))
+            })
+            .when(menu == Some(MenuKind::Code), |this| {
+                this.child(Self::action_item(
+                    "Completion",
+                    crate::editor_view::Complete,
+                ))
+                .child(Self::action_item(
+                    "Reformat Code",
+                    crate::editor_view::Reformat,
+                ))
+                .child(Self::action_item(
+                    "Signature Help",
+                    crate::editor_view::SignatureHelp,
+                ))
+            })
+            .when(menu == Some(MenuKind::Navigate), |this| {
+                this.child(Self::action_item("Back    Alt+Left", NavigateBack))
+                    .child(Self::action_item("Forward    Alt+Right", NavigateForward))
+                    .child(Self::action_item("Go to Class    Ctrl+N", GoToClass))
+                    .child(Self::action_item(
+                        "Go to Symbol    Ctrl+Shift+Alt+O",
+                        GoToSymbol,
+                    ))
+                    .child(Self::action_item(
+                        "Go to Definition",
+                        crate::editor_view::Definition,
+                    ))
+                    .child(Self::action_item(
+                        "Find References",
+                        crate::editor_view::References,
+                    ))
+            })
+            .when(menu == Some(MenuKind::Help), |this| {
+                this.child(Self::action_item("Axiom Commands", CommandPalette))
+                    .child(Self::action_item("About Axiom", ShowAbout))
+            });
+        div()
+            .relative()
+            .h(m.menu_height)
+            .flex()
+            .flex_col()
+            .bg(t.window_background)
+            .child(
+                div()
+                    .h(m.menu_height)
+                    .flex()
+                    .items_center()
+                    .children(labels.into_iter().map(|(label, kind)| {
+                        let workspace = workspace.clone();
+                        div()
+                            .id(label)
+                            .px_3()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .text_size(m.ui_font_size)
+                            .text_color(t.text_secondary)
+                            .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
+                            .on_click(move |_, _, cx| {
+                                workspace.update(cx, |this, cx| {
+                                    this.open_menu = (this.open_menu != Some(kind)).then_some(kind);
+                                    cx.notify();
+                                });
+                            })
+                            .child(label)
+                    })),
+            )
+            .when(menu.is_some(), |this| this.child(dropdown))
+    }
+
+    fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .bg(t.editor_background)
+            .text_color(t.text_primary)
+            .child(
+                div()
+                    .w(px(54.))
+                    .h(px(54.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(m.border_radius_medium)
+                    .bg(t.accent)
+                    .text_color(t.window_background)
+                    .text_size(px(22.))
+                    .child("RS"),
+            )
+            .child(div().text_size(px(30.)).child("Axiom"))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(t.text_muted)
+                    .child("PHP IDE written in Rust"),
+            )
+            .child(
+                div()
+                    .id("welcome-open-project")
+                    .px_6()
+                    .py_3()
+                    .rounded(m.border_radius_small)
+                    .bg(t.accent)
+                    .text_color(t.window_background)
+                    .hover(move |style| style.bg(t.accent_hover))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenProject), cx))
+                    .child("Open Project"),
+            )
+            .child(
+                div()
+                    .mt_4()
+                    .text_color(t.text_secondary)
+                    .child("Recent Projects"),
+            )
+            .children(self.recent_projects.existing().map(|entry| {
+                let path = entry.path.clone();
+                let label = path.display().to_string();
+                let workspace = workspace.clone();
+                div()
+                    .id(SharedString::from(format!("recent:{}", path.display())))
+                    .px_4()
+                    .py_1()
+                    .rounded(m.border_radius_small)
+                    .text_color(t.text_secondary)
+                    .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
+                    .on_click(move |_, _, cx| {
+                        workspace.update(cx, |this, cx| {
+                            this.request_operation(PendingOperation::OpenProject(path.clone()), cx)
+                        });
+                    })
+                    .child(label)
+            }))
+    }
+
+    fn render_dialogs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        div()
+            .when_some(self.pending_delete.clone(), |this, path| {
+                let confirm_workspace = workspace.clone();
+                let cancel_workspace = workspace.clone();
+                this.child(
+                    div()
+                        .p_3()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .bg(t.elevated_surface)
+                        .border_b_1()
+                        .border_color(t.border)
+                        .text_color(t.text_primary)
+                        .child(format!("Delete {}? This cannot be undone.", path.display()))
+                        .child(
+                            div()
+                                .id("confirm-delete")
+                                .px_3()
+                                .py_1()
+                                .rounded(m.border_radius_small)
+                                .bg(t.error)
+                                .on_click(move |_, _, cx| {
+                                    confirm_workspace
+                                        .update(cx, |this, cx| this.confirm_delete(cx));
+                                })
+                                .child("Delete"),
+                        )
+                        .child(
+                            div()
+                                .id("cancel-delete")
+                                .px_3()
+                                .py_1()
+                                .rounded(m.border_radius_small)
+                                .bg(t.pressed)
+                                .on_click(move |_, _, cx| {
+                                    cancel_workspace.update(cx, |this, cx| {
+                                        this.pending_delete = None;
+                                        this.status = "Deletion cancelled".into();
+                                        cx.notify();
+                                    });
+                                })
+                                .child("Cancel"),
+                        ),
+                )
+            })
+            .when(self.pending_operation.is_some(), |this| {
+                let save_workspace = workspace.clone();
+                let discard_workspace = workspace.clone();
+                let cancel_workspace = workspace.clone();
+                this.child(
+                    div()
+                        .p_3()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .bg(t.elevated_surface)
+                        .border_b_1()
+                        .border_color(t.border)
+                        .text_color(t.text_primary)
+                        .child("You have unsaved changes.")
+                        .child(
+                            div()
+                                .id("save-continue")
+                                .px_3()
+                                .py_1()
+                                .rounded(m.border_radius_small)
+                                .bg(t.accent)
+                                .on_click(move |_, _, cx| {
+                                    save_workspace.update(cx, |this, cx| {
+                                        if this.save_all_now(cx)
+                                            && let Some(operation) = this.pending_operation.take()
+                                        {
+                                            this.perform_operation(operation, cx);
+                                        }
+                                    });
+                                })
+                                .child("Save All & Continue"),
+                        )
+                        .child(
+                            div()
+                                .id("discard-continue")
+                                .px_3()
+                                .py_1()
+                                .rounded(m.border_radius_small)
+                                .bg(t.warning)
+                                .on_click(move |_, _, cx| {
+                                    discard_workspace.update(cx, |this, cx| {
+                                        if let Some(operation) = this.pending_operation.take() {
+                                            this.perform_operation(operation, cx);
+                                        }
+                                    });
+                                })
+                                .child("Discard"),
+                        )
+                        .child(
+                            div()
+                                .id("cancel-operation")
+                                .px_3()
+                                .py_1()
+                                .rounded(m.border_radius_small)
+                                .bg(t.pressed)
+                                .on_click(move |_, _, cx| {
+                                    cancel_workspace.update(cx, |this, cx| {
+                                        this.pending_operation = None;
+                                        this.status = "Operation cancelled".into();
+                                        cx.notify();
+                                    });
+                                })
+                                .child("Cancel"),
+                        ),
+                )
+            })
+            .when(self.show_about, |this| {
+                let workspace = workspace.clone();
+                this.child(
+                    div()
+                        .p_3()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .bg(t.elevated_surface)
+                        .border_b_1()
+                        .border_color(t.border)
+                        .text_color(t.text_primary)
+                        .child(format!(
+                            "Axiom — IDE for PHP written in Rust — Version {}",
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .child(
+                            div()
+                                .id("close-about")
+                                .px_3()
+                                .py_1()
+                                .rounded(m.border_radius_small)
+                                .bg(t.pressed)
+                                .on_click(move |_, _, cx| {
+                                    workspace.update(cx, |this, cx| {
+                                        this.show_about = false;
+                                        cx.notify();
+                                    });
+                                })
+                                .child("Close"),
+                        ),
+                )
+            })
+    }
+
+    fn render_terminal_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        let profile = self
+            .terminal_session
+            .as_ref()
+            .map(|session| session.profile_label())
+            .unwrap_or("Terminal");
+        let status = self
+            .terminal_session
+            .as_ref()
+            .map(|session| {
+                if session.is_exited() {
+                    "exited"
+                } else {
+                    "running"
+                }
+            })
+            .unwrap_or("not started");
+
+        div()
+            .h(px(220.))
+            .min_h(px(120.))
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(t.border)
+            .bg(t.editor_background)
+            .child(
+                div()
+                    .h(m.panel_header_height)
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(t.border_subtle)
+                    .bg(t.panel_background)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_color(t.text_primary).child("Terminal"))
+                            .child(
+                                div()
+                                    .text_color(t.text_muted)
+                                    .child(format!("{profile} - {status}")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("close-terminal")
+                            .px_2()
+                            .rounded(m.border_radius_small)
+                            .text_color(t.text_muted)
+                            .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
+                            .on_click(move |_, _, cx| {
+                                workspace.update(cx, |this, cx| {
+                                    this.terminal_visible = false;
+                                    cx.notify();
+                                });
+                            })
+                            .child("x"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .when_some(self.terminal_view.clone(), |this, terminal| {
+                        this.child(terminal)
+                    }),
+            )
+    }
+}
+
+impl Render for WorkspaceView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        if let Some(path) = self.startup_file.take() {
+            self.open_file(path, window, cx);
+        }
+        let active_editor = self
+            .active
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.editor.clone());
+        let title = self.project.as_ref().map_or_else(
+            || "Axiom".to_owned(),
+            |project| {
+                self.active
+                    .and_then(|index| self.tabs.get(index))
+                    .map_or_else(
+                        || format!("{} — Axiom", project.name()),
+                        |tab| {
+                            format!(
+                                "{} — {} — Axiom",
+                                tab.editor.read(cx).title(),
+                                project.name()
+                            )
+                        },
+                    )
+            },
+        );
+        window.set_window_title(&title);
+        let lsp_status = match self.lsp.as_ref().map(|lsp| lsp.status()) {
+            Some(ServerStatus::Starting) => "Starting",
+            Some(ServerStatus::Ready) => "Ready",
+            Some(ServerStatus::Stopped) => "Stopped",
+            Some(ServerStatus::NotFound) | None => "Not Found",
+        };
+        let runtime_stub_status = self.runtime_stubs.label();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .relative()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::handle_workspace_keydown))
+            .on_action(cx.listener(Self::open_project))
+            .on_action(cx.listener(Self::open_file_dialog))
+            .on_action(cx.listener(Self::save_all))
+            .on_action(cx.listener(Self::close_active_file))
+            .on_action(cx.listener(Self::close_project_action))
+            .on_action(cx.listener(Self::exit))
+            .on_action(cx.listener(Self::show_about))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::toggle_project))
+            .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::navigate_back))
+            .on_action(cx.listener(Self::navigate_forward))
+            .on_action(cx.listener(Self::go_to_class))
+            .on_action(cx.listener(Self::go_to_symbol))
+            .on_action(cx.listener(Self::command_palette))
+            .on_action(cx.listener(Self::settings))
+            .on_action(cx.listener(Self::palette_up))
+            .on_action(cx.listener(Self::palette_down))
+            .on_action(cx.listener(Self::palette_confirm))
+            .on_action(cx.listener(Self::palette_escape))
+            .bg(t.window_background)
+            .text_size(m.ui_font_size)
+            .text_color(t.text_primary)
+            .child(self.render_menu_bar(cx))
+            .child(self.render_dialogs(cx))
+            .when(self.command_palette_visible, |this| this.child(self.render_command_palette(cx)))
+            .when(self.settings_visible, |this| this.child(self.render_settings(cx)))
+            .when(self.project.is_none(), |this| this.child(self.render_welcome(cx)))
+            .when(self.project.is_some(), |this| this.child(
+                div()
+                    .id("terminal-tool-window")
+                    .h(px(30.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .bg(t.panel_background)
+                    .border_t_1()
+                    .border_color(t.border_subtle)
+                    .text_color(t.text_primary)
+                    .hover(|style| style.bg(t.hover))
+                    .on_click({
+                        let workspace = workspace.clone();
+                        move |_, window, cx| {
+                            workspace.update(cx, |this, cx| this.toggle_terminal(&ToggleTerminal, window, cx));
+                        }
+                    })
+                    .child("▣  Terminal"),
+            ))
+            .when(self.project.is_some(), |this| this.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .child(self.render_activity_bar(cx))
+                    .when(self.project_panel_visible, |this| {
+                        this.child(self.render_explorer(cx))
+                    })
+                    .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(self.render_tabs(cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .when_some(active_editor, |this, editor| this.child(editor))
+                                .when(self.active.is_none(), |this| {
+                                    this.flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .bg(t.editor_background)
+                                        .text_color(t.text_muted)
+                                        .child("Selecione um arquivo no Project Explorer")
+                                }),
+                        )
+                        .when(self.terminal_visible, |this| {
+                            this.child(self.render_terminal_panel(cx))
+                        }),
+                ),
+            ))
+            .when(self.project.is_some(), |this| this.child(
+                div()
+                    .h(m.status_bar_height)
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_t_1()
+                    .border_color(t.border_subtle)
+                    .bg(t.panel_background)
+                    .text_size(m.ui_font_size)
+                    .text_color(t.text_secondary)
+                    .child(self.status.clone())
+                    .child(format!(
+                        "PHP  ·  Intelephense: {lsp_status}  ·  Runtime: {runtime_stub_status}  ·  UTF-8"
+                    )),
+            ))
+    }
+}
+
+impl EntityInputHandler for WorkspaceView {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        actual: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        actual.replace(range.clone());
+        Some(
+            self.command_palette_query
+                .chars()
+                .skip(range.start)
+                .take(range.end.saturating_sub(range.start))
+                .collect(),
+        )
+    }
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.command_palette_query.encode_utf16().count()
+                ..self.command_palette_query.encode_utf16().count(),
+            reversed: false,
+        })
+    }
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range.unwrap_or_else(|| {
+            self.command_palette_query.encode_utf16().count()
+                ..self.command_palette_query.encode_utf16().count()
+        });
+        let start = self
+            .command_palette_query
+            .char_indices()
+            .nth(range.start)
+            .map(|(i, _)| i)
+            .unwrap_or(self.command_palette_query.len());
+        let end = self
+            .command_palette_query
+            .char_indices()
+            .nth(range.end)
+            .map(|(i, _)| i)
+            .unwrap_or(self.command_palette_query.len());
+        self.command_palette_query.replace_range(start..end, text);
+        self.command_palette_selected = 0;
+        cx.notify();
+    }
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_text_in_range(range, text, window, cx);
+    }
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        Some(bounds)
+    }
+    fn character_index_for_point(
+        &mut self,
+        _: gpui::Point<gpui::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.command_palette_query.encode_utf16().count())
+    }
+}
+
+struct WorkspaceInputElement {
+    workspace: Entity<WorkspaceView>,
+}
+impl IntoElement for WorkspaceInputElement {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+impl Element for WorkspaceInputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: gpui::Bounds<gpui::Pixels>,
+        _: &mut (),
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus = self.workspace.read(cx).focus.clone();
+        window.handle_input(
+            &focus,
+            ElementInputHandler::new(bounds, self.workspace.clone()),
+            cx,
+        );
+    }
+}
+
+impl Focusable for WorkspaceView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.active
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.editor.read(cx).focus_handle(cx))
+            .unwrap_or_else(|| self.focus.clone())
+    }
+}

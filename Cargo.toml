@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/axiom-app",
+    "crates/axiom-editor",
+    "crates/axiom-project",
+    "crates/axiom-lsp",
+    "crates/axiom-php",
+    "crates/axiom-syntax",
+    "crates/axiom-terminal",
+    "crates/axiom-index",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/omegaalfa/Axiom.git"
+
+[workspace.dependencies]
+gpui = "0.2"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter = "0.25"
+tree-sitter-php = "0.24.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+lsp-types = "0.97"
+url = "2.5"
+portable-pty = "0.9"
+vt100 = "0.16.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

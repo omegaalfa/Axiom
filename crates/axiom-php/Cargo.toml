@@ -1,0 +1,15 @@
+[package]
+name = "axiom-php"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native PHP runtime symbols and stub indexing for Axiom"
+
+[dependencies]
+axiom-syntax = { path = "../axiom-syntax" }
+tree-sitter.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27"

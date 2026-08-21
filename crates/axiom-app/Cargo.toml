@@ -1,0 +1,39 @@
+[package]
+name = "axiom-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Axiom — IDE moderna para PHP escrita em Rust"
+default-run = "axiom"
+[[bin]]
+name = "axiom"
+path = "src/main.rs"
+test = false
+bench = false
+
+
+[dependencies]
+gpui.workspace = true
+axiom-editor = { path = "../axiom-editor" }
+axiom-lsp = { path = "../axiom-lsp" }
+axiom-php = { path = "../axiom-php" }
+axiom-project = { path = "../axiom-project" }
+axiom-index = { path = "../axiom-index" }
+axiom-syntax = { path = "../axiom-syntax" }
+axiom-terminal = { path = "../axiom-terminal" }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+directories = "6.0"
+open = "5.3"
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[dev-dependencies]
+tempfile = "3.27"

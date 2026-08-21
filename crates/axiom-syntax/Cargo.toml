@@ -1,0 +1,12 @@
+[package]
+name = "axiom-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Incremental PHP syntax engine for Axiom"
+
+[dependencies]
+tree-sitter.workspace = true
+tree-sitter-php.workspace = true
+

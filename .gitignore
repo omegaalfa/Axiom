@@ -1,0 +1,22 @@
+# Rust
+target/
+**/*.rs.bk
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Axiom user/local state (legacy RustStorm state is kept outside the repo)
+.axiom/
+.ruststorm/
+*.sqlite
+*.keymap.json
+*.local.json
+
+# Logs
+*.log

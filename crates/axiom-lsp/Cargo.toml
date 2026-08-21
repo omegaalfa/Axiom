@@ -1,0 +1,18 @@
+[package]
+name = "axiom-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Generic Language Server Protocol client for Axiom"
+
+[dependencies]
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[[bin]]
+name = "fake-lsp"
+path = "src/bin/fake_lsp.rs"
