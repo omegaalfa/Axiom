@@ -1118,6 +1118,15 @@ impl WorkspaceView {
                     if debug_input_enabled() {
                         tracing::info!(kind, path, start, end, "[NAVIGATION TARGET]");
                     }
+                    if let Some(active) = self.active.and_then(|index| self.tabs.get(index))
+                        && let Some(position) = active.editor.read(cx).current_lsp_position()
+                    {
+                        self.navigation_back.push(NavigationLocation {
+                            path: active.path.clone(),
+                            position,
+                        });
+                        self.navigation_forward.clear();
+                    }
                     self.command_palette_mode = None;
                     self.open_file(PathBuf::from(path), window, cx);
                     if let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) {
