@@ -574,9 +574,33 @@ impl EditorView {
             (previous, next),
             (Some('{'), Some('}')) | (Some('['), Some(']'))
         );
+        if debug_input_enabled() {
+            tracing::info!(
+                offset,
+                before_char = ?previous,
+                after_char = ?next,
+                "[EDITOR ENTER]"
+            );
+            tracing::info!(
+                detected = pair,
+                kind = if matches!((previous, next), (Some('{'), Some('}'))) {
+                    "brace"
+                } else if pair {
+                    "bracket"
+                } else {
+                    "none"
+                },
+                "[PAIR ENTER]"
+            );
+        }
         if pair {
-            let inner_indent = self.auto_indent();
-            let base_indent = inner_indent.trim_end_matches("    ");
+            let line = self.document.line_of_offset(offset);
+            let line_content = self.document.line_content(line);
+            let base_indent = line_content
+                .chars()
+                .take_while(|character| character.is_whitespace())
+                .collect::<String>();
+            let inner_indent = format!("{base_indent}    ");
             let insertion = format!("\n{inner_indent}\n{base_indent}");
             self.document.insert_text(&insertion);
             self.document.move_cursor(
@@ -644,6 +668,16 @@ impl EditorView {
         } else {
             content.len()
         };
+        if debug_input_enabled() {
+            tracing::info!(
+                indent,
+                selection_start,
+                selection_end,
+                start_line,
+                end_line,
+                "[EDITOR INDENT]"
+            );
+        }
         let original = &content[replace_start..replace_end];
         let mut transformed = String::with_capacity(original.len() + 16);
         for segment in original.split_inclusive('\n') {
@@ -1941,6 +1975,10 @@ fn runtime_signature_detail(symbol: &axiom_php::Symbol) -> String {
         })
         .unwrap_or_default();
     format!("{}{} • {:?}", symbol.name, signature, symbol.origin)
+}
+
+fn debug_input_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_INPUT").is_some()
 }
 
 impl Render for EditorView {

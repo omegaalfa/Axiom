@@ -757,6 +757,23 @@ impl WorkspaceView {
     }
 
     fn open_project(&mut self, _: &OpenProject, _: &mut Window, cx: &mut Context<Self>) {
+        if debug_input_enabled() {
+            tracing::info!(received = true, "[OPEN PROJECT COMMAND]");
+        }
+        self.open_project_picker(cx);
+    }
+
+    fn open_project_picker(&mut self, cx: &mut Context<Self>) {
+        if debug_input_enabled() {
+            tracing::info!(
+                before = if self.project_dialog_open {
+                    "Opening"
+                } else {
+                    "Idle"
+                },
+                "[PICKER STATE]"
+            );
+        }
         if self.project_dialog_open {
             return;
         }
@@ -764,6 +781,9 @@ impl WorkspaceView {
         self.open_menu = None;
         self.status = "Opening project...".into();
         cx.notify();
+        if debug_input_enabled() {
+            tracing::info!(spawned = true, "[DIALOG TASK]");
+        }
         let workspace = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let path = rfd::AsyncFileDialog::new()
@@ -772,10 +792,13 @@ impl WorkspaceView {
                 .map(|handle| handle.path().to_path_buf());
             if let Some(path) = path {
                 if debug_input_enabled() {
-                    tracing::info!(path = %path.display(), "[DIALOG] project selected");
+                    tracing::info!(selected = %path.display(), "[DIALOG RESULT]");
                 }
                 let _ = workspace.update(cx, |this, cx| {
                     this.project_dialog_open = false;
+                    if debug_input_enabled() {
+                        tracing::info!(after = "Idle", "[PICKER STATE]");
+                    }
                     if debug_input_enabled() {
                         tracing::info!(path = %path.display(), "[PROJECT] opening");
                     }
@@ -784,6 +807,10 @@ impl WorkspaceView {
             } else {
                 let _ = workspace.update(cx, |this, cx| {
                     this.project_dialog_open = false;
+                    if debug_input_enabled() {
+                        tracing::info!(cancelled = true, "[DIALOG RESULT]");
+                        tracing::info!(after = "Idle", "[PICKER STATE]");
+                    }
                     this.status = "Project selection cancelled".into();
                     cx.notify();
                 });
@@ -2617,11 +2644,22 @@ impl WorkspaceView {
             .rounded(m.border_radius_small)
             .text_color(t.text_primary)
             .hover(move |style| style.bg(t.hover))
+            .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                if debug_input_enabled() {
+                    tracing::info!(id = %id, "[NAV ITEM MOUSE DOWN]");
+                }
+            })
             .on_click(move |_, window, cx| {
                 if debug_input_enabled() {
-                    tracing::info!(command = %id, "[NAVIGATE MENU] dispatch");
+                    tracing::info!(id = %id, "[NAV ITEM CLICK]");
                 }
-                workspace.update(cx, |this, cx| this.execute_command(id, window, cx));
+                workspace.update(cx, |this, cx| {
+                    this.open_menu = None;
+                    this.execute_command(id, window, cx);
+                    if debug_input_enabled() {
+                        tracing::info!(id = %id, executed = true, "[COMMAND RESULT]");
+                    }
+                });
             })
             .child(label)
             .when(!shortcut.is_empty(), |this| {
@@ -2677,7 +2715,7 @@ impl WorkspaceView {
             .shadow_lg()
             .occlude()
             .when(menu == Some(MenuKind::File), |this| {
-                this.child(self.command_item("project.open", "Open Project…", OpenProject))
+                this.child(self.command_dispatch_item("project.open", "Open Project…", cx))
                     .child(self.command_item("project.open_file", "Open File…", OpenFile))
                     .child(self.command_item("editor.save", "Save", crate::editor_view::Save))
                     .child(Self::action_item("Save All", SaveAll))
@@ -2830,7 +2868,14 @@ impl WorkspaceView {
                     .bg(t.accent)
                     .text_color(t.window_background)
                     .hover(move |style| style.bg(t.accent_hover))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenProject), cx))
+                    .on_click({
+                        let workspace = workspace.clone();
+                        move |_, window, cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.execute_command("project.open", window, cx);
+                            });
+                        }
+                    })
                     .child("Open Project"),
             )
             .child(
