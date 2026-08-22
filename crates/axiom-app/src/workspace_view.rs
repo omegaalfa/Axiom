@@ -62,6 +62,7 @@ actions!(
         NavigateForward,
         GoToClass,
         GoToSymbol,
+        DebugInput,
     ]
 );
 
@@ -78,6 +79,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", PaletteEscape, Some("CommandPalette")),
         KeyBinding::new("alt-left", NavigateBack, None),
         KeyBinding::new("alt-right", NavigateForward, None),
+        KeyBinding::new("f12", DebugInput, None),
     ]
 }
 
@@ -965,6 +967,13 @@ impl WorkspaceView {
             "editor.reformat" => {
                 self.dispatch_editor_action(crate::editor_view::Reformat, window, cx)
             }
+            "editor.undo" => self.dispatch_editor_action(crate::editor_view::Undo, window, cx),
+            "editor.redo" => self.dispatch_editor_action(crate::editor_view::Redo, window, cx),
+            "editor.select_all" => {
+                self.dispatch_editor_action(crate::editor_view::SelectAll, window, cx)
+            }
+            "editor.save" => self.dispatch_editor_action(crate::editor_view::Save, window, cx),
+            "editor.find" => self.find(&Find, window, cx),
             "code.completion" => {
                 self.dispatch_editor_action(crate::editor_view::Complete, window, cx)
             }
@@ -1062,6 +1071,12 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn debug_input(&mut self, _: &DebugInput, _: &mut Window, cx: &mut Context<Self>) {
+        self.status = "Input key received (F12)".into();
+        tracing::info!("[RESULT] debug F12 executed");
+        cx.notify();
+    }
+
     fn select_setting_command(&mut self, id: String, cx: &mut Context<Self>) {
         self.settings_selected = Some(id);
         cx.notify();
@@ -1135,6 +1150,16 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if debug_keys_enabled() || debug_input_enabled() {
+            tracing::info!(
+                key = %event.keystroke.key,
+                ctrl = event.keystroke.modifiers.control,
+                shift = event.keystroke.modifiers.shift,
+                alt = event.keystroke.modifiers.alt,
+                context = "workspace-root",
+                "[KEY RAW]"
+            );
+        }
         if self.shortcut_capture {
             self.capture_shortcut(event, window, cx);
             return;
@@ -1158,6 +1183,10 @@ impl WorkspaceView {
             stroke.push_str("alt-");
         }
         stroke.push_str(&key);
+        if stroke == "f12" {
+            self.debug_input(&DebugInput, window, cx);
+            return;
+        }
         if let Some(command) = self
             .keymap
             .commands()
@@ -2434,7 +2463,12 @@ impl WorkspaceView {
             .rounded(m.border_radius_small)
             .text_color(t.text_primary)
             .hover(move |style| style.bg(t.hover))
-            .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+            .on_click(move |_, window, cx| {
+                if debug_input_enabled() {
+                    tracing::info!(target = %label, "[ACTION] menu action dispatch");
+                }
+                window.dispatch_action(action.boxed_clone(), cx)
+            })
             .child(label)
     }
 
@@ -2460,7 +2494,12 @@ impl WorkspaceView {
             .rounded(m.border_radius_small)
             .text_color(t.text_primary)
             .hover(move |style| style.bg(t.hover))
-            .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+            .on_click(move |_, window, cx| {
+                if debug_input_enabled() {
+                    tracing::info!(target = %id, "[ACTION] menu command dispatch");
+                }
+                window.dispatch_action(action.boxed_clone(), cx)
+            })
             .child(label)
             .when(!shortcut.is_empty(), |this| {
                 this.child(
@@ -2604,6 +2643,9 @@ impl WorkspaceView {
                             .text_color(t.text_secondary)
                             .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
                             .on_click(move |_, _, cx| {
+                                if debug_input_enabled() {
+                                    tracing::info!(target = %label, "[MOUSE] menu click");
+                                }
                                 workspace.update(cx, |this, cx| {
                                     this.open_menu = (this.open_menu != Some(kind)).then_some(kind);
                                     cx.notify();
@@ -3036,6 +3078,11 @@ impl Render for WorkspaceView {
             .flex_col()
             .relative()
             .track_focus(&self.focus)
+            .on_mouse_down(MouseButton::Left, |event, _, _| {
+                if debug_input_enabled() {
+                    tracing::debug!(x = ?event.position.x, y = ?event.position.y, "[MOUSE RAW]");
+                }
+            })
             .on_key_down(cx.listener(Self::handle_workspace_keydown))
             .on_action(cx.listener(Self::open_project))
             .on_action(cx.listener(Self::open_file_dialog))
@@ -3054,6 +3101,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::settings))
+            .on_action(cx.listener(Self::debug_input))
             .on_action(cx.listener(Self::palette_up))
             .on_action(cx.listener(Self::palette_down))
             .on_action(cx.listener(Self::palette_confirm))
@@ -3325,6 +3373,12 @@ impl Focusable for WorkspaceView {
 
 fn debug_keys_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_KEYS").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
+}
+
+fn debug_input_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_INPUT").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
 }
