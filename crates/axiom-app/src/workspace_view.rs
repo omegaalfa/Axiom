@@ -805,7 +805,12 @@ impl WorkspaceView {
                     return;
                 }
                 if debug_input_enabled() {
-                    tracing::info!(selected = %path.display(), "[DIALOG RESULT]");
+                    tracing::info!(
+                        kind = "folder",
+                        selected = %path.display(),
+                        type = "directory",
+                        "[DIALOG RESULT]"
+                    );
                 }
                 let _ = workspace.update(cx, |this, cx| {
                     this.project_dialog_open = false;
@@ -860,7 +865,12 @@ impl WorkspaceView {
                         return;
                     }
                     if debug_input_enabled() {
-                        tracing::info!(path = %path.display(), "[DIALOG RESULT]");
+                        tracing::info!(
+                            kind = "file",
+                            path = %path.display(),
+                            type = "file",
+                            "[DIALOG RESULT]"
+                        );
                         tracing::info!(path = %path.display(), "[EDITOR] open_file");
                     }
                     this.open_file_background(path, cx);
@@ -2659,7 +2669,7 @@ impl WorkspaceView {
         let t = theme();
         let m = metrics();
         div()
-            .id(label)
+            .id(SharedString::from(format!("menu-command-{id}")))
             .px_3()
             .h(m.toolbar_height)
             .flex()
@@ -2839,6 +2849,28 @@ impl WorkspaceView {
                                             menu_after = ?this.open_menu,
                                             "[MENU] state changed; notify=true"
                                         );
+                                        if this.open_menu == Some(MenuKind::File) {
+                                            for (index, (label, command)) in [
+                                                ("Open Project…", "project.open_project"),
+                                                ("Open File…", "project.open_file"),
+                                                ("Save", "editor.save"),
+                                                ("Save All", "workspace.save_all"),
+                                                ("Close File", "workspace.close_file"),
+                                                ("Close Project", "workspace.close_project"),
+                                                ("Settings", "settings.open"),
+                                                ("Exit", "workspace.exit"),
+                                            ]
+                                            .into_iter()
+                                            .enumerate()
+                                            {
+                                                tracing::info!(
+                                                    index,
+                                                    label,
+                                                    command,
+                                                    "[FILE MENU ITEM]"
+                                                );
+                                            }
+                                        }
                                     }
                                     cx.notify();
                                 });

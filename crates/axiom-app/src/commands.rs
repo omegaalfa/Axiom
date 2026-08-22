@@ -353,4 +353,27 @@ mod tests {
         keymap.reset("editor.reformat");
         assert_eq!(keymap.shortcut("editor.reformat"), Some("ctrl-alt-l"));
     }
+
+    #[test]
+    fn project_open_commands_are_distinct_and_explicit() {
+        let keymap = Keymap::default();
+        let project = keymap
+            .commands()
+            .iter()
+            .find(|command| command.id == "project.open_project")
+            .expect("project command");
+        let file = keymap
+            .commands()
+            .iter()
+            .find(|command| command.id == "project.open_file")
+            .expect("file command");
+        assert_ne!(project.id, file.id);
+        assert!(
+            project
+                .description
+                .to_ascii_lowercase()
+                .contains("directory")
+        );
+        assert!(file.description.to_ascii_lowercase().contains("file"));
+    }
 }
