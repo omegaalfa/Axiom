@@ -47,6 +47,7 @@ actions!(
         CloseProject,
         Exit,
         ShowAbout,
+        ShowFeatures,
         Find,
         ToggleProject,
         ToggleTerminal,
@@ -178,6 +179,7 @@ pub struct WorkspaceView {
     command_palette_query: String,
     command_palette_selected: usize,
     command_palette_mode: Option<String>,
+    features_visible: bool,
     settings_visible: bool,
     settings_selected: Option<String>,
     shortcut_capture: bool,
@@ -508,6 +510,7 @@ impl WorkspaceView {
             command_palette_query: String::new(),
             command_palette_selected: 0,
             command_palette_mode: None,
+            features_visible: false,
             settings_visible: false,
             settings_selected: None,
             shortcut_capture: false,
@@ -779,6 +782,12 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn show_features(&mut self, _: &ShowFeatures, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        self.features_visible = true;
+        cx.notify();
+    }
+
     fn find(&mut self, _: &Find, _: &mut Window, cx: &mut Context<Self>) {
         self.open_menu = None;
         self.status = "Find UI is deferred; editor text search is not implemented yet".into();
@@ -886,6 +895,8 @@ impl WorkspaceView {
 
     fn execute_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         match id {
+            "help.features" => self.show_features(&ShowFeatures, window, cx),
+            "workspace.commands" => self.command_palette(&CommandPalette, window, cx),
             "terminal.toggle" => self.toggle_terminal(&ToggleTerminal, window, cx),
             "project.open" => self.open_project(&OpenProject, window, cx),
             "project.open_file" => self.open_file_dialog(&OpenFile, window, cx),
@@ -2300,6 +2311,55 @@ impl WorkspaceView {
             .child(label)
     }
 
+    fn command_item<A: Action + Clone + 'static>(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        action: A,
+    ) -> impl IntoElement {
+        let shortcut = self
+            .keymap
+            .shortcut(id)
+            .map(Self::format_shortcut)
+            .unwrap_or_default();
+        let t = theme();
+        let m = metrics();
+        div()
+            .id(label)
+            .px_3()
+            .h(m.toolbar_height)
+            .flex()
+            .items_center()
+            .rounded(m.border_radius_small)
+            .text_color(t.text_primary)
+            .hover(move |style| style.bg(t.hover))
+            .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+            .child(label)
+            .when(!shortcut.is_empty(), |this| {
+                this.child(
+                    div()
+                        .ml_auto()
+                        .text_color(t.text_muted)
+                        .child(shortcut.clone()),
+                )
+            })
+    }
+
+    fn format_shortcut(value: &str) -> String {
+        value
+            .split('-')
+            .map(|part| match part {
+                "ctrl" => "Ctrl".to_owned(),
+                "shift" => "Shift".to_owned(),
+                "alt" => "Alt".to_owned(),
+                "space" => "Space".to_owned(),
+                "`" => "`".to_owned(),
+                other => other.to_ascii_uppercase(),
+            })
+            .collect::<Vec<_>>()
+            .join("+")
+    }
+
     fn render_menu_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
@@ -2328,9 +2388,9 @@ impl WorkspaceView {
             .shadow_lg()
             .occlude()
             .when(menu == Some(MenuKind::File), |this| {
-                this.child(Self::action_item("Open Project…", OpenProject))
-                    .child(Self::action_item("Open File…", OpenFile))
-                    .child(Self::action_item("Save", crate::editor_view::Save))
+                this.child(self.command_item("project.open", "Open Project…", OpenProject))
+                    .child(self.command_item("project.open_file", "Open File…", OpenFile))
+                    .child(self.command_item("editor.save", "Save", crate::editor_view::Save))
                     .child(Self::action_item("Save All", SaveAll))
                     .child(Self::action_item("Close File", CloseFile))
                     .child(Self::action_item("Close Project", CloseProject))
@@ -2338,27 +2398,30 @@ impl WorkspaceView {
                     .child(Self::action_item("Exit", Exit))
             })
             .when(menu == Some(MenuKind::Edit), |this| {
-                this.child(Self::action_item("Undo", crate::editor_view::Undo))
-                    .child(Self::action_item("Redo", crate::editor_view::Redo))
-                    .child(Self::action_item("Cut", crate::editor_view::Cut))
-                    .child(Self::action_item("Copy", crate::editor_view::Copy))
-                    .child(Self::action_item("Paste", crate::editor_view::Paste))
-                    .child(Self::action_item(
+                this.child(self.command_item("editor.undo", "Undo", crate::editor_view::Undo))
+                    .child(self.command_item("editor.redo", "Redo", crate::editor_view::Redo))
+                    .child(self.command_item("editor.cut", "Cut", crate::editor_view::Cut))
+                    .child(self.command_item("editor.copy", "Copy", crate::editor_view::Copy))
+                    .child(self.command_item("editor.paste", "Paste", crate::editor_view::Paste))
+                    .child(self.command_item(
+                        "editor.select_all",
                         "Select All",
                         crate::editor_view::SelectAll,
                     ))
-                    .child(Self::action_item("Find", Find))
+                    .child(self.command_item("editor.find", "Find", Find))
             })
             .when(menu == Some(MenuKind::View), |this| {
                 this.child(Self::action_item("Project Tool Window", ToggleProject))
-                    .child(Self::action_item("Terminal", ToggleTerminal))
+                    .child(self.command_item("terminal.toggle", "Terminal", ToggleTerminal))
             })
             .when(menu == Some(MenuKind::Code), |this| {
-                this.child(Self::action_item(
+                this.child(self.command_item(
+                    "code.completion",
                     "Completion",
                     crate::editor_view::Complete,
                 ))
-                .child(Self::action_item(
+                .child(self.command_item(
+                    "editor.reformat",
                     "Reformat Code",
                     crate::editor_view::Reformat,
                 ))
@@ -2368,14 +2431,12 @@ impl WorkspaceView {
                 ))
             })
             .when(menu == Some(MenuKind::Navigate), |this| {
-                this.child(Self::action_item("Back    Alt+Left", NavigateBack))
-                    .child(Self::action_item("Forward    Alt+Right", NavigateForward))
-                    .child(Self::action_item("Go to Class    Ctrl+N", GoToClass))
-                    .child(Self::action_item(
-                        "Go to Symbol    Ctrl+Shift+Alt+O",
-                        GoToSymbol,
-                    ))
-                    .child(Self::action_item(
+                this.child(self.command_item("navigate.back", "Back", NavigateBack))
+                    .child(self.command_item("navigate.forward", "Forward", NavigateForward))
+                    .child(self.command_item("navigate.class", "Go to Class", GoToClass))
+                    .child(self.command_item("navigate.symbol", "Go to Symbol", GoToSymbol))
+                    .child(self.command_item(
+                        "navigate.definition",
                         "Go to Definition",
                         crate::editor_view::Definition,
                     ))
@@ -2385,8 +2446,13 @@ impl WorkspaceView {
                     ))
             })
             .when(menu == Some(MenuKind::Help), |this| {
-                this.child(Self::action_item("Axiom Commands", CommandPalette))
-                    .child(Self::action_item("About Axiom", ShowAbout))
+                this.child(self.command_item(
+                    "workspace.commands",
+                    "Axiom Commands",
+                    CommandPalette,
+                ))
+                .child(self.command_item("help.features", "Axiom Features", ShowFeatures))
+                .child(Self::action_item("About Axiom", ShowAbout))
             });
         div()
             .relative()
@@ -2720,6 +2786,84 @@ impl WorkspaceView {
                     }),
             )
     }
+
+    fn render_features(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        div()
+            .absolute()
+            .top(px(54.))
+            .left(px(180.))
+            .w(px(680.))
+            .max_h(px(620.))
+            .flex()
+            .flex_col()
+            .p_4()
+            .gap_2()
+            .bg(t.window_background)
+            .border_1()
+            .border_color(t.border)
+            .rounded(m.border_radius_medium)
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child("Axiom Features")
+                    .child(div().id("close-features").px_2().child("×").on_click(
+                        move |_, _, cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.features_visible = false;
+                                cx.notify();
+                            });
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .text_color(t.text_muted)
+                    .child("Implemented and available in this build"),
+            )
+            .children(
+                [
+                    "Editor",
+                    "Navigation",
+                    "Code",
+                    "Project",
+                    "Tool Windows",
+                    "Help",
+                ]
+                .into_iter()
+                .map(|category| {
+                    let commands = self
+                        .keymap
+                        .commands()
+                        .iter()
+                        .filter(|command| command.category == category);
+                    div()
+                        .mt_2()
+                        .child(div().text_color(t.accent).child(category))
+                        .children(commands.map(|command| {
+                            let shortcut = self
+                                .keymap
+                                .shortcut(&command.id)
+                                .map(Self::format_shortcut)
+                                .unwrap_or_else(|| "None".into());
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(command.title.clone())
+                                .child(div().text_color(t.text_muted).child(shortcut))
+                                .child(
+                                    div()
+                                        .text_color(t.text_secondary)
+                                        .child(format!(" — {}", command.description)),
+                                )
+                        }))
+                }),
+            )
+    }
 }
 
 impl Render for WorkspaceView {
@@ -2773,6 +2917,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::close_project_action))
             .on_action(cx.listener(Self::exit))
             .on_action(cx.listener(Self::show_about))
+            .on_action(cx.listener(Self::show_features))
             .on_action(cx.listener(Self::find))
             .on_action(cx.listener(Self::toggle_project))
             .on_action(cx.listener(Self::toggle_terminal))
@@ -2793,6 +2938,7 @@ impl Render for WorkspaceView {
             .child(self.render_dialogs(cx))
             .when(self.command_palette_visible, |this| this.child(self.render_command_palette(cx)))
             .when(self.settings_visible, |this| this.child(self.render_settings(cx)))
+            .when(self.features_visible, |this| this.child(self.render_features(cx)))
             .when(self.project.is_none(), |this| this.child(self.render_welcome(cx)))
             .when(self.project.is_some(), |this| this.child(
                 div()

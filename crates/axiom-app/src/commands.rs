@@ -14,6 +14,41 @@ pub struct CommandDescriptor {
 pub fn registry() -> Vec<CommandDescriptor> {
     vec![
         command(
+            "editor.undo",
+            "Undo",
+            "Undoes the last editor change.",
+            "Editor",
+            "ctrl-z",
+        ),
+        command(
+            "editor.redo",
+            "Redo",
+            "Redoes the last undone editor change.",
+            "Editor",
+            "ctrl-y",
+        ),
+        command(
+            "editor.select_all",
+            "Select All",
+            "Selects the entire document.",
+            "Editor",
+            "ctrl-a",
+        ),
+        command(
+            "editor.save",
+            "Save",
+            "Saves the active document.",
+            "Editor",
+            "ctrl-s",
+        ),
+        command(
+            "editor.find",
+            "Find",
+            "Finds text in the active document.",
+            "Editor",
+            "ctrl-f",
+        ),
+        command(
             "editor.copy",
             "Copy",
             "Copies the selected text.",
@@ -89,6 +124,20 @@ pub fn registry() -> Vec<CommandDescriptor> {
             "Shows or hides the integrated terminal.",
             "Tool Windows",
             "ctrl-`",
+        ),
+        command(
+            "workspace.commands",
+            "Command Palette",
+            "Searches and runs Axiom commands.",
+            "Help",
+            "ctrl-shift-p",
+        ),
+        command(
+            "help.features",
+            "Axiom Features",
+            "Shows implemented features and their current shortcuts.",
+            "Help",
+            "",
         ),
         command(
             "project.open",
@@ -286,12 +335,12 @@ mod tests {
         let mut keymap = Keymap::default();
         assert!(
             keymap
-                .set_shortcut("editor.reformat", Some("ctrl-s".into()))
+                .set_shortcut("editor.reformat", Some("ctrl-shift-l".into()))
                 .is_ok()
         );
         assert!(
             keymap
-                .set_shortcut("editor.copy", Some("ctrl-s".into()))
+                .set_shortcut("editor.copy", Some("ctrl-shift-l".into()))
                 .is_err()
         );
         keymap.reset("editor.reformat");

@@ -793,6 +793,79 @@ impl EditorView {
                 });
             }
         }
+        let constant_names: Vec<(String, String)> = index
+            .symbols()
+            .iter()
+            .filter(|symbol| {
+                matches!(
+                    symbol.kind,
+                    axiom_index::ProjectSymbolKind::Constant
+                        | axiom_index::ProjectSymbolKind::ClassConstant
+                )
+            })
+            .map(|symbol| (symbol.name.clone(), symbol.fully_qualified_name.clone()))
+            .collect();
+        drop(index);
+        let runtime_symbols = self.runtime_symbols.clone();
+        self.add_unknown_constant_inspections(text, &constant_names, runtime_symbols.as_ref());
+    }
+
+    fn add_unknown_constant_inspections(
+        &mut self,
+        text: &str,
+        constants: &[(String, String)],
+        runtime_symbols: Option<&Arc<RuntimeSymbolIndex>>,
+    ) {
+        const BUILT_INS: &[&str] = &[
+            "PHP_VERSION",
+            "PHP_VERSION_ID",
+            "PHP_INT_MAX",
+            "PHP_INT_MIN",
+            "PHP_INT_SIZE",
+            "PHP_OS",
+            "PHP_OS_FAMILY",
+            "DIRECTORY_SEPARATOR",
+            "PATH_SEPARATOR",
+            "E_ERROR",
+            "E_WARNING",
+            "E_PARSE",
+            "E_NOTICE",
+        ];
+        let mut offset = 0;
+        while let Some(relative) = text[offset..].find("echo ") {
+            let start = offset + relative + 5;
+            let name_end = start
+                + text[start..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+            let name = &text[start..name_end];
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+                && !BUILT_INS.iter().any(|builtin| builtin == &name)
+            {
+                let declared = constants.iter().any(|(symbol_name, fqn)| {
+                    symbol_name == name || fqn.ends_with(&format!("\\{name}"))
+                });
+                let runtime =
+                    runtime_symbols.is_some_and(|symbols| symbols.find_constant(name).is_some());
+                if !declared && !runtime {
+                    self.diagnostics.push(ByteDiagnostic {
+                        range: start..name_end,
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        message: format!("Undefined constant '{name}'"),
+                    });
+                }
+            }
+            offset = name_end.max(start + 1);
+            if offset >= text.len() {
+                break;
+            }
+        }
     }
 
     fn sync_lsp(&mut self) {
