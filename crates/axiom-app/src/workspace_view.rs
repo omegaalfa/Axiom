@@ -22,8 +22,8 @@ use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSe
 use gpui::{
     Action, App, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
-    LayoutId, Modifiers, MouseButton, Pixels, SharedString, Style, Timer, UTF16Selection, Window,
-    actions, div, prelude::*, px, relative,
+    LayoutId, Modifiers, MouseButton, Pixels, Point, SharedString, Style, Timer, UTF16Selection,
+    Window, actions, div, prelude::*, px, relative,
 };
 
 use crate::{
@@ -177,6 +177,9 @@ pub struct WorkspaceView {
     show_about: bool,
     startup_file: Option<PathBuf>,
     explorer_context: Option<ExplorerContext>,
+    context_menu_position: Point<Pixels>,
+    context_menu_selected: usize,
+    context_submenu_selected: usize,
     selected_path: Option<PathBuf>,
     explorer_new_menu_open: bool,
     explorer_operation: Option<ExplorerOperation>,
@@ -551,6 +554,9 @@ impl WorkspaceView {
             show_about: false,
             startup_file: None,
             explorer_context: None,
+            context_menu_position: Point::default(),
+            context_menu_selected: 0,
+            context_submenu_selected: 0,
             selected_path: None,
             explorer_new_menu_open: false,
             explorer_operation: None,
@@ -1365,14 +1371,73 @@ impl WorkspaceView {
             }
             return;
         }
-        if key == "escape" && self.explorer_new_menu_open {
-            self.explorer_new_menu_open = false;
-            cx.notify();
-            return;
-        }
-        if key == "escape" && self.explorer_context.is_some() {
-            self.explorer_context = None;
-            cx.notify();
+        if self.explorer_context.is_some() {
+            if key == "escape" {
+                if self.explorer_new_menu_open {
+                    self.explorer_new_menu_open = false;
+                    if debug_input_enabled() {
+                        tracing::info!(selected_path = ?self.selected_path, reason = "escape", "[SUBMENU CLOSE]");
+                    }
+                    cx.notify();
+                } else {
+                    if debug_input_enabled() {
+                        tracing::info!(selected_path = ?self.selected_path, reason = "escape", "[CONTEXT MENU ESCAPE]");
+                    }
+                    self.close_context_menu("escape", cx);
+                }
+                return;
+            }
+            let submenu_count = 7;
+            let new_index = if self
+                .explorer_context
+                .as_ref()
+                .is_some_and(|context| context.kind == EntryKind::File)
+            {
+                2
+            } else {
+                1
+            };
+            if self.explorer_new_menu_open {
+                match key.as_str() {
+                    "left" => {
+                        self.explorer_new_menu_open = false;
+                        if debug_input_enabled() {
+                            tracing::info!(selected_path = ?self.selected_path, reason = "left", "[SUBMENU CLOSE]");
+                        }
+                        cx.notify();
+                    }
+                    "up" => {
+                        self.context_submenu_selected =
+                            self.context_submenu_selected.saturating_sub(1);
+                        cx.notify();
+                    }
+                    "down" => {
+                        self.context_submenu_selected =
+                            (self.context_submenu_selected + 1).min(submenu_count - 1);
+                        cx.notify();
+                    }
+                    "enter" => self.execute_new_submenu_item(window, cx),
+                    _ => {}
+                }
+                return;
+            }
+            match key.as_str() {
+                "up" => {
+                    self.context_menu_selected = self.context_menu_selected.saturating_sub(1);
+                    cx.notify();
+                }
+                "down" => {
+                    self.context_menu_selected = (self.context_menu_selected + 1).min(7);
+                    cx.notify();
+                }
+                "right" if self.context_menu_selected == new_index => {
+                    self.open_context_submenu(cx);
+                }
+                "enter" if self.context_menu_selected == new_index => {
+                    self.open_context_submenu(cx);
+                }
+                _ => {}
+            }
             return;
         }
         if key == "escape" && self.open_menu.is_some() {
@@ -1689,6 +1754,75 @@ impl WorkspaceView {
         }
     }
 
+    fn close_context_menu(&mut self, reason: &'static str, cx: &mut Context<Self>) {
+        if self.explorer_context.take().is_some() {
+            self.explorer_new_menu_open = false;
+            if debug_input_enabled() {
+                tracing::info!(
+                    selected_path = ?self.selected_path,
+                    reason,
+                    "[CONTEXT MENU CLOSE]"
+                );
+            }
+            cx.notify();
+        }
+    }
+
+    fn open_context_menu(
+        &mut self,
+        path: PathBuf,
+        kind: EntryKind,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_path = Some(path.clone());
+        self.context_menu_position = position;
+        self.open_menu = None;
+        self.context_menu_selected = 0;
+        self.context_submenu_selected = 0;
+        self.explorer_new_menu_open = false;
+        self.explorer_context = Some(ExplorerContext { path, kind });
+        if debug_input_enabled() {
+            tracing::info!(selected_path = ?self.selected_path, "[CONTEXT MENU OPEN]");
+        }
+        cx.notify();
+    }
+
+    fn open_context_submenu(&mut self, cx: &mut Context<Self>) {
+        if self.explorer_context.is_some() {
+            self.explorer_new_menu_open = true;
+            self.context_submenu_selected = 0;
+            if debug_input_enabled() {
+                tracing::info!(selected_path = ?self.selected_path, "[SUBMENU OPEN]");
+            }
+            cx.notify();
+        }
+    }
+
+    fn execute_new_submenu_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(context) = self.explorer_context.as_ref() else {
+            return;
+        };
+        let directory = Self::context_directory(&context.path, context.kind).to_path_buf();
+        if debug_input_enabled() {
+            tracing::info!(
+                selected_path = ?self.selected_path,
+                index = self.context_submenu_selected,
+                "[CONTEXT MENU ACTION]"
+            );
+        }
+        match self.context_submenu_selected {
+            0 => self.new_file(directory, window, cx),
+            1 => self.new_directory(directory, cx),
+            2 => self.new_php_file(directory, cx),
+            3 => self.new_php_item(directory, "class", cx),
+            4 => self.new_php_item(directory, "interface", cx),
+            5 => self.new_php_item(directory, "trait", cx),
+            6 => self.new_php_item(directory, "enum", cx),
+            _ => {}
+        }
+    }
+
     fn new_file(&mut self, directory: PathBuf, _: &mut Window, cx: &mut Context<Self>) {
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
@@ -1699,6 +1833,7 @@ impl WorkspaceView {
 
     fn open_new_menu(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
         self.selected_path = Some(directory.clone());
+        self.context_menu_position = Point::new(px(34.), px(70.));
         self.explorer_context = Some(ExplorerContext {
             path: directory,
             kind: EntryKind::Directory,
@@ -2506,24 +2641,20 @@ impl WorkspaceView {
                     .text_color(t.text_primary)
                     .when_some(project_root.clone(), |this, root| {
                         let workspace = workspace.clone();
-                        this.on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                        this.on_mouse_down(MouseButton::Right, move |event, _, cx| {
                             workspace.update(cx, |this, cx| {
-                                this.selected_path = Some(root.clone());
-                                this.explorer_new_menu_open = false;
-                                this.explorer_context = Some(ExplorerContext {
-                                    path: root.clone(),
-                                    kind: EntryKind::Directory,
-                                });
-                                cx.notify();
+                                this.open_context_menu(
+                                    root.clone(),
+                                    EntryKind::Directory,
+                                    event.position,
+                                    cx,
+                                );
                             });
                             cx.stop_propagation();
                         })
                     })
                     .child(format!("▾ {root_name}")),
             )
-            .when(self.explorer_context.is_some(), |this| {
-                this.child(self.render_explorer_context(cx))
-            })
             .when(self.explorer_operation.is_some(), |this| {
                 this.child(self.render_explorer_operation(cx))
             })
@@ -2573,16 +2704,15 @@ impl WorkspaceView {
                                     }
                                 });
                             })
-                            .on_mouse_down(MouseButton::Right, move |_, window, cx| {
+                            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                                 context_workspace.update(cx, |this, cx| {
                                     window.focus(&this.focus);
-                                    this.selected_path = Some(context_item.path.clone());
-                                    this.explorer_new_menu_open = false;
-                                    this.explorer_context = Some(ExplorerContext {
-                                        path: context_item.path.clone(),
-                                        kind: context_item.kind,
-                                    });
-                                    cx.notify();
+                                    this.open_context_menu(
+                                        context_item.path.clone(),
+                                        context_item.kind,
+                                        event.position,
+                                        cx,
+                                    );
                                 });
                                 cx.stop_propagation();
                             })
@@ -2597,7 +2727,7 @@ impl WorkspaceView {
             )
     }
 
-    fn render_explorer_context(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_explorer_context(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
         let workspace = cx.entity();
@@ -2613,9 +2743,25 @@ impl WorkspaceView {
             .to_path_buf();
         let directory = Self::context_directory(&context.path, context.kind).to_path_buf();
         let is_root = context.path == root;
+        let menu_width = px(300.);
+        let submenu_width = px(250.);
+        let opens_left = self.context_menu_position.x + menu_width + submenu_width
+            > window.viewport_size().width;
+        let menu_left = self
+            .context_menu_position
+            .x
+            .max(px(0.))
+            .min((window.viewport_size().width - menu_width).max(px(0.)));
+        let menu_top = self
+            .context_menu_position
+            .y
+            .max(px(0.))
+            .min((window.viewport_size().height - px(360.)).max(px(0.)));
         div()
-            .mx_2()
-            .mb_1()
+            .absolute()
+            .left(menu_left)
+            .top(menu_top)
+            .w(menu_width)
             .p_1()
             .rounded(m.border_radius_medium)
             .border_1()
@@ -2655,8 +2801,9 @@ impl WorkspaceView {
             })
             .child({
                 let workspace = workspace.clone();
+                let click_workspace = workspace.clone();
                 let directory = directory.clone();
-                let submenu = self.render_new_submenu(directory.clone(), cx);
+                let submenu = self.render_new_submenu(directory.clone(), opens_left, cx);
                 div()
                     .relative()
                     .id("explorer-new-submenu-trigger")
@@ -2675,6 +2822,11 @@ impl WorkspaceView {
                             }
                             cx.notify();
                         });
+                    })
+                    .on_click({
+                        move |_, _, cx| {
+                            click_workspace.update(cx, |this, cx| this.open_context_submenu(cx));
+                        }
                     })
                     .child("New")
                     .child("▶")
@@ -2711,15 +2863,20 @@ impl WorkspaceView {
             })
     }
 
-    fn render_new_submenu(&self, directory: PathBuf, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_new_submenu(
+        &self,
+        directory: PathBuf,
+        opens_left: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let workspace = cx.entity();
         let t = theme();
         let m = metrics();
         div()
             .absolute()
-            .left(px(180.))
+            .left(if opens_left { px(-296.) } else { px(296.) })
             .top(px(0.))
-            .w(px(190.))
+            .w(px(250.))
             .p_1()
             .flex()
             .flex_col()
@@ -2730,6 +2887,21 @@ impl WorkspaceView {
             .rounded(m.border_radius_medium)
             .shadow_lg()
             .on_mouse_move(|_, _, _| {})
+            .child({
+                let workspace = workspace.clone();
+                let directory = directory.clone();
+                Self::explorer_menu_item("File", move |window, cx| {
+                    workspace.update(cx, |this, cx| this.new_file(directory.clone(), window, cx));
+                })
+            })
+            .child({
+                let workspace = workspace.clone();
+                let directory = directory.clone();
+                Self::explorer_menu_item("Directory", move |_, cx| {
+                    workspace.update(cx, |this, cx| this.new_directory(directory.clone(), cx));
+                })
+            })
+            .child(div().h(px(1.)).mx_2().bg(t.border_subtle))
             .child({
                 let workspace = workspace.clone();
                 let directory = directory.clone();
@@ -2771,19 +2943,6 @@ impl WorkspaceView {
                     workspace.update(cx, |this, cx| {
                         this.new_php_item(directory.clone(), "enum", cx)
                     });
-                })
-            })
-            .child({
-                let workspace = workspace.clone();
-                let directory = directory.clone();
-                Self::explorer_menu_item("File", move |window, cx| {
-                    workspace.update(cx, |this, cx| this.new_file(directory.clone(), window, cx));
-                })
-            })
-            .child({
-                let workspace = workspace.clone();
-                Self::explorer_menu_item("Directory", move |_, cx| {
-                    workspace.update(cx, |this, cx| this.new_directory(directory.clone(), cx));
                 })
             })
     }
@@ -2886,7 +3045,12 @@ impl WorkspaceView {
             .items_center()
             .rounded(m.border_radius_small)
             .hover(move |style| style.bg(t.hover))
-            .on_click(move |_, window, cx| handler(window, cx))
+            .on_click(move |_, window, cx| {
+                if debug_input_enabled() {
+                    tracing::info!(item = %label, "[CONTEXT MENU ACTION]");
+                }
+                handler(window, cx)
+            })
             .child(label)
     }
 
@@ -3838,6 +4002,30 @@ impl Render for WorkspaceView {
                             }
                         })),
                 )
+            })
+            .when(self.explorer_context.is_some(), |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .id("context-menu-dismiss-layer")
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                            if debug_input_enabled() {
+                                tracing::info!(
+                                    selected_path = ?this.selected_path,
+                                    "[CONTEXT MENU OUTSIDE CLICK]"
+                                );
+                            }
+                            window.focus(&this.focus);
+                            this.close_context_menu("outside_click", cx);
+                        })),
+                )
+            })
+            .when(self.explorer_context.is_some(), |this| {
+                this.child(self.render_explorer_context(window, cx))
             })
             .child(self.render_menu_bar(window, cx))
             .child(self.render_dialogs(cx))
