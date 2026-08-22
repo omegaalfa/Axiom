@@ -20,8 +20,8 @@ use axiom_php::{RuntimeSymbolIndex, StubProvider};
 use axiom_project::{EntryKind, FileContent, Project, read_file_content};
 use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSession};
 use gpui::{
-    Action, App, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
+    Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
     LayoutId, Modifiers, MouseButton, Pixels, Point, SharedString, Style, Timer, UTF16Selection,
     Window, actions, div, prelude::*, px, relative,
 };
@@ -198,6 +198,9 @@ pub struct WorkspaceView {
     explorer_namespace: String,
     explorer_extends: String,
     explorer_implements: String,
+    modal_focus: FocusHandle,
+    modal_focus_pending: bool,
+    explorer_selection: UTF16Selection,
     pending_delete: Option<PathBuf>,
     project_panel_visible: bool,
     terminal_session: Option<std::sync::Arc<TerminalSession>>,
@@ -258,7 +261,10 @@ impl WorkspaceView {
                     } else {
                         self.command_palette_query.clone()
                     })
-                    .child(WorkspaceInputElement { workspace }),
+                    .child(WorkspaceInputElement {
+                        workspace,
+                        focus: self.focus.clone(),
+                    }),
             )
             .children(commands.iter().enumerate().map(|(index, command)| {
                 let selected = index == self.command_palette_selected;
@@ -378,6 +384,7 @@ impl WorkspaceView {
                                     })
                                     .child(WorkspaceInputElement {
                                         workspace: workspace.clone(),
+                                        focus: self.focus.clone(),
                                     }),
                             )
                             .children(self.keymap.search(&self.settings_query).into_iter().map(
@@ -586,6 +593,12 @@ impl WorkspaceView {
             explorer_namespace: String::new(),
             explorer_extends: String::new(),
             explorer_implements: String::new(),
+            modal_focus: cx.focus_handle(),
+            modal_focus_pending: false,
+            explorer_selection: UTF16Selection {
+                range: 0..0,
+                reversed: false,
+            },
             pending_delete: None,
             project_panel_visible: true,
             terminal_session: None,
@@ -1388,7 +1401,7 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if debug_keys_enabled() || debug_input_enabled() {
+        if self.explorer_operation.is_none() && (debug_keys_enabled() || debug_input_enabled()) {
             tracing::info!(
                 key = %event.keystroke.key,
                 ctrl = event.keystroke.modifiers.control,
@@ -1416,6 +1429,9 @@ impl WorkspaceView {
             return;
         }
         if self.explorer_operation.is_some() {
+            if debug_input_enabled() && !matches!(key.as_str(), "escape" | "enter") {
+                tracing::info!(key = %key, "[MODAL INPUT]");
+            }
             match key.as_str() {
                 "escape" => self.cancel_explorer_operation(cx),
                 "enter" => self.confirm_explorer_operation(cx),
@@ -1904,6 +1920,11 @@ impl WorkspaceView {
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
         self.explorer_input = "untitled".into();
+        self.explorer_selection = UTF16Selection {
+            range: 0..self.explorer_input.encode_utf16().count(),
+            reversed: false,
+        };
+        self.modal_focus_pending = true;
         self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::NewFile(directory));
         cx.notify();
@@ -1952,6 +1973,11 @@ impl WorkspaceView {
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
         self.explorer_input = "untitled.php".into();
+        self.explorer_selection = UTF16Selection {
+            range: 0..self.explorer_input.encode_utf16().count(),
+            reversed: false,
+        };
+        self.modal_focus_pending = true;
         self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::NewPhpFile(directory));
         cx.notify();
@@ -1964,6 +1990,11 @@ impl WorkspaceView {
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
         self.explorer_input = "New Folder".into();
+        self.explorer_selection = UTF16Selection {
+            range: 0..self.explorer_input.encode_utf16().count(),
+            reversed: false,
+        };
+        self.modal_focus_pending = true;
         self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::NewDirectory(directory));
         cx.notify();
@@ -1976,6 +2007,11 @@ impl WorkspaceView {
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
         self.explorer_input = "NewItem".into();
+        self.explorer_selection = UTF16Selection {
+            range: 0..self.explorer_input.encode_utf16().count(),
+            reversed: false,
+        };
+        self.modal_focus_pending = true;
         self.explorer_namespace = self
             .project
             .as_ref()
@@ -2002,6 +2038,11 @@ impl WorkspaceView {
             return;
         };
         self.explorer_input = current_name;
+        self.explorer_selection = UTF16Selection {
+            range: 0..self.explorer_input.encode_utf16().count(),
+            reversed: false,
+        };
+        self.modal_focus_pending = true;
         self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::Rename(path));
         cx.notify();
@@ -2010,6 +2051,7 @@ impl WorkspaceView {
     fn cancel_explorer_operation(&mut self, cx: &mut Context<Self>) {
         self.explorer_operation = None;
         self.explorer_new_menu_open = false;
+        self.modal_focus_pending = false;
         self.explorer_input.clear();
         self.explorer_namespace.clear();
         self.explorer_extends.clear();
@@ -2021,6 +2063,7 @@ impl WorkspaceView {
         let Some(operation) = self.explorer_operation.take() else {
             return;
         };
+        self.modal_focus_pending = false;
         let name = self.explorer_input.trim().to_owned();
         self.explorer_input.clear();
         if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
@@ -3127,6 +3170,8 @@ impl WorkspaceView {
             .border_1()
             .border_color(t.border)
             .rounded(m.border_radius_medium)
+            .cursor(CursorStyle::Arrow)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .shadow_lg()
             .child(title)
             .when(self.explorer_operation.as_ref().is_some_and(|operation| matches!(operation, ExplorerOperation::NewPhp { .. })), |this| {
@@ -3141,12 +3186,22 @@ impl WorkspaceView {
                     .flex()
                     .items_center()
                     .bg(t.panel_background)
+                    .cursor(CursorStyle::IBeam)
                     .id("explorer-operation-input")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        if debug_input_enabled() {
+                            tracing::info!("[MODAL INPUT MOUSE DOWN]");
+                        }
+                        cx.stop_propagation();
+                    })
                     .on_click({
                         let workspace = workspace.clone();
                         move |_, window, cx| {
                             workspace.update(cx, |this, cx| {
-                                window.focus(&this.focus);
+                                window.focus(&this.modal_focus);
+                                if debug_input_enabled() {
+                                    tracing::info!("[MODAL INPUT MOUSE DOWN]");
+                                }
                                 cx.notify();
                             });
                         }
@@ -3154,6 +3209,7 @@ impl WorkspaceView {
                     .child(self.explorer_input.clone())
                     .child(WorkspaceInputElement {
                         workspace: workspace.clone(),
+                        focus: self.modal_focus.clone(),
                     }),
             )
             .child(
@@ -3166,6 +3222,7 @@ impl WorkspaceView {
                             .id("explorer-operation-cancel")
                             .px_2()
                             .py_1()
+                            .cursor(CursorStyle::PointingHand)
                             .on_click({
                                 let workspace = workspace.clone();
                                 move |_, _, cx| {
@@ -3181,6 +3238,7 @@ impl WorkspaceView {
                             .px_2()
                             .py_1()
                             .bg(t.accent)
+                            .cursor(CursorStyle::PointingHand)
                             .text_color(t.window_background)
                             .on_click(move |_, _, cx| {
                                 workspace
@@ -4029,6 +4087,14 @@ impl Render for WorkspaceView {
             }
             self.focus_active_editor = false;
         }
+        if self.explorer_operation.is_some() && self.modal_focus_pending {
+            window.focus(&self.modal_focus);
+            self.modal_focus_pending = false;
+            if debug_input_enabled() {
+                tracing::info!(target = "name_input", "[MODAL FOCUS REQUEST]");
+                tracing::info!(focused = true, "[MODAL FOCUS]");
+            }
+        }
         let title = self.project.as_ref().map_or_else(
             || "Axiom".to_owned(),
             |project| {
@@ -4208,7 +4274,18 @@ impl Render for WorkspaceView {
                 this.child(self.render_explorer_context(window, cx))
             })
             .when(self.explorer_operation.is_some(), |this| {
-                this.child(self.render_explorer_operation(cx))
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .id("modal-backdrop")
+                        .bg(gpui::rgba(0x00000055))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(self.render_explorer_operation(cx)),
+                )
             })
             .child(self.render_menu_bar(window, cx))
             .child(self.render_dialogs(cx))
@@ -4246,7 +4323,9 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Context<Self>,
     ) -> Option<String> {
         actual.replace(range.clone());
-        let query = if self.settings_visible && !self.command_palette_visible {
+        let query = if self.explorer_operation.is_some() {
+            &self.explorer_input
+        } else if self.settings_visible && !self.command_palette_visible {
             &self.settings_query
         } else {
             &self.command_palette_query
@@ -4265,9 +4344,17 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if self.explorer_operation.is_some() {
+            return Some(UTF16Selection {
+                range: self.explorer_selection.range.clone(),
+                reversed: self.explorer_selection.reversed,
+            });
+        }
         Some(UTF16Selection {
             range: {
-                let length = if self.settings_visible && !self.command_palette_visible {
+                let length = if self.explorer_operation.is_some() {
+                    self.explorer_input.encode_utf16().count()
+                } else if self.settings_visible && !self.command_palette_visible {
                     self.settings_query.encode_utf16().count()
                 } else {
                     self.command_palette_query.encode_utf16().count()
@@ -4317,6 +4404,14 @@ impl EntityInputHandler for WorkspaceView {
         query.replace_range(start..end, text);
         if editing_explorer {
             self.explorer_input = query;
+            let length = self.explorer_input.encode_utf16().count();
+            self.explorer_selection = UTF16Selection {
+                range: length..length,
+                reversed: false,
+            };
+            if debug_input_enabled() {
+                tracing::info!(event = "text", "[MODAL INPUT]");
+            }
         } else if editing_settings {
             self.settings_query = query;
         } else {
@@ -4346,12 +4441,13 @@ impl EntityInputHandler for WorkspaceView {
     }
     fn character_index_for_point(
         &mut self,
-        _: gpui::Point<gpui::Pixels>,
+        point: gpui::Point<gpui::Pixels>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
         Some(if self.explorer_operation.is_some() {
-            self.explorer_input.encode_utf16().count()
+            let x: f32 = point.x.into();
+            ((x.max(0.0) / 8.0).round() as usize).min(self.explorer_input.encode_utf16().count())
         } else if self.settings_visible && !self.command_palette_visible {
             self.settings_query.encode_utf16().count()
         } else {
@@ -4362,6 +4458,7 @@ impl EntityInputHandler for WorkspaceView {
 
 struct WorkspaceInputElement {
     workspace: Entity<WorkspaceView>,
+    focus: FocusHandle,
 }
 impl IntoElement for WorkspaceInputElement {
     type Element = Self;
@@ -4410,9 +4507,8 @@ impl Element for WorkspaceInputElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus = self.workspace.read(cx).focus.clone();
         window.handle_input(
-            &focus,
+            &self.focus,
             ElementInputHandler::new(bounds, self.workspace.clone()),
             cx,
         );
