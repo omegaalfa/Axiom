@@ -190,6 +190,7 @@ pub struct WorkspaceView {
     shortcut_conflict: Option<String>,
     debug_overlay_visible: bool,
     focus_active_editor: bool,
+    project_dialog_open: bool,
 }
 
 impl WorkspaceView {
@@ -558,6 +559,7 @@ impl WorkspaceView {
             shortcut_conflict: None,
             debug_overlay_visible: false,
             focus_active_editor: false,
+            project_dialog_open: false,
         };
         if let StartupTarget::Project { root, initial_file } = startup {
             workspace.open_project_path(root);
@@ -755,6 +757,10 @@ impl WorkspaceView {
     }
 
     fn open_project(&mut self, _: &OpenProject, _: &mut Window, cx: &mut Context<Self>) {
+        if self.project_dialog_open {
+            return;
+        }
+        self.project_dialog_open = true;
         self.open_menu = None;
         self.status = "Opening project...".into();
         cx.notify();
@@ -769,6 +775,7 @@ impl WorkspaceView {
                     tracing::info!(path = %path.display(), "[DIALOG] project selected");
                 }
                 let _ = workspace.update(cx, |this, cx| {
+                    this.project_dialog_open = false;
                     if debug_input_enabled() {
                         tracing::info!(path = %path.display(), "[PROJECT] opening");
                     }
@@ -776,6 +783,7 @@ impl WorkspaceView {
                 });
             } else {
                 let _ = workspace.update(cx, |this, cx| {
+                    this.project_dialog_open = false;
                     this.status = "Project selection cancelled".into();
                     cx.notify();
                 });
@@ -2586,6 +2594,46 @@ impl WorkspaceView {
             })
     }
 
+    fn command_dispatch_item(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let shortcut = self
+            .keymap
+            .shortcut(id)
+            .map(Self::format_shortcut)
+            .unwrap_or_default();
+        let workspace = cx.entity();
+        let t = theme();
+        let m = metrics();
+        div()
+            .id(label)
+            .px_3()
+            .h(m.toolbar_height)
+            .flex()
+            .items_center()
+            .rounded(m.border_radius_small)
+            .text_color(t.text_primary)
+            .hover(move |style| style.bg(t.hover))
+            .on_click(move |_, window, cx| {
+                if debug_input_enabled() {
+                    tracing::info!(command = %id, "[NAVIGATE MENU] dispatch");
+                }
+                workspace.update(cx, |this, cx| this.execute_command(id, window, cx));
+            })
+            .child(label)
+            .when(!shortcut.is_empty(), |this| {
+                this.child(
+                    div()
+                        .ml_auto()
+                        .text_color(t.text_muted)
+                        .child(shortcut.clone()),
+                )
+            })
+    }
+
     fn format_shortcut(value: &str) -> String {
         value
             .split('-')
@@ -2672,14 +2720,14 @@ impl WorkspaceView {
                 ))
             })
             .when(menu == Some(MenuKind::Navigate), |this| {
-                this.child(self.command_item("navigate.back", "Back", NavigateBack))
-                    .child(self.command_item("navigate.forward", "Forward", NavigateForward))
-                    .child(self.command_item("navigate.class", "Go to Class", GoToClass))
-                    .child(self.command_item("navigate.symbol", "Go to Symbol", GoToSymbol))
-                    .child(self.command_item(
+                this.child(self.command_dispatch_item("navigate.back", "Back", cx))
+                    .child(self.command_dispatch_item("navigate.forward", "Forward", cx))
+                    .child(self.command_dispatch_item("navigate.class", "Go to Class", cx))
+                    .child(self.command_dispatch_item("navigate.symbol", "Go to Symbol", cx))
+                    .child(self.command_dispatch_item(
                         "navigate.definition",
                         "Go to Definition",
-                        crate::editor_view::Definition,
+                        cx,
                     ))
                     .child(Self::action_item(
                         "Find References",

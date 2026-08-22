@@ -568,22 +568,29 @@ impl EditorView {
         }
         let offset = self.document.cursor_offset();
         let content = self.document.content();
-        let between_pair = offset < content.len()
-            && matches!(
-                content[offset..].chars().next(),
-                Some('}') | Some(']') | Some(')')
+        let next = content[offset..].chars().next();
+        let previous = content[..offset].chars().next_back();
+        let pair = matches!(
+            (previous, next),
+            (Some('{'), Some('}')) | (Some('['), Some(']'))
+        );
+        if pair {
+            let inner_indent = self.auto_indent();
+            let base_indent = inner_indent.trim_end_matches("    ");
+            let insertion = format!("\n{inner_indent}\n{base_indent}");
+            self.document.insert_text(&insertion);
+            self.document.move_cursor(
+                self.document
+                    .cursor_offset()
+                    .saturating_sub(base_indent.len() + 1),
             );
+            self.after_edit(cx);
+            return;
+        }
         let indent = self.auto_indent();
         self.document.insert_newline();
         if !indent.is_empty() {
             self.document.insert_text(&indent);
-        }
-        if between_pair {
-            self.document.insert_newline();
-            let base = indent.trim_end_matches("    ");
-            self.document.insert_text(base);
-            self.document
-                .move_cursor(self.document.cursor_offset().saturating_sub(base.len() + 1));
         }
         self.after_edit(cx);
     }
@@ -605,23 +612,65 @@ impl EditorView {
     }
 
     fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
-        self.document.insert_text("    ");
-        self.after_edit(cx);
+        if self.document.selection_offsets().is_some() {
+            self.transform_selected_lines(true, cx);
+        } else {
+            self.document.insert_text("    ");
+            self.after_edit(cx);
+        }
     }
 
     fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
-        let line = self.document.line_of_offset(self.document.cursor_offset());
-        let start = self.document.offset_of_line(line);
+        self.transform_selected_lines(false, cx);
+    }
+
+    fn transform_selected_lines(&mut self, indent: bool, cx: &mut Context<Self>) {
         let content = self.document.content();
-        let end = (start + 4).min(content.len());
-        let remove = content[start..end]
-            .chars()
-            .take_while(|ch| *ch == ' ')
-            .count();
-        if remove > 0 {
-            self.document.set_selection(start, start + remove);
-            self.document.insert_text("");
+        let (selection_start, selection_end) =
+            self.document.selection_offsets().unwrap_or_else(|| {
+                let cursor = self.document.cursor_offset();
+                (cursor, cursor)
+            });
+        let start_line = self.document.line_of_offset(selection_start);
+        let mut end_line = self.document.line_of_offset(selection_end);
+        if selection_end > selection_start
+            && selection_end == self.document.offset_of_line(end_line)
+        {
+            end_line = end_line.saturating_sub(1);
         }
+        let replace_start = self.document.offset_of_line(start_line);
+        let replace_end = if end_line + 1 < self.document.line_count() {
+            self.document.offset_of_line(end_line + 1)
+        } else {
+            content.len()
+        };
+        let original = &content[replace_start..replace_end];
+        let mut transformed = String::with_capacity(original.len() + 16);
+        for segment in original.split_inclusive('\n') {
+            let (line, newline) = segment
+                .strip_suffix('\n')
+                .map_or((segment, ""), |line| (line, "\n"));
+            if indent {
+                transformed.push_str("    ");
+                transformed.push_str(line);
+            } else {
+                let remove = line
+                    .as_bytes()
+                    .iter()
+                    .take(4)
+                    .take_while(|byte| **byte == b' ')
+                    .count();
+                transformed.push_str(&line[remove..]);
+            }
+            transformed.push_str(newline);
+        }
+        if transformed == original {
+            return;
+        }
+        self.document.set_selection(replace_start, replace_end);
+        self.document.insert_text(&transformed);
+        self.document
+            .set_selection(replace_start, replace_start + transformed.len());
         self.after_edit(cx);
     }
 
