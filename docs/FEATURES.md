@@ -14,7 +14,9 @@ The current shortcut is shown in the Edit menu and in Settings → Keymap.
 ### Completion
 
 Press `Ctrl+Space` at a PHP expression. Native project/runtime indexes are used
-when available; a configured LSP can provide additional results.
+when available; a configured LSP can provide additional results. Member
+completion also opens automatically after `->`, `::`, and `new` when the
+relevant index is ready.
 
 ### Go to Definition
 
@@ -42,6 +44,13 @@ be opened with Ctrl+Click.
 Press `Ctrl+Shift+P` to search commands. File → Settings → Keymap lets you
 search actions, inspect descriptions, edit or remove shortcuts, and reset them.
 Menus and this help view use the current keymap.
+
+### Windows diagnostics
+
+For shortcut troubleshooting, start a debug build with `AXIOM_DEBUG_KEYS=1`.
+Axiom logs key names, matched command IDs, context, and dispatch results;
+typed text is never logged. The status bar reports LSP and PHP runtime-stub
+availability so completion claims can be checked against the running project.
 
 ## Partial
 

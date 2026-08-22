@@ -14,10 +14,10 @@ use axiom_project::is_php_file;
 use axiom_syntax::PhpSyntax;
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy,
-    SharedString, Style, TextRun, UTF16Selection, UniformListScrollHandle, Window, actions, div,
-    font, prelude::*, px, relative, uniform_list,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollStrategy, SharedString, Style, TextRun, UTF16Selection, UniformListScrollHandle, Window,
+    actions, div, font, prelude::*, px, relative, uniform_list,
 };
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
@@ -678,10 +678,31 @@ impl EditorView {
         cx.notify();
     }
 
+    fn debug_keydown(&mut self, event: &KeyDownEvent, _: &mut Window, _: &mut Context<Self>) {
+        if std::env::var_os("AXIOM_DEBUG_KEYS").is_some_and(|value| {
+            !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+        }) {
+            tracing::debug!(
+                key = %event.keystroke.key,
+                ctrl = event.keystroke.modifiers.control,
+                alt = event.keystroke.modifiers.alt,
+                shift = event.keystroke.modifiers.shift,
+                context = "editor",
+                "Axiom key event"
+            );
+        }
+    }
+
     fn after_edit(&mut self, cx: &mut Context<Self>) {
         self.sync_syntax();
         self.sync_lsp();
         self.maybe_trigger_completion();
+        let native = self.native_completions();
+        if native.is_empty() {
+            self.completions.clear();
+        } else {
+            self.set_completions(native, cx);
+        }
         self.selection_anchor = None;
         self.preferred_x = None;
         self.marked_range = None;
@@ -903,6 +924,9 @@ impl EditorView {
         }
         if !native.is_empty() {
             self.set_completions(native, cx);
+        } else if self.lsp.is_none() {
+            self.status = Some("Completion unavailable (no PHP index or language server)".into());
+            cx.notify();
         }
     }
 
@@ -1218,11 +1242,12 @@ impl EditorView {
         }
     }
 
-    fn reformat(&mut self, _: &Reformat, _: &mut Window, _: &mut Context<Self>) {
+    fn reformat(&mut self, _: &Reformat, _: &mut Window, cx: &mut Context<Self>) {
         if let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) {
             lsp.request_formatting(uri.clone(), 4, true);
         } else {
             self.status = Some("Formatter unavailable (no PHP language server)".into());
+            cx.notify();
         }
     }
 
@@ -1797,6 +1822,7 @@ impl Render for EditorView {
             .bg(t.editor_background)
             .key_context("Editor")
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::debug_keydown))
             .cursor(if self.ctrl_hover_range.is_some() {
                 CursorStyle::PointingHand
             } else {

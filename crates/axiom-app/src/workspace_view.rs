@@ -181,6 +181,7 @@ pub struct WorkspaceView {
     command_palette_mode: Option<String>,
     features_visible: bool,
     settings_visible: bool,
+    settings_query: String,
     settings_selected: Option<String>,
     shortcut_capture: bool,
     captured_shortcut: Option<String>,
@@ -214,6 +215,11 @@ impl WorkspaceView {
                     .px_3()
                     .flex()
                     .items_center()
+                    .child(if self.command_palette_query.is_empty() {
+                        "Search commands...".to_owned()
+                    } else {
+                        self.command_palette_query.clone()
+                    })
                     .child(WorkspaceInputElement { workspace }),
             )
             .children(commands.iter().enumerate().map(|(index, command)| {
@@ -256,6 +262,7 @@ impl WorkspaceView {
         let t = theme();
         let m = metrics();
         let workspace = cx.entity();
+        let close_workspace = workspace.clone();
         div()
             .absolute()
             .top(px(42.))
@@ -281,7 +288,7 @@ impl WorkspaceView {
                     .child("Settings")
                     .child(div().id("close-settings").px_2().child("×").on_click(
                         move |_, window, cx| {
-                            workspace.update(cx, |this, cx| {
+                            close_workspace.update(cx, |this, cx| {
                                 this.settings_visible = false;
                                 this.restore_editor_focus(window, cx);
                                 cx.notify();
@@ -308,38 +315,66 @@ impl WorkspaceView {
                             .flex()
                             .flex_col()
                             .p_4()
-                            .child("Search actions...")
-                            .children(self.keymap.commands().iter().map(|command| {
-                                let workspace = cx.entity();
-                                let selected =
-                                    self.settings_selected.as_deref() == Some(command.id.as_str());
-                                let command_id = command.id.clone();
+                            .child(
                                 div()
-                                    .id(SharedString::from(format!("keymap-{}", command.id)))
-                                    .h(m.toolbar_height)
+                                    .h(px(34.))
+                                    .px_2()
                                     .flex()
                                     .items_center()
-                                    .px_2()
-                                    .bg(if selected {
-                                        t.selection
+                                    .bg(t.panel_background)
+                                    .text_color(t.text_muted)
+                                    .id("settings-search")
+                                    .on_click({
+                                        let workspace = workspace.clone();
+                                        move |_, window, cx| {
+                                            workspace.update(cx, |this, cx| {
+                                                window.focus(&this.focus);
+                                                cx.notify();
+                                            });
+                                        }
+                                    })
+                                    .child(if self.settings_query.is_empty() {
+                                        "Search actions...".to_owned()
                                     } else {
-                                        t.window_background
+                                        self.settings_query.clone()
                                     })
-                                    .on_click(move |_, _, cx| {
-                                        workspace.update(cx, |this, cx| {
-                                            this.select_setting_command(command_id.clone(), cx)
+                                    .child(WorkspaceInputElement {
+                                        workspace: workspace.clone(),
+                                    }),
+                            )
+                            .children(self.keymap.search(&self.settings_query).into_iter().map(
+                                |command| {
+                                    let workspace = cx.entity();
+                                    let selected = self.settings_selected.as_deref()
+                                        == Some(command.id.as_str());
+                                    let command_id = command.id.clone();
+                                    div()
+                                        .id(SharedString::from(format!("keymap-{}", command.id)))
+                                        .h(m.toolbar_height)
+                                        .flex()
+                                        .items_center()
+                                        .px_2()
+                                        .bg(if selected {
+                                            t.selection
+                                        } else {
+                                            t.window_background
                                         })
-                                    })
-                                    .child(command.title.clone())
-                                    .child(
-                                        div().ml_auto().text_color(t.text_muted).child(
-                                            self.keymap
-                                                .shortcut(&command.id)
-                                                .unwrap_or("None")
-                                                .to_owned(),
-                                        ),
-                                    )
-                            }))
+                                        .on_click(move |_, _, cx| {
+                                            workspace.update(cx, |this, cx| {
+                                                this.select_setting_command(command_id.clone(), cx)
+                                            })
+                                        })
+                                        .child(command.title.clone())
+                                        .child(
+                                            div().ml_auto().text_color(t.text_muted).child(
+                                                self.keymap
+                                                    .shortcut(&command.id)
+                                                    .unwrap_or("None")
+                                                    .to_owned(),
+                                            ),
+                                        )
+                                },
+                            ))
                             .when_some(
                                 self.settings_selected.as_ref().and_then(|id| {
                                     self.keymap
@@ -512,6 +547,7 @@ impl WorkspaceView {
             command_palette_mode: None,
             features_visible: false,
             settings_visible: false,
+            settings_query: String::new(),
             settings_selected: None,
             shortcut_capture: false,
             captured_shortcut: None,
@@ -1021,6 +1057,7 @@ impl WorkspaceView {
 
     fn settings(&mut self, _: &Settings, _: &mut Window, cx: &mut Context<Self>) {
         self.settings_visible = true;
+        self.settings_query.clear();
         self.settings_selected = None;
         cx.notify();
     }
@@ -1128,7 +1165,12 @@ impl WorkspaceView {
             .find(|command| self.keymap.shortcut(&command.id) == Some(stroke.as_str()))
         {
             let id = command.id.clone();
+            if debug_keys_enabled() {
+                tracing::info!(key = %stroke, matched = %id, context = "workspace", executed = true, "Axiom key event");
+            }
             self.execute_command(&id, window, cx);
+        } else if debug_keys_enabled() {
+            tracing::debug!(key = %stroke, matched = "", context = "workspace", executed = false, "Axiom key event");
         }
     }
 
@@ -3107,8 +3149,13 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Context<Self>,
     ) -> Option<String> {
         actual.replace(range.clone());
+        let query = if self.settings_visible && !self.command_palette_visible {
+            &self.settings_query
+        } else {
+            &self.command_palette_query
+        };
         Some(
-            self.command_palette_query
+            query
                 .chars()
                 .skip(range.start)
                 .take(range.end.saturating_sub(range.start))
@@ -3122,8 +3169,14 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.command_palette_query.encode_utf16().count()
-                ..self.command_palette_query.encode_utf16().count(),
+            range: {
+                let length = if self.settings_visible && !self.command_palette_visible {
+                    self.settings_query.encode_utf16().count()
+                } else {
+                    self.command_palette_query.encode_utf16().count()
+                };
+                length..length
+            },
             reversed: false,
         })
     }
@@ -3142,23 +3195,30 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range.unwrap_or_else(|| {
-            self.command_palette_query.encode_utf16().count()
-                ..self.command_palette_query.encode_utf16().count()
-        });
-        let start = self
-            .command_palette_query
+        let editing_settings = self.settings_visible && !self.command_palette_visible;
+        let mut query = if editing_settings {
+            self.settings_query.clone()
+        } else {
+            self.command_palette_query.clone()
+        };
+        let range =
+            range.unwrap_or_else(|| query.encode_utf16().count()..query.encode_utf16().count());
+        let start = query
             .char_indices()
             .nth(range.start)
             .map(|(i, _)| i)
-            .unwrap_or(self.command_palette_query.len());
-        let end = self
-            .command_palette_query
+            .unwrap_or(query.len());
+        let end = query
             .char_indices()
             .nth(range.end)
             .map(|(i, _)| i)
-            .unwrap_or(self.command_palette_query.len());
-        self.command_palette_query.replace_range(start..end, text);
+            .unwrap_or(query.len());
+        query.replace_range(start..end, text);
+        if editing_settings {
+            self.settings_query = query;
+        } else {
+            self.command_palette_query = query;
+        }
         self.command_palette_selected = 0;
         cx.notify();
     }
@@ -3187,7 +3247,11 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.command_palette_query.encode_utf16().count())
+        Some(if self.settings_visible && !self.command_palette_visible {
+            self.settings_query.encode_utf16().count()
+        } else {
+            self.command_palette_query.encode_utf16().count()
+        })
     }
 }
 
@@ -3257,4 +3321,10 @@ impl Focusable for WorkspaceView {
             .map(|tab| tab.editor.read(cx).focus_handle(cx))
             .unwrap_or_else(|| self.focus.clone())
     }
+}
+
+fn debug_keys_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_KEYS").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
 }
