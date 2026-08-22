@@ -189,6 +189,7 @@ pub struct WorkspaceView {
     captured_shortcut: Option<String>,
     shortcut_conflict: Option<String>,
     debug_overlay_visible: bool,
+    focus_active_editor: bool,
 }
 
 impl WorkspaceView {
@@ -556,6 +557,7 @@ impl WorkspaceView {
             captured_shortcut: None,
             shortcut_conflict: None,
             debug_overlay_visible: false,
+            focus_active_editor: false,
         };
         if let StartupTarget::Project { root, initial_file } = startup {
             workspace.open_project_path(root);
@@ -602,8 +604,16 @@ impl WorkspaceView {
     }
 
     fn open_project_path(&mut self, path: PathBuf) {
+        if debug_input_enabled() {
+            tracing::info!(path = %path.display(), "[PROJECT] open path");
+        }
         match Project::open(path).map_err(|error| error.to_string()) {
-            Ok(project) => self.set_project(project),
+            Ok(project) => {
+                self.set_project(project);
+                if debug_input_enabled() {
+                    tracing::info!("[PROJECT] ready");
+                }
+            }
             Err(error) => self.status = format!("Falha ao abrir projeto: {error}").into(),
         }
     }
@@ -746,6 +756,8 @@ impl WorkspaceView {
 
     fn open_project(&mut self, _: &OpenProject, _: &mut Window, cx: &mut Context<Self>) {
         self.open_menu = None;
+        self.status = "Opening project...".into();
+        cx.notify();
         let workspace = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let path = rfd::AsyncFileDialog::new()
@@ -753,8 +765,19 @@ impl WorkspaceView {
                 .await
                 .map(|handle| handle.path().to_path_buf());
             if let Some(path) = path {
+                if debug_input_enabled() {
+                    tracing::info!(path = %path.display(), "[DIALOG] project selected");
+                }
                 let _ = workspace.update(cx, |this, cx| {
+                    if debug_input_enabled() {
+                        tracing::info!(path = %path.display(), "[PROJECT] opening");
+                    }
                     this.request_operation(PendingOperation::OpenProject(path), cx);
+                });
+            } else {
+                let _ = workspace.update(cx, |this, cx| {
+                    this.status = "Project selection cancelled".into();
+                    cx.notify();
                 });
             }
         })
@@ -970,6 +993,7 @@ impl WorkspaceView {
         }
         match id {
             "help.features" => self.show_features(&ShowFeatures, window, cx),
+            "settings.open" => self.settings(&Settings, window, cx),
             "workspace.commands" => self.command_palette(&CommandPalette, window, cx),
             "terminal.toggle" => self.toggle_terminal(&ToggleTerminal, window, cx),
             "project.open" => self.open_project(&OpenProject, window, cx),
@@ -1206,8 +1230,35 @@ impl WorkspaceView {
             stroke.push_str("alt-");
         }
         stroke.push_str(&key);
+        if self.command_palette_visible {
+            match key.as_str() {
+                "down" => self.palette_down(&PaletteDown, window, cx),
+                "up" => self.palette_up(&PaletteUp, window, cx),
+                "enter" => self.palette_confirm(&PaletteConfirm, window, cx),
+                "escape" => self.palette_escape(&PaletteEscape, window, cx),
+                "home" => {
+                    self.command_palette_selected = 0;
+                    cx.notify();
+                }
+                "end" => {
+                    self.command_palette_selected = self.palette_commands().len().saturating_sub(1);
+                    cx.notify();
+                }
+                "backspace" => {
+                    self.command_palette_query.pop();
+                    self.command_palette_selected = 0;
+                    cx.notify();
+                }
+                _ => {}
+            }
+            return;
+        }
         if stroke == "f12" {
             self.debug_input(&DebugInput, window, cx);
+            return;
+        }
+        if stroke == "shift-tab" {
+            self.dispatch_editor_action(crate::editor_view::Outdent, window, cx);
             return;
         }
         if let Some(command) = self
@@ -1653,6 +1704,7 @@ impl WorkspaceView {
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
         self.tabs.push(OpenTab { path, editor });
         self.active = Some(self.tabs.len() - 1);
+        self.focus_active_editor = true;
         cx.notify();
     }
 
@@ -3078,6 +3130,12 @@ impl Render for WorkspaceView {
             .active
             .and_then(|index| self.tabs.get(index))
             .map(|tab| tab.editor.clone());
+        if self.focus_active_editor {
+            if let Some(editor) = active_editor.as_ref() {
+                window.focus(&editor.read(cx).focus_handle(cx));
+            }
+            self.focus_active_editor = false;
+        }
         let title = self.project.as_ref().map_or_else(
             || "Axiom".to_owned(),
             |project| {

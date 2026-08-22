@@ -37,6 +37,7 @@ actions!(
         Delete,
         Enter,
         Tab,
+        Outdent,
         Left,
         Right,
         Up,
@@ -81,6 +82,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("delete", Delete, Some("Editor")),
         KeyBinding::new("enter", Enter, Some("Editor")),
         KeyBinding::new("tab", Tab, Some("Editor")),
+        KeyBinding::new("shift-tab", Outdent, Some("Editor")),
         KeyBinding::new("left", Left, Some("Editor")),
         KeyBinding::new("right", Right, Some("Editor")),
         KeyBinding::new("up", Up, Some("Editor")),
@@ -604,6 +606,22 @@ impl EditorView {
 
     fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
         self.document.insert_text("    ");
+        self.after_edit(cx);
+    }
+
+    fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
+        let line = self.document.line_of_offset(self.document.cursor_offset());
+        let start = self.document.offset_of_line(line);
+        let content = self.document.content();
+        let end = (start + 4).min(content.len());
+        let remove = content[start..end]
+            .chars()
+            .take_while(|ch| *ch == ' ')
+            .count();
+        if remove > 0 {
+            self.document.set_selection(start, start + remove);
+            self.document.insert_text("");
+        }
         self.after_edit(cx);
     }
 
@@ -1243,10 +1261,25 @@ impl EditorView {
     }
 
     fn reformat(&mut self, _: &Reformat, _: &mut Window, cx: &mut Context<Self>) {
-        if let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) {
+        if let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri)
+            && lsp.status() == axiom_lsp::ServerStatus::Ready
+        {
+            tracing::info!("[FORMAT] provider=lsp");
             lsp.request_formatting(uri.clone(), 4, true);
         } else {
-            self.status = Some("Formatter unavailable (no PHP language server)".into());
+            let formatted = native_format_php(&self.document.content());
+            if formatted != self.document.content() {
+                let cursor = self.document.cursor_offset();
+                self.document.select_all();
+                self.document.insert_text(&formatted);
+                self.document.move_cursor(cursor.min(formatted.len()));
+                self.after_edit(cx);
+                self.status = Some("Formatted with Axiom PHP Formatter".into());
+                tracing::info!("[FORMAT] provider=axiom-native");
+            } else {
+                self.status = Some("Axiom PHP Formatter: no changes".into());
+                tracing::info!("[FORMAT] provider=axiom-native changes=0");
+            }
             cx.notify();
         }
     }
@@ -1765,6 +1798,70 @@ impl EditorView {
     }
 }
 
+fn native_format_php(text: &str) -> String {
+    let mut result = String::with_capacity(text.len() + text.len() / 4);
+    let mut indent = 0usize;
+    let mut block_comment = false;
+    let mut quote: Option<char> = None;
+    for (line_index, raw_line) in text.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            if line_index > 0 {
+                result.push('\n');
+            }
+            continue;
+        }
+        let closes =
+            trimmed.starts_with('}') || trimmed.starts_with(']') || trimmed.starts_with(')');
+        if closes {
+            indent = indent.saturating_sub(1);
+        }
+        if line_index > 0 {
+            result.push('\n');
+        }
+        result.push_str(&"    ".repeat(indent));
+        result.push_str(trimmed);
+        let mut chars = trimmed.chars().peekable();
+        let mut opens = 0usize;
+        let mut closes_on_line = 0usize;
+        while let Some(ch) = chars.next() {
+            if block_comment {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    block_comment = false;
+                }
+                continue;
+            }
+            if let Some(active_quote) = quote {
+                if ch == '\\' {
+                    chars.next();
+                } else if ch == active_quote {
+                    quote = None;
+                }
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                block_comment = true;
+            } else if (ch == '/' && chars.peek() == Some(&'/')) || ch == '#' {
+                break;
+            } else if matches!(ch, '\'' | '"' | '`') {
+                quote = Some(ch);
+            } else if matches!(ch, '{' | '[' | '(') {
+                opens += 1;
+            } else if matches!(ch, '}' | ']' | ')') {
+                closes_on_line += 1;
+            }
+        }
+        indent = indent.saturating_add(opens);
+        indent = indent.saturating_sub(closes_on_line.saturating_sub(usize::from(closes)));
+    }
+    if text.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
 fn runtime_signature_detail(symbol: &axiom_php::Symbol) -> String {
     let signature = symbol
         .signature
@@ -1832,6 +1929,7 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::tab))
+            .on_action(cx.listener(Self::outdent))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::up))
@@ -2317,4 +2415,26 @@ fn shape(window: &mut Window, text: &str) -> gpui::ShapedLine {
         strikethrough: None,
     };
     window.text_system().shape_line(text, px(14.), &[run], None)
+}
+
+#[cfg(test)]
+mod formatter_tests {
+    use super::native_format_php;
+
+    #[test]
+    fn indents_nested_php_blocks() {
+        let input = "<?php\nclass Test{\npublic function foo(){\n$value=1;\nif($value){\necho \"ok\";\n}\n}\n}\n";
+        let output = native_format_php(input);
+        assert!(output.contains("class Test{\n    public function foo(){\n        $value=1;"));
+        assert!(output.contains("        if($value){\n            echo \"ok\";"));
+    }
+
+    #[test]
+    fn ignores_braces_in_strings_and_comments() {
+        let input = "<?php\nfunction test(){\n$text = \"{ not a block }\";\n// } remains a comment\nreturn $text;\n}\n";
+        let output = native_format_php(input);
+        assert!(output.contains("    $text = \"{ not a block }\";"));
+        assert!(output.contains("    // } remains a comment"));
+        assert!(output.contains("    return $text;"));
+    }
 }

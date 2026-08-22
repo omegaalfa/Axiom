@@ -140,6 +140,13 @@ pub fn registry() -> Vec<CommandDescriptor> {
             "",
         ),
         command(
+            "settings.open",
+            "Settings",
+            "Opens Axiom settings and the configurable keymap.",
+            "Help",
+            "",
+        ),
+        command(
             "project.open",
             "Open Project",
             "Opens a project directory.",
