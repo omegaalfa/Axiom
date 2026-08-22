@@ -22,8 +22,8 @@ use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSe
 use gpui::{
     Action, App, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
-    LayoutId, MouseButton, SharedString, Style, Timer, UTF16Selection, Window, actions, div,
-    prelude::*, px, relative,
+    LayoutId, Modifiers, MouseButton, SharedString, Style, Timer, UTF16Selection, Window, actions,
+    div, prelude::*, px, relative,
 };
 
 use crate::{
@@ -119,7 +119,7 @@ enum RuntimeStubStatus {
     NotFound,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuKind {
     File,
     Edit,
@@ -188,6 +188,7 @@ pub struct WorkspaceView {
     shortcut_capture: bool,
     captured_shortcut: Option<String>,
     shortcut_conflict: Option<String>,
+    debug_overlay_visible: bool,
 }
 
 impl WorkspaceView {
@@ -554,6 +555,7 @@ impl WorkspaceView {
             shortcut_capture: false,
             captured_shortcut: None,
             shortcut_conflict: None,
+            debug_overlay_visible: false,
         };
         if let StartupTarget::Project { root, initial_file } = startup {
             workspace.open_project_path(root);
@@ -956,6 +958,16 @@ impl WorkspaceView {
     }
 
     fn execute_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if debug_input_enabled() {
+            tracing::info!(
+                command = %id,
+                palette = self.command_palette_visible,
+                features = self.features_visible,
+                settings = self.settings_visible,
+                terminal = self.terminal_visible,
+                "[COMMAND] state before"
+            );
+        }
         match id {
             "help.features" => self.show_features(&ShowFeatures, window, cx),
             "workspace.commands" => self.command_palette(&CommandPalette, window, cx),
@@ -1020,6 +1032,16 @@ impl WorkspaceView {
             "editor.paste" => self.dispatch_editor_action(crate::editor_view::Paste, window, cx),
             _ => self.status = format!("Command {id} is not available in this context").into(),
         }
+        if debug_input_enabled() {
+            tracing::info!(
+                command = %id,
+                palette = self.command_palette_visible,
+                features = self.features_visible,
+                settings = self.settings_visible,
+                terminal = self.terminal_visible,
+                "[COMMAND] state after; notify=true"
+            );
+        }
     }
 
     fn go_to_class(&mut self, _: &GoToClass, window: &mut Window, cx: &mut Context<Self>) {
@@ -1072,6 +1094,7 @@ impl WorkspaceView {
     }
 
     fn debug_input(&mut self, _: &DebugInput, _: &mut Window, cx: &mut Context<Self>) {
+        self.debug_overlay_visible = !self.debug_overlay_visible;
         self.status = "Input key received (F12)".into();
         tracing::info!("[RESULT] debug F12 executed");
         cx.notify();
@@ -1171,15 +1194,15 @@ impl WorkspaceView {
             return;
         }
         let key = event.keystroke.key.to_ascii_lowercase();
-        let modifiers = event.keystroke.modifiers;
+        let (control, shift, alt) = normalize_modifiers(event.keystroke.modifiers);
         let mut stroke = String::new();
-        if modifiers.control {
+        if control {
             stroke.push_str("ctrl-");
         }
-        if modifiers.shift {
+        if shift {
             stroke.push_str("shift-");
         }
-        if modifiers.alt {
+        if alt {
             stroke.push_str("alt-");
         }
         stroke.push_str(&key);
@@ -2647,7 +2670,15 @@ impl WorkspaceView {
                                     tracing::info!(target = %label, "[MOUSE] menu click");
                                 }
                                 workspace.update(cx, |this, cx| {
+                                    let before = this.open_menu;
                                     this.open_menu = (this.open_menu != Some(kind)).then_some(kind);
+                                    if debug_input_enabled() {
+                                        tracing::info!(
+                                            menu_before = ?before,
+                                            menu_after = ?this.open_menu,
+                                            "[MENU] state changed; notify=true"
+                                        );
+                                    }
                                     cx.notify();
                                 });
                             })
@@ -3110,10 +3141,6 @@ impl Render for WorkspaceView {
             .text_size(m.ui_font_size)
             .text_color(t.text_primary)
             .child(self.render_menu_bar(cx))
-            .child(self.render_dialogs(cx))
-            .when(self.command_palette_visible, |this| this.child(self.render_command_palette(cx)))
-            .when(self.settings_visible, |this| this.child(self.render_settings(cx)))
-            .when(self.features_visible, |this| this.child(self.render_features(cx)))
             .when(self.project.is_none(), |this| this.child(self.render_welcome(cx)))
             .when(self.project.is_some(), |this| this.child(
                 div()
@@ -3185,6 +3212,29 @@ impl Render for WorkspaceView {
                         "PHP  ·  Intelephense: {lsp_status}  ·  Runtime: {runtime_stub_status}  ·  UTF-8"
                     )),
             ))
+            .child(self.render_dialogs(cx))
+            .when(self.command_palette_visible, |this| {
+                this.child(self.render_command_palette(cx))
+            })
+            .when(self.settings_visible, |this| this.child(self.render_settings(cx)))
+            .when(self.features_visible, |this| this.child(self.render_features(cx)))
+            .when(self.debug_overlay_visible, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(260.))
+                        .left(px(420.))
+                        .right(px(420.))
+                        .h(px(100.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(t.error)
+                        .text_color(t.window_background)
+                        .text_size(px(24.))
+                        .child("INPUT TEST ACTIVE"),
+                )
+            })
     }
 }
 
@@ -3381,4 +3431,36 @@ fn debug_input_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
+}
+
+fn normalize_modifiers(modifiers: Modifiers) -> (bool, bool, bool) {
+    (modifiers.control, modifiers.shift, modifiers.alt)
+}
+
+#[cfg(test)]
+mod modifier_tests {
+    use super::normalize_modifiers;
+    use gpui::Modifiers;
+
+    #[test]
+    fn preserves_plain_control_shift_and_alt() {
+        assert_eq!(
+            normalize_modifiers(Modifiers {
+                control: true,
+                shift: true,
+                alt: false,
+                ..Default::default()
+            }),
+            (true, true, false)
+        );
+        assert_eq!(
+            normalize_modifiers(Modifiers {
+                control: true,
+                shift: false,
+                alt: true,
+                ..Default::default()
+            }),
+            (true, false, true)
+        );
+    }
 }
