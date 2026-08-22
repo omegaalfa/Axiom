@@ -22,8 +22,8 @@ use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSe
 use gpui::{
     Action, App, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
-    LayoutId, Modifiers, MouseButton, SharedString, Style, Timer, UTF16Selection, Window, actions,
-    div, prelude::*, px, relative,
+    LayoutId, Modifiers, MouseButton, Pixels, SharedString, Style, Timer, UTF16Selection, Window,
+    actions, div, prelude::*, px, relative,
 };
 
 use crate::{
@@ -161,6 +161,7 @@ pub struct WorkspaceView {
     recent_projects: RecentProjects,
     recent_path: Option<PathBuf>,
     open_menu: Option<MenuKind>,
+    menu_anchor_x: Pixels,
     pending_operation: Option<PendingOperation>,
     show_about: bool,
     startup_file: Option<PathBuf>,
@@ -530,6 +531,7 @@ impl WorkspaceView {
             recent_projects,
             recent_path,
             open_menu: None,
+            menu_anchor_x: px(0.),
             pending_operation: None,
             show_about: false,
             startup_file: None,
@@ -1106,16 +1108,24 @@ impl WorkspaceView {
                 self.command_palette_visible = true;
             }
             id if id.starts_with("class:") || id.starts_with("symbol:") => {
-                let mut parts = id.rsplitn(3, ':');
+                let kind = id.split(':').next().unwrap_or("symbol");
+                let payload = id.get(kind.len() + 1..).unwrap_or_default();
+                let mut parts = payload.rsplitn(3, ':');
                 let end = parts.next().and_then(|value| value.parse::<usize>().ok());
                 let start = parts.next().and_then(|value| value.parse::<usize>().ok());
                 let path = parts.next();
                 if let (Some(end), Some(start), Some(path)) = (end, start, path) {
+                    if debug_input_enabled() {
+                        tracing::info!(kind, path, start, end, "[NAVIGATION TARGET]");
+                    }
                     self.command_palette_mode = None;
                     self.open_file(PathBuf::from(path), window, cx);
                     if let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) {
                         tab.editor
                             .update(cx, |editor, cx| editor.reveal_byte_range(start..end, cx));
+                    }
+                    if debug_input_enabled() {
+                        tracing::info!(success = true, "[NAVIGATION RESULT]");
                     }
                 }
             }
@@ -2754,7 +2764,7 @@ impl WorkspaceView {
             .join("+")
     }
 
-    fn render_menu_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_menu_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
         let workspace = cx.entity();
@@ -2770,7 +2780,10 @@ impl WorkspaceView {
         let dropdown = div()
             .absolute()
             .top(m.menu_height)
-            .left(px(0.))
+            .left(
+                self.menu_anchor_x
+                    .min((window.viewport_size().width - px(230.)).max(px(0.))),
+            )
             .w(px(230.))
             .py_1()
             .flex()
@@ -2874,11 +2887,12 @@ impl WorkspaceView {
                             .text_size(m.ui_font_size)
                             .text_color(t.text_secondary)
                             .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
-                            .on_mouse_move(move |_, _, cx| {
+                            .on_mouse_move(move |event, _, cx| {
                                 click_workspace.update(cx, |this, cx| {
                                     if this.open_menu.is_some() && this.open_menu != Some(kind) {
                                         let before = this.open_menu;
                                         this.open_menu = Some(kind);
+                                        this.menu_anchor_x = event.position.x;
                                         if debug_input_enabled() {
                                             tracing::info!(
                                                 menu_before = ?before,
@@ -2890,12 +2904,13 @@ impl WorkspaceView {
                                     }
                                 });
                             })
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |event, _, cx| {
                                 if debug_input_enabled() {
                                     tracing::info!(target = %label, "[MOUSE] menu click");
                                 }
                                 workspace.update(cx, |this, cx| {
                                     let before = this.open_menu;
+                                    this.menu_anchor_x = event.position().x;
                                     this.open_menu = (this.open_menu != Some(kind)).then_some(kind);
                                     if debug_input_enabled() {
                                         tracing::info!(
@@ -3472,7 +3487,7 @@ impl Render for WorkspaceView {
                         "PHP  ·  Intelephense: {lsp_status}  ·  Runtime: {runtime_stub_status}  ·  UTF-8"
                     )),
             ))
-            .child(self.render_menu_bar(cx))
+            .child(self.render_menu_bar(window, cx))
             .child(self.render_dialogs(cx))
             .when(self.command_palette_visible, |this| {
                 this.child(self.render_command_palette(cx))
