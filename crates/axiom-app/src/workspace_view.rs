@@ -178,6 +178,7 @@ pub struct WorkspaceView {
     startup_file: Option<PathBuf>,
     explorer_context: Option<ExplorerContext>,
     selected_path: Option<PathBuf>,
+    explorer_new_menu_open: bool,
     explorer_operation: Option<ExplorerOperation>,
     explorer_input: String,
     pending_delete: Option<PathBuf>,
@@ -551,6 +552,7 @@ impl WorkspaceView {
             startup_file: None,
             explorer_context: None,
             selected_path: None,
+            explorer_new_menu_open: false,
             explorer_operation: None,
             explorer_input: String::new(),
             pending_delete: None,
@@ -1098,6 +1100,20 @@ impl WorkspaceView {
                     cx.notify();
                 }
             }
+            "project.new" => {
+                if let Some(directory) = self.selected_path.clone().or_else(|| {
+                    self.project
+                        .as_ref()
+                        .map(|project| project.root_path().to_path_buf())
+                }) {
+                    let directory = if directory.is_dir() {
+                        directory
+                    } else {
+                        directory.parent().unwrap_or(&directory).to_path_buf()
+                    };
+                    self.open_new_menu(directory, cx);
+                }
+            }
             "navigate.back" => self.navigate_back(&NavigateBack, window, cx),
             "navigate.forward" => self.navigate_forward(&NavigateForward, window, cx),
             "editor.reformat" => {
@@ -1349,6 +1365,16 @@ impl WorkspaceView {
             }
             return;
         }
+        if key == "escape" && self.explorer_new_menu_open {
+            self.explorer_new_menu_open = false;
+            cx.notify();
+            return;
+        }
+        if key == "escape" && self.explorer_context.is_some() {
+            self.explorer_context = None;
+            cx.notify();
+            return;
+        }
         if key == "escape" && self.open_menu.is_some() {
             let before = self.open_menu;
             self.open_menu = None;
@@ -1591,44 +1617,68 @@ impl WorkspaceView {
             self.explorer.retain(|candidate| {
                 candidate.path == prefix || !candidate.path.starts_with(&prefix)
             });
-        } else if let Some(project) = &self.project {
-            match project.read_directory(&item.path) {
-                Ok(entries) => {
-                    let children = entries.into_iter().map(|entry| ExplorerItem {
-                        path: entry.path,
-                        name: entry.name,
-                        kind: entry.kind,
-                        depth: item.depth + 1,
-                    });
-                    self.explorer.splice(index + 1..index + 1, children);
-                    self.expanded.insert(item.path);
-                }
-                Err(error) => self.status = format!("Falha ao abrir pasta: {error}").into(),
-            }
+        } else if let Some(project) = self.project.clone() {
+            let directory = item.path.clone();
+            let depth = item.depth + 1;
+            let workspace = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                let result = project.read_directory(&directory);
+                let _ = workspace.update(cx, |this, cx| {
+                    match result {
+                        Ok(entries) => {
+                            let children = entries.into_iter().map(|entry| ExplorerItem {
+                                path: entry.path,
+                                name: entry.name,
+                                kind: entry.kind,
+                                depth,
+                            });
+                            this.explorer.splice(index + 1..index + 1, children);
+                            this.expanded.insert(directory.clone());
+                        }
+                        Err(error) => this.status = format!("Falha ao abrir pasta: {error}").into(),
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
         }
         cx.notify();
     }
 
     fn refresh_explorer(&mut self, cx: &mut Context<Self>) {
-        let Some(project) = &self.project else { return };
-        match project.read_directory(project.root_path()) {
-            Ok(entries) => {
-                self.explorer = entries
-                    .into_iter()
-                    .map(|entry| ExplorerItem {
-                        path: entry.path,
-                        name: entry.name,
-                        kind: entry.kind,
-                        depth: 0,
-                    })
-                    .collect();
-                self.expanded.clear();
-                self.status = "Project Explorer refreshed".into();
-            }
-            Err(error) => self.status = format!("Falha ao atualizar projeto: {error}").into(),
-        }
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let root = project.root_path().to_path_buf();
+        let workspace = cx.entity().downgrade();
+        self.status = "Refreshing Project Explorer...".into();
         self.explorer_context = None;
         cx.notify();
+        cx.spawn(async move |_, cx| {
+            let result = project.read_directory(&root);
+            let _ = workspace.update(cx, |this, cx| {
+                match result {
+                    Ok(entries) => {
+                        this.explorer = entries
+                            .into_iter()
+                            .map(|entry| ExplorerItem {
+                                path: entry.path,
+                                name: entry.name,
+                                kind: entry.kind,
+                                depth: 0,
+                            })
+                            .collect();
+                        this.expanded.clear();
+                        this.status = "Project Explorer refreshed".into();
+                    }
+                    Err(error) => {
+                        this.status = format!("Falha ao atualizar projeto: {error}").into()
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn context_directory(path: &Path, kind: EntryKind) -> &Path {
@@ -1641,13 +1691,29 @@ impl WorkspaceView {
 
     fn new_file(&mut self, directory: PathBuf, _: &mut Window, cx: &mut Context<Self>) {
         self.explorer_context = None;
+        self.explorer_new_menu_open = false;
         self.explorer_input = "untitled".into();
         self.explorer_operation = Some(ExplorerOperation::NewFile(directory));
         cx.notify();
     }
 
+    fn open_new_menu(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
+        self.selected_path = Some(directory.clone());
+        self.explorer_context = Some(ExplorerContext {
+            path: directory,
+            kind: EntryKind::Directory,
+        });
+        self.explorer_new_menu_open = true;
+        if debug_input_enabled() {
+            tracing::info!("[EXPLORER TOOLBAR CLICK] button=new");
+            tracing::info!(command = "project.new", "[ACTION]");
+        }
+        cx.notify();
+    }
+
     fn new_php_file(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
         self.explorer_context = None;
+        self.explorer_new_menu_open = false;
         self.explorer_input = "untitled.php".into();
         self.explorer_operation = Some(ExplorerOperation::NewPhpFile(directory));
         cx.notify();
@@ -1655,6 +1721,7 @@ impl WorkspaceView {
 
     fn new_directory(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
         self.explorer_context = None;
+        self.explorer_new_menu_open = false;
         self.explorer_input = "New Folder".into();
         self.explorer_operation = Some(ExplorerOperation::NewDirectory(directory));
         cx.notify();
@@ -1662,6 +1729,7 @@ impl WorkspaceView {
 
     fn new_php_item(&mut self, directory: PathBuf, keyword: &'static str, cx: &mut Context<Self>) {
         self.explorer_context = None;
+        self.explorer_new_menu_open = false;
         self.explorer_input = "NewItem".into();
         self.explorer_operation = Some(ExplorerOperation::NewPhp { directory, keyword });
         cx.notify();
@@ -1669,6 +1737,7 @@ impl WorkspaceView {
 
     fn rename_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.explorer_context = None;
+        self.explorer_new_menu_open = false;
         let Some(current_name) = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1683,6 +1752,7 @@ impl WorkspaceView {
 
     fn cancel_explorer_operation(&mut self, cx: &mut Context<Self>) {
         self.explorer_operation = None;
+        self.explorer_new_menu_open = false;
         self.explorer_input.clear();
         cx.notify();
     }
@@ -1720,7 +1790,14 @@ impl WorkspaceView {
                     format!("{name}.php")
                 };
                 let symbol = name.trim_end_matches(".php");
-                let body = format!("<?php\n\n{keyword} {symbol}\n{{\n}}\n");
+                let namespace = project.path_to_namespace(directory.join(&name));
+                let namespace_line = namespace
+                    .as_deref()
+                    .and_then(|value| value.rsplit_once('\\').map(|(prefix, _)| prefix))
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("\nnamespace {value};\n"))
+                    .unwrap_or_default();
+                let body = format!("<?php\n{namespace_line}\n{keyword} {symbol}\n{{\n}}\n");
                 project.create_file(&directory, &name).map(|path| {
                     let _ = fs::write(&path, body);
                     Some(path)
@@ -2352,7 +2429,7 @@ impl WorkspaceView {
                                 this.child(
                                     div()
                                         .id("explorer-new-file")
-                                        .tooltip(|_, cx| tooltip("New File", cx))
+                                        .tooltip(|_, cx| tooltip("New", cx))
                                         .px_1()
                                         .w(m.toolbar_height)
                                         .h(m.toolbar_height)
@@ -2361,11 +2438,19 @@ impl WorkspaceView {
                                         .justify_center()
                                         .rounded(m.border_radius_small)
                                         .hover(move |s| s.bg(t.hover))
+                                        .on_mouse_down(MouseButton::Left, |_, _, _| {
+                                            if debug_input_enabled() {
+                                                tracing::info!(
+                                                    "[EXPLORER TOOLBAR MOUSE DOWN] button=new"
+                                                );
+                                            }
+                                        })
                                         .on_click({
                                             let root = root.clone();
                                             move |_, window, cx| {
                                                 new_file_workspace.update(cx, |this, cx| {
-                                                    this.new_file(root.clone(), window, cx)
+                                                    this.open_new_menu(root.clone(), cx);
+                                                    let _ = window;
                                                 })
                                             }
                                         })
@@ -2424,6 +2509,7 @@ impl WorkspaceView {
                         this.on_mouse_down(MouseButton::Right, move |_, _, cx| {
                             workspace.update(cx, |this, cx| {
                                 this.selected_path = Some(root.clone());
+                                this.explorer_new_menu_open = false;
                                 this.explorer_context = Some(ExplorerContext {
                                     path: root.clone(),
                                     kind: EntryKind::Directory,
@@ -2491,6 +2577,7 @@ impl WorkspaceView {
                                 context_workspace.update(cx, |this, cx| {
                                     window.focus(&this.focus);
                                     this.selected_path = Some(context_item.path.clone());
+                                    this.explorer_new_menu_open = false;
                                     this.explorer_context = Some(ExplorerContext {
                                         path: context_item.path.clone(),
                                         kind: context_item.kind,
@@ -2569,22 +2656,85 @@ impl WorkspaceView {
             .child({
                 let workspace = workspace.clone();
                 let directory = directory.clone();
-                Self::explorer_menu_item("File", move |window, cx| {
-                    workspace.update(cx, |this, cx| this.new_file(directory.clone(), window, cx));
+                let submenu = self.render_new_submenu(directory.clone(), cx);
+                div()
+                    .relative()
+                    .id("explorer-new-submenu-trigger")
+                    .h(metrics().toolbar_height)
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded(metrics().border_radius_small)
+                    .hover(move |style| style.bg(theme().hover))
+                    .on_mouse_move(move |_, _, cx| {
+                        workspace.update(cx, |this, cx| {
+                            this.explorer_new_menu_open = true;
+                            if debug_input_enabled() {
+                                tracing::info!("[SUBMENU] open=New");
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .child("New")
+                    .child("▶")
+                    .when(self.explorer_new_menu_open, |this| this.child(submenu))
+            })
+            .when(!is_root, |this| {
+                let rename_workspace = workspace.clone();
+                let delete_workspace = workspace.clone();
+                let rename_path = context.path.clone();
+                let delete_path = context.path.clone();
+                this.child(Self::explorer_menu_item("Rename  F2", move |window, cx| {
+                    rename_workspace.update(cx, |this, cx| {
+                        window.focus(&this.focus);
+                        this.rename_entry(rename_path.clone(), cx)
+                    });
+                }))
+                .child(Self::explorer_menu_item("Delete", move |_, cx| {
+                    delete_workspace
+                        .update(cx, |this, cx| this.request_delete(delete_path.clone(), cx));
+                }))
+            })
+            .child({
+                let workspace = workspace.clone();
+                let path = context.path.clone();
+                Self::explorer_menu_item("Copy Path", move |_, cx| {
+                    workspace.update(cx, |this, cx| this.copy_path(&path, cx));
                 })
             })
+            .child({
+                let workspace = workspace.clone();
+                Self::explorer_menu_item("Refresh", move |_, cx| {
+                    workspace.update(cx, |this, cx| this.refresh_explorer(cx));
+                })
+            })
+    }
+
+    fn render_new_submenu(&self, directory: PathBuf, cx: &mut Context<Self>) -> impl IntoElement {
+        let workspace = cx.entity();
+        let t = theme();
+        let m = metrics();
+        div()
+            .absolute()
+            .left(px(180.))
+            .top(px(0.))
+            .w(px(190.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .bg(t.menu_background)
+            .border_1()
+            .border_color(t.border)
+            .rounded(m.border_radius_medium)
+            .shadow_lg()
+            .on_mouse_move(|_, _, _| {})
             .child({
                 let workspace = workspace.clone();
                 let directory = directory.clone();
                 Self::explorer_menu_item("PHP File", move |_, cx| {
                     workspace.update(cx, |this, cx| this.new_php_file(directory.clone(), cx));
-                })
-            })
-            .child({
-                let workspace = workspace.clone();
-                let directory = directory.clone();
-                Self::explorer_menu_item("New Directory", move |_, cx| {
-                    workspace.update(cx, |this, cx| this.new_directory(directory.clone(), cx));
                 })
             })
             .child({
@@ -2623,33 +2773,17 @@ impl WorkspaceView {
                     });
                 })
             })
-            .when(!is_root, |this| {
-                let rename_workspace = workspace.clone();
-                let delete_workspace = workspace.clone();
-                let rename_path = context.path.clone();
-                let delete_path = context.path.clone();
-                this.child(Self::explorer_menu_item("Rename  F2", move |window, cx| {
-                    rename_workspace.update(cx, |this, cx| {
-                        window.focus(&this.focus);
-                        this.rename_entry(rename_path.clone(), cx)
-                    });
-                }))
-                .child(Self::explorer_menu_item("Delete", move |_, cx| {
-                    delete_workspace
-                        .update(cx, |this, cx| this.request_delete(delete_path.clone(), cx));
-                }))
-            })
             .child({
                 let workspace = workspace.clone();
-                let path = context.path.clone();
-                Self::explorer_menu_item("Copy Path", move |_, cx| {
-                    workspace.update(cx, |this, cx| this.copy_path(&path, cx));
+                let directory = directory.clone();
+                Self::explorer_menu_item("File", move |window, cx| {
+                    workspace.update(cx, |this, cx| this.new_file(directory.clone(), window, cx));
                 })
             })
             .child({
                 let workspace = workspace.clone();
-                Self::explorer_menu_item("Refresh", move |_, cx| {
-                    workspace.update(cx, |this, cx| this.refresh_explorer(cx));
+                Self::explorer_menu_item("Directory", move |_, cx| {
+                    workspace.update(cx, |this, cx| this.new_directory(directory.clone(), cx));
                 })
             })
     }

@@ -112,7 +112,7 @@ pub struct Psr4Mapping {
     pub dev: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Project {
     root_path: PathBuf,
     composer: Option<ComposerProject>,

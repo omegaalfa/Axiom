@@ -167,6 +167,13 @@ pub fn registry() -> Vec<CommandDescriptor> {
             "Project",
             "f2",
         ),
+        command(
+            "project.new",
+            "New",
+            "Create a new project file or directory.",
+            "Project",
+            "",
+        ),
     ]
 }
 
