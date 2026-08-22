@@ -160,6 +160,13 @@ pub fn registry() -> Vec<CommandDescriptor> {
             "Project",
             "ctrl-o",
         ),
+        command(
+            "project.rename",
+            "Rename",
+            "Rename the selected file or directory.",
+            "Project",
+            "f2",
+        ),
     ]
 }
 
@@ -375,5 +382,19 @@ mod tests {
                 .contains("directory")
         );
         assert!(file.description.to_ascii_lowercase().contains("file"));
+    }
+
+    #[test]
+    fn rename_command_defaults_to_f2() {
+        let keymap = Keymap::default();
+        assert_eq!(keymap.shortcut("project.rename"), Some("f2"));
+        assert_eq!(
+            keymap
+                .commands()
+                .iter()
+                .find(|command| command.id == "project.rename")
+                .map(|command| command.title.as_str()),
+            Some("Rename")
+        );
     }
 }

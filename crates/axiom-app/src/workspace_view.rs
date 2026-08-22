@@ -1085,6 +1085,19 @@ impl WorkspaceView {
             "terminal.toggle" => self.toggle_terminal(&ToggleTerminal, window, cx),
             "project.open_project" => self.open_project(&OpenProject, window, cx),
             "project.open_file" => self.open_file_dialog(&OpenFile, window, cx),
+            "project.rename" => {
+                if let Some(path) = self.selected_path.clone() {
+                    if debug_input_enabled() {
+                        tracing::info!(path = %path.display(), "[RENAME]");
+                        tracing::info!(popup_open = true, "[RENAME POPUP]");
+                    }
+                    window.focus(&self.focus);
+                    self.rename_entry(path, cx);
+                } else {
+                    self.status = "No project item selected".into();
+                    cx.notify();
+                }
+            }
             "navigate.back" => self.navigate_back(&NavigateBack, window, cx),
             "navigate.forward" => self.navigate_forward(&NavigateForward, window, cx),
             "editor.reformat" => {
@@ -1328,9 +1341,11 @@ impl WorkspaceView {
             }
             return;
         }
-        if self.focus.is_focused(window) && key == "f2" {
-            if let Some(path) = self.selected_path.clone() {
-                self.rename_entry(path, cx);
+        if self.explorer_operation.is_some() {
+            match key.as_str() {
+                "escape" => self.cancel_explorer_operation(cx),
+                "enter" => self.confirm_explorer_operation(cx),
+                _ => {}
             }
             return;
         }
@@ -1393,11 +1408,11 @@ impl WorkspaceView {
             .find(|command| self.keymap.shortcut(&command.id) == Some(stroke.as_str()))
         {
             let id = command.id.clone();
-            if debug_keys_enabled() {
+            if debug_keys_enabled() || debug_input_enabled() {
                 tracing::info!(key = %stroke, matched = %id, context = "workspace", executed = true, "Axiom key event");
             }
             self.execute_command(&id, window, cx);
-        } else if debug_keys_enabled() {
+        } else if debug_keys_enabled() || debug_input_enabled() {
             tracing::debug!(key = %stroke, matched = "", context = "workspace", executed = false, "Axiom key event");
         }
     }
@@ -2613,9 +2628,11 @@ impl WorkspaceView {
                 let delete_workspace = workspace.clone();
                 let rename_path = context.path.clone();
                 let delete_path = context.path.clone();
-                this.child(Self::explorer_menu_item("Rename", move |_, cx| {
-                    rename_workspace
-                        .update(cx, |this, cx| this.rename_entry(rename_path.clone(), cx));
+                this.child(Self::explorer_menu_item("Rename  F2", move |window, cx| {
+                    rename_workspace.update(cx, |this, cx| {
+                        window.focus(&this.focus);
+                        this.rename_entry(rename_path.clone(), cx)
+                    });
                 }))
                 .child(Self::explorer_menu_item("Delete", move |_, cx| {
                     delete_workspace
@@ -2947,6 +2964,18 @@ impl WorkspaceView {
             ("Navigate", MenuKind::Navigate),
             ("Help", MenuKind::Help),
         ];
+        if debug_input_enabled()
+            && let Some(active) = menu
+        {
+            tracing::info!(
+                active = ?active,
+                dismiss = true,
+                dropdown = true,
+                anchor_x = ?self.menu_anchor_x,
+                z_order = "dropdown-above-dismiss",
+                "[MENU RENDER]"
+            );
+        }
         let dropdown = div()
             .absolute()
             .top(m.menu_height)
@@ -3559,11 +3588,6 @@ impl Render for WorkspaceView {
                     tracing::debug!(x = ?event.position.x, y = ?event.position.y, "[MOUSE RAW]");
                 }
             })
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                if this.open_menu.take().is_some() {
-                    cx.notify();
-                }
-            }))
             .on_key_down(cx.listener(Self::handle_workspace_keydown))
             .on_action(cx.listener(Self::open_project))
             .on_action(cx.listener(Self::open_file_dialog))
@@ -3662,6 +3686,25 @@ impl Render for WorkspaceView {
                         "PHP  ·  Intelephense: {lsp_status}  ·  Runtime: {runtime_stub_status}  ·  UTF-8"
                     )),
             ))
+            .when(self.open_menu.is_some(), |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(m.menu_height)
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .id("menu-dismiss-layer")
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            if let Some(menu) = this.open_menu.take() {
+                                if debug_input_enabled() {
+                                    tracing::info!(reason = "outside_click", menu = ?menu, "[MENU DISMISS]");
+                                }
+                                cx.notify();
+                            }
+                        })),
+                )
+            })
             .child(self.render_menu_bar(window, cx))
             .child(self.render_dialogs(cx))
             .when(self.command_palette_visible, |this| {
