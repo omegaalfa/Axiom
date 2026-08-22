@@ -1645,7 +1645,7 @@ impl EditorView {
             .h(px(LINE_HEIGHT))
             .line_height(px(LINE_HEIGHT))
             .text_size(px(FONT_SIZE))
-            .font_family("monospace")
+            .font_family("Cascadia Mono")
             .text_color(t.text_primary)
             .bg(if cursor_here {
                 t.active_line
@@ -2284,7 +2284,7 @@ fn shape(window: &mut Window, text: &str) -> gpui::ShapedLine {
     let text: SharedString = text.to_owned().into();
     let run = TextRun {
         len: text.len(),
-        font: font("monospace"),
+        font: font("Cascadia Mono"),
         color: style.color,
         background_color: None,
         underline: None,

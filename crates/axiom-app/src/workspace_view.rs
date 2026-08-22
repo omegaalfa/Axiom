@@ -721,20 +721,34 @@ impl WorkspaceView {
         .detach();
     }
 
-    fn open_file_dialog(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_file_dialog(&mut self, _: &OpenFile, _: &mut Window, cx: &mut Context<Self>) {
         self.open_menu = None;
-        let mut dialog = rfd::FileDialog::new();
-        if let Some(project) = &self.project {
-            dialog = dialog.set_directory(project.root_path());
-        }
-        if let Some(path) = dialog.pick_file() {
-            if self.project.is_none()
-                && let Some(parent) = path.parent()
-            {
-                self.open_project_path(parent.to_path_buf());
+        let directory = self
+            .project
+            .as_ref()
+            .map(|project| project.root_path().to_path_buf());
+        let workspace = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let mut dialog = rfd::AsyncFileDialog::new();
+            if let Some(directory) = directory {
+                dialog = dialog.set_directory(directory);
             }
-            self.open_file(path, window, cx);
-        }
+            let path = dialog
+                .pick_file()
+                .await
+                .map(|handle| handle.path().to_path_buf());
+            if let Some(path) = path {
+                let _ = workspace.update(cx, |this, cx| {
+                    if this.project.is_none()
+                        && let Some(parent) = path.parent()
+                    {
+                        this.open_project_path(parent.to_path_buf());
+                    }
+                    this.open_file_background(path, cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn save_all(&mut self, _: &SaveAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -1332,107 +1346,132 @@ impl WorkspaceView {
         }
     }
 
-    fn new_file(&mut self, directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn new_file(&mut self, directory: PathBuf, _: &mut Window, cx: &mut Context<Self>) {
         self.explorer_context = None;
-        let Some(chosen) = rfd::FileDialog::new()
-            .set_title("New File")
-            .set_directory(&directory)
-            .set_file_name("untitled")
-            .save_file()
-        else {
-            return;
-        };
-        let Some(name) = chosen.file_name().and_then(|name| name.to_str()) else {
-            self.status = "Invalid file name".into();
-            cx.notify();
-            return;
-        };
-        let result = self
-            .project
-            .as_ref()
-            .expect("project is open")
-            .create_file(&directory, name);
-        match result {
-            Ok(path) => {
-                self.refresh_explorer(cx);
-                self.open_file(path, window, cx);
-            }
-            Err(error) => {
-                self.status = format!("Falha ao criar arquivo: {error}").into();
-                cx.notify();
-            }
-        }
+        let workspace = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let chosen = rfd::AsyncFileDialog::new()
+                .set_title("New File")
+                .set_directory(directory.clone())
+                .set_file_name("untitled")
+                .save_file()
+                .await
+                .map(|handle| handle.path().to_path_buf());
+            let Some(chosen) = chosen else { return };
+            let _ = workspace.update(cx, |this, cx| {
+                let Some(name) = chosen.file_name().and_then(|name| name.to_str()) else {
+                    this.status = "Invalid file name".into();
+                    cx.notify();
+                    return;
+                };
+                match this
+                    .project
+                    .as_ref()
+                    .expect("project is open")
+                    .create_file(&directory, name)
+                {
+                    Ok(path) => {
+                        this.refresh_explorer(cx);
+                        this.open_file_background(path, cx);
+                    }
+                    Err(error) => {
+                        this.status = format!("Falha ao criar arquivo: {error}").into();
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     fn new_directory(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
         self.explorer_context = None;
-        let Some(chosen) = rfd::FileDialog::new()
-            .set_title("New Directory")
-            .set_directory(&directory)
-            .set_file_name("New Folder")
-            .save_file()
-        else {
-            return;
-        };
-        let Some(name) = chosen.file_name().and_then(|name| name.to_str()) else {
-            self.status = "Invalid directory name".into();
-            cx.notify();
-            return;
-        };
-        match self
-            .project
-            .as_ref()
-            .expect("project is open")
-            .create_directory(&directory, name)
-        {
-            Ok(_) => self.refresh_explorer(cx),
-            Err(error) => {
-                self.status = format!("Falha ao criar diretório: {error}").into();
-                cx.notify();
-            }
-        }
+        let workspace = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let chosen = rfd::AsyncFileDialog::new()
+                .set_title("New Directory")
+                .set_directory(directory.clone())
+                .set_file_name("New Folder")
+                .save_file()
+                .await
+                .map(|handle| handle.path().to_path_buf());
+            let Some(chosen) = chosen else { return };
+            let _ = workspace.update(cx, |this, cx| {
+                let Some(name) = chosen.file_name().and_then(|name| name.to_str()) else {
+                    this.status = "Invalid directory name".into();
+                    cx.notify();
+                    return;
+                };
+                match this
+                    .project
+                    .as_ref()
+                    .expect("project is open")
+                    .create_directory(&directory, name)
+                {
+                    Ok(_) => this.refresh_explorer(cx),
+                    Err(error) => {
+                        this.status = format!("Failed to create directory: {error}").into();
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     fn rename_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.explorer_context = None;
-        let Some(parent) = path.parent() else { return };
-        let Some(current_name) = path.file_name().and_then(|name| name.to_str()) else {
+        let Some(parent) = path.parent().map(Path::to_path_buf) else {
             return;
         };
-        let Some(chosen) = rfd::FileDialog::new()
-            .set_title("Rename")
-            .set_directory(parent)
-            .set_file_name(current_name)
-            .save_file()
+        let Some(current_name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
         else {
             return;
         };
-        let Some(new_name) = chosen.file_name().and_then(|name| name.to_str()) else {
-            self.status = "Invalid name".into();
-            cx.notify();
-            return;
-        };
-        let result = self
-            .project
-            .as_ref()
-            .expect("project is open")
-            .rename(&path, new_name);
-        match result {
-            Ok(destination) => {
-                for tab in &mut self.tabs {
-                    if let Ok(relative) = tab.path.strip_prefix(&path) {
-                        tab.path = destination.join(relative);
-                        tab.editor
-                            .update(cx, |editor, _| editor.relocate_path(&path, &destination));
+        let workspace = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let chosen = rfd::AsyncFileDialog::new()
+                .set_title("Rename")
+                .set_directory(parent)
+                .set_file_name(current_name)
+                .save_file()
+                .await
+                .map(|handle| handle.path().to_path_buf());
+            let Some(chosen) = chosen else { return };
+            let _ = workspace.update(cx, |this, cx| {
+                let Some(new_name) = chosen.file_name().and_then(|name| name.to_str()) else {
+                    this.status = "Invalid name".into();
+                    cx.notify();
+                    return;
+                };
+                let result = this
+                    .project
+                    .as_ref()
+                    .expect("project is open")
+                    .rename(&path, new_name);
+                match result {
+                    Ok(destination) => {
+                        for tab in &mut this.tabs {
+                            if let Ok(relative) = tab.path.strip_prefix(&path) {
+                                tab.path = destination.join(relative);
+                                tab.editor.update(cx, |editor, _| {
+                                    editor.relocate_path(&path, &destination)
+                                });
+                            }
+                        }
+                        this.refresh_explorer(cx);
+                    }
+                    Err(error) => {
+                        this.status = format!("Falha ao renomear: {error}").into();
+                        cx.notify();
                     }
                 }
-                self.refresh_explorer(cx);
-            }
-            Err(error) => {
-                self.status = format!("Falha ao renomear: {error}").into();
-                cx.notify();
-            }
-        }
+            });
+        })
+        .detach();
     }
 
     fn request_delete(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1484,6 +1523,42 @@ impl WorkspaceView {
         cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
         self.explorer_context = None;
         self.status = "Path copied".into();
+        cx.notify();
+    }
+
+    fn open_file_background(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let path = match fs::canonicalize(path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = format!("Falha ao normalizar arquivo: {error}").into();
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+            self.active = Some(index);
+            cx.notify();
+            return;
+        }
+        let document = match Document::from_file(&path) {
+            Ok(document) => document,
+            Err(error) => {
+                self.status = format!("Falha ao abrir arquivo: {error}").into();
+                cx.notify();
+                return;
+            }
+        };
+        let lsp = self.lsp.clone();
+        let editor = cx.new(|cx| EditorView::from_document(path.clone(), document, lsp, cx));
+        if let Some(symbols) = &self._runtime_symbols {
+            editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
+        }
+        if let Some(index) = &self.project_index {
+            editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+        }
+        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+        self.tabs.push(OpenTab { path, editor });
+        self.active = Some(self.tabs.len() - 1);
         cx.notify();
     }
 

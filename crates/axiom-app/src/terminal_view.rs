@@ -333,7 +333,7 @@ impl Render for TerminalView {
             .track_focus(&self.focus)
             .bg(t.editor_background)
             .text_color(t.text_primary)
-            .font_family("monospace")
+            .font_family("Cascadia Mono")
             .text_size(m.editor_font_size)
             .line_height(m.editor_line_height)
             .on_action(cx.listener(Self::enter))
