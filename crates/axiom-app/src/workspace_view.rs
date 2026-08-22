@@ -184,6 +184,9 @@ pub struct WorkspaceView {
     explorer_new_menu_open: bool,
     explorer_operation: Option<ExplorerOperation>,
     explorer_input: String,
+    explorer_namespace: String,
+    explorer_extends: String,
+    explorer_implements: String,
     pending_delete: Option<PathBuf>,
     project_panel_visible: bool,
     terminal_session: Option<std::sync::Arc<TerminalSession>>,
@@ -561,6 +564,9 @@ impl WorkspaceView {
             explorer_new_menu_open: false,
             explorer_operation: None,
             explorer_input: String::new(),
+            explorer_namespace: String::new(),
+            explorer_extends: String::new(),
+            explorer_implements: String::new(),
             pending_delete: None,
             project_panel_visible: true,
             terminal_session: None,
@@ -1097,10 +1103,17 @@ impl WorkspaceView {
                 if let Some(path) = self.selected_path.clone() {
                     if debug_input_enabled() {
                         tracing::info!(path = %path.display(), "[RENAME]");
-                        tracing::info!(popup_open = true, "[RENAME POPUP]");
+                        tracing::info!(popup_open = true, "[RENAME DIALOG]");
                     }
                     window.focus(&self.focus);
                     self.rename_entry(path, cx);
+                    if debug_input_enabled() {
+                        tracing::info!(
+                            command = "project.rename",
+                            executed = true,
+                            "[COMMAND RESULT]"
+                        );
+                    }
                 } else {
                     self.status = "No project item selected".into();
                     cx.notify();
@@ -1500,6 +1513,7 @@ impl WorkspaceView {
         {
             let id = command.id.clone();
             if debug_keys_enabled() || debug_input_enabled() {
+                tracing::info!(key = %stroke, matched = %id, "[KEYMAP]");
                 tracing::info!(key = %stroke, matched = %id, context = "workspace", executed = true, "Axiom key event");
             }
             self.execute_command(&id, window, cx);
@@ -1810,6 +1824,19 @@ impl WorkspaceView {
                 index = self.context_submenu_selected,
                 "[CONTEXT MENU ACTION]"
             );
+            let kind = [
+                "file",
+                "directory",
+                "php_file",
+                "php_class",
+                "php_interface",
+                "php_trait",
+                "php_enum",
+            ]
+            .get(self.context_submenu_selected)
+            .copied()
+            .unwrap_or("unknown");
+            tracing::info!(kind, selected_path = ?self.selected_path, target_directory = %directory.display(), "[NEW ITEM ACTION]");
         }
         match self.context_submenu_selected {
             0 => self.new_file(directory, window, cx),
@@ -1824,9 +1851,13 @@ impl WorkspaceView {
     }
 
     fn new_file(&mut self, directory: PathBuf, _: &mut Window, cx: &mut Context<Self>) {
+        if self.explorer_context.is_some() && debug_input_enabled() {
+            tracing::info!(selected_path = ?self.selected_path, reason = "action", "[CONTEXT MENU CLOSE]");
+        }
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
         self.explorer_input = "untitled".into();
+        self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::NewFile(directory));
         cx.notify();
     }
@@ -1847,30 +1878,52 @@ impl WorkspaceView {
     }
 
     fn new_php_file(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
+        if self.explorer_context.is_some() && debug_input_enabled() {
+            tracing::info!(selected_path = ?self.selected_path, reason = "action", "[CONTEXT MENU CLOSE]");
+        }
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
         self.explorer_input = "untitled.php".into();
+        self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::NewPhpFile(directory));
         cx.notify();
     }
 
     fn new_directory(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
+        if self.explorer_context.is_some() && debug_input_enabled() {
+            tracing::info!(selected_path = ?self.selected_path, reason = "action", "[CONTEXT MENU CLOSE]");
+        }
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
         self.explorer_input = "New Folder".into();
+        self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::NewDirectory(directory));
         cx.notify();
     }
 
     fn new_php_item(&mut self, directory: PathBuf, keyword: &'static str, cx: &mut Context<Self>) {
+        if self.explorer_context.is_some() && debug_input_enabled() {
+            tracing::info!(selected_path = ?self.selected_path, reason = "action", "[CONTEXT MENU CLOSE]");
+        }
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
         self.explorer_input = "NewItem".into();
+        self.explorer_namespace = self
+            .project
+            .as_ref()
+            .and_then(|project| project.path_to_namespace(directory.join("NewItem.php")))
+            .and_then(|value| value.rsplit_once('\\').map(|(prefix, _)| prefix.to_owned()))
+            .unwrap_or_default();
+        self.explorer_extends.clear();
+        self.explorer_implements.clear();
         self.explorer_operation = Some(ExplorerOperation::NewPhp { directory, keyword });
         cx.notify();
     }
 
     fn rename_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if debug_input_enabled() {
+            tracing::info!(selected_path = %path.display(), popup_open = true, "[RENAME DIALOG]");
+        }
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
         let Some(current_name) = path
@@ -1881,6 +1934,7 @@ impl WorkspaceView {
             return;
         };
         self.explorer_input = current_name;
+        self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::Rename(path));
         cx.notify();
     }
@@ -1889,6 +1943,9 @@ impl WorkspaceView {
         self.explorer_operation = None;
         self.explorer_new_menu_open = false;
         self.explorer_input.clear();
+        self.explorer_namespace.clear();
+        self.explorer_extends.clear();
+        self.explorer_implements.clear();
         cx.notify();
     }
 
@@ -1925,14 +1982,28 @@ impl WorkspaceView {
                     format!("{name}.php")
                 };
                 let symbol = name.trim_end_matches(".php");
-                let namespace = project.path_to_namespace(directory.join(&name));
-                let namespace_line = namespace
-                    .as_deref()
-                    .and_then(|value| value.rsplit_once('\\').map(|(prefix, _)| prefix))
-                    .filter(|value| !value.is_empty())
-                    .map(|value| format!("\nnamespace {value};\n"))
-                    .unwrap_or_default();
-                let body = format!("<?php\n{namespace_line}\n{keyword} {symbol}\n{{\n}}\n");
+                let namespace_line = if self.explorer_namespace.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\nnamespace {};\n", self.explorer_namespace.trim())
+                };
+                let extends = if self.explorer_extends.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" extends {}", self.explorer_extends.trim())
+                };
+                let implements = if self.explorer_implements.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" implements {}", self.explorer_implements.trim())
+                };
+                let inheritance = if keyword == "class" {
+                    format!("{extends}{implements}")
+                } else {
+                    String::new()
+                };
+                let declaration = format!("{keyword} {symbol}{inheritance}");
+                let body = format!("<?php\n{namespace_line}\n{declaration}\n{{\n}}\n");
                 project.create_file(&directory, &name).map(|path| {
                     let _ = fs::write(&path, body);
                     Some(path)
@@ -2768,6 +2839,7 @@ impl WorkspaceView {
             .border_color(t.border)
             .flex()
             .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .bg(t.menu_background)
             .text_color(t.text_primary)
             .when(context.kind == EntryKind::File, |this| {
@@ -2956,7 +3028,13 @@ impl WorkspaceView {
             Some(ExplorerOperation::NewDirectory(_)) => "New Directory",
             Some(ExplorerOperation::NewFile(_)) => "File",
             Some(ExplorerOperation::NewPhpFile(_)) => "PHP File",
-            Some(ExplorerOperation::NewPhp { keyword, .. }) => keyword,
+            Some(ExplorerOperation::NewPhp { keyword, .. }) => match keyword {
+                "class" => "Create New PHP Class",
+                "interface" => "Create New PHP Interface",
+                "trait" => "Create New PHP Trait",
+                "enum" => "Create New PHP Enum",
+                _ => "Create New PHP Item",
+            },
             None => "",
         };
         div()
@@ -2974,6 +3052,11 @@ impl WorkspaceView {
             .rounded(m.border_radius_medium)
             .shadow_lg()
             .child(title)
+            .when(self.explorer_operation.as_ref().is_some_and(|operation| matches!(operation, ExplorerOperation::NewPhp { .. })), |this| {
+                this.child(format!("Directory: {}", self.operation_directory().display()))
+                    .child(format!("Namespace: {}", if self.explorer_namespace.is_empty() { "(none)" } else { &self.explorer_namespace }))
+                    .child("Extends / Implements: optional text fields supported by the generated template")
+            })
             .child(
                 div()
                     .h(px(34.))
@@ -3031,6 +3114,17 @@ impl WorkspaceView {
             )
     }
 
+    fn operation_directory(&self) -> PathBuf {
+        match self.explorer_operation.as_ref() {
+            Some(ExplorerOperation::NewFile(directory))
+            | Some(ExplorerOperation::NewPhpFile(directory))
+            | Some(ExplorerOperation::NewPhp { directory, .. })
+            | Some(ExplorerOperation::NewDirectory(directory)) => directory.clone(),
+            Some(ExplorerOperation::Rename(path)) => path.parent().unwrap_or(path).to_path_buf(),
+            None => PathBuf::new(),
+        }
+    }
+
     fn explorer_menu_item(
         label: &'static str,
         handler: impl Fn(&mut Window, &mut App) + 'static,
@@ -3045,11 +3139,19 @@ impl WorkspaceView {
             .items_center()
             .rounded(m.border_radius_small)
             .hover(move |style| style.bg(t.hover))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                if debug_input_enabled() {
+                    tracing::info!("[SUBMENU ITEM MOUSE DOWN]");
+                }
+                cx.stop_propagation();
+            })
             .on_click(move |_, window, cx| {
                 if debug_input_enabled() {
                     tracing::info!(item = %label, "[CONTEXT MENU ACTION]");
+                    tracing::info!(item = %label, "[SUBMENU ITEM CLICK]");
                 }
-                handler(window, cx)
+                handler(window, cx);
+                cx.stop_propagation();
             })
             .child(label)
     }
