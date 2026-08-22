@@ -2815,7 +2815,10 @@ impl WorkspaceView {
                 .child(Self::action_item("About Axiom", ShowAbout))
             });
         div()
-            .relative()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .right(px(0.))
             .h(m.menu_height)
             .flex()
             .flex_col()
@@ -3346,7 +3349,7 @@ impl Render for WorkspaceView {
             .bg(t.window_background)
             .text_size(m.ui_font_size)
             .text_color(t.text_primary)
-            .child(self.render_menu_bar(cx))
+            .child(div().h(m.menu_height))
             .when(self.project.is_none(), |this| this.child(self.render_welcome(cx)))
             .when(self.project.is_some(), |this| this.child(
                 div()
@@ -3418,6 +3421,7 @@ impl Render for WorkspaceView {
                         "PHP  ·  Intelephense: {lsp_status}  ·  Runtime: {runtime_stub_status}  ·  UTF-8"
                     )),
             ))
+            .child(self.render_menu_bar(cx))
             .child(self.render_dialogs(cx))
             .when(self.command_palette_visible, |this| {
                 this.child(self.render_command_palette(cx))
