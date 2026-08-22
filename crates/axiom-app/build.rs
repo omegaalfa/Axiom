@@ -11,7 +11,7 @@ fn main() {
     {
         // Se existir um arquivo de ícone, compila ele
         if std::path::Path::new("assets/axiom.ico").exists() {
-            embed_resource::compile("assets/axiom.rc", embed_resource::NONE);
+            let _ = embed_resource::compile("assets/axiom.rc", embed_resource::NONE);
         }
     }
 }

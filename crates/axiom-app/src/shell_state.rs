@@ -38,7 +38,7 @@ pub fn resolve_startup_target(
 }
 
 fn target_for_explicit_path(path: PathBuf) -> StartupTarget {
-    let path = fs::canonicalize(&path).unwrap_or(path);
+    let path = normalize_path(fs::canonicalize(&path).unwrap_or(path));
     if path.is_file() {
         let Some(parent) = path.parent().map(Path::to_path_buf) else {
             return StartupTarget::Welcome;
@@ -77,6 +77,16 @@ pub struct RecentProjects {
     pub projects: Vec<RecentProject>,
 }
 
+fn normalize_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(path) = path.to_str().and_then(|path| path.strip_prefix("\\\\?\\")) {
+            return PathBuf::from(path);
+        }
+    }
+    path
+}
+
 impl RecentProjects {
     pub fn load(path: &Path) -> Self {
         fs::read(path)
@@ -93,7 +103,8 @@ impl RecentProjects {
     }
 
     pub fn add(&mut self, path: &Path, last_opened: u64) {
-        let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let normalized =
+            normalize_path(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
         self.projects.retain(|entry| entry.path != normalized);
         self.projects.push(RecentProject {
             path: normalized,

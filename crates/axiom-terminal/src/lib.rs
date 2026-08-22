@@ -1,7 +1,6 @@
 //! Cross-platform PTY session and VT screen state for Axiom.
 
 use std::{
-    env,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -10,6 +9,9 @@ use std::{
     },
     thread,
 };
+
+#[cfg(unix)]
+use std::env;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalLinkKind {
@@ -311,6 +313,7 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     #[test]

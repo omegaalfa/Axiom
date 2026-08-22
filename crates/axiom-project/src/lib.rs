@@ -289,7 +289,7 @@ impl Project {
                     path.push(segment);
                 }
                 path.set_extension("php");
-                Some(path)
+                Some(normalize_canonical(path))
             })
             .collect()
     }
@@ -307,7 +307,7 @@ impl Project {
                 {
                     path.push(segment);
                 }
-                Some(path)
+                Some(normalize_canonical(path))
             })
             .collect()
     }
@@ -407,19 +407,31 @@ fn collect_mappings(root: &Path, composer: &ComposerProject) -> Vec<Psr4Mapping>
 }
 
 fn normalize_existing_or_lexical(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| {
-        let mut normalized = PathBuf::new();
-        for component in path.components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    normalized.pop();
+    fs::canonicalize(path)
+        .map(normalize_canonical)
+        .unwrap_or_else(|_| {
+            let mut normalized = PathBuf::new();
+            for component in path.components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    other => normalized.push(other.as_os_str()),
                 }
-                other => normalized.push(other.as_os_str()),
             }
+            normalized
+        })
+}
+
+fn normalize_canonical(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(path) = path.to_str().and_then(|path| path.strip_prefix("\\\\?\\")) {
+            return PathBuf::from(path);
         }
-        normalized
-    })
+    }
+    path
 }
 
 #[cfg(test)]

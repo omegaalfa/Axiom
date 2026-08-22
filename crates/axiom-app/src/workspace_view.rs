@@ -706,9 +706,19 @@ impl WorkspaceView {
 
     fn open_project(&mut self, _: &OpenProject, _: &mut Window, cx: &mut Context<Self>) {
         self.open_menu = None;
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            self.request_operation(PendingOperation::OpenProject(path), cx);
-        }
+        let workspace = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let path = rfd::AsyncFileDialog::new()
+                .pick_folder()
+                .await
+                .map(|handle| handle.path().to_path_buf());
+            if let Some(path) = path {
+                let _ = workspace.update(cx, |this, cx| {
+                    this.request_operation(PendingOperation::OpenProject(path), cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn open_file_dialog(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
