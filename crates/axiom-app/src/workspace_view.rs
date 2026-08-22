@@ -198,10 +198,12 @@ pub struct WorkspaceView {
     explorer_namespace: String,
     explorer_extends: String,
     explorer_implements: String,
-    modal_focus: FocusHandle,
+    modal_input_focus: FocusHandle,
     modal_focus_pending: bool,
+    delete_focus_pending: bool,
     explorer_selection: UTF16Selection,
     pending_delete: Option<PathBuf>,
+    pending_delete_is_directory: bool,
     project_panel_visible: bool,
     terminal_session: Option<std::sync::Arc<TerminalSession>>,
     terminal_view: Option<Entity<TerminalView>>,
@@ -593,13 +595,15 @@ impl WorkspaceView {
             explorer_namespace: String::new(),
             explorer_extends: String::new(),
             explorer_implements: String::new(),
-            modal_focus: cx.focus_handle(),
+            modal_input_focus: cx.focus_handle(),
             modal_focus_pending: false,
+            delete_focus_pending: false,
             explorer_selection: UTF16Selection {
                 range: 0..0,
                 reversed: false,
             },
             pending_delete: None,
+            pending_delete_is_directory: false,
             project_panel_visible: true,
             terminal_session: None,
             terminal_view: None,
@@ -1401,7 +1405,10 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.explorer_operation.is_none() && (debug_keys_enabled() || debug_input_enabled()) {
+        if self.explorer_operation.is_none()
+            && self.pending_delete.is_none()
+            && (debug_keys_enabled() || debug_input_enabled())
+        {
             tracing::info!(
                 key = %event.keystroke.key,
                 ctrl = event.keystroke.modifiers.control,
@@ -1422,6 +1429,19 @@ impl WorkspaceView {
             return;
         }
         let key = event.keystroke.key.to_ascii_lowercase();
+        if self.pending_delete.is_some() {
+            if debug_input_enabled() {
+                tracing::info!(key = %key, "[DELETE MODAL KEY]");
+            }
+            if key == "escape" {
+                self.pending_delete = None;
+                self.pending_delete_is_directory = false;
+                self.delete_focus_pending = false;
+                self.status = "Deletion cancelled".into();
+                cx.notify();
+            }
+            return;
+        }
         if self.focus.is_focused(window) && key == "delete" {
             if let Some(path) = self.selected_path.clone() {
                 self.request_delete(path, cx);
@@ -2038,8 +2058,14 @@ impl WorkspaceView {
             return;
         };
         self.explorer_input = current_name;
+        let basename_len = self
+            .explorer_input
+            .rsplit_once('.')
+            .filter(|(_, extension)| !extension.is_empty())
+            .map(|(basename, _)| basename.encode_utf16().count())
+            .unwrap_or_else(|| self.explorer_input.encode_utf16().count());
         self.explorer_selection = UTF16Selection {
-            range: 0..self.explorer_input.encode_utf16().count(),
+            range: 0..basename_len,
             reversed: false,
         };
         self.modal_focus_pending = true;
@@ -2157,7 +2183,11 @@ impl WorkspaceView {
         {
             self.status = "Save or close modified files before deleting".into();
         } else {
+            self.pending_delete_is_directory = fs::metadata(&path)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
             self.pending_delete = Some(path);
+            self.delete_focus_pending = true;
             self.status = "Confirm deletion".into();
             if debug_input_enabled() {
                 tracing::info!(confirmation_open = true, "[DELETE]");
@@ -2170,6 +2200,8 @@ impl WorkspaceView {
         let Some(path) = self.pending_delete.take() else {
             return;
         };
+        self.delete_focus_pending = false;
+        self.pending_delete_is_directory = false;
         match self
             .project
             .as_ref()
@@ -3198,7 +3230,7 @@ impl WorkspaceView {
                         let workspace = workspace.clone();
                         move |_, window, cx| {
                             workspace.update(cx, |this, cx| {
-                                window.focus(&this.modal_focus);
+                                window.focus(&this.modal_input_focus);
                                 if debug_input_enabled() {
                                     tracing::info!("[MODAL INPUT MOUSE DOWN]");
                                 }
@@ -3209,7 +3241,7 @@ impl WorkspaceView {
                     .child(self.explorer_input.clone())
                     .child(WorkspaceInputElement {
                         workspace: workspace.clone(),
-                        focus: self.modal_focus.clone(),
+                        focus: self.modal_input_focus.clone(),
                     }),
             )
             .child(
@@ -3770,45 +3802,102 @@ impl WorkspaceView {
             .when_some(self.pending_delete.clone(), |this, path| {
                 let confirm_workspace = workspace.clone();
                 let cancel_workspace = workspace.clone();
+                let cancel_backdrop = workspace.clone();
+                let delete_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("selected entry")
+                    .to_owned();
                 this.child(
                     div()
-                        .p_3()
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
                         .flex()
                         .items_center()
-                        .gap_3()
-                        .bg(t.elevated_surface)
-                        .border_b_1()
-                        .border_color(t.border)
-                        .text_color(t.text_primary)
-                        .child(format!("Delete {}? This cannot be undone.", path.display()))
+                        .justify_center()
+                        .bg(gpui::rgba(0x00000055))
+                        .cursor(CursorStyle::Arrow)
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                            cancel_backdrop.update(cx, |this, cx| {
+                                this.pending_delete = None;
+                                this.pending_delete_is_directory = false;
+                                this.delete_focus_pending = false;
+                                this.status = "Deletion cancelled".into();
+                                if debug_input_enabled() {
+                                    tracing::info!(reason = "backdrop", "[DELETE MODAL CLOSE]");
+                                }
+                                cx.notify();
+                            });
+                        })
                         .child(
                             div()
-                                .id("confirm-delete")
-                                .px_3()
-                                .py_1()
-                                .rounded(m.border_radius_small)
-                                .bg(t.error)
-                                .on_click(move |_, _, cx| {
-                                    confirm_workspace
-                                        .update(cx, |this, cx| this.confirm_delete(cx));
+                                .w(px(430.))
+                                .p_4()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .bg(t.popup_background)
+                                .border_1()
+                                .border_color(t.border)
+                                .rounded(m.border_radius_medium)
+                                .shadow_lg()
+                                .text_color(t.text_primary)
+                                .cursor(CursorStyle::Arrow)
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(if self.pending_delete_is_directory {
+                                    "Delete Directory?"
+                                } else {
+                                    "Delete File?"
                                 })
-                                .child("Delete"),
-                        )
-                        .child(
-                            div()
-                                .id("cancel-delete")
-                                .px_3()
-                                .py_1()
-                                .rounded(m.border_radius_small)
-                                .bg(t.pressed)
-                                .on_click(move |_, _, cx| {
-                                    cancel_workspace.update(cx, |this, cx| {
-                                        this.pending_delete = None;
-                                        this.status = "Deletion cancelled".into();
-                                        cx.notify();
-                                    });
+                                .child(delete_name)
+                                .child(if self.pending_delete_is_directory {
+                                    "Delete directory and all of its contents? This action cannot be undone."
+                                } else {
+                                    "This action cannot be undone."
                                 })
-                                .child("Cancel"),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id("cancel-delete")
+                                                .px_3()
+                                                .py_1()
+                                                .rounded(m.border_radius_small)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .bg(t.pressed)
+                                                .on_click(move |_, _, cx| {
+                                                    cancel_workspace.update(cx, |this, cx| {
+                                                        this.pending_delete = None;
+                                                        this.pending_delete_is_directory = false;
+                                                        this.delete_focus_pending = false;
+                                                        this.status = "Deletion cancelled".into();
+                                                        cx.notify();
+                                                    });
+                                                })
+                                                .child("Cancel"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("confirm-delete")
+                                                .px_3()
+                                                .py_1()
+                                                .rounded(m.border_radius_small)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .bg(t.error)
+                                                .text_color(t.window_background)
+                                                .on_click(move |_, _, cx| {
+                                                    confirm_workspace.update(cx, |this, cx| this.confirm_delete(cx));
+                                                })
+                                                .child("Delete"),
+                                        ),
+                                ),
                         ),
                 )
             })
@@ -4088,11 +4177,27 @@ impl Render for WorkspaceView {
             self.focus_active_editor = false;
         }
         if self.explorer_operation.is_some() && self.modal_focus_pending {
-            window.focus(&self.modal_focus);
+            window.focus(&self.modal_input_focus);
             self.modal_focus_pending = false;
+            if debug_input_enabled() {
+                tracing::info!(
+                    active = self.modal_input_focus.is_focused(window),
+                    "[MODAL INPUT HANDLER]"
+                );
+            }
             if debug_input_enabled() {
                 tracing::info!(target = "name_input", "[MODAL FOCUS REQUEST]");
                 tracing::info!(focused = true, "[MODAL FOCUS]");
+            }
+        }
+        if self.pending_delete.is_some() && self.delete_focus_pending {
+            window.focus(&self.modal_input_focus);
+            self.delete_focus_pending = false;
+            if debug_input_enabled() {
+                tracing::info!(
+                    active = self.modal_input_focus.is_focused(window),
+                    "[DELETE MODAL FOCUS]"
+                );
             }
         }
         let title = self.project.as_ref().map_or_else(
@@ -4330,13 +4435,9 @@ impl EntityInputHandler for WorkspaceView {
         } else {
             &self.command_palette_query
         };
-        Some(
-            query
-                .chars()
-                .skip(range.start)
-                .take(range.end.saturating_sub(range.start))
-                .collect(),
-        )
+        let start = utf16_to_byte_offset(query, range.start);
+        let end = utf16_to_byte_offset(query, range.end);
+        Some(query[start..end].to_owned())
     }
     fn selected_text_range(
         &mut self,
@@ -4376,7 +4477,7 @@ impl EntityInputHandler for WorkspaceView {
         &mut self,
         range: Option<std::ops::Range<usize>>,
         text: &str,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let editing_explorer = self.explorer_operation.is_some();
@@ -4391,16 +4492,9 @@ impl EntityInputHandler for WorkspaceView {
         };
         let range =
             range.unwrap_or_else(|| query.encode_utf16().count()..query.encode_utf16().count());
-        let start = query
-            .char_indices()
-            .nth(range.start)
-            .map(|(i, _)| i)
-            .unwrap_or(query.len());
-        let end = query
-            .char_indices()
-            .nth(range.end)
-            .map(|(i, _)| i)
-            .unwrap_or(query.len());
+        let start = utf16_to_byte_offset(&query, range.start);
+        let end = utf16_to_byte_offset(&query, range.end);
+        let before_len = query.encode_utf16().count();
         query.replace_range(start..end, text);
         if editing_explorer {
             self.explorer_input = query;
@@ -4410,7 +4504,29 @@ impl EntityInputHandler for WorkspaceView {
                 reversed: false,
             };
             if debug_input_enabled() {
-                tracing::info!(event = "text", "[MODAL INPUT]");
+                tracing::info!(
+                    active = self.modal_input_focus.is_focused(window),
+                    "[MODAL INPUT HANDLER]"
+                );
+                tracing::info!(
+                    range_start = range.start,
+                    range_end = range.end,
+                    inserted_len = text.encode_utf16().count(),
+                    "[MODAL REPLACE TEXT]"
+                );
+                tracing::info!(
+                    value_len_before = before_len,
+                    value_len_after = length,
+                    changed = true,
+                    "[MODAL STATE]"
+                );
+                if text.is_empty() {
+                    tracing::info!(
+                        range_start = range.start,
+                        range_end = range.end,
+                        "[MODAL DELETE]"
+                    );
+                }
             }
         } else if editing_settings {
             self.settings_query = query;
@@ -4524,6 +4640,23 @@ impl Focusable for WorkspaceView {
     }
 }
 
+fn utf16_to_byte_offset(text: &str, offset: usize) -> usize {
+    if offset == 0 {
+        return 0;
+    }
+    let mut units = 0;
+    for (byte, ch) in text.char_indices() {
+        if units >= offset {
+            return byte;
+        }
+        units += ch.len_utf16();
+        if units >= offset {
+            return byte + ch.len_utf8();
+        }
+    }
+    text.len()
+}
+
 fn debug_keys_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_KEYS").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
@@ -4542,7 +4675,7 @@ fn normalize_modifiers(modifiers: Modifiers) -> (bool, bool, bool) {
 
 #[cfg(test)]
 mod modifier_tests {
-    use super::normalize_modifiers;
+    use super::{normalize_modifiers, utf16_to_byte_offset};
     use gpui::Modifiers;
 
     #[test]
@@ -4565,5 +4698,27 @@ mod modifier_tests {
             }),
             (true, false, true)
         );
+    }
+
+    #[test]
+    fn modal_text_ranges_use_utf16_offsets() {
+        let text = "A😀B";
+        assert_eq!(&text[..utf16_to_byte_offset(text, 1)], "A");
+        assert_eq!(&text[..utf16_to_byte_offset(text, 3)], "A😀");
+        assert_eq!(utf16_to_byte_offset(text, 4), text.len());
+    }
+
+    #[test]
+    fn modal_selection_replacement_preserves_extension_boundary() {
+        let value = "test.php";
+        let end = value
+            .rsplit_once('.')
+            .map(|(basename, _)| basename.encode_utf16().count())
+            .unwrap();
+        let start_byte = utf16_to_byte_offset(value, 0);
+        let end_byte = utf16_to_byte_offset(value, end);
+        let mut replaced = value.to_owned();
+        replaced.replace_range(start_byte..end_byte, "Example");
+        assert_eq!(replaced, "Example.php");
     }
 }
