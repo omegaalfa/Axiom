@@ -1286,6 +1286,15 @@ impl WorkspaceView {
             return;
         }
         let key = event.keystroke.key.to_ascii_lowercase();
+        if key == "escape" && self.open_menu.is_some() {
+            let before = self.open_menu;
+            self.open_menu = None;
+            if debug_input_enabled() {
+                tracing::info!(menu_before = ?before, menu_after = ?self.open_menu, "[MENU ESCAPE]");
+            }
+            cx.notify();
+            return;
+        }
         let (control, shift, alt) = normalize_modifiers(event.keystroke.modifiers);
         let mut stroke = String::new();
         if control {
@@ -1384,7 +1393,15 @@ impl WorkspaceView {
 
     fn toggle_project(&mut self, _: &ToggleProject, _: &mut Window, cx: &mut Context<Self>) {
         self.open_menu = None;
+        let before = self.project_panel_visible;
         self.project_panel_visible = !self.project_panel_visible;
+        if debug_input_enabled() {
+            tracing::info!(
+                before,
+                after = self.project_panel_visible,
+                "[PROJECT PANEL]"
+            );
+        }
         cx.notify();
     }
 
@@ -2113,6 +2130,7 @@ impl WorkspaceView {
         let m = metrics();
         let workspace = cx.entity();
         let project_workspace = workspace.clone();
+        let project_active = self.project_panel_visible;
         div()
             .w(m.activity_bar_width)
             .h_full()
@@ -2137,21 +2155,37 @@ impl WorkspaceView {
                     .hover(move |style| style.bg(t.hover))
                     .on_click(move |_, _, cx| {
                         project_workspace.update(cx, |this, cx| {
-                            this.project_panel_visible = true;
-                            this.status = "Project tool window".into();
+                            let before = this.project_panel_visible;
+                            this.project_panel_visible = !this.project_panel_visible;
+                            if debug_input_enabled() {
+                                tracing::info!(
+                                    before,
+                                    after = this.project_panel_visible,
+                                    "[PROJECT PANEL]"
+                                );
+                            }
                             cx.notify();
                         });
                     })
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(0.))
-                            .h(px(20.))
-                            .w(px(2.))
-                            .rounded_r(m.border_radius_small)
-                            .bg(t.accent),
-                    )
-                    .child(activity_icon(ActivityIcon::Project, t.accent)),
+                    .when(project_active, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .left(px(0.))
+                                .h(px(20.))
+                                .w(px(2.))
+                                .rounded_r(m.border_radius_small)
+                                .bg(t.accent),
+                        )
+                    })
+                    .child(activity_icon(
+                        ActivityIcon::Project,
+                        if project_active {
+                            t.accent
+                        } else {
+                            t.text_muted
+                        },
+                    )),
             )
             .child(
                 div()
@@ -2830,6 +2864,7 @@ impl WorkspaceView {
                     .items_center()
                     .children(labels.into_iter().map(|(label, kind)| {
                         let workspace = workspace.clone();
+                        let click_workspace = workspace.clone();
                         div()
                             .id(label)
                             .px_3()
@@ -2839,6 +2874,22 @@ impl WorkspaceView {
                             .text_size(m.ui_font_size)
                             .text_color(t.text_secondary)
                             .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
+                            .on_mouse_move(move |_, _, cx| {
+                                click_workspace.update(cx, |this, cx| {
+                                    if this.open_menu.is_some() && this.open_menu != Some(kind) {
+                                        let before = this.open_menu;
+                                        this.open_menu = Some(kind);
+                                        if debug_input_enabled() {
+                                            tracing::info!(
+                                                menu_before = ?before,
+                                                menu_after = ?this.open_menu,
+                                                "[MENU HOVER SWITCH]"
+                                            );
+                                        }
+                                        cx.notify();
+                                    }
+                                });
+                            })
                             .on_click(move |_, _, cx| {
                                 if debug_input_enabled() {
                                     tracing::info!(target = %label, "[MOUSE] menu click");

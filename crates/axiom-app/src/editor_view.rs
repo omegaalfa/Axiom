@@ -1335,11 +1335,14 @@ impl EditorView {
         }
     }
 
-    fn references(&mut self, _: &References, _: &mut Window, _: &mut Context<Self>) {
+    fn references(&mut self, _: &References, _: &mut Window, cx: &mut Context<Self>) {
         if let (Some(lsp), Some(uri), Some(position)) =
             (&self.lsp, &self.lsp_uri, self.lsp_position())
         {
             lsp.request_references(uri.clone(), position);
+        } else {
+            self.status = Some("No references found (language server unavailable)".into());
+            cx.notify();
         }
     }
 
