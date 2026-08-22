@@ -758,6 +758,7 @@ impl WorkspaceView {
 
     fn open_project(&mut self, _: &OpenProject, _: &mut Window, cx: &mut Context<Self>) {
         if debug_input_enabled() {
+            tracing::info!(id = "project.open_project", "[COMMAND]");
             tracing::info!(received = true, "[OPEN PROJECT COMMAND]");
         }
         self.open_project_picker(cx);
@@ -783,6 +784,7 @@ impl WorkspaceView {
         cx.notify();
         if debug_input_enabled() {
             tracing::info!(spawned = true, "[DIALOG TASK]");
+            tracing::info!(kind = "folder", "[DIALOG]");
         }
         let workspace = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
@@ -791,6 +793,17 @@ impl WorkspaceView {
                 .await
                 .map(|handle| handle.path().to_path_buf());
             if let Some(path) = path {
+                if !path.is_dir() {
+                    let _ = workspace.update(cx, |this, cx| {
+                        this.project_dialog_open = false;
+                        this.status = "Open Project requires a directory".into();
+                        if debug_input_enabled() {
+                            tracing::info!(after = "Idle", "[PICKER STATE]");
+                        }
+                        cx.notify();
+                    });
+                    return;
+                }
                 if debug_input_enabled() {
                     tracing::info!(selected = %path.display(), "[DIALOG RESULT]");
                 }
@@ -820,6 +833,10 @@ impl WorkspaceView {
     }
 
     fn open_file_dialog(&mut self, _: &OpenFile, _: &mut Window, cx: &mut Context<Self>) {
+        if debug_input_enabled() {
+            tracing::info!(id = "project.open_file", "[COMMAND]");
+            tracing::info!(kind = "file", "[DIALOG]");
+        }
         self.open_menu = None;
         let directory = self
             .project
@@ -837,13 +854,19 @@ impl WorkspaceView {
                 .map(|handle| handle.path().to_path_buf());
             if let Some(path) = path {
                 let _ = workspace.update(cx, |this, cx| {
-                    if this.project.is_none()
-                        && let Some(parent) = path.parent()
-                    {
-                        this.open_project_path(parent.to_path_buf());
+                    if !path.is_file() {
+                        this.status = "Open File requires a file".into();
+                        cx.notify();
+                        return;
+                    }
+                    if debug_input_enabled() {
+                        tracing::info!(path = %path.display(), "[DIALOG RESULT]");
+                        tracing::info!(path = %path.display(), "[EDITOR] open_file");
                     }
                     this.open_file_background(path, cx);
                 });
+            } else if debug_input_enabled() {
+                tracing::info!(cancelled = true, "[DIALOG RESULT]");
             }
         })
         .detach();
@@ -1031,7 +1054,7 @@ impl WorkspaceView {
             "settings.open" => self.settings(&Settings, window, cx),
             "workspace.commands" => self.command_palette(&CommandPalette, window, cx),
             "terminal.toggle" => self.toggle_terminal(&ToggleTerminal, window, cx),
-            "project.open" => self.open_project(&OpenProject, window, cx),
+            "project.open_project" => self.open_project(&OpenProject, window, cx),
             "project.open_file" => self.open_file_dialog(&OpenFile, window, cx),
             "navigate.back" => self.navigate_back(&NavigateBack, window, cx),
             "navigate.forward" => self.navigate_forward(&NavigateForward, window, cx),
@@ -2646,12 +2669,12 @@ impl WorkspaceView {
             .hover(move |style| style.bg(t.hover))
             .on_mouse_down(MouseButton::Left, move |_, _, _| {
                 if debug_input_enabled() {
-                    tracing::info!(id = %id, "[NAV ITEM MOUSE DOWN]");
+                    tracing::info!(label = %label, command = %id, "[MENU ITEM MOUSE DOWN]");
                 }
             })
             .on_click(move |_, window, cx| {
                 if debug_input_enabled() {
-                    tracing::info!(id = %id, "[NAV ITEM CLICK]");
+                    tracing::info!(label = %label, command = %id, "[MENU ITEM CLICK]");
                 }
                 workspace.update(cx, |this, cx| {
                     this.open_menu = None;
@@ -2715,8 +2738,8 @@ impl WorkspaceView {
             .shadow_lg()
             .occlude()
             .when(menu == Some(MenuKind::File), |this| {
-                this.child(self.command_dispatch_item("project.open", "Open Project…", cx))
-                    .child(self.command_item("project.open_file", "Open File…", OpenFile))
+                this.child(self.command_dispatch_item("project.open_project", "Open Project…", cx))
+                    .child(self.command_dispatch_item("project.open_file", "Open File…", cx))
                     .child(self.command_item("editor.save", "Save", crate::editor_view::Save))
                     .child(Self::action_item("Save All", SaveAll))
                     .child(Self::action_item("Close File", CloseFile))
@@ -2872,7 +2895,7 @@ impl WorkspaceView {
                         let workspace = workspace.clone();
                         move |_, window, cx| {
                             workspace.update(cx, |this, cx| {
-                                this.execute_command("project.open", window, cx);
+                                this.execute_command("project.open_project", window, cx);
                             });
                         }
                     })

@@ -147,7 +147,7 @@ pub fn registry() -> Vec<CommandDescriptor> {
             "",
         ),
         command(
-            "project.open",
+            "project.open_project",
             "Open Project",
             "Opens a project directory.",
             "Project",
