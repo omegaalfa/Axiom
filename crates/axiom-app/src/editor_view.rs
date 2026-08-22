@@ -1331,6 +1331,9 @@ impl EditorView {
         if let (Some(lsp), Some(uri), Some(position)) =
             (&self.lsp, &self.lsp_uri, self.lsp_position())
         {
+            if debug_input_enabled() {
+                tracing::info!(document = ?uri, "[DEFINITION REQUEST]");
+            }
             lsp.request_definition(uri.clone(), position);
         } else {
             self.status = Some("Definition unavailable (language server not ready)".into());
@@ -1567,19 +1570,23 @@ impl EditorView {
         self.ctrl_hover_range = None;
         let offset = self.mouse_offset(line, event.position.x, window);
         if event.modifiers.control {
-            if let Some(syntax) = &self.syntax
-                && let Some(token) = syntax.token_at_byte(offset)
-                && debug_input_enabled()
-            {
+            if debug_input_enabled() {
                 tracing::info!(
+                    ctrl = true,
+                    button = "left",
                     x = ?event.position.x,
                     y = ?event.position.y,
                     line,
                     byte = offset,
-                    text = %token.text,
-                    kind = %token.kind,
                     "[EDITOR CTRL CLICK]"
                 );
+                if let Some(token) = self
+                    .syntax
+                    .as_ref()
+                    .and_then(|syntax| syntax.token_at_byte(offset))
+                {
+                    tracing::info!(text = %token.text, kind = %token.kind, "[TOKEN]");
+                }
             }
             self.move_to(offset, cx);
             self.selecting = false;

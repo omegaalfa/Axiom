@@ -125,6 +125,17 @@ enum ExplorerOperation {
     Rename(PathBuf),
 }
 
+#[derive(Clone, Copy, Debug)]
+enum NewItemKind {
+    File,
+    Directory,
+    PhpFile,
+    PhpClass,
+    PhpInterface,
+    PhpTrait,
+    PhpEnum,
+}
+
 enum RuntimeStubStatus {
     Loaded { files: usize, symbols: usize },
     NotFound,
@@ -538,6 +549,14 @@ impl WorkspaceView {
             .as_deref()
             .map(RecentProjects::load)
             .unwrap_or_default();
+        let keymap = Keymap::load_user();
+        if debug_input_enabled() {
+            tracing::info!(
+                command = "project.rename",
+                shortcut = ?keymap.shortcut("project.rename"),
+                "[KEYMAP EFFECTIVE]"
+            );
+        }
         let mut workspace = Self {
             project: None,
             explorer: Vec::new(),
@@ -578,7 +597,7 @@ impl WorkspaceView {
             project_index: None,
             index_generation: 0,
             index_results: None,
-            keymap: Keymap::load_user(),
+            keymap,
             command_palette_visible: false,
             command_palette_query: String::new(),
             command_palette_selected: 0,
@@ -1083,6 +1102,7 @@ impl WorkspaceView {
 
     fn execute_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if debug_input_enabled() {
+            tracing::info!(id = %id, "[COMMAND DISPATCH]");
             tracing::info!(
                 command = %id,
                 palette = self.command_palette_visible,
@@ -1237,6 +1257,25 @@ impl WorkspaceView {
             self.navigate_to_definition(DefinitionTarget { path, position }, cx);
         } else {
             self.status = "Definition não encontrada".into();
+        }
+    }
+
+    fn definition_action(
+        &mut self,
+        _: &crate::editor_view::Definition,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let has_lsp = self
+            .active
+            .and_then(|index| self.tabs.get(index))
+            .and_then(|tab| tab.editor.read(cx).lsp_uri())
+            .is_some();
+        if !has_lsp {
+            if debug_input_enabled() {
+                tracing::info!(provider = "native", "[DEFINITION REQUEST]");
+            }
+            self.navigate_native_definition(cx);
         }
     }
 
@@ -1474,6 +1513,9 @@ impl WorkspaceView {
             stroke.push_str("alt-");
         }
         stroke.push_str(&key);
+        if debug_input_enabled() {
+            tracing::info!(raw = %event.keystroke.key, normalized = %stroke, "[KEY NORMALIZE]");
+        }
         if self.command_palette_visible {
             match key.as_str() {
                 "down" => self.palette_down(&PaletteDown, window, cx),
@@ -1513,11 +1555,15 @@ impl WorkspaceView {
         {
             let id = command.id.clone();
             if debug_keys_enabled() || debug_input_enabled() {
+                tracing::info!(shortcut = %stroke, result = %id, "[KEYMAP LOOKUP]");
                 tracing::info!(key = %stroke, matched = %id, "[KEYMAP]");
                 tracing::info!(key = %stroke, matched = %id, context = "workspace", executed = true, "Axiom key event");
             }
             self.execute_command(&id, window, cx);
         } else if debug_keys_enabled() || debug_input_enabled() {
+            if debug_input_enabled() {
+                tracing::info!(shortcut = %stroke, result = "none", "[KEYMAP LOOKUP]");
+            }
             tracing::debug!(key = %stroke, matched = "", context = "workspace", executed = false, "Axiom key event");
         }
     }
@@ -1838,16 +1884,17 @@ impl WorkspaceView {
             .unwrap_or("unknown");
             tracing::info!(kind, selected_path = ?self.selected_path, target_directory = %directory.display(), "[NEW ITEM ACTION]");
         }
-        match self.context_submenu_selected {
-            0 => self.new_file(directory, window, cx),
-            1 => self.new_directory(directory, cx),
-            2 => self.new_php_file(directory, cx),
-            3 => self.new_php_item(directory, "class", cx),
-            4 => self.new_php_item(directory, "interface", cx),
-            5 => self.new_php_item(directory, "trait", cx),
-            6 => self.new_php_item(directory, "enum", cx),
-            _ => {}
-        }
+        let kind = match self.context_submenu_selected {
+            0 => NewItemKind::File,
+            1 => NewItemKind::Directory,
+            2 => NewItemKind::PhpFile,
+            3 => NewItemKind::PhpClass,
+            4 => NewItemKind::PhpInterface,
+            5 => NewItemKind::PhpTrait,
+            6 => NewItemKind::PhpEnum,
+            _ => return,
+        };
+        self.begin_new_item(kind, directory, window, cx);
     }
 
     fn new_file(&mut self, directory: PathBuf, _: &mut Window, cx: &mut Context<Self>) {
@@ -1860,6 +1907,27 @@ impl WorkspaceView {
         self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::NewFile(directory));
         cx.notify();
+    }
+
+    fn begin_new_item(
+        &mut self,
+        kind: NewItemKind,
+        directory: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if debug_input_enabled() {
+            tracing::info!(?kind, target_directory = %directory.display(), "[NEW ITEM ACTION]");
+        }
+        match kind {
+            NewItemKind::File => self.new_file(directory, window, cx),
+            NewItemKind::Directory => self.new_directory(directory, cx),
+            NewItemKind::PhpFile => self.new_php_file(directory, cx),
+            NewItemKind::PhpClass => self.new_php_item(directory, "class", cx),
+            NewItemKind::PhpInterface => self.new_php_item(directory, "interface", cx),
+            NewItemKind::PhpTrait => self.new_php_item(directory, "trait", cx),
+            NewItemKind::PhpEnum => self.new_php_item(directory, "enum", cx),
+        }
     }
 
     fn open_new_menu(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
@@ -2726,9 +2794,6 @@ impl WorkspaceView {
                     })
                     .child(format!("▾ {root_name}")),
             )
-            .when(self.explorer_operation.is_some(), |this| {
-                this.child(self.render_explorer_operation(cx))
-            })
             .child(
                 div()
                     .id("explorer-scroll")
@@ -2912,7 +2977,8 @@ impl WorkspaceView {
                 this.child(Self::explorer_menu_item("Rename  F2", move |window, cx| {
                     rename_workspace.update(cx, |this, cx| {
                         window.focus(&this.focus);
-                        this.rename_entry(rename_path.clone(), cx)
+                        this.selected_path = Some(rename_path.clone());
+                        this.execute_command("project.rename", window, cx);
                     });
                 }))
                 .child(Self::explorer_menu_item("Delete", move |_, cx| {
@@ -2963,57 +3029,68 @@ impl WorkspaceView {
                 let workspace = workspace.clone();
                 let directory = directory.clone();
                 Self::explorer_menu_item("File", move |window, cx| {
-                    workspace.update(cx, |this, cx| this.new_file(directory.clone(), window, cx));
+                    workspace.update(cx, |this, cx| {
+                        this.begin_new_item(NewItemKind::File, directory.clone(), window, cx)
+                    });
                 })
             })
             .child({
                 let workspace = workspace.clone();
                 let directory = directory.clone();
-                Self::explorer_menu_item("Directory", move |_, cx| {
-                    workspace.update(cx, |this, cx| this.new_directory(directory.clone(), cx));
+                Self::explorer_menu_item("Directory", move |window, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.begin_new_item(NewItemKind::Directory, directory.clone(), window, cx)
+                    });
                 })
             })
             .child(div().h(px(1.)).mx_2().bg(t.border_subtle))
             .child({
                 let workspace = workspace.clone();
                 let directory = directory.clone();
-                Self::explorer_menu_item("PHP File", move |_, cx| {
-                    workspace.update(cx, |this, cx| this.new_php_file(directory.clone(), cx));
-                })
-            })
-            .child({
-                let workspace = workspace.clone();
-                let directory = directory.clone();
-                Self::explorer_menu_item("PHP Class", move |_, cx| {
+                Self::explorer_menu_item("PHP File", move |window, cx| {
                     workspace.update(cx, |this, cx| {
-                        this.new_php_item(directory.clone(), "class", cx)
+                        this.begin_new_item(NewItemKind::PhpFile, directory.clone(), window, cx)
                     });
                 })
             })
             .child({
                 let workspace = workspace.clone();
                 let directory = directory.clone();
-                Self::explorer_menu_item("PHP Interface", move |_, cx| {
+                Self::explorer_menu_item("PHP Class", move |window, cx| {
                     workspace.update(cx, |this, cx| {
-                        this.new_php_item(directory.clone(), "interface", cx)
+                        this.begin_new_item(NewItemKind::PhpClass, directory.clone(), window, cx)
                     });
                 })
             })
             .child({
                 let workspace = workspace.clone();
                 let directory = directory.clone();
-                Self::explorer_menu_item("PHP Trait", move |_, cx| {
+                Self::explorer_menu_item("PHP Interface", move |window, cx| {
                     workspace.update(cx, |this, cx| {
-                        this.new_php_item(directory.clone(), "trait", cx)
+                        this.begin_new_item(
+                            NewItemKind::PhpInterface,
+                            directory.clone(),
+                            window,
+                            cx,
+                        )
                     });
                 })
             })
             .child({
                 let workspace = workspace.clone();
                 let directory = directory.clone();
-                Self::explorer_menu_item("PHP Enum", move |_, cx| {
+                Self::explorer_menu_item("PHP Trait", move |window, cx| {
                     workspace.update(cx, |this, cx| {
-                        this.new_php_item(directory.clone(), "enum", cx)
+                        this.begin_new_item(NewItemKind::PhpTrait, directory.clone(), window, cx)
+                    });
+                })
+            })
+            .child({
+                let workspace = workspace.clone();
+                let directory = directory.clone();
+                Self::explorer_menu_item("PHP Enum", move |window, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.begin_new_item(NewItemKind::PhpEnum, directory.clone(), window, cx)
                     });
                 })
             })
@@ -4004,6 +4081,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::navigate_forward))
             .on_action(cx.listener(Self::go_to_class))
             .on_action(cx.listener(Self::go_to_symbol))
+            .on_action(cx.listener(Self::definition_action))
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::settings))
             .on_action(cx.listener(Self::debug_input))
@@ -4128,6 +4206,9 @@ impl Render for WorkspaceView {
             })
             .when(self.explorer_context.is_some(), |this| {
                 this.child(self.render_explorer_context(window, cx))
+            })
+            .when(self.explorer_operation.is_some(), |this| {
+                this.child(self.render_explorer_operation(cx))
             })
             .child(self.render_menu_bar(window, cx))
             .child(self.render_dialogs(cx))
