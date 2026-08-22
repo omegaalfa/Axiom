@@ -114,6 +114,17 @@ struct ExplorerContext {
     kind: EntryKind,
 }
 
+enum ExplorerOperation {
+    NewFile(PathBuf),
+    NewPhpFile(PathBuf),
+    NewPhp {
+        directory: PathBuf,
+        keyword: &'static str,
+    },
+    NewDirectory(PathBuf),
+    Rename(PathBuf),
+}
+
 enum RuntimeStubStatus {
     Loaded { files: usize, symbols: usize },
     NotFound,
@@ -166,6 +177,9 @@ pub struct WorkspaceView {
     show_about: bool,
     startup_file: Option<PathBuf>,
     explorer_context: Option<ExplorerContext>,
+    selected_path: Option<PathBuf>,
+    explorer_operation: Option<ExplorerOperation>,
+    explorer_input: String,
     pending_delete: Option<PathBuf>,
     project_panel_visible: bool,
     terminal_session: Option<std::sync::Arc<TerminalSession>>,
@@ -536,6 +550,9 @@ impl WorkspaceView {
             show_about: false,
             startup_file: None,
             explorer_context: None,
+            selected_path: None,
+            explorer_operation: None,
+            explorer_input: String::new(),
             pending_delete: None,
             project_panel_visible: true,
             terminal_session: None,
@@ -1305,6 +1322,18 @@ impl WorkspaceView {
             return;
         }
         let key = event.keystroke.key.to_ascii_lowercase();
+        if self.focus.is_focused(window) && key == "delete" {
+            if let Some(path) = self.selected_path.clone() {
+                self.request_delete(path, cx);
+            }
+            return;
+        }
+        if self.focus.is_focused(window) && key == "f2" {
+            if let Some(path) = self.selected_path.clone() {
+                self.rename_entry(path, cx);
+            }
+            return;
+        }
         if key == "escape" && self.open_menu.is_some() {
             let before = self.open_menu;
             self.open_menu = None;
@@ -1597,82 +1626,34 @@ impl WorkspaceView {
 
     fn new_file(&mut self, directory: PathBuf, _: &mut Window, cx: &mut Context<Self>) {
         self.explorer_context = None;
-        let workspace = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            let chosen = rfd::AsyncFileDialog::new()
-                .set_title("New File")
-                .set_directory(directory.clone())
-                .set_file_name("untitled")
-                .save_file()
-                .await
-                .map(|handle| handle.path().to_path_buf());
-            let Some(chosen) = chosen else { return };
-            let _ = workspace.update(cx, |this, cx| {
-                let Some(name) = chosen.file_name().and_then(|name| name.to_str()) else {
-                    this.status = "Invalid file name".into();
-                    cx.notify();
-                    return;
-                };
-                match this
-                    .project
-                    .as_ref()
-                    .expect("project is open")
-                    .create_file(&directory, name)
-                {
-                    Ok(path) => {
-                        this.refresh_explorer(cx);
-                        this.open_file_background(path, cx);
-                    }
-                    Err(error) => {
-                        this.status = format!("Falha ao criar arquivo: {error}").into();
-                        cx.notify();
-                    }
-                }
-            });
-        })
-        .detach();
+        self.explorer_input = "untitled".into();
+        self.explorer_operation = Some(ExplorerOperation::NewFile(directory));
+        cx.notify();
+    }
+
+    fn new_php_file(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
+        self.explorer_context = None;
+        self.explorer_input = "untitled.php".into();
+        self.explorer_operation = Some(ExplorerOperation::NewPhpFile(directory));
+        cx.notify();
     }
 
     fn new_directory(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
         self.explorer_context = None;
-        let workspace = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            let chosen = rfd::AsyncFileDialog::new()
-                .set_title("New Directory")
-                .set_directory(directory.clone())
-                .set_file_name("New Folder")
-                .save_file()
-                .await
-                .map(|handle| handle.path().to_path_buf());
-            let Some(chosen) = chosen else { return };
-            let _ = workspace.update(cx, |this, cx| {
-                let Some(name) = chosen.file_name().and_then(|name| name.to_str()) else {
-                    this.status = "Invalid directory name".into();
-                    cx.notify();
-                    return;
-                };
-                match this
-                    .project
-                    .as_ref()
-                    .expect("project is open")
-                    .create_directory(&directory, name)
-                {
-                    Ok(_) => this.refresh_explorer(cx),
-                    Err(error) => {
-                        this.status = format!("Failed to create directory: {error}").into();
-                        cx.notify();
-                    }
-                }
-            });
-        })
-        .detach();
+        self.explorer_input = "New Folder".into();
+        self.explorer_operation = Some(ExplorerOperation::NewDirectory(directory));
+        cx.notify();
+    }
+
+    fn new_php_item(&mut self, directory: PathBuf, keyword: &'static str, cx: &mut Context<Self>) {
+        self.explorer_context = None;
+        self.explorer_input = "NewItem".into();
+        self.explorer_operation = Some(ExplorerOperation::NewPhp { directory, keyword });
+        cx.notify();
     }
 
     fn rename_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.explorer_context = None;
-        let Some(parent) = path.parent().map(Path::to_path_buf) else {
-            return;
-        };
         let Some(current_name) = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1680,50 +1661,85 @@ impl WorkspaceView {
         else {
             return;
         };
-        let workspace = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            let chosen = rfd::AsyncFileDialog::new()
-                .set_title("Rename")
-                .set_directory(parent)
-                .set_file_name(current_name)
-                .save_file()
-                .await
-                .map(|handle| handle.path().to_path_buf());
-            let Some(chosen) = chosen else { return };
-            let _ = workspace.update(cx, |this, cx| {
-                let Some(new_name) = chosen.file_name().and_then(|name| name.to_str()) else {
-                    this.status = "Invalid name".into();
-                    cx.notify();
-                    return;
+        self.explorer_input = current_name;
+        self.explorer_operation = Some(ExplorerOperation::Rename(path));
+        cx.notify();
+    }
+
+    fn cancel_explorer_operation(&mut self, cx: &mut Context<Self>) {
+        self.explorer_operation = None;
+        self.explorer_input.clear();
+        cx.notify();
+    }
+
+    fn confirm_explorer_operation(&mut self, cx: &mut Context<Self>) {
+        let Some(operation) = self.explorer_operation.take() else {
+            return;
+        };
+        let name = self.explorer_input.trim().to_owned();
+        self.explorer_input.clear();
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+            self.status = "Invalid name".into();
+            cx.notify();
+            return;
+        }
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let result = match operation {
+            ExplorerOperation::NewFile(directory) => {
+                project.create_file(&directory, &name).map(Some)
+            }
+            ExplorerOperation::NewPhpFile(directory) => {
+                let name = if name.ends_with(".php") {
+                    name
+                } else {
+                    format!("{name}.php")
                 };
-                let result = this
-                    .project
-                    .as_ref()
-                    .expect("project is open")
-                    .rename(&path, new_name);
-                match result {
-                    Ok(destination) => {
-                        for tab in &mut this.tabs {
-                            if let Ok(relative) = tab.path.strip_prefix(&path) {
-                                tab.path = destination.join(relative);
-                                tab.editor.update(cx, |editor, _| {
-                                    editor.relocate_path(&path, &destination)
-                                });
-                            }
-                        }
-                        this.refresh_explorer(cx);
-                    }
-                    Err(error) => {
-                        this.status = format!("Falha ao renomear: {error}").into();
-                        cx.notify();
+                project.create_file(&directory, &name).map(Some)
+            }
+            ExplorerOperation::NewPhp { directory, keyword } => {
+                let name = if name.ends_with(".php") {
+                    name
+                } else {
+                    format!("{name}.php")
+                };
+                let symbol = name.trim_end_matches(".php");
+                let body = format!("<?php\n\n{keyword} {symbol}\n{{\n}}\n");
+                project.create_file(&directory, &name).map(|path| {
+                    let _ = fs::write(&path, body);
+                    Some(path)
+                })
+            }
+            ExplorerOperation::NewDirectory(directory) => {
+                project.create_directory(&directory, &name).map(|_| None)
+            }
+            ExplorerOperation::Rename(path) => project.rename(&path, &name).map(|destination| {
+                for tab in &mut self.tabs {
+                    if let Ok(relative) = tab.path.strip_prefix(&path) {
+                        tab.path = destination.join(relative);
+                        tab.editor
+                            .update(cx, |editor, _| editor.relocate_path(&path, &destination));
                     }
                 }
-            });
-        })
-        .detach();
+                None
+            }),
+        };
+        match result {
+            Ok(Some(path)) => {
+                self.refresh_explorer(cx);
+                self.open_file_background(path, cx);
+            }
+            Ok(None) => self.refresh_explorer(cx),
+            Err(error) => self.status = format!("Operation failed: {error}").into(),
+        }
+        cx.notify();
     }
 
     fn request_delete(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if debug_input_enabled() {
+            tracing::info!(path = %path.display(), "[EXPLORER ACTION] action=delete");
+        }
         self.explorer_context = None;
         if self
             .tabs
@@ -1734,6 +1750,9 @@ impl WorkspaceView {
         } else {
             self.pending_delete = Some(path);
             self.status = "Confirm deletion".into();
+            if debug_input_enabled() {
+                tracing::info!(confirmation_open = true, "[DELETE]");
+            }
         }
         cx.notify();
     }
@@ -1749,6 +1768,9 @@ impl WorkspaceView {
             .delete(&path)
         {
             Ok(()) => {
+                if debug_input_enabled() {
+                    tracing::info!(success = true, "[DELETE RESULT]");
+                }
                 for tab in self.tabs.iter().filter(|tab| tab.path.starts_with(&path)) {
                     tab.editor.read(cx).close_lsp_document();
                 }
@@ -1762,6 +1784,9 @@ impl WorkspaceView {
                 self.status = "Entry deleted".into();
             }
             Err(error) => {
+                if debug_input_enabled() {
+                    tracing::info!(success = false, error = %error, "[DELETE RESULT]");
+                }
                 self.status = format!("Falha ao excluir: {error}").into();
                 cx.notify();
             }
@@ -2383,6 +2408,7 @@ impl WorkspaceView {
                         let workspace = workspace.clone();
                         this.on_mouse_down(MouseButton::Right, move |_, _, cx| {
                             workspace.update(cx, |this, cx| {
+                                this.selected_path = Some(root.clone());
                                 this.explorer_context = Some(ExplorerContext {
                                     path: root.clone(),
                                     kind: EntryKind::Directory,
@@ -2396,6 +2422,9 @@ impl WorkspaceView {
             )
             .when(self.explorer_context.is_some(), |this| {
                 this.child(self.render_explorer_context(cx))
+            })
+            .when(self.explorer_operation.is_some(), |this| {
+                this.child(self.render_explorer_operation(cx))
             })
             .child(
                 div()
@@ -2433,15 +2462,20 @@ impl WorkspaceView {
                             .hover(move |style| style.bg(t.hover))
                             .on_click(move |_, window, cx| {
                                 workspace.update(cx, |this, cx| {
+                                    window.focus(&this.focus);
                                     if item.kind == EntryKind::Directory {
+                                        this.selected_path = Some(item.path.clone());
                                         this.toggle_directory(index, cx);
                                     } else {
+                                        this.selected_path = Some(item.path.clone());
                                         this.open_file(item.path.clone(), window, cx);
                                     }
                                 });
                             })
-                            .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                            .on_mouse_down(MouseButton::Right, move |_, window, cx| {
                                 context_workspace.update(cx, |this, cx| {
+                                    window.focus(&this.focus);
+                                    this.selected_path = Some(context_item.path.clone());
                                     this.explorer_context = Some(ExplorerContext {
                                         path: context_item.path.clone(),
                                         kind: context_item.kind,
@@ -2520,8 +2554,15 @@ impl WorkspaceView {
             .child({
                 let workspace = workspace.clone();
                 let directory = directory.clone();
-                Self::explorer_menu_item("New File", move |window, cx| {
+                Self::explorer_menu_item("File", move |window, cx| {
                     workspace.update(cx, |this, cx| this.new_file(directory.clone(), window, cx));
+                })
+            })
+            .child({
+                let workspace = workspace.clone();
+                let directory = directory.clone();
+                Self::explorer_menu_item("PHP File", move |_, cx| {
+                    workspace.update(cx, |this, cx| this.new_php_file(directory.clone(), cx));
                 })
             })
             .child({
@@ -2529,6 +2570,42 @@ impl WorkspaceView {
                 let directory = directory.clone();
                 Self::explorer_menu_item("New Directory", move |_, cx| {
                     workspace.update(cx, |this, cx| this.new_directory(directory.clone(), cx));
+                })
+            })
+            .child({
+                let workspace = workspace.clone();
+                let directory = directory.clone();
+                Self::explorer_menu_item("PHP Class", move |_, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.new_php_item(directory.clone(), "class", cx)
+                    });
+                })
+            })
+            .child({
+                let workspace = workspace.clone();
+                let directory = directory.clone();
+                Self::explorer_menu_item("PHP Interface", move |_, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.new_php_item(directory.clone(), "interface", cx)
+                    });
+                })
+            })
+            .child({
+                let workspace = workspace.clone();
+                let directory = directory.clone();
+                Self::explorer_menu_item("PHP Trait", move |_, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.new_php_item(directory.clone(), "trait", cx)
+                    });
+                })
+            })
+            .child({
+                let workspace = workspace.clone();
+                let directory = directory.clone();
+                Self::explorer_menu_item("PHP Enum", move |_, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.new_php_item(directory.clone(), "enum", cx)
+                    });
                 })
             })
             .when(!is_root, |this| {
@@ -2558,6 +2635,90 @@ impl WorkspaceView {
                     workspace.update(cx, |this, cx| this.refresh_explorer(cx));
                 })
             })
+    }
+
+    fn render_explorer_operation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        let title = match self.explorer_operation {
+            Some(ExplorerOperation::Rename(_)) => "Rename",
+            Some(ExplorerOperation::NewDirectory(_)) => "New Directory",
+            Some(ExplorerOperation::NewFile(_)) => "File",
+            Some(ExplorerOperation::NewPhpFile(_)) => "PHP File",
+            Some(ExplorerOperation::NewPhp { keyword, .. }) => keyword,
+            None => "",
+        };
+        div()
+            .absolute()
+            .top(px(110.))
+            .left(px(320.))
+            .w(px(360.))
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .bg(t.popup_background)
+            .border_1()
+            .border_color(t.border)
+            .rounded(m.border_radius_medium)
+            .shadow_lg()
+            .child(title)
+            .child(
+                div()
+                    .h(px(34.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .bg(t.panel_background)
+                    .id("explorer-operation-input")
+                    .on_click({
+                        let workspace = workspace.clone();
+                        move |_, window, cx| {
+                            workspace.update(cx, |this, cx| {
+                                window.focus(&this.focus);
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .child(self.explorer_input.clone())
+                    .child(WorkspaceInputElement {
+                        workspace: workspace.clone(),
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("explorer-operation-cancel")
+                            .px_2()
+                            .py_1()
+                            .on_click({
+                                let workspace = workspace.clone();
+                                move |_, _, cx| {
+                                    workspace
+                                        .update(cx, |this, cx| this.cancel_explorer_operation(cx));
+                                }
+                            })
+                            .child("Cancel"),
+                    )
+                    .child(
+                        div()
+                            .id("explorer-operation-confirm")
+                            .px_2()
+                            .py_1()
+                            .bg(t.accent)
+                            .text_color(t.window_background)
+                            .on_click(move |_, _, cx| {
+                                workspace
+                                    .update(cx, |this, cx| this.confirm_explorer_operation(cx));
+                            })
+                            .child("Confirm"),
+                    ),
+            )
     }
 
     fn explorer_menu_item(
@@ -3398,6 +3559,11 @@ impl Render for WorkspaceView {
                     tracing::debug!(x = ?event.position.x, y = ?event.position.y, "[MOUSE RAW]");
                 }
             })
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if this.open_menu.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .on_key_down(cx.listener(Self::handle_workspace_keydown))
             .on_action(cx.listener(Self::open_project))
             .on_action(cx.listener(Self::open_file_dialog))
@@ -3578,8 +3744,12 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let editing_settings = self.settings_visible && !self.command_palette_visible;
-        let mut query = if editing_settings {
+        let editing_explorer = self.explorer_operation.is_some();
+        let editing_settings =
+            self.settings_visible && !self.command_palette_visible && !editing_explorer;
+        let mut query = if editing_explorer {
+            self.explorer_input.clone()
+        } else if editing_settings {
             self.settings_query.clone()
         } else {
             self.command_palette_query.clone()
@@ -3597,7 +3767,9 @@ impl EntityInputHandler for WorkspaceView {
             .map(|(i, _)| i)
             .unwrap_or(query.len());
         query.replace_range(start..end, text);
-        if editing_settings {
+        if editing_explorer {
+            self.explorer_input = query;
+        } else if editing_settings {
             self.settings_query = query;
         } else {
             self.command_palette_query = query;
@@ -3630,7 +3802,9 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(if self.settings_visible && !self.command_palette_visible {
+        Some(if self.explorer_operation.is_some() {
+            self.explorer_input.encode_utf16().count()
+        } else if self.settings_visible && !self.command_palette_visible {
             self.settings_query.encode_utf16().count()
         } else {
             self.command_palette_query.encode_utf16().count()

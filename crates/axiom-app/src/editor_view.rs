@@ -1327,11 +1327,14 @@ impl EditorView {
         }
     }
 
-    fn definition(&mut self, _: &Definition, _: &mut Window, _: &mut Context<Self>) {
+    fn definition(&mut self, _: &Definition, _: &mut Window, cx: &mut Context<Self>) {
         if let (Some(lsp), Some(uri), Some(position)) =
             (&self.lsp, &self.lsp_uri, self.lsp_position())
         {
             lsp.request_definition(uri.clone(), position);
+        } else {
+            self.status = Some("Definition unavailable (language server not ready)".into());
+            cx.notify();
         }
     }
 
@@ -1563,7 +1566,21 @@ impl EditorView {
         let line = self.mouse_line(event.position);
         self.ctrl_hover_range = None;
         let offset = self.mouse_offset(line, event.position.x, window);
-        if event.modifiers.control && self.lsp.is_some() {
+        if event.modifiers.control {
+            if let Some(syntax) = &self.syntax
+                && let Some(token) = syntax.token_at_byte(offset)
+                && debug_input_enabled()
+            {
+                tracing::info!(
+                    x = ?event.position.x,
+                    y = ?event.position.y,
+                    line,
+                    byte = offset,
+                    text = %token.text,
+                    kind = %token.kind,
+                    "[EDITOR CTRL CLICK]"
+                );
+            }
             self.move_to(offset, cx);
             self.selecting = false;
             window.dispatch_action(Definition.boxed_clone(), cx);
