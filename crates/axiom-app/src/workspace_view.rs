@@ -3354,7 +3354,11 @@ impl WorkspaceView {
             })
     }
 
-    fn render_explorer_operation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_explorer_operation(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let t = theme();
         let m = metrics();
         let workspace = cx.entity();
@@ -3373,6 +3377,9 @@ impl WorkspaceView {
             .range
             .end
             .min(self.explorer_input.encode_utf16().count());
+        let caret_x: f32 = modal_text_line(window, &self.explorer_input)
+            .x_for_index(utf16_to_byte_offset(&self.explorer_input, caret))
+            .into();
         let input_before = utf16_slice(&self.explorer_input, 0, selection_start);
         let input_selected = utf16_slice(&self.explorer_input, selection_start, selection_end);
         let input_after = utf16_slice(
@@ -3507,7 +3514,7 @@ impl WorkspaceView {
                             .child(
                                 div()
                                     .absolute()
-                                    .left(px((caret as f32) * 8.0))
+                                    .left(px(caret_x))
                                     .top(px(4.))
                                     .w(px(1.))
                                     .h(px(25.))
@@ -4670,7 +4677,7 @@ impl Render for WorkspaceView {
                         .id("modal-backdrop")
                         .bg(gpui::rgba(0x00000055))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(self.render_explorer_operation(cx)),
+                        .child(self.render_explorer_operation(window, cx)),
                 )
             })
             .child(self.render_menu_bar(window, cx))
