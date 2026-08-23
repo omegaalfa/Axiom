@@ -205,6 +205,7 @@ pub struct WorkspaceView {
     modal_focus_pending: bool,
     delete_focus_pending: bool,
     explorer_selection: UTF16Selection,
+    explorer_undo: Vec<(String, UTF16Selection)>,
     pending_delete: Option<PathBuf>,
     pending_delete_is_directory: bool,
     project_panel_visible: bool,
@@ -607,6 +608,7 @@ impl WorkspaceView {
                 range: 0..0,
                 reversed: false,
             },
+            explorer_undo: Vec::new(),
             pending_delete: None,
             pending_delete_is_directory: false,
             project_panel_visible: true,
@@ -2012,6 +2014,7 @@ impl WorkspaceView {
         }
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
+        self.explorer_undo.clear();
         self.explorer_input = "untitled".into();
         self.explorer_selection = UTF16Selection {
             range: 0..self.explorer_input.encode_utf16().count(),
@@ -2065,6 +2068,7 @@ impl WorkspaceView {
         }
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
+        self.explorer_undo.clear();
         self.explorer_input = "untitled.php".into();
         self.explorer_selection = UTF16Selection {
             range: 0..self.explorer_input.encode_utf16().count(),
@@ -2082,6 +2086,7 @@ impl WorkspaceView {
         }
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
+        self.explorer_undo.clear();
         self.explorer_input = "New Folder".into();
         self.explorer_selection = UTF16Selection {
             range: 0..self.explorer_input.encode_utf16().count(),
@@ -2099,6 +2104,7 @@ impl WorkspaceView {
         }
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
+        self.explorer_undo.clear();
         self.explorer_input = "NewItem".into();
         self.explorer_selection = UTF16Selection {
             range: 0..self.explorer_input.encode_utf16().count(),
@@ -2131,6 +2137,7 @@ impl WorkspaceView {
             return;
         };
         self.explorer_input = current_name;
+        self.explorer_undo.clear();
         let basename_len = self
             .explorer_input
             .rsplit_once('.')
@@ -2152,6 +2159,7 @@ impl WorkspaceView {
         self.explorer_new_menu_open = false;
         self.modal_focus_pending = false;
         self.explorer_input.clear();
+        self.explorer_undo.clear();
         self.explorer_namespace.clear();
         self.explorer_extends.clear();
         self.explorer_implements.clear();
@@ -2164,6 +2172,19 @@ impl WorkspaceView {
         text: &str,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .explorer_operation
+            .as_ref()
+            .is_some_and(|operation| matches!(operation, ExplorerOperation::Rename(_)))
+        {
+            self.explorer_undo.push((
+                self.explorer_input.clone(),
+                UTF16Selection {
+                    range: self.explorer_selection.range.clone(),
+                    reversed: self.explorer_selection.reversed,
+                },
+            ));
+        }
         let before = self.explorer_input.encode_utf16().count();
         let (updated, caret) = replace_utf16_range(&self.explorer_input, range.clone(), text);
         self.explorer_input = updated;
@@ -2216,6 +2237,26 @@ impl WorkspaceView {
             .range
             .start
             .max(self.explorer_selection.range.end);
+        if modifiers.control
+            && key == "z"
+            && self
+                .explorer_operation
+                .as_ref()
+                .is_some_and(|operation| matches!(operation, ExplorerOperation::Rename(_)))
+        {
+            if let Some((value, selection)) = self.explorer_undo.pop() {
+                self.explorer_input = value;
+                self.explorer_selection = selection;
+                if debug_input_enabled() {
+                    tracing::info!(
+                        selection = ?self.explorer_selection.range,
+                        "[RENAME UNDO]"
+                    );
+                }
+                cx.notify();
+            }
+            return true;
+        }
         if modifiers.control && key == "a" {
             self.explorer_selection = UTF16Selection {
                 range: 0..length,
@@ -2263,6 +2304,7 @@ impl WorkspaceView {
         self.modal_focus_pending = false;
         let name = self.explorer_input.trim().to_owned();
         self.explorer_input.clear();
+        self.explorer_undo.clear();
         if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
             self.status = "Invalid name".into();
             cx.notify();
@@ -4801,6 +4843,15 @@ impl EntityInputHandler for WorkspaceView {
             }
         });
         let before_len = query.encode_utf16().count();
+        if editing_rename {
+            self.explorer_undo.push((
+                self.explorer_input.clone(),
+                UTF16Selection {
+                    range: self.explorer_selection.range.clone(),
+                    reversed: self.explorer_selection.reversed,
+                },
+            ));
+        }
         let (query, caret) = replace_utf16_range(&query, range.clone(), text);
         if editing_explorer {
             self.explorer_input = query;
