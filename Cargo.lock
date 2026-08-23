@@ -528,6 +528,8 @@ name = "axiom-php"
 version = "0.1.0"
 dependencies = [
  "axiom-syntax",
+ "serde",
+ "serde_json",
  "tempfile",
  "tracing",
  "tree-sitter",

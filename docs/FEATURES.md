@@ -67,6 +67,13 @@ runtime/project signature details, and shows native signature help with the
 active parameter highlighted. `Complete Current Statement` (`Ctrl+Shift+Enter`)
 adds a semicolon only when the caret is at the end of an unterminated line.
 
+Runtime stubs are loaded from the external `Runtime Stubs Directory` under the
+Axiom config directory by default. `AXIOM_PHP_STUBS` (with the legacy
+`RUSTSTORM_PHP_STUBS` fallback) overrides it. The Settings panel exposes
+Open Folder, Reload, and Clear Cache; the JSON cache is fingerprinted per PHP
+file and written atomically, so adding or changing a stub does not require an
+Axiom rebuild.
+
 ## Planned
 
 Debugger, complete Git UI, plugin marketplace, deep Laravel/Symfony support,

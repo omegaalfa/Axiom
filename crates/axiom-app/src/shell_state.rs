@@ -136,6 +136,20 @@ pub fn recent_projects_path() -> Option<PathBuf> {
     Some(current)
 }
 
+pub fn axiom_config_dir() -> Option<PathBuf> {
+    ProjectDirs::from("dev", "Axiom", "Axiom")
+        .map(|directories| directories.config_dir().to_path_buf())
+}
+
+pub fn runtime_stubs_default_path() -> Option<PathBuf> {
+    axiom_config_dir().map(|path| path.join("stubs"))
+}
+
+pub fn runtime_stubs_cache_path() -> Option<PathBuf> {
+    ProjectDirs::from("dev", "Axiom", "Axiom")
+        .map(|directories| directories.cache_dir().join("php-stubs-index-v1.json"))
+}
+
 pub fn unix_timestamp_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

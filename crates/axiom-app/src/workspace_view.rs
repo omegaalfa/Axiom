@@ -12,7 +12,8 @@ use std::{
 
 use axiom_app::commands::Keymap;
 use axiom_app::shell_state::{
-    RecentProjects, StartupTarget, recent_projects_path, unix_timestamp_now,
+    RecentProjects, StartupTarget, recent_projects_path, runtime_stubs_cache_path,
+    runtime_stubs_default_path, unix_timestamp_now,
 };
 use axiom_editor::Document;
 use axiom_index::ProjectSymbolIndex;
@@ -181,6 +182,8 @@ pub struct WorkspaceView {
     status: SharedString,
     lsp: Option<std::sync::Arc<LspBridge>>,
     runtime_stubs: RuntimeStubStatus,
+    runtime_stub_path: PathBuf,
+    runtime_stub_cache_path: Option<PathBuf>,
     // Retained independently from the editor/LSP; native completion is deliberately out of scope.
     _runtime_symbols: Option<std::sync::Arc<RuntimeSymbolIndex>>,
     recent_projects: RecentProjects,
@@ -359,6 +362,7 @@ impl WorkspaceView {
                             .bg(t.panel_background)
                             .child("Keymap")
                             .child(div().mt_2().text_color(t.text_muted).child("PHP"))
+                            .child(div().text_color(t.text_muted).child("Runtime Stubs"))
                             .child(div().text_color(t.text_muted).child("Formatter")),
                     )
                     .child(
@@ -394,6 +398,71 @@ impl WorkspaceView {
                                         workspace: workspace.clone(),
                                         focus: self.focus.clone(),
                                     }),
+                            )
+                            .child(
+                                div()
+                                    .mt_3()
+                                    .p_2()
+                                    .bg(t.panel_background)
+                                    .child(format!(
+                                        "Runtime Stubs Directory: {}",
+                                        self.runtime_stub_path.display()
+                                    ))
+                                    .child(format!("Status: {}", self.runtime_stubs.label()))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .mt_2()
+                                            .child(
+                                                div()
+                                                    .id("runtime-stubs-open")
+                                                    .px_2()
+                                                    .child("Open Folder")
+                                                    .on_click({
+                                                        let workspace = workspace.clone();
+                                                        move |_, _, cx| {
+                                                            workspace.update(cx, |this, cx| {
+                                                                let _ = fs::create_dir_all(
+                                                                    &this.runtime_stub_path,
+                                                                );
+                                                                let _ = open::that(
+                                                                    &this.runtime_stub_path,
+                                                                );
+                                                                cx.notify();
+                                                            });
+                                                        }
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("runtime-stubs-reload")
+                                                    .px_2()
+                                                    .child("Reload")
+                                                    .on_click({
+                                                        let workspace = workspace.clone();
+                                                        move |_, _, cx| {
+                                                            workspace.update(cx, |this, cx| {
+                                                                this.reload_runtime_stubs(cx)
+                                                            });
+                                                        }
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("runtime-stubs-clear-cache")
+                                                    .px_2()
+                                                    .child("Clear Cache")
+                                                    .on_click({
+                                                        let workspace = workspace.clone();
+                                                        move |_, _, cx| {
+                                                            workspace.update(cx, |this, cx| {
+                                                                this.clear_runtime_stub_cache(cx)
+                                                            });
+                                                        }
+                                                    }),
+                                            ),
+                                    ),
                             )
                             .children(self.keymap.search(&self.settings_query).into_iter().map(
                                 |command| {
@@ -582,6 +651,8 @@ impl WorkspaceView {
             status: "Abra um arquivo no painel Project".into(),
             lsp: None,
             runtime_stubs,
+            runtime_stub_path: Self::runtime_stub_path(),
+            runtime_stub_cache_path: runtime_stubs_cache_path(),
             _runtime_symbols: runtime_symbols,
             recent_projects,
             recent_path,
@@ -666,22 +737,51 @@ impl WorkspaceView {
         RuntimeStubStatus,
         Option<std::sync::Arc<RuntimeSymbolIndex>>,
     ) {
-        let Some(provider) = StubProvider::from_env() else {
-            return (RuntimeStubStatus::NotFound, None);
-        };
-        match provider.load() {
-            Ok((index, report)) => (
-                RuntimeStubStatus::Loaded {
-                    files: report.files_parsed,
-                    symbols: report.symbols_indexed,
-                },
-                Some(std::sync::Arc::new(index)),
-            ),
+        let provider = StubProvider::from_env()
+            .unwrap_or_else(|| StubProvider::new(Self::runtime_stub_path()));
+        let configured_path = provider.root().to_path_buf();
+        let _ = fs::create_dir_all(&configured_path);
+        let cache = runtime_stubs_cache_path();
+        let result = cache
+            .as_deref()
+            .map_or_else(|| provider.load(), |cache| provider.load_incremental(cache));
+        match result {
+            Ok((index, report)) => {
+                if debug_stubs_enabled() {
+                    tracing::info!(
+                        configured_path = %configured_path.display(),
+                        exists = configured_path.is_dir(),
+                        files = report.files_parsed,
+                        symbols = report.symbols_indexed,
+                        load_errors = report.errors.len(),
+                        "[RUNTIME STUBS]"
+                    );
+                }
+                (
+                    RuntimeStubStatus::Loaded {
+                        files: report.files_discovered,
+                        symbols: report.symbols_indexed,
+                    },
+                    Some(std::sync::Arc::new(index)),
+                )
+            }
             Err(error) => {
+                if debug_stubs_enabled() {
+                    tracing::info!(configured_path = %configured_path.display(), exists = configured_path.is_dir(), files = 0, symbols = 0, load_errors = 1, "[RUNTIME STUBS]");
+                }
                 tracing::warn!(%error, "PHP runtime stubs unavailable");
                 (RuntimeStubStatus::NotFound, None)
             }
         }
+    }
+
+    fn runtime_stub_path() -> PathBuf {
+        if let Some(path) =
+            std::env::var_os("AXIOM_PHP_STUBS").or_else(|| std::env::var_os("RUSTSTORM_PHP_STUBS"))
+        {
+            return PathBuf::from(path);
+        }
+        runtime_stubs_default_path().unwrap_or_else(|| PathBuf::from("stubs"))
     }
 
     fn begin_open_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1400,6 +1500,41 @@ impl WorkspaceView {
         self.settings_query.clear();
         self.settings_selected = None;
         cx.notify();
+    }
+
+    fn reload_runtime_stubs(&mut self, cx: &mut Context<Self>) {
+        self.status = "Runtime Stubs: Updating...".into();
+        let provider = StubProvider::new(self.runtime_stub_path.clone());
+        let _ = fs::create_dir_all(&self.runtime_stub_path);
+        let result = self
+            .runtime_stub_cache_path
+            .as_deref()
+            .map_or_else(|| provider.load(), |cache| provider.load_incremental(cache));
+        match result {
+            Ok((index, report)) => {
+                self.runtime_stubs = RuntimeStubStatus::Loaded {
+                    files: report.files_discovered,
+                    symbols: report.symbols_indexed,
+                };
+                let shared = Arc::new(index);
+                self._runtime_symbols = Some(shared.clone());
+                for tab in &self.tabs {
+                    tab.editor
+                        .update(cx, |editor, _| editor.set_runtime_symbols(shared.clone()));
+                }
+                self.status =
+                    format!("Runtime Stubs: Ready ({} symbols)", report.symbols_indexed).into();
+            }
+            Err(error) => self.status = format!("Runtime Stubs: Error — {error}").into(),
+        }
+        cx.notify();
+    }
+
+    fn clear_runtime_stub_cache(&mut self, cx: &mut Context<Self>) {
+        if let Some(cache) = &self.runtime_stub_cache_path {
+            let _ = fs::remove_file(cache);
+        }
+        self.reload_runtime_stubs(cx);
     }
 
     fn debug_input(&mut self, _: &DebugInput, _: &mut Window, cx: &mut Context<Self>) {
@@ -4665,7 +4800,7 @@ impl Render for WorkspaceView {
                     .text_color(t.text_secondary)
                     .child(self.status.clone())
                     .child(format!(
-                        "PHP  ·  Intelephense: {lsp_status}  ·  Runtime: {runtime_stub_status}  ·  UTF-8"
+                        "PHP  ·  Intelephense: {lsp_status}  ·  Runtime Stubs: {runtime_stub_status}  ·  UTF-8"
                     )),
             ))
             .when(self.open_menu.is_some(), |this| {
@@ -5091,6 +5226,19 @@ fn debug_input_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
+}
+
+fn debug_completion_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
+}
+
+fn debug_stubs_enabled() -> bool {
+    debug_completion_enabled()
+        || std::env::var_os("AXIOM_DEBUG_STUBS").is_some_and(|value| {
+            !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+        })
 }
 
 fn normalize_modifiers(modifiers: Modifiers) -> (bool, bool, bool) {

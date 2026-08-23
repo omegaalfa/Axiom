@@ -9,9 +9,10 @@ use std::{
 };
 
 use axiom_syntax::PhpSyntax;
+use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
     Function,
     Class,
@@ -24,26 +25,26 @@ pub enum SymbolKind {
     GlobalConstant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolOrigin {
     Project,
     Composer,
     PhpRuntime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceLocation {
     pub file: PathBuf,
     pub range: Range<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Availability {
     pub since: Option<String>,
     pub until: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parameter {
     pub name: String,
     pub declared_type: Option<String>,
@@ -53,21 +54,21 @@ pub struct Parameter {
     pub by_reference: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Signature {
     pub parameters: Vec<Parameter>,
     pub declared_return_type: Option<String>,
     pub phpdoc_return_type: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhpDocParam {
     pub name: String,
     pub declared_type: Option<String>,
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PhpDoc {
     pub description: Option<String>,
     pub params: Vec<PhpDocParam>,
@@ -77,7 +78,7 @@ pub struct PhpDoc {
     pub deprecated: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: String,
     pub fqn: String,
@@ -203,6 +204,105 @@ impl StubProvider {
         );
         Ok((index, report))
     }
+
+    /// Incrementally loads the external stub tree using a small JSON cache.
+    /// Cache writes are atomic, so a second Axiom instance can safely rebuild
+    /// concurrently without leaving a partially-written index behind.
+    pub fn load_incremental(
+        &self,
+        cache_path: &Path,
+    ) -> Result<(RuntimeSymbolIndex, LoadReport), StubProviderError> {
+        let files = self.discover()?;
+        let old = fs::read(cache_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<StubCache>(&bytes).ok())
+            .filter(|cache| {
+                cache.schema_version == STUB_CACHE_SCHEMA
+                    && cache.parser_version == STUB_PARSER_VERSION
+            });
+        let mut index = RuntimeSymbolIndex::default();
+        let mut entries = Vec::new();
+        let mut report = LoadReport {
+            files_discovered: files.len(),
+            ..Default::default()
+        };
+        for stub in files {
+            let metadata = fs::metadata(&stub.path)?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_secs());
+            let cached = old.as_ref().and_then(|cache| {
+                cache.files.iter().find(|file| {
+                    file.path == stub.path
+                        && file.modified == modified
+                        && file.size == metadata.len()
+                })
+            });
+            let symbols = if let Some(cached) = cached {
+                cached.symbols.clone()
+            } else {
+                match fs::read_to_string(&stub.path).and_then(|text| {
+                    extract_symbols(&text, &stub.path, &stub.extension)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                }) {
+                    Ok(symbols) => symbols,
+                    Err(error) => {
+                        report.errors.push(StubError {
+                            file: stub.path.clone(),
+                            message: error.to_string(),
+                        });
+                        Vec::new()
+                    }
+                }
+            };
+            if cached.is_none() {
+                report.files_parsed += 1;
+            }
+            report.symbols_indexed += symbols.len();
+            for symbol in &symbols {
+                index.insert(symbol.clone());
+            }
+            entries.push(StubCacheFile {
+                path: stub.path,
+                modified,
+                size: metadata.len(),
+                symbols,
+            });
+        }
+        let cache = StubCache {
+            schema_version: STUB_CACHE_SCHEMA,
+            parser_version: STUB_PARSER_VERSION,
+            files: entries,
+        };
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temp = cache_path.with_extension("tmp");
+        fs::write(&temp, serde_json::to_vec(&cache).map_err(io::Error::other)?)?;
+        let _ = fs::remove_file(cache_path);
+        fs::rename(temp, cache_path)?;
+        Ok((index, report))
+    }
+}
+
+const STUB_CACHE_SCHEMA: u32 = 1;
+const STUB_PARSER_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StubCache {
+    schema_version: u32,
+    parser_version: u32,
+    files: Vec<StubCacheFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StubCacheFile {
+    path: PathBuf,
+    modified: u64,
+    size: u64,
+    symbols: Vec<Symbol>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,7 +311,7 @@ pub struct StubFile {
     pub extension: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RuntimeSymbolIndex {
     classes: HashMap<String, Vec<Symbol>>,
     functions: HashMap<String, Vec<Symbol>>,
@@ -798,6 +898,40 @@ mod tests {
                 .any(|symbol| symbol.kind == SymbolKind::ClassConstant && symbol.name == "ATOM")
         );
         assert!(index.find_constant("PHP_VERSION_ID").is_some());
+    }
+
+    #[test]
+    fn incremental_cache_reuses_and_updates_files() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("Custom.php");
+        fs::write(
+            &file,
+            "<?php class CustomRuntime { public function hello() {} }",
+        )
+        .unwrap();
+        let cache = root.path().join("cache.json");
+        let provider = StubProvider::new(root.path());
+        let (index, first) = provider.load_incremental(&cache).unwrap();
+        assert_eq!(first.files_parsed, 1);
+        assert!(index.find_class("CustomRuntime").is_some());
+        let (_, warm) = provider.load_incremental(&cache).unwrap();
+        assert_eq!(warm.files_parsed, 0);
+        fs::write(
+            &file,
+            "<?php class CustomRuntime { public function world() {} }",
+        )
+        .unwrap();
+        let (updated, changed) = provider.load_incremental(&cache).unwrap();
+        assert_eq!(changed.files_parsed, 1);
+        assert!(
+            updated
+                .members_of("CustomRuntime")
+                .iter()
+                .any(|symbol| symbol.name == "world")
+        );
+        fs::remove_file(&file).unwrap();
+        let (removed, _) = provider.load_incremental(&cache).unwrap();
+        assert!(removed.find_class("CustomRuntime").is_none());
     }
 
     #[test]

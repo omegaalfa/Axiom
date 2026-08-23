@@ -1140,7 +1140,10 @@ impl EditorView {
                 .last()
                 .map_or(owner_end, |(i, _)| i);
             let owner = text[owner_start..owner_end].trim_start_matches('$');
-            if let Some(class_fqn) = self.resolve_native_type(owner, &text[..owner_start]) {
+            if let Some(class_fqn) = self.resolve_native_type(owner, &text[..owner_end]) {
+                if debug_completion_enabled() {
+                    tracing::info!(trigger = "MemberAccess", receiver_type = %class_fqn, "[COMPLETION CONTEXT]");
+                }
                 let mut members = Vec::new();
                 if let Some(index) = &self.project_symbols
                     && let Ok(index) = index.read()
@@ -1181,6 +1184,10 @@ impl EditorView {
                 }
                 let mut seen = std::collections::HashSet::new();
                 members.retain(|item| seen.insert(item.label.to_ascii_lowercase()));
+                if debug_completion_enabled() {
+                    tracing::info!(runtime_count = members.len(), "[COMPLETION PROVIDER]");
+                    tracing::info!(result_count = members.len(), "[COMPLETION RESULT]");
+                }
                 return members.into_iter().take(40).collect();
             }
         }
@@ -2276,8 +2283,14 @@ fn debug_input_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT").is_some()
 }
 
+fn debug_completion_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
+}
+
 impl Render for EditorView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
         let status = self.status.clone().or_else(|| {
@@ -2294,6 +2307,32 @@ impl Render for EditorView {
         });
         let has_selection = self.document.selection_offsets().is_some();
         let php_navigation = is_php_file(&self.file_path) && self.lsp.is_some();
+        let viewport = self.scroll.0.borrow().base_handle.bounds();
+        let line = self.document.line_of_offset(self.document.cursor_offset());
+        let line_start = self.document.offset_of_line(line);
+        let line_content = self.document.line_content(line);
+        let line_text = trim_eol(line_content.as_ref());
+        let caret_x = shape(window, line_text).x_for_index(
+            self.document
+                .cursor_offset()
+                .saturating_sub(line_start)
+                .min(line_text.len()),
+        );
+        let mut popup_x = viewport.left() + px(GUTTER_WIDTH + TEXT_PADDING) + caret_x;
+        let popup_width = px(420.);
+        popup_x = popup_x.min((viewport.right() - popup_width).max(viewport.left()));
+        let below_y = viewport.top() + px((line as f32 + 1.0) * LINE_HEIGHT)
+            - self.scroll.0.borrow().base_handle.offset().y;
+        let popup_height = px(220.);
+        let opens_above = below_y + popup_height > viewport.bottom();
+        let popup_y = if opens_above {
+            (below_y - popup_height - px(4.)).max(viewport.top())
+        } else {
+            below_y.min((viewport.bottom() - popup_height).max(viewport.top()))
+        };
+        if debug_completion_enabled() && !self.completions.is_empty() {
+            tracing::info!(anchor_x = ?popup_x, anchor_y = ?popup_y, width = ?popup_width, height = ?popup_height, above_editor = opens_above, clipped = false, items = self.completions.len(), selected = self.completion_selected, "[COMPLETION POPUP]");
+        }
         div()
             .flex()
             .flex_col()
@@ -2378,17 +2417,19 @@ impl Render for EditorView {
                         this.child(
                             div()
                                 .absolute()
-                                .left(px(GUTTER_WIDTH + 80.))
-                                .bottom(px(12.))
-                                .w(px(320.))
+                                .left(popup_x)
+                                .top(popup_y)
+                                .w(popup_width)
                                 .max_h(px(220.))
-                                .overflow_hidden()
+                                .id("completion-popup-scroll")
+                                .overflow_y_scroll()
                                 .rounded(m.border_radius_medium)
                                 .bg(t.popup_background)
                                 .border_1()
                                 .border_color(t.border)
                                 .shadow_lg()
-                                .children(self.completions.iter().take(8).enumerate().map(
+                                .occlude()
+                                .children(self.completions.iter().enumerate().map(
                                     |(index, item)| {
                                         div()
                                             .h(m.toolbar_height)
@@ -2404,10 +2445,17 @@ impl Render for EditorView {
                                             .child(
                                                 div().w(m.icon_size).text_color(t.info).child("ƒ"),
                                             )
-                                            .child(item.label.clone())
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .overflow_hidden()
+                                                    .child(item.label.clone()),
+                                            )
                                             .when_some(item.detail.clone(), |row, detail| {
                                                 row.child(
                                                     div()
+                                                        .max_w(px(190.))
+                                                        .overflow_hidden()
                                                         .ml_auto()
                                                         .text_color(t.text_muted)
                                                         .child(detail),
@@ -2421,8 +2469,12 @@ impl Render for EditorView {
                         this.child(
                             div()
                                 .absolute()
-                                .left(px(GUTTER_WIDTH + 80.))
-                                .bottom(px(12.))
+                                .left(popup_x)
+                                .top(if opens_above {
+                                    below_y
+                                } else {
+                                    popup_y + popup_height + px(4.)
+                                })
                                 .max_w(px(520.))
                                 .p_3()
                                 .rounded(m.border_radius_medium)
@@ -2430,6 +2482,7 @@ impl Render for EditorView {
                                 .border_1()
                                 .border_color(t.border)
                                 .shadow_lg()
+                                .occlude()
                                 .text_color(t.text_primary)
                                 .child(hover),
                         )
