@@ -232,7 +232,9 @@ impl StubProvider {
                 .modified()
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_secs());
+                .map_or(0, |duration| {
+                    duration.as_nanos().min(u64::MAX as u128) as u64
+                });
             let cached = old.as_ref().and_then(|cache| {
                 cache.files.iter().find(|file| {
                     file.path == stub.path
