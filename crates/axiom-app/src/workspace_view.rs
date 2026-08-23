@@ -3400,7 +3400,7 @@ impl WorkspaceView {
             .absolute()
             .top(px(110.))
             .left(px(320.))
-            .w(px(360.))
+            .w(px(320.))
             .p_3()
             .flex()
             .flex_col()
