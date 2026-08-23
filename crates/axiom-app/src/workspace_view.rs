@@ -1,9 +1,10 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
     thread,
@@ -141,6 +142,7 @@ enum NewItemKind {
 }
 
 enum RuntimeStubStatus {
+    Loading,
     Loaded { files: usize, symbols: usize },
     NotFound,
 }
@@ -162,10 +164,15 @@ enum PendingOperation {
 }
 
 type ProjectLoadPayload = (Project, Vec<ProjectEntry>, Arc<LspBridge>);
+type RuntimeLoadResult = (
+    u64,
+    Result<(RuntimeStubStatus, Arc<RuntimeSymbolIndex>), String>,
+);
 
 impl RuntimeStubStatus {
     fn label(&self) -> String {
         match self {
+            Self::Loading => "Loading...".to_owned(),
             Self::Loaded { files, symbols } => {
                 format!("Loaded ({files} files, {symbols} symbols)")
             }
@@ -186,6 +193,10 @@ pub struct WorkspaceView {
     runtime_stubs: RuntimeStubStatus,
     runtime_stub_path: PathBuf,
     runtime_stub_cache_path: Option<PathBuf>,
+    runtime_load_generation: u64,
+    runtime_load_results: Option<Receiver<RuntimeLoadResult>>,
+    runtime_watch_events: Option<Receiver<()>>,
+    runtime_watch_stop: Arc<AtomicBool>,
     // Retained independently from the editor/LSP; native completion is deliberately out of scope.
     _runtime_symbols: Option<std::sync::Arc<RuntimeSymbolIndex>>,
     recent_projects: RecentProjects,
@@ -657,7 +668,6 @@ impl WorkspaceView {
     }
 
     pub fn new(startup: StartupTarget, cx: &mut Context<Self>) -> Self {
-        let (runtime_stubs, runtime_symbols) = Self::load_runtime_stubs();
         let recent_path = recent_projects_path();
         let recent_projects = recent_path
             .as_deref()
@@ -680,10 +690,14 @@ impl WorkspaceView {
             focus: cx.focus_handle(),
             status: "Abra um arquivo no painel Project".into(),
             lsp: None,
-            runtime_stubs,
+            runtime_stubs: RuntimeStubStatus::Loading,
             runtime_stub_path: Self::runtime_stub_path(),
             runtime_stub_cache_path: runtime_stubs_cache_path(),
-            _runtime_symbols: runtime_symbols,
+            _runtime_symbols: None,
+            runtime_load_generation: 0,
+            runtime_load_results: None,
+            runtime_watch_events: None,
+            runtime_watch_stop: Arc::new(AtomicBool::new(false)),
             recent_projects,
             recent_path,
             open_menu: None,
@@ -740,6 +754,8 @@ impl WorkspaceView {
             project_load_generation: 0,
             project_load_results: None,
         };
+        workspace.begin_runtime_stub_load(cx, false);
+        workspace.start_runtime_watcher(cx);
         if let StartupTarget::Project { root, initial_file } = startup {
             workspace.begin_open_project(root, cx);
             workspace.startup_file = initial_file;
@@ -752,6 +768,8 @@ impl WorkspaceView {
                         this.poll_lsp(cx);
                         this.poll_index(cx);
                         this.poll_project_load(cx);
+                        this.poll_runtime_stub_load(cx);
+                        this.poll_runtime_watcher(cx);
                     })
                     .is_err()
                 {
@@ -763,6 +781,7 @@ impl WorkspaceView {
         workspace
     }
 
+    #[allow(dead_code)]
     fn load_runtime_stubs() -> (
         RuntimeStubStatus,
         Option<std::sync::Arc<RuntimeSymbolIndex>>,
@@ -812,6 +831,107 @@ impl WorkspaceView {
             return PathBuf::from(path);
         }
         runtime_stubs_default_path().unwrap_or_else(|| PathBuf::from("stubs"))
+    }
+
+    fn begin_runtime_stub_load(&mut self, cx: &mut Context<Self>, updating: bool) {
+        self.runtime_load_generation = self.runtime_load_generation.wrapping_add(1);
+        let generation = self.runtime_load_generation;
+        let path = self.runtime_stub_path.clone();
+        let cache = self.runtime_stub_cache_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.runtime_load_results = Some(receiver);
+        self.runtime_stubs = RuntimeStubStatus::Loading;
+        self.status = if updating {
+            "Runtime Stubs: Updating..."
+        } else {
+            "Runtime Stubs: Loading..."
+        }
+        .into();
+        thread::spawn(move || {
+            let provider = StubProvider::new(path);
+            let result = cache
+                .as_deref()
+                .map_or_else(|| provider.load(), |cache| provider.load_incremental(cache))
+                .map(|(index, report)| {
+                    (
+                        RuntimeStubStatus::Loaded {
+                            files: report.files_discovered,
+                            symbols: report.symbols_indexed,
+                        },
+                        Arc::new(index),
+                    )
+                })
+                .map_err(|error| error.to_string());
+            let _ = sender.send((generation, result));
+        });
+        cx.notify();
+    }
+
+    fn poll_runtime_stub_load(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = self.runtime_load_results.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.runtime_load_results = None;
+                return;
+            }
+        };
+        self.runtime_load_results = None;
+        let (generation, result) = result;
+        if generation != self.runtime_load_generation {
+            return;
+        }
+        match result {
+            Ok((status, symbols)) => {
+                let count = match status {
+                    RuntimeStubStatus::Loaded { symbols, .. } => symbols,
+                    _ => 0,
+                };
+                self.runtime_stubs = status;
+                self._runtime_symbols = Some(symbols.clone());
+                for tab in &self.tabs {
+                    tab.editor
+                        .update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
+                }
+                self.status = format!("Runtime Stubs: Ready ({count} symbols)").into();
+            }
+            Err(error) => {
+                self.runtime_stubs = RuntimeStubStatus::NotFound;
+                self.status = format!("Runtime Stubs: Error — {error}").into();
+            }
+        }
+        cx.notify();
+    }
+
+    fn start_runtime_watcher(&mut self, cx: &mut Context<Self>) {
+        let root = self.runtime_stub_path.clone();
+        let stop = self.runtime_watch_stop.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.runtime_watch_events = Some(receiver);
+        thread::spawn(move || {
+            let mut previous = stub_snapshot(&root).unwrap_or_default();
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(std::time::Duration::from_millis(400));
+                let current = stub_snapshot(&root).unwrap_or_default();
+                if current != previous {
+                    previous = current;
+                    let _ = sender.send(());
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    fn poll_runtime_watcher(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = self.runtime_watch_events.as_ref() else {
+            return;
+        };
+        if receiver.try_recv().is_ok() && self.runtime_load_results.is_none() {
+            self.begin_runtime_stub_load(cx, true);
+        }
     }
 
     fn begin_open_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1633,7 +1753,8 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn reload_runtime_stubs(&mut self, cx: &mut Context<Self>) {
+    #[allow(dead_code)]
+    fn reload_runtime_stubs_sync(&mut self, cx: &mut Context<Self>) {
         self.status = "Runtime Stubs: Updating...".into();
         let provider = StubProvider::new(self.runtime_stub_path.clone());
         let _ = fs::create_dir_all(&self.runtime_stub_path);
@@ -1659,6 +1780,11 @@ impl WorkspaceView {
             Err(error) => self.status = format!("Runtime Stubs: Error — {error}").into(),
         }
         cx.notify();
+    }
+
+    fn reload_runtime_stubs(&mut self, cx: &mut Context<Self>) {
+        let _ = fs::create_dir_all(&self.runtime_stub_path);
+        self.begin_runtime_stub_load(cx, true);
     }
 
     fn clear_runtime_stub_cache(&mut self, cx: &mut Context<Self>) {
@@ -4765,6 +4891,12 @@ impl WorkspaceView {
     }
 }
 
+impl Drop for WorkspaceView {
+    fn drop(&mut self) {
+        self.runtime_watch_stop.store(true, Ordering::Relaxed);
+    }
+}
+
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
@@ -5375,6 +5507,43 @@ struct StubImportReport {
     conflicts: usize,
 }
 
+fn stub_snapshot(root: &Path) -> std::io::Result<HashMap<PathBuf, (u64, u128)>> {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        out: &mut HashMap<PathBuf, (u64, u128)>,
+    ) -> std::io::Result<()> {
+        if !current.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(current)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, out)?;
+            } else if path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("php"))
+            {
+                let metadata = fs::metadata(&path)?;
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |duration| duration.as_nanos());
+                if let Ok(relative) = path.strip_prefix(root) {
+                    out.insert(relative.to_path_buf(), (metadata.len(), modified));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut snapshot = HashMap::new();
+    visit(root, root, &mut snapshot)?;
+    Ok(snapshot)
+}
+
 fn copy_stub_files(files: &[PathBuf], target: &Path) -> std::io::Result<StubImportReport> {
     let mut report = StubImportReport::default();
     fs::create_dir_all(target)?;
@@ -5425,12 +5594,14 @@ fn copy_stub_tree(source: &Path, target: &Path) -> std::io::Result<StubImportRep
     Ok(report)
 }
 
+#[allow(dead_code)]
 fn debug_completion_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
 }
 
+#[allow(dead_code)]
 fn debug_stubs_enabled() -> bool {
     debug_completion_enabled()
         || std::env::var_os("AXIOM_DEBUG_STUBS").is_some_and(|value| {
