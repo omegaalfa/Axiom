@@ -1669,6 +1669,9 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         self.open_menu = None;
+        if debug_stubs_enabled() {
+            tracing::info!("[STUB IMPORT ACTION] files");
+        }
         self.import_runtime_stub_files(cx);
     }
 
@@ -1676,6 +1679,9 @@ impl WorkspaceView {
         let target = self.runtime_stub_path.clone();
         let workspace = cx.entity().downgrade();
         self.status = "Runtime Stubs: Choose a folder to import...".into();
+        if debug_stubs_enabled() {
+            tracing::info!(target = %target.display(), "[STUB IMPORT PICKER] open folder");
+        }
         cx.spawn(async move |_, cx| {
             let selected = rfd::AsyncFileDialog::new()
                 .pick_folder()
@@ -1690,6 +1696,17 @@ impl WorkspaceView {
                     copy_stub_tree(&source, &target).map(Some)
                 },
             );
+            if debug_stubs_enabled() {
+                match &result {
+                    Ok(Some(report)) => tracing::info!(
+                        copied = report.copied,
+                        conflicts = report.conflicts,
+                        "[STUB IMPORT COPY] folder complete"
+                    ),
+                    Ok(None) => tracing::info!("[STUB IMPORT PICKER] cancelled"),
+                    Err(error) => tracing::warn!(%error, "[STUB IMPORT COPY] failed"),
+                }
+            }
             let _ = workspace.update(cx, |this, cx| {
                 match result {
                     Ok(Some(report)) => {
@@ -1716,6 +1733,9 @@ impl WorkspaceView {
         let target = self.runtime_stub_path.clone();
         let workspace = cx.entity().downgrade();
         self.status = "Runtime Stubs: Choose PHP files to import...".into();
+        if debug_stubs_enabled() {
+            tracing::info!(target = %target.display(), "[STUB IMPORT PICKER] open files");
+        }
         cx.spawn(async move |_, cx| {
             let selected = rfd::AsyncFileDialog::new()
                 .add_filter("PHP stubs", &["php"])
@@ -1731,6 +1751,17 @@ impl WorkspaceView {
                 || Ok(None),
                 |files| copy_stub_files(&files, &target).map(Some),
             );
+            if debug_stubs_enabled() {
+                match &result {
+                    Ok(Some(report)) => tracing::info!(
+                        copied = report.copied,
+                        conflicts = report.conflicts,
+                        "[STUB IMPORT COPY] files complete"
+                    ),
+                    Ok(None) => tracing::info!("[STUB IMPORT PICKER] cancelled"),
+                    Err(error) => tracing::warn!(%error, "[STUB IMPORT COPY] failed"),
+                }
+            }
             let _ = workspace.update(cx, |this, cx| {
                 match result {
                     Ok(Some(report)) => {
