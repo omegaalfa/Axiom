@@ -7,6 +7,7 @@ use std::{
         mpsc::{self, Receiver, TryRecvError},
     },
     thread,
+    time::Instant,
 };
 
 use axiom_app::commands::Keymap;
@@ -17,7 +18,7 @@ use axiom_editor::Document;
 use axiom_index::ProjectSymbolIndex;
 use axiom_lsp::{ServerStatus, uri_to_path};
 use axiom_php::{RuntimeSymbolIndex, StubProvider};
-use axiom_project::{EntryKind, FileContent, Project, read_file_content};
+use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_content};
 use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSession};
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
@@ -157,6 +158,8 @@ enum PendingOperation {
     Exit,
 }
 
+type ProjectLoadPayload = (Project, Vec<ProjectEntry>, Arc<LspBridge>);
+
 impl RuntimeStubStatus {
     fn label(&self) -> String {
         match self {
@@ -229,6 +232,8 @@ pub struct WorkspaceView {
     debug_overlay_visible: bool,
     focus_active_editor: bool,
     project_dialog_open: bool,
+    project_load_generation: u64,
+    project_load_results: Option<Receiver<(u64, Result<ProjectLoadPayload, String>)>>,
 }
 
 impl WorkspaceView {
@@ -629,9 +634,11 @@ impl WorkspaceView {
             debug_overlay_visible: false,
             focus_active_editor: false,
             project_dialog_open: false,
+            project_load_generation: 0,
+            project_load_results: None,
         };
         if let StartupTarget::Project { root, initial_file } = startup {
-            workspace.open_project_path(root);
+            workspace.begin_open_project(root, cx);
             workspace.startup_file = initial_file;
         }
         cx.spawn(async move |this, cx| {
@@ -641,6 +648,7 @@ impl WorkspaceView {
                     .update(cx, |this, cx| {
                         this.poll_lsp(cx);
                         this.poll_index(cx);
+                        this.poll_project_load(cx);
                     })
                     .is_err()
                 {
@@ -674,22 +682,89 @@ impl WorkspaceView {
         }
     }
 
-    fn open_project_path(&mut self, path: PathBuf) {
+    fn begin_open_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.project_load_generation = self.project_load_generation.wrapping_add(1);
+        let generation = self.project_load_generation;
+        let (sender, receiver) = mpsc::channel();
+        self.project_load_results = Some(receiver);
+        self.status = "Opening project...".into();
         if debug_input_enabled() {
-            tracing::info!(path = %path.display(), "[PROJECT] open path");
+            tracing::info!(path = %path.display(), generation, "[PROJECT] open path");
+            tracing::info!(name = "load_project_shell", "[PROJECT STEP START]");
         }
-        match Project::open(path).map_err(|error| error.to_string()) {
-            Ok(project) => {
-                self.set_project(project);
+        thread::spawn(move || {
+            let started = Instant::now();
+            let result = (|| {
+                let project = Project::open(&path).map_err(|error| error.to_string())?;
+                let root = project.root_path().to_path_buf();
+                let entries = project
+                    .read_directory(&root)
+                    .map_err(|error| error.to_string())?;
+                let lsp = LspBridge::start(project.root_path());
+                Ok((project, entries, lsp))
+            })();
+            if debug_input_enabled() {
+                tracing::info!(
+                    name = "load_project_shell",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "[PROJECT STEP END]"
+                );
+            }
+            let _ = sender.send((generation, result));
+        });
+        cx.notify();
+    }
+
+    fn poll_project_load(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = self.project_load_results.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.project_load_results = None;
+                return;
+            }
+        };
+        self.project_load_results = None;
+        let (generation, result) = result;
+        if generation != self.project_load_generation {
+            return;
+        }
+        match result {
+            Ok((project, entries, lsp)) => {
+                let started = Instant::now();
+                self.finish_project_load(project, entries, lsp, cx);
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if debug_input_enabled() && elapsed_ms > 50 {
+                    tracing::warn!(
+                        operation = "publish_project_shell",
+                        elapsed_ms,
+                        "[UI BLOCK WARNING]"
+                    );
+                }
                 if debug_input_enabled() {
                     tracing::info!("[PROJECT] ready");
                 }
             }
-            Err(error) => self.status = format!("Falha ao abrir projeto: {error}").into(),
+            Err(error) => {
+                self.status = format!("Falha ao abrir projeto: {error}").into();
+                if debug_input_enabled() {
+                    tracing::warn!(%error, "[PROJECT] open failed");
+                }
+                cx.notify();
+            }
         }
     }
 
-    fn set_project(&mut self, project: Project) {
+    fn finish_project_load(
+        &mut self,
+        project: Project,
+        entries: Vec<ProjectEntry>,
+        lsp: Arc<LspBridge>,
+        cx: &mut Context<Self>,
+    ) {
         self.navigation_back.clear();
         self.navigation_forward.clear();
         let root = project.root_path().to_path_buf();
@@ -698,7 +773,7 @@ impl WorkspaceView {
         let (sender, receiver) = mpsc::channel();
         self.index_results = Some(receiver);
         self.project_index = None;
-        self.status = "PHP Indexing...".into();
+        self.status = "Project opened — indexing...".into();
         let index_root = root.clone();
         thread::spawn(move || {
             let mut index = ProjectSymbolIndex::new();
@@ -708,7 +783,7 @@ impl WorkspaceView {
                 .map_err(|error| error.to_string());
             let _ = sender.send((generation, result));
         });
-        match project.read_directory(&root) {
+        match Ok::<_, axiom_project::ProjectError>(entries) {
             Ok(entries) => {
                 self.explorer = entries
                     .into_iter()
@@ -720,13 +795,7 @@ impl WorkspaceView {
                     })
                     .collect();
                 self.expanded.clear();
-                self.status = if project.composer().is_some() {
-                    "PHP Project • Composer".into()
-                } else if let Some(error) = project.composer_error() {
-                    format!("PHP Project • composer.json inválido: {error}").into()
-                } else {
-                    "PHP Project".into()
-                };
+                self.status = "Project opened — indexing...".into();
                 self.project = Some(project);
                 self.recent_projects.add(&root, unix_timestamp_now());
                 if let Some(path) = &self.recent_path
@@ -734,10 +803,8 @@ impl WorkspaceView {
                 {
                     tracing::warn!("failed to persist recent projects: {error}");
                 }
-                self.lsp = self
-                    .project
-                    .as_ref()
-                    .map(|project| LspBridge::start(project.root_path()));
+                self.lsp = Some(lsp);
+                cx.notify();
             }
             Err(error) => self.status = format!("Falha ao ler projeto: {error}").into(),
         }
@@ -794,7 +861,7 @@ impl WorkspaceView {
         match operation {
             PendingOperation::OpenProject(path) => {
                 self.clear_project(cx);
-                self.open_project_path(path);
+                self.begin_open_project(path, cx);
             }
             PendingOperation::CloseProject => self.clear_project(cx),
             PendingOperation::Exit => {
@@ -805,6 +872,8 @@ impl WorkspaceView {
     }
 
     fn clear_project(&mut self, cx: &mut Context<Self>) {
+        self.project_load_generation = self.project_load_generation.wrapping_add(1);
+        self.project_load_results = None;
         self.navigation_back.clear();
         self.navigation_forward.clear();
         for tab in &self.tabs {
