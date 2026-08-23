@@ -860,6 +860,31 @@ impl EditorView {
         cx.notify();
     }
 
+    fn should_expand_member_dash(&self) -> bool {
+        let text = self.document.content();
+        let cursor = self.document.cursor_offset();
+        let before = &text[..cursor];
+        if !before.ends_with('-')
+            || before[..before.len() - 1]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            return false;
+        }
+        let owner_start = before[..before.len() - 1]
+            .char_indices()
+            .rev()
+            .take_while(|(_, ch)| ch.is_alphanumeric() || matches!(ch, '_' | '$' | '\\'))
+            .last()
+            .map_or(before.len() - 1, |(index, _)| index);
+        let owner = &before[owner_start..before.len() - 1];
+        if owner == "$this" {
+            return before[..owner_start].contains("class ");
+        }
+        self.resolve_native_type(owner, before).is_some()
+    }
+
     fn schedule_incremental_index_update(&self) {
         let (Some(index), Some(revision)) = (
             self.project_symbols.clone(),
@@ -929,6 +954,85 @@ impl EditorView {
             })
             .unwrap_or_default();
         self.add_native_inspections(&text);
+        self.add_native_argument_inspections(&text);
+    }
+
+    fn add_native_argument_inspections(&mut self, text: &str) {
+        let Some(runtime) = self.runtime_symbols.as_ref() else {
+            return;
+        };
+        let mut search = 0;
+        while let Some(relative_open) = text[search..].find('(') {
+            let open = search + relative_open;
+            let Some(close) = matching_paren(text, open) else {
+                break;
+            };
+            let callable_start = text[..open]
+                .char_indices()
+                .rev()
+                .take_while(|(_, ch)| {
+                    ch.is_alphanumeric() || matches!(ch, '_' | '$' | '\\' | ':' | '-')
+                })
+                .last()
+                .map_or(open, |(index, _)| index);
+            let callable = text[callable_start..open].trim();
+            let name = callable
+                .rsplit_once("::")
+                .or_else(|| callable.rsplit_once("->"))
+                .map(|(_, name)| name)
+                .unwrap_or(callable)
+                .trim_start_matches('$');
+            if name.is_empty() {
+                search = close.saturating_add(1);
+                continue;
+            }
+            let symbol = callable
+                .rsplit_once("::")
+                .or_else(|| callable.rsplit_once("->"))
+                .and_then(|(owner, _)| {
+                    let owner = self.resolve_native_type(owner.trim(), &text[..open])?;
+                    runtime
+                        .methods_of(&owner)
+                        .find(|symbol| symbol.name == name)
+                })
+                .or_else(|| runtime.find_function(name));
+            if let Some(symbol) = symbol
+                && let Some(signature) = symbol.signature.as_ref()
+            {
+                let arguments = count_call_arguments(&text[open + 1..close]);
+                let required = signature
+                    .parameters
+                    .iter()
+                    .filter(|parameter| !parameter.optional && !parameter.variadic)
+                    .count();
+                let variadic = signature
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.variadic);
+                let too_few = arguments < required;
+                let too_many = !variadic && arguments > signature.parameters.len();
+                if too_few || too_many {
+                    let expected = if too_many {
+                        format!(
+                            "Expected at most {} arguments, found {arguments}",
+                            signature.parameters.len()
+                        )
+                    } else {
+                        format!(
+                            "Expected {} argument{}, found {arguments}",
+                            required,
+                            if required == 1 { "" } else { "s" }
+                        )
+                    };
+                    self.diagnostics.push(ByteDiagnostic {
+                        range: callable_start..close + 1,
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: expected,
+                    });
+                }
+            }
+            search = close.saturating_add(1);
+        }
     }
 
     fn add_native_inspections(&mut self, text: &str) {
@@ -2828,7 +2932,13 @@ impl EntityInputHandler for EditorView {
             .or(self.marked_range.clone())
             .unwrap_or_else(|| self.selected_range());
         self.document.set_selection(range.start, range.end);
-        self.insert_text_with_pairs(text);
+        let insertion =
+            if text == "-" && range.start == range.end && self.should_expand_member_dash() {
+                "->"
+            } else {
+                text
+            };
+        self.insert_text_with_pairs(insertion);
         self.after_edit(cx);
     }
 
@@ -2980,6 +3090,41 @@ fn trim_eol(text: &str) -> &str {
     text.strip_suffix("\r\n")
         .or_else(|| text.strip_suffix('\n'))
         .unwrap_or(text)
+}
+
+fn matching_paren(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, ch) in text[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn count_call_arguments(arguments: &str) -> usize {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let mut depth = 0usize;
+    let mut count = 1usize;
+    for ch in trimmed.chars() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
 }
 
 fn strip_snippet_placeholders(snippet: &str) -> String {

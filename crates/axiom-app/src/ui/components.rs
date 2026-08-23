@@ -28,6 +28,6 @@ pub fn separator() -> impl IntoElement {
     div().h_px().mx_1().bg(theme().border_subtle)
 }
 
-pub fn tooltip(text: &'static str, cx: &mut App) -> AnyView {
+pub fn tooltip(text: impl Into<SharedString>, cx: &mut App) -> AnyView {
     cx.new(|_| Tooltip { text: text.into() }).into()
 }
