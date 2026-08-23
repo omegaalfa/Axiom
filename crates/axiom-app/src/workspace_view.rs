@@ -4077,6 +4077,10 @@ impl WorkspaceView {
         let t = theme();
         let m = metrics();
         let workspace = cx.entity();
+        let project_root = self
+            .project
+            .as_ref()
+            .map(|project| project.root_path().to_path_buf());
         div()
             .h(m.tab_height)
             .flex()
@@ -4088,6 +4092,8 @@ impl WorkspaceView {
                 let title = editor.title();
                 let dirty = editor.is_dirty();
                 let icon = file_icon(&tab.path, false, false).glyph();
+                let tab_tooltip =
+                    tab_display_path(&tab.path, project_root.as_deref(), &self.runtime_stub_path);
                 let activate_workspace = workspace.clone();
                 let close_workspace = workspace.clone();
                 div()
@@ -4114,6 +4120,7 @@ impl WorkspaceView {
                         t.text_secondary
                     })
                     .hover(move |style| style.bg(t.hover))
+                    .tooltip(move |_, cx| tooltip(tab_tooltip.clone(), cx))
                     .on_click(move |_, window, cx| {
                         activate_workspace.update(cx, |this, cx| this.activate(index, window, cx));
                     })
@@ -5642,6 +5649,18 @@ fn debug_stubs_enabled() -> bool {
 
 fn normalize_modifiers(modifiers: Modifiers) -> (bool, bool, bool) {
     (modifiers.control, modifiers.shift, modifiers.alt)
+}
+
+fn tab_display_path(path: &Path, project_root: Option<&Path>, runtime_root: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(runtime_root) {
+        return format!("Runtime Stub\n{}", relative.display());
+    }
+    if let Some(root) = project_root
+        && let Ok(relative) = path.strip_prefix(root)
+    {
+        return relative.display().to_string();
+    }
+    path.display().to_string()
 }
 
 #[cfg(test)]
