@@ -958,9 +958,8 @@ impl EditorView {
     }
 
     fn add_native_argument_inspections(&mut self, text: &str) {
-        let Some(runtime) = self.runtime_symbols.as_ref() else {
-            return;
-        };
+        let runtime = self.runtime_symbols.clone();
+        let project = self.project_symbols.clone();
         let mut search = 0;
         while let Some(relative_open) = text[search..].find('(') {
             let open = search + relative_open;
@@ -986,37 +985,62 @@ impl EditorView {
                 search = close.saturating_add(1);
                 continue;
             }
-            let symbol = callable
-                .rsplit_once("::")
-                .or_else(|| callable.rsplit_once("->"))
-                .and_then(|(owner, _)| {
-                    let owner = self.resolve_native_type(owner.trim(), &text[..open])?;
-                    runtime
-                        .methods_of(&owner)
-                        .find(|symbol| symbol.name == name)
-                })
-                .or_else(|| runtime.find_function(name));
-            if let Some(symbol) = symbol
-                && let Some(signature) = symbol.signature.as_ref()
-            {
+            let runtime_signature = runtime.as_ref().and_then(|runtime| {
+                callable
+                    .rsplit_once("::")
+                    .or_else(|| callable.rsplit_once("->"))
+                    .and_then(|(owner, _)| {
+                        let owner = self.resolve_native_type(owner.trim(), &text[..open])?;
+                        runtime
+                            .methods_of(&owner)
+                            .find(|symbol| symbol.name == name)
+                    })
+                    .or_else(|| runtime.find_function(name))
+                    .and_then(|symbol| {
+                        symbol.signature.as_ref().map(|signature| {
+                            (
+                                signature
+                                    .parameters
+                                    .iter()
+                                    .filter(|parameter| !parameter.optional && !parameter.variadic)
+                                    .count(),
+                                signature.parameters.len(),
+                                signature
+                                    .parameters
+                                    .iter()
+                                    .any(|parameter| parameter.variadic),
+                            )
+                        })
+                    })
+            });
+            let signature_info = runtime_signature.or_else(|| {
+                let project = project.as_ref()?.read().ok()?;
+                let symbol = callable
+                    .rsplit_once("::")
+                    .or_else(|| callable.rsplit_once("->"))
+                    .and_then(|(owner, _)| {
+                        let owner = self.resolve_native_type(owner.trim(), &text[..open])?;
+                        project
+                            .find_methods(&owner)
+                            .into_iter()
+                            .find(|symbol| symbol.name == name)
+                    })
+                    .or_else(|| {
+                        project.symbols().iter().find(|symbol| {
+                            symbol.kind == ProjectSymbolKind::Function && symbol.name == name
+                        })
+                    });
+                let detail = project_callable_detail(symbol?)?;
+                let (required, maximum, variadic) = signature_counts_from_detail(&detail);
+                Some((required, maximum, variadic))
+            });
+            if let Some((required, maximum, variadic)) = signature_info {
                 let arguments = count_call_arguments(&text[open + 1..close]);
-                let required = signature
-                    .parameters
-                    .iter()
-                    .filter(|parameter| !parameter.optional && !parameter.variadic)
-                    .count();
-                let variadic = signature
-                    .parameters
-                    .iter()
-                    .any(|parameter| parameter.variadic);
                 let too_few = arguments < required;
-                let too_many = !variadic && arguments > signature.parameters.len();
+                let too_many = !variadic && arguments > maximum;
                 if too_few || too_many {
                     let expected = if too_many {
-                        format!(
-                            "Expected at most {} arguments, found {arguments}",
-                            signature.parameters.len()
-                        )
+                        format!("Expected at most {maximum} arguments, found {arguments}")
                     } else {
                         format!(
                             "Expected {} argument{}, found {arguments}",
@@ -3107,6 +3131,54 @@ fn matching_paren(text: &str, open: usize) -> Option<usize> {
         }
     }
     None
+}
+
+fn project_callable_detail(symbol: &axiom_index::ProjectSymbol) -> Option<String> {
+    let text = std::fs::read_to_string(&symbol.file).ok()?;
+    let needle = format!("function {}", symbol.name);
+    let start = text.find(&needle)?;
+    let tail = &text[start + needle.len()..];
+    let open = tail.find('(')?;
+    let close = matching_paren(tail, open)?;
+    let suffix = tail[close + 1..]
+        .trim_start()
+        .strip_prefix(':')
+        .and_then(|value| value.split(['{', '\n']).next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(": {value}"))
+        .unwrap_or_default();
+    Some(format!("{}{}{}", symbol.name, &tail[open..=close], suffix))
+}
+
+fn signature_counts_from_detail(detail: &str) -> (usize, usize, bool) {
+    let Some(open) = detail.find('(') else {
+        return (0, 0, false);
+    };
+    let Some(close) = matching_paren(detail, open) else {
+        return (0, 0, false);
+    };
+    let parameters = &detail[open + 1..close];
+    if parameters.trim().is_empty() {
+        return (0, 0, false);
+    }
+    let mut required = 0;
+    let mut maximum = 0;
+    let mut variadic = false;
+    for parameter in parameters.split(',') {
+        let parameter = parameter.trim();
+        if parameter.is_empty() {
+            continue;
+        }
+        maximum += 1;
+        if parameter.contains("...") {
+            variadic = true;
+        }
+        if !parameter.contains('=') && !parameter.contains("...") {
+            required += 1;
+        }
+    }
+    (required, maximum, variadic)
 }
 
 fn count_call_arguments(arguments: &str) -> usize {
