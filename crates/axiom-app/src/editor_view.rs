@@ -374,11 +374,13 @@ impl EditorView {
 
     pub fn set_runtime_symbols(&mut self, symbols: Arc<RuntimeSymbolIndex>) {
         self.runtime_symbols = Some(symbols);
+        self.sync_syntax();
     }
 
     pub fn set_project_symbols(&mut self, symbols: Arc<std::sync::RwLock<ProjectSymbolIndex>>) {
         self.project_symbols = Some(symbols);
         self.project_index_revision = Some(Arc::new(AtomicU64::new(0)));
+        self.sync_syntax();
     }
 
     pub fn close_lsp_document(&self) {
@@ -1341,6 +1343,9 @@ impl EditorView {
                         if debug_completion_enabled() {
                             tracing::info!(symbol = %symbol.name, source = %symbol.location.file.display(), "[RUNTIME COMPLETION]");
                         }
+                        let import = matches!(symbol.kind, RuntimeKind::Class | RuntimeKind::Interface | RuntimeKind::Trait | RuntimeKind::Enum)
+                            .then(|| self.composer_import_edit(&symbol.fqn))
+                            .flatten();
                         CompletionItem {
                         label: symbol.name.clone(),
                         detail: Some(
@@ -1358,6 +1363,7 @@ impl EditorView {
                             | RuntimeKind::Enum => CompletionItemKind::CLASS,
                             _ => CompletionItemKind::VALUE,
                         }),
+                        additional_text_edits: import.map(|edit| vec![edit]),
                         ..Default::default()
                         }
                     })
@@ -1533,7 +1539,11 @@ impl EditorView {
                     .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '\\')
                     .collect();
                 if !name.is_empty() {
-                    return Some(self.qualify_type(&name));
+                    let resolved = self.qualify_type(&name);
+                    if debug_completion_enabled() {
+                        tracing::info!(variable = %variable, written = %name, resolved = %resolved, source = "runtime/project", "[LOCAL TYPE]");
+                    }
+                    return Some(resolved);
                 }
             }
         }
@@ -3012,13 +3022,13 @@ impl EntityInputHandler for EditorView {
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or_else(|| self.selected_range());
+        let smart_arrow =
+            text == "-" && range.start == range.end && self.should_expand_member_dash();
+        if smart_arrow && debug_completion_enabled() {
+            tracing::info!(converted = true, "[SMART ARROW]");
+        }
         self.document.set_selection(range.start, range.end);
-        let insertion =
-            if text == "-" && range.start == range.end && self.should_expand_member_dash() {
-                "->"
-            } else {
-                text
-            };
+        let insertion = if smart_arrow { "->" } else { text };
         self.insert_text_with_pairs(insertion);
         self.after_edit(cx);
     }
