@@ -3360,6 +3360,28 @@ impl WorkspaceView {
         let t = theme();
         let m = metrics();
         let workspace = cx.entity();
+        let selection_start = self
+            .explorer_selection
+            .range
+            .start
+            .min(self.explorer_selection.range.end);
+        let selection_end = self
+            .explorer_selection
+            .range
+            .start
+            .max(self.explorer_selection.range.end);
+        let caret = self
+            .explorer_selection
+            .range
+            .end
+            .min(self.explorer_input.encode_utf16().count());
+        let input_before = utf16_slice(&self.explorer_input, 0, selection_start);
+        let input_selected = utf16_slice(&self.explorer_input, selection_start, selection_end);
+        let input_after = utf16_slice(
+            &self.explorer_input,
+            selection_end,
+            self.explorer_input.encode_utf16().count(),
+        );
         let title = match self.explorer_operation {
             Some(ExplorerOperation::Rename(_)) => "Rename",
             Some(ExplorerOperation::NewDirectory(_)) => "New Directory",
@@ -3413,7 +3435,11 @@ impl WorkspaceView {
                             workspace.update(cx, |this, cx| {
                                 window.focus(&this.modal_input_focus);
                                 let x: f32 = event.position.x.into();
-                                let new = ((x - 340.0).max(0.0) / 8.0).round() as usize;
+                                // GPUI reports window coordinates for this
+                                // listener. Keep a relative fallback for
+                                // platform backends that report local points.
+                                let local_x = if x > 120.0 { x - 340.0 } else { x };
+                                let new = (local_x.max(0.0) / 8.0).round() as usize;
                                 let new = new.min(this.explorer_input.encode_utf16().count());
                                 let old = this.explorer_selection.range.end;
                                 this.explorer_selection = UTF16Selection {
@@ -3422,7 +3448,7 @@ impl WorkspaceView {
                                 };
                                 if debug_input_enabled() {
                                     tracing::info!("[MODAL INPUT MOUSE DOWN]");
-                                    tracing::info!(old, new, "[MODAL CARET]");
+                                    tracing::info!(x, old, new, "[MODAL CARET]");
                                 }
                                 cx.notify();
                             });
@@ -3440,7 +3466,35 @@ impl WorkspaceView {
                             });
                         }
                     })
-                    .child(self.explorer_input.clone())
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .h_full()
+                            .font_family("Cascadia Mono")
+                            .child(
+                                div()
+                                    .flex()
+                                    .h_full()
+                                    .items_center()
+                                    .child(input_before)
+                                    .child(
+                                        div()
+                                            .when(!input_selected.is_empty(), |this| this.bg(t.selection))
+                                            .child(input_selected),
+                                    )
+                                    .child(input_after),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px((caret as f32) * 8.0))
+                                    .top(px(4.))
+                                    .w(px(1.))
+                                    .h(px(25.))
+                                    .bg(t.text_primary),
+                            ),
+                    )
                     .child(WorkspaceInputElement {
                         workspace: workspace.clone(),
                         focus: self.modal_input_focus.clone(),
@@ -4877,6 +4931,17 @@ fn utf16_to_byte_offset(text: &str, offset: usize) -> usize {
     text.len()
 }
 
+fn utf16_slice(text: &str, start: usize, end: usize) -> String {
+    let (start, end) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let start_byte = utf16_to_byte_offset(text, start);
+    let end_byte = utf16_to_byte_offset(text, end);
+    text[start_byte..end_byte].to_owned()
+}
+
 fn debug_keys_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_KEYS").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
@@ -4895,7 +4960,7 @@ fn normalize_modifiers(modifiers: Modifiers) -> (bool, bool, bool) {
 
 #[cfg(test)]
 mod modifier_tests {
-    use super::{normalize_modifiers, utf16_to_byte_offset};
+    use super::{normalize_modifiers, utf16_slice, utf16_to_byte_offset};
     use gpui::Modifiers;
 
     #[test]
@@ -4940,5 +5005,11 @@ mod modifier_tests {
         let mut replaced = value.to_owned();
         replaced.replace_range(start_byte..end_byte, "Example");
         assert_eq!(replaced, "Example.php");
+    }
+
+    #[test]
+    fn modal_selection_slice_handles_unicode_ranges() {
+        assert_eq!(utf16_slice("A😀B.php", 0, 3), "A😀");
+        assert_eq!(utf16_slice("A😀B.php", 3, 4), "B");
     }
 }
