@@ -54,6 +54,7 @@ actions!(
         ToggleProject,
         ToggleTerminal,
         OpenInTerminal,
+        ImportRuntimeStubs,
         CommandPalette,
         Settings,
         PaletteUp,
@@ -430,6 +431,20 @@ impl WorkspaceView {
                                                                     &this.runtime_stub_path,
                                                                 );
                                                                 cx.notify();
+                                                            });
+                                                        }
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("runtime-stubs-import")
+                                                    .px_2()
+                                                    .child("Import…")
+                                                    .on_click({
+                                                        let workspace = workspace.clone();
+                                                        move |_, _, cx| {
+                                                            workspace.update(cx, |this, cx| {
+                                                                this.import_runtime_stubs(cx)
                                                             });
                                                         }
                                                     }),
@@ -1499,6 +1514,52 @@ impl WorkspaceView {
         self.settings_visible = true;
         self.settings_query.clear();
         self.settings_selected = None;
+        cx.notify();
+    }
+
+    fn import_runtime_stubs_action(
+        &mut self,
+        _: &ImportRuntimeStubs,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_menu = None;
+        self.import_runtime_stubs(cx);
+    }
+
+    fn import_runtime_stubs(&mut self, cx: &mut Context<Self>) {
+        let target = self.runtime_stub_path.clone();
+        let workspace = cx.entity().downgrade();
+        self.status = "Runtime Stubs: Choose a folder to import...".into();
+        cx.spawn(async move |_, cx| {
+            let selected = rfd::AsyncFileDialog::new()
+                .pick_folder()
+                .await
+                .map(|handle| handle.path().to_path_buf());
+            let result = selected.map_or_else(
+                || Ok(None),
+                |source| {
+                    if source == target {
+                        return Ok(Some(0));
+                    }
+                    copy_stub_tree(&source, &target).map(Some)
+                },
+            );
+            let _ = workspace.update(cx, |this, cx| {
+                match result {
+                    Ok(Some(count)) => {
+                        this.status = format!("Imported {count} runtime stub file(s)").into();
+                        this.reload_runtime_stubs(cx);
+                    }
+                    Ok(None) => this.status = "Runtime stubs import cancelled".into(),
+                    Err(error) => {
+                        this.status = format!("Runtime stubs import failed: {error}").into()
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -4025,6 +4086,10 @@ impl WorkspaceView {
             .when(menu == Some(MenuKind::File), |this| {
                 this.child(self.command_dispatch_item("project.open_project", "Open Project…", cx))
                     .child(self.command_dispatch_item("project.open_file", "Open File…", cx))
+                    .child(Self::action_item(
+                        "Import Runtime Stubs…",
+                        ImportRuntimeStubs,
+                    ))
                     .child(self.command_item("editor.save", "Save", crate::editor_view::Save))
                     .child(Self::action_item("Save All", SaveAll))
                     .child(Self::action_item("Close File", CloseFile))
@@ -4716,6 +4781,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::find))
             .on_action(cx.listener(Self::toggle_project))
             .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::import_runtime_stubs_action))
             .on_action(cx.listener(Self::navigate_back))
             .on_action(cx.listener(Self::navigate_forward))
             .on_action(cx.listener(Self::go_to_class))
@@ -5226,6 +5292,28 @@ fn debug_input_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
+}
+
+fn copy_stub_tree(source: &Path, target: &Path) -> std::io::Result<usize> {
+    fn copy_directory(source: &Path, target: &Path, count: &mut usize) -> std::io::Result<()> {
+        fs::create_dir_all(target)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let path = entry.path();
+            let destination = target.join(entry.file_name());
+            if path.is_dir() {
+                copy_directory(&path, &destination, count)?;
+            } else if path.is_file() {
+                fs::copy(&path, &destination)?;
+                *count += 1;
+            }
+        }
+        Ok(())
+    }
+
+    let mut count = 0;
+    copy_directory(source, target, &mut count)?;
+    Ok(count)
 }
 
 fn debug_completion_enabled() -> bool {
