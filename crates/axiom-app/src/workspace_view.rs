@@ -55,6 +55,7 @@ actions!(
         ToggleTerminal,
         OpenInTerminal,
         ImportRuntimeStubs,
+        ImportRuntimeStubFiles,
         CommandPalette,
         Settings,
         PaletteUp,
@@ -431,6 +432,20 @@ impl WorkspaceView {
                                                                     &this.runtime_stub_path,
                                                                 );
                                                                 cx.notify();
+                                                            });
+                                                        }
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("runtime-stubs-import-files")
+                                                    .px_2()
+                                                    .child("Import Files…")
+                                                    .on_click({
+                                                        let workspace = workspace.clone();
+                                                        move |_, _, cx| {
+                                                            workspace.update(cx, |this, cx| {
+                                                                this.import_runtime_stub_files(cx)
                                                             });
                                                         }
                                                     }),
@@ -1527,6 +1542,16 @@ impl WorkspaceView {
         self.import_runtime_stubs(cx);
     }
 
+    fn import_runtime_stub_files_action(
+        &mut self,
+        _: &ImportRuntimeStubFiles,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_menu = None;
+        self.import_runtime_stub_files(cx);
+    }
+
     fn import_runtime_stubs(&mut self, cx: &mut Context<Self>) {
         let target = self.runtime_stub_path.clone();
         let workspace = cx.entity().downgrade();
@@ -1540,15 +1565,60 @@ impl WorkspaceView {
                 || Ok(None),
                 |source| {
                     if source == target {
-                        return Ok(Some(0));
+                        return Ok(Some(StubImportReport::default()));
                     }
                     copy_stub_tree(&source, &target).map(Some)
                 },
             );
             let _ = workspace.update(cx, |this, cx| {
                 match result {
-                    Ok(Some(count)) => {
-                        this.status = format!("Imported {count} runtime stub file(s)").into();
+                    Ok(Some(report)) => {
+                        this.status = format!(
+                            "Imported {} stub files ({} conflicts skipped)",
+                            report.copied, report.conflicts
+                        )
+                        .into();
+                        this.reload_runtime_stubs(cx);
+                    }
+                    Ok(None) => this.status = "Runtime stubs import cancelled".into(),
+                    Err(error) => {
+                        this.status = format!("Runtime stubs import failed: {error}").into()
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn import_runtime_stub_files(&mut self, cx: &mut Context<Self>) {
+        let target = self.runtime_stub_path.clone();
+        let workspace = cx.entity().downgrade();
+        self.status = "Runtime Stubs: Choose PHP files to import...".into();
+        cx.spawn(async move |_, cx| {
+            let selected = rfd::AsyncFileDialog::new()
+                .add_filter("PHP stubs", &["php"])
+                .pick_files()
+                .await
+                .map(|files| {
+                    files
+                        .into_iter()
+                        .map(|file| file.path().to_path_buf())
+                        .collect::<Vec<_>>()
+                });
+            let result = selected.map_or_else(
+                || Ok(None),
+                |files| copy_stub_files(&files, &target).map(Some),
+            );
+            let _ = workspace.update(cx, |this, cx| {
+                match result {
+                    Ok(Some(report)) => {
+                        this.status = format!(
+                            "Imported {} stub files ({} conflicts skipped)",
+                            report.copied, report.conflicts
+                        )
+                        .into();
                         this.reload_runtime_stubs(cx);
                     }
                     Ok(None) => this.status = "Runtime stubs import cancelled".into(),
@@ -4090,6 +4160,10 @@ impl WorkspaceView {
                         "Import Runtime Stubs…",
                         ImportRuntimeStubs,
                     ))
+                    .child(Self::action_item(
+                        "Import Stub Files",
+                        ImportRuntimeStubFiles,
+                    ))
                     .child(self.command_item("editor.save", "Save", crate::editor_view::Save))
                     .child(Self::action_item("Save All", SaveAll))
                     .child(Self::action_item("Close File", CloseFile))
@@ -4782,6 +4856,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::toggle_project))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::import_runtime_stubs_action))
+            .on_action(cx.listener(Self::import_runtime_stub_files_action))
             .on_action(cx.listener(Self::navigate_back))
             .on_action(cx.listener(Self::navigate_forward))
             .on_action(cx.listener(Self::go_to_class))
@@ -5294,26 +5369,60 @@ fn debug_input_enabled() -> bool {
     })
 }
 
-fn copy_stub_tree(source: &Path, target: &Path) -> std::io::Result<usize> {
-    fn copy_directory(source: &Path, target: &Path, count: &mut usize) -> std::io::Result<()> {
+#[derive(Default)]
+struct StubImportReport {
+    copied: usize,
+    conflicts: usize,
+}
+
+fn copy_stub_files(files: &[PathBuf], target: &Path) -> std::io::Result<StubImportReport> {
+    let mut report = StubImportReport::default();
+    fs::create_dir_all(target)?;
+    for file in files {
+        if file.extension().and_then(|value| value.to_str()) != Some("php") {
+            continue;
+        }
+        let destination = target.join(file.file_name().unwrap_or_default());
+        if destination.exists() {
+            report.conflicts += 1;
+            continue;
+        }
+        fs::copy(file, destination)?;
+        report.copied += 1;
+    }
+    Ok(report)
+}
+
+fn copy_stub_tree(source: &Path, target: &Path) -> std::io::Result<StubImportReport> {
+    fn copy_directory(
+        source: &Path,
+        target: &Path,
+        report: &mut StubImportReport,
+    ) -> std::io::Result<()> {
         fs::create_dir_all(target)?;
         for entry in fs::read_dir(source)? {
             let entry = entry?;
             let path = entry.path();
             let destination = target.join(entry.file_name());
             if path.is_dir() {
-                copy_directory(&path, &destination, count)?;
-            } else if path.is_file() {
+                copy_directory(&path, &destination, report)?;
+            } else if path.is_file()
+                && path.extension().and_then(|value| value.to_str()) == Some("php")
+            {
+                if destination.exists() {
+                    report.conflicts += 1;
+                    continue;
+                }
                 fs::copy(&path, &destination)?;
-                *count += 1;
+                report.copied += 1;
             }
         }
         Ok(())
     }
 
-    let mut count = 0;
-    copy_directory(source, target, &mut count)?;
-    Ok(count)
+    let mut report = StubImportReport::default();
+    copy_directory(source, target, &mut report)?;
+    Ok(report)
 }
 
 fn debug_completion_enabled() -> bool {
