@@ -1256,6 +1256,9 @@ impl WorkspaceView {
             "code.completion" => {
                 self.dispatch_editor_action(crate::editor_view::Complete, window, cx)
             }
+            "editor.complete_statement" => {
+                self.dispatch_editor_action(crate::editor_view::CompleteStatement, window, cx)
+            }
             "navigate.definition" => {
                 let has_lsp = self
                     .active

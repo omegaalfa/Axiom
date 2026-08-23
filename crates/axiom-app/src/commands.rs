@@ -119,6 +119,13 @@ pub fn registry() -> Vec<CommandDescriptor> {
             "ctrl-space",
         ),
         command(
+            "editor.complete_statement",
+            "Complete Current Statement",
+            "Complete the current PHP statement with required delimiters when safe.",
+            "Code",
+            "ctrl-shift-enter",
+        ),
+        command(
             "terminal.toggle",
             "Terminal",
             "Shows or hides the integrated terminal.",

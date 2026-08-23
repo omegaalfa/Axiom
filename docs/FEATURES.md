@@ -62,6 +62,11 @@ LSP completion, hover, diagnostics, references, formatting, and signature help
 depend on a configured compatible PHP server such as Intelephense. Rich PHP
 type inference and framework-specific intelligence are still being expanded.
 
+Call completion safely adds `()` for function and method proposals, exposes
+runtime/project signature details, and shows native signature help with the
+active parameter highlighted. `Complete Current Statement` (`Ctrl+Shift+Enter`)
+adds a semicolon only when the caret is at the end of an unterminated line.
+
 ## Planned
 
 Debugger, complete Git UI, plugin marketplace, deep Laravel/Symfony support,

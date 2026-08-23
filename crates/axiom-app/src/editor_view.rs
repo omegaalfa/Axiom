@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
+    fs,
     ops::Range,
     path::{Path, PathBuf},
     sync::{
@@ -68,6 +69,7 @@ actions!(
         NativeDefinition,
         Reformat,
         SignatureHelp,
+        CompleteStatement,
         Escape,
     ]
 );
@@ -113,6 +115,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-alt-l", Reformat, Some("Editor")),
         KeyBinding::new("secondary-alt-l", Reformat, Some("Editor")),
         KeyBinding::new("ctrl-shift-space", SignatureHelp, Some("Editor")),
+        KeyBinding::new("ctrl-shift-enter", CompleteStatement, Some("Editor")),
         KeyBinding::new("escape", Escape, Some("Editor")),
     ]
 }
@@ -671,7 +674,9 @@ impl EditorView {
     }
 
     fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
-        if self.document.selection_offsets().is_some() {
+        if !self.completions.is_empty() {
+            self.accept_completion(cx);
+        } else if self.document.selection_offsets().is_some() {
             self.transform_selected_lines(true, cx);
         } else {
             self.document.insert_text("    ");
@@ -834,6 +839,11 @@ impl EditorView {
         self.sync_lsp();
         self.schedule_incremental_index_update();
         self.maybe_trigger_completion();
+        let cursor = self.document.cursor_offset();
+        let content = self.document.content();
+        if cursor > 0 && matches!(content[..cursor].chars().next_back(), Some('(' | ',')) {
+            self.hover_popup = self.native_signature_help();
+        }
         let native = self.native_completions();
         if native.is_empty() {
             self.completions.clear();
@@ -1147,7 +1157,7 @@ impl EditorView {
                             })
                             .map(|symbol| CompletionItem {
                                 label: symbol.name.clone(),
-                                detail: Some(format!("{:?} • Project", symbol.kind)),
+                                detail: Some(project_method_detail(symbol)),
                                 kind: Some(CompletionItemKind::METHOD),
                                 ..Default::default()
                             }),
@@ -1184,7 +1194,13 @@ impl EditorView {
                     .take(40)
                     .map(|symbol| CompletionItem {
                         label: symbol.name.clone(),
-                        detail: Some(format!("{:?} • PHP Runtime", symbol.kind)),
+                        detail: Some(
+                            if matches!(symbol.kind, RuntimeKind::Function | RuntimeKind::Method) {
+                                runtime_signature_detail(symbol)
+                            } else {
+                                format!("{:?} • PHP Runtime", symbol.kind)
+                            },
+                        ),
                         kind: Some(match symbol.kind {
                             RuntimeKind::Function => CompletionItemKind::FUNCTION,
                             RuntimeKind::Class
@@ -1460,11 +1476,123 @@ impl EditorView {
         }
     }
 
-    fn signature_help(&mut self, _: &SignatureHelp, _: &mut Window, _: &mut Context<Self>) {
+    fn signature_help(&mut self, _: &SignatureHelp, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.native_signature_help() {
+            self.hover_popup = Some(text);
+            cx.notify();
+        }
         if let (Some(lsp), Some(uri), Some(position)) =
             (&self.lsp, &self.lsp_uri, self.lsp_position())
         {
             lsp.request_signature_help(uri.clone(), position);
+        }
+    }
+
+    fn native_signature_help(&self) -> Option<String> {
+        let text = self.document.content();
+        let cursor = self.document.cursor_offset().min(text.len());
+        let before = &text[..cursor];
+        let open = before.rfind('(')?;
+        let callable = before[..open]
+            .trim_end()
+            .rsplit(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == ':'))
+            .next()?;
+        let name = callable.rsplit("::").next().unwrap_or(callable);
+        let receiver = callable
+            .rsplit_once("::")
+            .map(|(owner, _)| owner)
+            .or_else(|| {
+                before[..open].rsplit_once("->").map(|(owner, _)| {
+                    owner
+                        .trim()
+                        .rsplit(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '$')
+                        .next()
+                        .unwrap_or(owner)
+                })
+            });
+        if let Some(index) = &self.project_symbols {
+            let owner = receiver;
+            if let Some(owner) =
+                owner.and_then(|owner| self.resolve_native_type(owner, &text[..open]))
+                && let Ok(index) = index.read()
+                && let Some(method) = index
+                    .find_methods(&owner)
+                    .into_iter()
+                    .find(|method| method.name == name)
+            {
+                let detail = project_method_detail(method);
+                return Some(
+                    detail
+                        .strip_suffix(" • Project")
+                        .unwrap_or(&detail)
+                        .to_owned(),
+                );
+            }
+        }
+        let symbol = self.runtime_symbols.as_ref().and_then(|index| {
+            index
+                .find_function(name)
+                .or_else(|| index.find_function(&format!("\\{name}")))
+                .or_else(|| {
+                    receiver.and_then(|owner| {
+                        index.methods_of(owner).find(|symbol| symbol.name == name)
+                    })
+                })
+        })?;
+        let signature = symbol.signature.as_ref()?;
+        let active = before[open + 1..].chars().filter(|ch| *ch == ',').count();
+        let params = signature
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(index, parameter)| {
+                let ty = parameter.declared_type.as_deref().unwrap_or("");
+                let optional = if parameter.optional { " = …" } else { "" };
+                let variadic = if parameter.variadic { "..." } else { "" };
+                let marker = if index == active { "▶ " } else { "" };
+                format!(
+                    "{marker}{ty} {variadic}${}{optional}",
+                    parameter.name.trim_start_matches('$')
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let return_type = signature
+            .declared_return_type
+            .as_deref()
+            .or(signature.phpdoc_return_type.as_deref())
+            .map(|value| format!(": {value}"))
+            .unwrap_or_default();
+        Some(format!("{}({}){}", symbol.name, params, return_type))
+    }
+
+    #[allow(dead_code)]
+    fn complete_statement(
+        &mut self,
+        _: &CompleteStatement,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cursor = self.document.cursor_offset();
+        let text = self.document.content();
+        let line_start = text[..cursor].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = text[cursor..].find('\n').map_or(text.len(), |i| cursor + i);
+        let line = &text[line_start..line_end];
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed.ends_with([';', '{', '}', ':', ',']) {
+            return;
+        }
+        if line[cursor.saturating_sub(line_start)..].trim().is_empty() {
+            self.document.move_cursor(line_end);
+            self.document.insert_text(";");
+            self.after_edit(cx);
+            if debug_input_enabled() {
+                tracing::info!(
+                    kind = "expression_statement",
+                    semicolon = true,
+                    "[COMPLETE STATEMENT]"
+                );
+            }
         }
     }
 
@@ -1520,6 +1648,22 @@ impl EditorView {
         if item.insert_text_format == Some(InsertTextFormat::SNIPPET) {
             text = strip_snippet_placeholders(&text);
         }
+        let content_before = self.document.content();
+        let call_like = matches!(
+            item.kind,
+            Some(CompletionItemKind::FUNCTION)
+                | Some(CompletionItemKind::METHOD)
+                | Some(CompletionItemKind::CONSTRUCTOR)
+        ) || (item.kind == Some(CompletionItemKind::CLASS)
+            && content_before[..range.start].trim_end().ends_with("new"));
+        let has_open = content_before[range.end..].starts_with('(')
+            || text.ends_with('(')
+            || text.contains("()");
+        if call_like && !has_open {
+            text.push('(');
+            text.push(')');
+        }
+        let inserted_text = text.clone();
         let mut edits = item.additional_text_edits.unwrap_or_default();
         let encoding = self
             .lsp
@@ -1538,6 +1682,17 @@ impl EditorView {
         let updated = axiom_lsp::apply_text_edits(&content, &edits, encoding);
         self.document.select_all();
         self.document.insert_text(&updated);
+        if call_like {
+            let inserted = inserted_text.trim_end_matches(')');
+            if let Some(position) = updated.find(inserted) {
+                let caret = if inserted_text.ends_with("()") {
+                    position + inserted_text.len() - 1
+                } else {
+                    position + inserted_text.len()
+                };
+                self.document.move_cursor(caret.min(updated.len()));
+            }
+        }
         self.completions.clear();
         self.after_edit(cx);
     }
@@ -2095,6 +2250,28 @@ fn runtime_signature_detail(symbol: &axiom_php::Symbol) -> String {
     format!("{}{} • {:?}", symbol.name, signature, symbol.origin)
 }
 
+fn project_method_detail(symbol: &axiom_index::ProjectSymbol) -> String {
+    let signature = fs::read_to_string(&symbol.file)
+        .ok()
+        .and_then(|text| {
+            let needle = format!("function {}", symbol.name);
+            let start = text.find(&needle)?;
+            let tail = &text[start + needle.len()..];
+            let open = tail.find('(')?;
+            let close = tail[open + 1..].find(')')? + open + 1;
+            let after = &tail[close + 1..];
+            let return_type = after
+                .trim_start()
+                .strip_prefix(':')
+                .and_then(|value| value.split_whitespace().next())
+                .map(|value| format!(": {value}"))
+                .unwrap_or_default();
+            Some(format!("{}{}", &tail[open..=close], return_type))
+        })
+        .unwrap_or_default();
+    format!("{}{} • Project", symbol.name, signature)
+}
+
 fn debug_input_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT").is_some()
 }
@@ -2159,6 +2336,7 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::references))
             .on_action(cx.listener(Self::reformat))
             .on_action(cx.listener(Self::signature_help))
+            .on_action(cx.listener(Self::complete_statement))
             .on_action(cx.listener(Self::escape))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
