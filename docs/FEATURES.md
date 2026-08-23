@@ -16,7 +16,11 @@ The current shortcut is shown in the Edit menu and in Settings → Keymap.
 Press `Ctrl+Space` at a PHP expression. Native project/runtime indexes are used
 when available; a configured LSP can provide additional results. Member
 completion also opens automatically after `->`, `::`, and `new` when the
-relevant index is ready.
+relevant index is ready. Dirty PHP buffers are re-indexed in the background
+after a short debounce, so newly added or removed methods become available
+without saving or restarting the IDE. Resolution currently covers common
+`new`, parameter/property declaration, `$this`, import, static, and runtime
+cases; complex unions and framework magic remain partial.
 
 ### Go to Definition
 

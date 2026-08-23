@@ -3,7 +3,12 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+    time::Duration,
 };
 
 use axiom_editor::Document;
@@ -136,6 +141,7 @@ pub struct EditorView {
     line_layouts: RefCell<HashMap<usize, CachedLineLayout>>,
     runtime_symbols: Option<Arc<RuntimeSymbolIndex>>,
     project_symbols: Option<Arc<std::sync::RwLock<ProjectSymbolIndex>>>,
+    project_index_revision: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Clone)]
@@ -191,6 +197,7 @@ impl EditorView {
             line_layouts: RefCell::new(HashMap::new()),
             runtime_symbols: None,
             project_symbols: None,
+            project_index_revision: None,
         };
         view.sync_syntax();
         view
@@ -366,6 +373,7 @@ impl EditorView {
 
     pub fn set_project_symbols(&mut self, symbols: Arc<std::sync::RwLock<ProjectSymbolIndex>>) {
         self.project_symbols = Some(symbols);
+        self.project_index_revision = Some(Arc::new(AtomicU64::new(0)));
     }
 
     pub fn close_lsp_document(&self) {
@@ -824,6 +832,7 @@ impl EditorView {
     fn after_edit(&mut self, cx: &mut Context<Self>) {
         self.sync_syntax();
         self.sync_lsp();
+        self.schedule_incremental_index_update();
         self.maybe_trigger_completion();
         let native = self.native_completions();
         if native.is_empty() {
@@ -837,6 +846,29 @@ impl EditorView {
         self.ctrl_hover_range = None;
         self.ensure_cursor_visible();
         cx.notify();
+    }
+
+    fn schedule_incremental_index_update(&self) {
+        let (Some(index), Some(revision)) = (
+            self.project_symbols.clone(),
+            self.project_index_revision.clone(),
+        ) else {
+            return;
+        };
+        let generation = revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let path = self.file_path.clone();
+        let text = self.document.content();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            if revision.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            if let Ok(mut index) = index.write()
+                && revision.load(Ordering::SeqCst) == generation
+            {
+                let _ = index.index_file_text(path, text);
+            }
+        });
     }
 
     fn maybe_trigger_completion(&self) {
@@ -1082,7 +1114,11 @@ impl EditorView {
             .last()
             .map_or(cursor, |(i, _)| i);
         let prefix = &text[start..cursor];
-        if prefix.len() < 2 {
+        let empty_prefix_context = before.ends_with("new ")
+            || before.ends_with("extends ")
+            || before.ends_with("implements ")
+            || before.ends_with("use ");
+        if prefix.is_empty() && member_operator.is_none() && !empty_prefix_context {
             return Vec::new();
         }
         if let Some((operator_start, is_static)) = member_operator {
@@ -1302,15 +1338,19 @@ impl EditorView {
             }
         }
         if let Some(pos) = context.rfind(&format!("${candidate}")) {
-            let tail = &context[pos.saturating_sub(120)..pos];
-            if let Some(colon) = tail.rfind(' ') {
-                let ty: String = tail[colon + 1..]
+            let declaration = &context[..pos];
+            let ty = declaration
+                .split_whitespace()
+                .last()
+                .unwrap_or_default()
+                .trim_start_matches('?')
+                .trim_matches('|');
+            if !ty.is_empty()
+                && ty
                     .chars()
-                    .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '\\')
-                    .collect();
-                if !ty.is_empty() {
-                    return Some(self.qualify_type(&ty));
-                }
+                    .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '\\')
+            {
+                return Some(self.qualify_type(ty));
             }
         }
         let lower = candidate.to_ascii_lowercase();
