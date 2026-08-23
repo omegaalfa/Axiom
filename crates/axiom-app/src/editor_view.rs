@@ -1176,11 +1176,16 @@ impl EditorView {
                                 symbol.name.starts_with(prefix)
                                     && (is_static || !symbol.name.starts_with('_'))
                             })
-                            .map(|symbol| CompletionItem {
-                                label: symbol.name.clone(),
-                                detail: Some(runtime_signature_detail(symbol)),
-                                kind: Some(CompletionItemKind::METHOD),
-                                ..Default::default()
+                            .map(|symbol| {
+                                if debug_completion_enabled() {
+                                    tracing::info!(class = %class_fqn, member = %symbol.name, source = %symbol.location.file.display(), "[RUNTIME COMPLETION]");
+                                }
+                                CompletionItem {
+                                    label: symbol.name.clone(),
+                                    detail: Some(runtime_signature_detail(symbol)),
+                                    kind: Some(CompletionItemKind::METHOD),
+                                    ..Default::default()
+                                }
                             }),
                     );
                 }
@@ -1201,7 +1206,11 @@ impl EditorView {
                     .search_prefix(prefix)
                     .into_iter()
                     .take(40)
-                    .map(|symbol| CompletionItem {
+                    .map(|symbol| {
+                        if debug_completion_enabled() {
+                            tracing::info!(symbol = %symbol.name, source = %symbol.location.file.display(), "[RUNTIME COMPLETION]");
+                        }
+                        CompletionItem {
                         label: symbol.name.clone(),
                         detail: Some(
                             if matches!(symbol.kind, RuntimeKind::Function | RuntimeKind::Method) {
@@ -1219,6 +1228,7 @@ impl EditorView {
                             _ => CompletionItemKind::VALUE,
                         }),
                         ..Default::default()
+                        }
                     })
                     .collect::<Vec<_>>()
             })
@@ -1549,6 +1559,9 @@ impl EditorView {
                 })
         })?;
         let signature = symbol.signature.as_ref()?;
+        if debug_completion_enabled() {
+            tracing::info!(symbol = %format!("{}::{}", symbol.fqn, symbol.name), parameters = signature.parameters.len(), source = %symbol.location.file.display(), "[RUNTIME SIGNATURE]");
+        }
         let active = before[open + 1..].chars().filter(|ch| *ch == ',').count();
         let params = signature
             .parameters

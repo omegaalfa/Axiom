@@ -937,6 +937,42 @@ mod tests {
     }
 
     #[test]
+    fn imported_custom_runtime_class_method_and_signature_are_indexed() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("CustomRuntime.php");
+        fs::write(
+            &file,
+            "<?php namespace AxiomTest; class CustomRuntime { public static function hello(string $name, int $age = 18): bool {} }",
+        )
+        .unwrap();
+        let (index, report) = StubProvider::new(root.path()).load().unwrap();
+        assert_eq!(report.files_parsed, 1);
+        let class = index.find_class("AxiomTest\\CustomRuntime").unwrap();
+        assert_eq!(class.fqn, "AxiomTest\\CustomRuntime");
+        let method = index
+            .methods_of("AxiomTest\\CustomRuntime")
+            .find(|symbol| symbol.name == "hello")
+            .unwrap();
+        let signature = method.signature.as_ref().unwrap();
+        assert_eq!(signature.parameters.len(), 2);
+        assert_eq!(
+            signature.parameters[0].declared_type.as_deref(),
+            Some("string")
+        );
+        assert_eq!(
+            signature.parameters[1].declared_type.as_deref(),
+            Some("int")
+        );
+        assert_eq!(signature.declared_return_type.as_deref(), Some("bool"));
+        assert!(
+            index
+                .search_prefix("CustomR")
+                .iter()
+                .any(|symbol| symbol.name == "CustomRuntime")
+        );
+    }
+
+    #[test]
     fn indexes_all_declaration_kinds_and_namespaces() {
         let (index, _) = load_fixture();
         assert_eq!(
