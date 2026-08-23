@@ -23,8 +23,8 @@ use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSe
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
-    LayoutId, Modifiers, MouseButton, Pixels, Point, SharedString, Style, Timer, UTF16Selection,
-    Window, actions, div, prelude::*, px, relative,
+    LayoutId, Modifiers, MouseButton, Pixels, Point, SharedString, Style, TextRun, Timer,
+    UTF16Selection, Window, actions, div, font, prelude::*, px, relative,
 };
 
 use crate::{
@@ -2164,11 +2164,9 @@ impl WorkspaceView {
         text: &str,
         cx: &mut Context<Self>,
     ) {
-        let start = utf16_to_byte_offset(&self.explorer_input, range.start);
-        let end = utf16_to_byte_offset(&self.explorer_input, range.end);
         let before = self.explorer_input.encode_utf16().count();
-        self.explorer_input.replace_range(start..end, text);
-        let caret = range.start + text.encode_utf16().count();
+        let (updated, caret) = replace_utf16_range(&self.explorer_input, range.clone(), text);
+        self.explorer_input = updated;
         self.explorer_selection = UTF16Selection {
             range: caret..caret,
             reversed: false,
@@ -3436,22 +3434,40 @@ impl WorkspaceView {
                         move |event, window, cx| {
                             cx.stop_propagation();
                             workspace.update(cx, |this, cx| {
+                                let before = this.explorer_selection.range.clone();
                                 window.focus(&this.modal_input_focus);
-                                let x: f32 = event.position.x.into();
-                                // GPUI reports window coordinates for this
-                                // listener. Keep a relative fallback for
-                                // platform backends that report local points.
-                                let local_x = if x > 120.0 { x - 340.0 } else { x };
-                                let new = (local_x.max(0.0) / 8.0).round() as usize;
-                                let new = new.min(this.explorer_input.encode_utf16().count());
-                                let old = this.explorer_selection.range.end;
+                                let absolute_x: f32 = event.position.x.into();
+                                // The input is inside the fixed modal at
+                                // left=320, border=1, padding=12+8. Keep this
+                                // origin in one place for mouse and caret
+                                // diagnostics; the text hit-test itself uses
+                                // GPUI's shaped line metrics.
+                                let text_origin_x = 341.0;
+                                let local_text_x = absolute_x - text_origin_x;
+                                let (byte_index, utf16_index) =
+                                    modal_hit_test(window, &this.explorer_input, local_text_x);
                                 this.explorer_selection = UTF16Selection {
-                                    range: new..new,
+                                    range: utf16_index..utf16_index,
                                     reversed: false,
                                 };
                                 if debug_input_enabled() {
-                                    tracing::info!("[MODAL INPUT MOUSE DOWN]");
-                                    tracing::info!(x, old, new, "[MODAL CARET]");
+                                    let text_width: f32 = modal_text_width(window, &this.explorer_input).into();
+                                    let input_selection = this
+                                        .selected_text_range(false, window, cx)
+                                        .map(|selection| selection.range);
+                                    tracing::info!(
+                                        local_x = local_text_x,
+                                        absolute_x,
+                                        text_origin_x,
+                                        text_width,
+                                        "[RENAME INPUT CLICK]"
+                                    );
+                                    tracing::info!(byte_index, utf16_index, "[RENAME HIT TEST]");
+                                    tracing::info!(before = ?before, after = ?this.explorer_selection.range, "[RENAME SELECTION]");
+                                    tracing::info!(
+                                        selected_range = ?input_selection,
+                                        "[INPUT HANDLER SELECTION]"
+                                    );
                                 }
                                 cx.notify();
                             });
@@ -4752,24 +4768,38 @@ impl EntityInputHandler for WorkspaceView {
             .is_some_and(|operation| matches!(operation, ExplorerOperation::Rename(_)));
         let editing_settings =
             self.settings_visible && !self.command_palette_visible && !editing_explorer;
-        let mut query = if editing_explorer {
+        let query = if editing_explorer {
             self.explorer_input.clone()
         } else if editing_settings {
             self.settings_query.clone()
         } else {
             self.command_palette_query.clone()
         };
-        let range =
-            range.unwrap_or_else(|| query.encode_utf16().count()..query.encode_utf16().count());
-        let start = utf16_to_byte_offset(&query, range.start);
-        let end = utf16_to_byte_offset(&query, range.end);
+        let range = range.unwrap_or_else(|| {
+            if editing_explorer {
+                let start = self
+                    .explorer_selection
+                    .range
+                    .start
+                    .min(self.explorer_selection.range.end);
+                let end = self
+                    .explorer_selection
+                    .range
+                    .start
+                    .max(self.explorer_selection.range.end);
+                start..end
+            } else {
+                let end = query.encode_utf16().count();
+                end..end
+            }
+        });
         let before_len = query.encode_utf16().count();
-        query.replace_range(start..end, text);
+        let (query, caret) = replace_utf16_range(&query, range.clone(), text);
         if editing_explorer {
             self.explorer_input = query;
             let length = self.explorer_input.encode_utf16().count();
             self.explorer_selection = UTF16Selection {
-                range: length..length,
+                range: caret..caret,
                 reversed: false,
             };
             if debug_input_enabled() {
@@ -4789,6 +4819,10 @@ impl EntityInputHandler for WorkspaceView {
                     value_len_after = length,
                     changed = true,
                     "[MODAL STATE]"
+                );
+                tracing::info!(
+                    selection_after = ?self.explorer_selection.range,
+                    "[RENAME SELECTION AFTER EDIT]"
                 );
                 if editing_rename {
                     tracing::info!(old_len = before_len, new_len = length, "[RENAME STATE]");
@@ -4831,16 +4865,14 @@ impl EntityInputHandler for WorkspaceView {
     }
     fn character_index_for_point(
         &mut self,
-        _: gpui::Point<gpui::Pixels>,
-        _: &mut Window,
+        point: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
         Some(if self.explorer_operation.is_some() {
-            // The clickable input element computes the caret from its window
-            // coordinates; GPUI asks this callback again during text dispatch.
-            // Return the authoritative caret rather than overwriting it with
-            // an absolute-window coordinate.
-            self.explorer_selection.range.end
+            let x: f32 = point.x.into();
+            let (_, utf16_index) = modal_hit_test(window, &self.explorer_input, x);
+            utf16_index
         } else if self.settings_visible && !self.command_palette_visible {
             self.settings_query.encode_utf16().count()
         } else {
@@ -4934,6 +4966,49 @@ fn utf16_to_byte_offset(text: &str, offset: usize) -> usize {
     text.len()
 }
 
+fn byte_to_utf16_offset(text: &str, offset: usize) -> usize {
+    let byte = offset.min(text.len());
+    text.get(..byte).unwrap_or(text).encode_utf16().count()
+}
+
+fn replace_utf16_range(
+    text: &str,
+    range: std::ops::Range<usize>,
+    replacement: &str,
+) -> (String, usize) {
+    let start = utf16_to_byte_offset(text, range.start);
+    let end = utf16_to_byte_offset(text, range.end);
+    let mut result = text.to_owned();
+    result.replace_range(start..end, replacement);
+    let caret = range.start + replacement.encode_utf16().count();
+    (result, caret)
+}
+
+fn modal_text_line(window: &mut Window, text: &str) -> gpui::ShapedLine {
+    let text: SharedString = text.to_owned().into();
+    let run = TextRun {
+        len: text.len(),
+        font: font("Cascadia Mono"),
+        color: window.text_style().color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window.text_system().shape_line(text, px(14.), &[run], None)
+}
+
+fn modal_text_width(window: &mut Window, text: &str) -> Pixels {
+    modal_text_line(window, text).width
+}
+
+fn modal_hit_test(window: &mut Window, text: &str, local_text_x: f32) -> (usize, usize) {
+    let shaped = modal_text_line(window, text);
+    let byte_index = shaped
+        .closest_index_for_x(px(local_text_x.max(0.0)))
+        .min(text.len());
+    (byte_index, byte_to_utf16_offset(text, byte_index))
+}
+
 fn utf16_slice(text: &str, start: usize, end: usize) -> String {
     let (start, end) = if start <= end {
         (start, end)
@@ -4963,7 +5038,10 @@ fn normalize_modifiers(modifiers: Modifiers) -> (bool, bool, bool) {
 
 #[cfg(test)]
 mod modifier_tests {
-    use super::{normalize_modifiers, utf16_slice, utf16_to_byte_offset};
+    use super::{
+        byte_to_utf16_offset, normalize_modifiers, replace_utf16_range, utf16_slice,
+        utf16_to_byte_offset,
+    };
     use gpui::Modifiers;
 
     #[test]
@@ -5008,6 +5086,44 @@ mod modifier_tests {
         let mut replaced = value.to_owned();
         replaced.replace_range(start_byte..end_byte, "Example");
         assert_eq!(replaced, "Example.php");
+    }
+
+    #[test]
+    fn rename_insertions_preserve_the_logical_caret() {
+        assert_eq!(
+            replace_utf16_range("test.php", 0..0, "X"),
+            ("Xtest.php".into(), 1)
+        );
+        assert_eq!(
+            replace_utf16_range("test.php", 2..2, "X"),
+            ("teXst.php".into(), 3)
+        );
+        assert_eq!(
+            replace_utf16_range("test.php", 4..4, "X"),
+            ("testX.php".into(), 5)
+        );
+        assert_eq!(
+            replace_utf16_range("test.php", 8..8, "X"),
+            ("test.phpX".into(), 9)
+        );
+    }
+
+    #[test]
+    fn rename_initial_selection_excludes_extension() {
+        let value = "test.php";
+        let basename_len = value
+            .rsplit_once('.')
+            .map(|(basename, _)| basename.encode_utf16().count())
+            .unwrap();
+        assert_eq!(basename_len, 4);
+    }
+
+    #[test]
+    fn rename_unicode_insert_uses_utf16_selection() {
+        let (result, caret) = replace_utf16_range("João.php", 2..2, "X");
+        assert_eq!(result, "JoXão.php");
+        assert_eq!(caret, 3);
+        assert_eq!(byte_to_utf16_offset(&result, 3), 3);
     }
 
     #[test]
