@@ -1277,6 +1277,13 @@ impl WorkspaceView {
             self.navigate_to_definition(DefinitionTarget { path, position }, cx);
         } else {
             self.status = "Definition não encontrada".into();
+            if debug_input_enabled() {
+                tracing::info!(
+                    success = false,
+                    reason = "no_definition",
+                    "[NAVIGATION RESULT]"
+                );
+            }
         }
     }
 
@@ -1451,6 +1458,7 @@ impl WorkspaceView {
             match key.as_str() {
                 "escape" => self.cancel_explorer_operation(cx),
                 "enter" => self.confirm_explorer_operation(cx),
+                _ if self.modal_key_edit(&key, event.keystroke.modifiers, cx) => {}
                 _ => {}
             }
             return;
@@ -2079,6 +2087,106 @@ impl WorkspaceView {
         self.explorer_extends.clear();
         self.explorer_implements.clear();
         cx.notify();
+    }
+
+    fn modal_replace_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let start = utf16_to_byte_offset(&self.explorer_input, range.start);
+        let end = utf16_to_byte_offset(&self.explorer_input, range.end);
+        let before = self.explorer_input.encode_utf16().count();
+        self.explorer_input.replace_range(start..end, text);
+        let caret = range.start + text.encode_utf16().count();
+        self.explorer_selection = UTF16Selection {
+            range: caret..caret,
+            reversed: false,
+        };
+        if debug_input_enabled() {
+            tracing::info!(
+                kind = if self
+                    .explorer_operation
+                    .as_ref()
+                    .is_some_and(|op| matches!(op, ExplorerOperation::Rename(_)))
+                {
+                    "rename"
+                } else {
+                    "explorer"
+                },
+                range_start = range.start,
+                range_end = range.end,
+                inserted_len = text.encode_utf16().count(),
+                "[MODAL REPLACE TEXT]"
+            );
+            if text.is_empty() {
+                tracing::info!(
+                    range_start = range.start,
+                    range_end = range.end,
+                    "[MODAL DELETE]"
+                );
+            }
+            tracing::info!(
+                value_len_before = before,
+                value_len_after = self.explorer_input.encode_utf16().count(),
+                changed = before != self.explorer_input.encode_utf16().count(),
+                "[MODAL STATE]"
+            );
+        }
+        cx.notify();
+    }
+
+    fn modal_key_edit(&mut self, key: &str, modifiers: Modifiers, cx: &mut Context<Self>) -> bool {
+        let length = self.explorer_input.encode_utf16().count();
+        let start = self
+            .explorer_selection
+            .range
+            .start
+            .min(self.explorer_selection.range.end);
+        let end = self
+            .explorer_selection
+            .range
+            .start
+            .max(self.explorer_selection.range.end);
+        if modifiers.control && key == "a" {
+            self.explorer_selection = UTF16Selection {
+                range: 0..length,
+                reversed: false,
+            };
+            cx.notify();
+            return true;
+        }
+        if key == "backspace" {
+            if start != end {
+                self.modal_replace_range(start..end, "", cx);
+            } else if start > 0 {
+                self.modal_replace_range(start - 1..start, "", cx);
+            }
+            return true;
+        }
+        if key == "delete" {
+            if start != end {
+                self.modal_replace_range(start..end, "", cx);
+            } else if end < length {
+                self.modal_replace_range(end..end + 1, "", cx);
+            }
+            return true;
+        }
+        if matches!(key, "left" | "right") {
+            let next = if key == "left" {
+                start.saturating_sub(1)
+            } else {
+                end.min(length).saturating_add(1).min(length)
+            };
+            self.explorer_selection = UTF16Selection {
+                range: next..next,
+                reversed: false,
+            };
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     fn confirm_explorer_operation(&mut self, cx: &mut Context<Self>) {
@@ -3229,11 +3337,27 @@ impl WorkspaceView {
                     .cursor(CursorStyle::IBeam)
                     .track_focus(&self.modal_input_focus)
                     .id("explorer-operation-input")
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        if debug_input_enabled() {
-                            tracing::info!("[MODAL INPUT MOUSE DOWN]");
+                    .on_mouse_down(MouseButton::Left, {
+                        let workspace = workspace.clone();
+                        move |event, window, cx| {
+                            cx.stop_propagation();
+                            workspace.update(cx, |this, cx| {
+                                window.focus(&this.modal_input_focus);
+                                let x: f32 = event.position.x.into();
+                                let new = ((x - 340.0).max(0.0) / 8.0).round() as usize;
+                                let new = new.min(this.explorer_input.encode_utf16().count());
+                                let old = this.explorer_selection.range.end;
+                                this.explorer_selection = UTF16Selection {
+                                    range: new..new,
+                                    reversed: false,
+                                };
+                                if debug_input_enabled() {
+                                    tracing::info!("[MODAL INPUT MOUSE DOWN]");
+                                    tracing::info!(old, new, "[MODAL CARET]");
+                                }
+                                cx.notify();
+                            });
                         }
-                        cx.stop_propagation();
                     })
                     .on_click({
                         let workspace = workspace.clone();
@@ -4581,23 +4705,16 @@ impl EntityInputHandler for WorkspaceView {
     }
     fn character_index_for_point(
         &mut self,
-        point: gpui::Point<gpui::Pixels>,
+        _: gpui::Point<gpui::Pixels>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
         Some(if self.explorer_operation.is_some() {
-            let x: f32 = point.x.into();
-            let new = ((x.max(0.0) / 8.0).round() as usize)
-                .min(self.explorer_input.encode_utf16().count());
-            let old = self.explorer_selection.range.end;
-            self.explorer_selection = UTF16Selection {
-                range: new..new,
-                reversed: false,
-            };
-            if debug_input_enabled() && old != new {
-                tracing::info!(old, new, "[MODAL CARET]");
-            }
-            new
+            // The clickable input element computes the caret from its window
+            // coordinates; GPUI asks this callback again during text dispatch.
+            // Return the authoritative caret rather than overwriting it with
+            // an absolute-window coordinate.
+            self.explorer_selection.range.end
         } else if self.settings_visible && !self.command_palette_visible {
             self.settings_query.encode_utf16().count()
         } else {

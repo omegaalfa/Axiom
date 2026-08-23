@@ -278,6 +278,32 @@ impl EditorView {
                             ),
                         ));
                     }
+                    // Keep navigation useful when a variable's type could not
+                    // be inferred from a local assignment. A unique method
+                    // name is safe to resolve without a full type engine.
+                    let matches: Vec<_> = index
+                        .symbols()
+                        .iter()
+                        .filter(|symbol| {
+                            symbol.kind == ProjectSymbolKind::Method && symbol.name == name
+                        })
+                        .collect();
+                    if matches.len() == 1 {
+                        let symbol = matches[0];
+                        let content = if symbol.file == self.file_path {
+                            text_at_cursor.clone()
+                        } else {
+                            std::fs::read_to_string(&symbol.file).ok()?
+                        };
+                        return Some((
+                            symbol.file.clone(),
+                            PositionCodec::offset_to_position(
+                                &content,
+                                symbol.range.start,
+                                self.lsp_encoding(),
+                            ),
+                        ));
+                    }
                 }
                 if let Some(runtime) = &self.runtime_symbols {
                     if let Some(symbol) = runtime
