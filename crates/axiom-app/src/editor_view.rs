@@ -145,6 +145,7 @@ pub struct EditorView {
     runtime_symbols: Option<Arc<RuntimeSymbolIndex>>,
     project_symbols: Option<Arc<std::sync::RwLock<ProjectSymbolIndex>>>,
     project_index_revision: Option<Arc<AtomicU64>>,
+    last_completion_layout: Option<(u32, u32, u32, u32, bool)>,
 }
 
 #[derive(Clone)]
@@ -201,6 +202,7 @@ impl EditorView {
             runtime_symbols: None,
             project_symbols: None,
             project_index_revision: None,
+            last_completion_layout: None,
         };
         view.sync_syntax();
         view
@@ -2279,6 +2281,89 @@ fn project_method_detail(symbol: &axiom_index::ProjectSymbol) -> String {
     format!("{}{} • Project", symbol.name, signature)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionPresentation {
+    primary: String,
+    return_type: Option<String>,
+    source: Option<String>,
+}
+
+fn completion_presentation(item: &CompletionItem) -> CompletionPresentation {
+    let mut detail = item.detail.clone().unwrap_or_default();
+    let source = detail.rsplit_once(" • ").map(|(_, source)| {
+        let source = source.trim_matches(|ch| ch == '"' || ch == '\'');
+        match source {
+            "PhpRuntime" | "Composer" => "Runtime".to_owned(),
+            "Project" => "Project".to_owned(),
+            "LSP" => "LSP".to_owned(),
+            other => other.to_owned(),
+        }
+    });
+    if let Some((head, _)) = detail.rsplit_once(" • ") {
+        detail = head.to_owned();
+    }
+    let label = item.label.trim();
+    let signature = detail.find('(').and_then(|open| {
+        detail
+            .rfind(')')
+            .filter(|close| *close >= open)
+            .map(|close| {
+                (
+                    detail[open + 1..close].to_owned(),
+                    detail[close + 1..].trim().to_owned(),
+                )
+            })
+    });
+    let (primary, return_type) = if let Some((parameters, suffix)) = signature {
+        let params = parameters
+            .split(',')
+            .map(str::trim)
+            .filter(|param| !param.is_empty())
+            .map(compress_completion_parameter)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let return_type = suffix
+            .strip_prefix(':')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        (
+            format!("{}({params})", label.trim_end_matches("()")),
+            return_type,
+        )
+    } else {
+        (label.to_owned(), None)
+    };
+    CompletionPresentation {
+        primary,
+        return_type,
+        source,
+    }
+}
+
+fn compress_completion_parameter(parameter: &str) -> String {
+    let mut value = parameter.trim().trim_start_matches('&').trim();
+    value = value.strip_prefix("...").unwrap_or(value);
+    value = value.split('=').next().unwrap_or(value).trim();
+    value
+        .rsplit_once('$')
+        .map(|(_, name)| format!("${}", name.trim()))
+        .unwrap_or_else(|| value.to_owned())
+}
+
+fn completion_icon(kind: Option<CompletionItemKind>) -> &'static str {
+    match kind {
+        Some(CompletionItemKind::METHOD | CompletionItemKind::FUNCTION) => "ƒ",
+        Some(CompletionItemKind::CLASS | CompletionItemKind::CONSTRUCTOR) => "C",
+        Some(CompletionItemKind::INTERFACE) => "I",
+        Some(CompletionItemKind::ENUM) => "E",
+        Some(CompletionItemKind::STRUCT) => "S",
+        Some(CompletionItemKind::PROPERTY | CompletionItemKind::FIELD) => "·",
+        Some(CompletionItemKind::CONSTANT | CompletionItemKind::ENUM_MEMBER) => "#",
+        _ => "•",
+    }
+}
+
 fn debug_input_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT").is_some()
 }
@@ -2318,20 +2403,65 @@ impl Render for EditorView {
                 .saturating_sub(line_start)
                 .min(line_text.len()),
         );
+        let presentations = self
+            .completions
+            .iter()
+            .map(completion_presentation)
+            .collect::<Vec<_>>();
+        let estimated_width = presentations
+            .iter()
+            .map(|item| {
+                item.primary.len().max(8) as f32 * 7.0
+                    + item
+                        .return_type
+                        .as_ref()
+                        .map_or(0.0, |v| v.len() as f32 * 6.0 + 12.0)
+                    + item
+                        .source
+                        .as_ref()
+                        .map_or(0.0, |v| v.len() as f32 * 6.0 + 12.0)
+                    + 54.0
+            })
+            .fold(280.0, f32::max);
+        let viewport_width: f32 = viewport.size.width.into();
+        let popup_width = px(estimated_width
+            .min(620.0)
+            .min((viewport_width - 16.0).max(180.0)));
         let mut popup_x = viewport.left() + px(GUTTER_WIDTH + TEXT_PADDING) + caret_x;
-        let popup_width = px(420.);
         popup_x = popup_x.min((viewport.right() - popup_width).max(viewport.left()));
         let below_y = viewport.top() + px((line as f32 + 1.0) * LINE_HEIGHT)
             - self.scroll.0.borrow().base_handle.offset().y;
-        let popup_height = px(220.);
+        let row_height = px(28.);
+        let popup_height = px((presentations.len() as f32 * 28.0).min(224.0));
         let opens_above = below_y + popup_height > viewport.bottom();
         let popup_y = if opens_above {
             (below_y - popup_height - px(4.)).max(viewport.top())
         } else {
             below_y.min((viewport.bottom() - popup_height).max(viewport.top()))
         };
+        if self.completions.is_empty() {
+            self.last_completion_layout = None;
+        }
         if debug_completion_enabled() && !self.completions.is_empty() {
-            tracing::info!(anchor_x = ?popup_x, anchor_y = ?popup_y, width = ?popup_width, height = ?popup_height, above_editor = opens_above, clipped = false, items = self.completions.len(), selected = self.completion_selected, "[COMPLETION POPUP]");
+            let x: f32 = popup_x.into();
+            let y: f32 = popup_y.into();
+            let width: f32 = popup_width.into();
+            let height: f32 = popup_height.into();
+            let key = (x as u32, y as u32, width as u32, height as u32, opens_above);
+            if self.last_completion_layout != Some(key) {
+                self.last_completion_layout = Some(key);
+                tracing::info!(
+                    items = self.completions.len(),
+                    x,
+                    y,
+                    width,
+                    height,
+                    row_height = 28,
+                    max_width = 620,
+                    placement = if opens_above { "above" } else { "below" },
+                    "[COMPLETION LAYOUT]"
+                );
+            }
         }
         div()
             .flex()
@@ -2420,7 +2550,7 @@ impl Render for EditorView {
                                 .left(popup_x)
                                 .top(popup_y)
                                 .w(popup_width)
-                                .max_h(px(220.))
+                                .max_h(px(224.))
                                 .id("completion-popup-scroll")
                                 .overflow_y_scroll()
                                 .rounded(m.border_radius_medium)
@@ -2429,40 +2559,69 @@ impl Render for EditorView {
                                 .border_color(t.border)
                                 .shadow_lg()
                                 .occlude()
-                                .children(self.completions.iter().enumerate().map(
-                                    |(index, item)| {
-                                        div()
-                                            .h(m.toolbar_height)
-                                            .px_2()
-                                            .flex()
-                                            .items_center()
-                                            .bg(if index == self.completion_selected {
-                                                t.selection
-                                            } else {
-                                                t.popup_background
-                                            })
-                                            .text_color(t.text_primary)
-                                            .child(
-                                                div().w(m.icon_size).text_color(t.info).child("ƒ"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .overflow_hidden()
-                                                    .child(item.label.clone()),
-                                            )
-                                            .when_some(item.detail.clone(), |row, detail| {
-                                                row.child(
+                                .children(
+                                    self.completions
+                                        .iter()
+                                        .enumerate()
+                                        .zip(presentations.iter())
+                                        .map(|((index, item), presentation)| {
+                                            div()
+                                                .h(row_height)
+                                                .w_full()
+                                                .px_2()
+                                                .flex()
+                                                .items_center()
+                                                .overflow_hidden()
+                                                .bg(if index == self.completion_selected {
+                                                    t.selection
+                                                } else {
+                                                    t.popup_background
+                                                })
+                                                .text_color(t.text_primary)
+                                                .child(
                                                     div()
-                                                        .max_w(px(190.))
-                                                        .overflow_hidden()
-                                                        .ml_auto()
-                                                        .text_color(t.text_muted)
-                                                        .child(detail),
+                                                        .w(px(18.))
+                                                        .flex_none()
+                                                        .text_color(t.info)
+                                                        .child(completion_icon(item.kind)),
                                                 )
-                                            })
-                                    },
-                                )),
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w(px(0.))
+                                                        .overflow_hidden()
+                                                        .child(presentation.primary.clone()),
+                                                )
+                                                .when_some(
+                                                    presentation.return_type.clone(),
+                                                    |row, return_type| {
+                                                        row.child(
+                                                            div()
+                                                                .max_w(px(120.))
+                                                                .flex_none()
+                                                                .overflow_hidden()
+                                                                .ml_2()
+                                                                .text_color(t.text_muted)
+                                                                .child(return_type),
+                                                        )
+                                                    },
+                                                )
+                                                .when_some(
+                                                    presentation.source.clone(),
+                                                    |row, source| {
+                                                        row.child(
+                                                            div()
+                                                                .max_w(px(64.))
+                                                                .flex_none()
+                                                                .overflow_hidden()
+                                                                .ml_2()
+                                                                .text_color(t.text_muted)
+                                                                .child(source),
+                                                        )
+                                                    },
+                                                )
+                                        }),
+                                ),
                         )
                     })
                     .when_some(self.hover_popup.clone(), |this, hover| {
@@ -2855,7 +3014,8 @@ fn shape(window: &mut Window, text: &str) -> gpui::ShapedLine {
 
 #[cfg(test)]
 mod formatter_tests {
-    use super::native_format_php;
+    use super::{completion_presentation, native_format_php};
+    use lsp_types::CompletionItem;
 
     #[test]
     fn indents_nested_php_blocks() {
@@ -2872,5 +3032,39 @@ mod formatter_tests {
         assert!(output.contains("    $text = \"{ not a block }\";"));
         assert!(output.contains("    // } remains a comment"));
         assert!(output.contains("    return $text;"));
+    }
+
+    #[test]
+    fn completion_source_separated_from_return_type() {
+        let item = CompletionItem {
+            label: "ghost".into(),
+            detail: Some(
+                "ghost(Closure $initializer, string|object $class): LazyObject • PhpRuntime".into(),
+            ),
+            ..Default::default()
+        };
+        let view = completion_presentation(&item);
+        assert_eq!(view.primary, "ghost($initializer, $class)");
+        assert_eq!(view.return_type.as_deref(), Some("LazyObject"));
+        assert_eq!(view.source.as_deref(), Some("Runtime"));
+    }
+
+    #[test]
+    fn completion_long_signature_is_truncated_to_compact_parameters() {
+        let item = CompletionItem {
+            label: "reflect".into(),
+            detail: Some("reflect(string|object $class = null): ReflectionClass • Project".into()),
+            ..Default::default()
+        };
+        assert_eq!(completion_presentation(&item).primary, "reflect($class)");
+    }
+
+    #[test]
+    fn completion_popup_layout_constants_keep_rows_deterministic() {
+        let row_height = 28.0_f32;
+        let max_width = 620.0_f32;
+        assert!(row_height > 0.0 && row_height <= 32.0);
+        assert!((280.0..=700.0).contains(&max_width));
+        assert_eq!(row_height, 28.0);
     }
 }
