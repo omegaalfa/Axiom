@@ -3382,6 +3382,8 @@ impl WorkspaceView {
             selection_end,
             self.explorer_input.encode_utf16().count(),
         );
+        let input_width =
+            ((self.explorer_input.encode_utf16().count() as f32) * 8.0 + 24.0).clamp(140.0, 300.0);
         let title = match self.explorer_operation {
             Some(ExplorerOperation::Rename(_)) => "Rename",
             Some(ExplorerOperation::NewDirectory(_)) => "New Directory",
@@ -3421,6 +3423,7 @@ impl WorkspaceView {
             .child(
                 div()
                     .h(px(34.))
+                    .w(px(input_width))
                     .px_2()
                     .flex()
                     .items_center()
