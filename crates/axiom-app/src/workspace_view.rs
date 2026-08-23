@@ -3798,7 +3798,13 @@ impl WorkspaceView {
         let t = theme();
         let m = metrics();
         let workspace = cx.entity();
-        div()
+        div().when(self.pending_delete.is_some(), |this| {
+            this.absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .right(px(0.))
+                .bottom(px(0.))
+        })
             .when_some(self.pending_delete.clone(), |this, path| {
                 let confirm_workspace = workspace.clone();
                 let cancel_workspace = workspace.clone();
