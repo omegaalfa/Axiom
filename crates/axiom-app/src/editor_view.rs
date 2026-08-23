@@ -60,6 +60,7 @@ actions!(
         HoverInfo,
         Definition,
         References,
+        NativeDefinition,
         Reformat,
         SignatureHelp,
         Escape,
@@ -1327,17 +1328,34 @@ impl EditorView {
         }
     }
 
-    fn definition(&mut self, _: &Definition, _: &mut Window, cx: &mut Context<Self>) {
+    fn definition(&mut self, _: &Definition, window: &mut Window, cx: &mut Context<Self>) {
         if let (Some(lsp), Some(uri), Some(position)) =
             (&self.lsp, &self.lsp_uri, self.lsp_position())
         {
-            if debug_input_enabled() {
-                tracing::info!(document = ?uri, "[DEFINITION REQUEST]");
+            if lsp.status() == axiom_lsp::ServerStatus::Ready {
+                if debug_input_enabled() {
+                    tracing::info!(document = ?uri, "[DEFINITION REQUEST]");
+                }
+                lsp.request_definition(uri.clone(), position);
+            } else {
+                if debug_input_enabled() {
+                    tracing::info!(
+                        provider = "native",
+                        reason = "lsp_not_ready",
+                        "[DEFINITION REQUEST]"
+                    );
+                }
+                window.dispatch_action(NativeDefinition.boxed_clone(), cx);
             }
-            lsp.request_definition(uri.clone(), position);
         } else {
-            self.status = Some("Definition unavailable (language server not ready)".into());
-            cx.notify();
+            if debug_input_enabled() {
+                tracing::info!(
+                    provider = "native",
+                    reason = "lsp_unavailable",
+                    "[DEFINITION REQUEST]"
+                );
+            }
+            window.dispatch_action(NativeDefinition.boxed_clone(), cx);
         }
     }
 
@@ -1698,6 +1716,13 @@ impl EditorView {
     ) {
         if !self.is_in_text_area(event.position) {
             return;
+        }
+        if event.modifiers.control && debug_input_enabled() {
+            tracing::info!(
+                button = "right",
+                reason = "right_button",
+                "[EDITOR CTRL CLICK IGNORED]"
+            );
         }
         let line = self.mouse_line(event.position);
         window.focus(&self.focus);

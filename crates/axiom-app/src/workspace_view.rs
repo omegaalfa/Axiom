@@ -1271,29 +1271,25 @@ impl WorkspaceView {
             .and_then(|index| self.tabs.get(index))
             .and_then(|tab| tab.editor.read(cx).native_definition_location());
         if let Some((path, position)) = native {
+            if debug_input_enabled() {
+                tracing::info!(path = %path.display(), line = position.line, character = position.character, "[NAVIGATION TARGET]");
+            }
             self.navigate_to_definition(DefinitionTarget { path, position }, cx);
         } else {
             self.status = "Definition não encontrada".into();
         }
     }
 
-    fn definition_action(
+    fn native_definition_action(
         &mut self,
-        _: &crate::editor_view::Definition,
+        _: &crate::editor_view::NativeDefinition,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let has_lsp = self
-            .active
-            .and_then(|index| self.tabs.get(index))
-            .and_then(|tab| tab.editor.read(cx).lsp_uri())
-            .is_some();
-        if !has_lsp {
-            if debug_input_enabled() {
-                tracing::info!(provider = "native", "[DEFINITION REQUEST]");
-            }
-            self.navigate_native_definition(cx);
+        if debug_input_enabled() {
+            tracing::info!(provider = "native", "[DEFINITION REQUEST]");
         }
+        self.navigate_native_definition(cx);
     }
 
     fn dispatch_editor_action<A: Action + Clone + 'static>(
@@ -2509,7 +2505,11 @@ impl WorkspaceView {
             self.navigation_back.push(origin);
             self.navigation_forward.clear();
         }
-        let index = if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+        let existing = self.tabs.iter().position(|tab| tab.path == path);
+        if debug_input_enabled() {
+            tracing::info!(existing = existing.is_some(), path = %path.display(), "[NAVIGATION TAB]");
+        }
+        let index = if let Some(index) = existing {
             index
         } else {
             let document = match Document::from_file(&path) {
@@ -2535,6 +2535,14 @@ impl WorkspaceView {
         self.tabs[index].editor.update(cx, |editor, cx| {
             editor.reveal_lsp_position(target.position, cx)
         });
+        if debug_input_enabled() {
+            tracing::info!(
+                line = target.position.line,
+                character = target.position.character,
+                "[NAVIGATION CARET]"
+            );
+            tracing::info!(success = true, "[NAVIGATION RESULT]");
+        }
     }
 
     fn navigate_back(&mut self, _: &NavigateBack, _: &mut Window, cx: &mut Context<Self>) {
@@ -3219,6 +3227,7 @@ impl WorkspaceView {
                     .items_center()
                     .bg(t.panel_background)
                     .cursor(CursorStyle::IBeam)
+                    .track_focus(&self.modal_input_focus)
                     .id("explorer-operation-input")
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         if debug_input_enabled() {
@@ -4258,7 +4267,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::navigate_forward))
             .on_action(cx.listener(Self::go_to_class))
             .on_action(cx.listener(Self::go_to_symbol))
-            .on_action(cx.listener(Self::definition_action))
+            .on_action(cx.listener(Self::native_definition_action))
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::settings))
             .on_action(cx.listener(Self::debug_input))
@@ -4487,6 +4496,10 @@ impl EntityInputHandler for WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let editing_explorer = self.explorer_operation.is_some();
+        let editing_rename = self
+            .explorer_operation
+            .as_ref()
+            .is_some_and(|operation| matches!(operation, ExplorerOperation::Rename(_)));
         let editing_settings =
             self.settings_visible && !self.command_palette_visible && !editing_explorer;
         let mut query = if editing_explorer {
@@ -4515,6 +4528,7 @@ impl EntityInputHandler for WorkspaceView {
                     "[MODAL INPUT HANDLER]"
                 );
                 tracing::info!(
+                    kind = if editing_rename { "rename" } else { "explorer" },
                     range_start = range.start,
                     range_end = range.end,
                     inserted_len = text.encode_utf16().count(),
@@ -4526,6 +4540,10 @@ impl EntityInputHandler for WorkspaceView {
                     changed = true,
                     "[MODAL STATE]"
                 );
+                if editing_rename {
+                    tracing::info!(old_len = before_len, new_len = length, "[RENAME STATE]");
+                }
+                tracing::info!(notify = true, "[MODAL NOTIFY]");
                 if text.is_empty() {
                     tracing::info!(
                         range_start = range.start,
@@ -4569,7 +4587,17 @@ impl EntityInputHandler for WorkspaceView {
     ) -> Option<usize> {
         Some(if self.explorer_operation.is_some() {
             let x: f32 = point.x.into();
-            ((x.max(0.0) / 8.0).round() as usize).min(self.explorer_input.encode_utf16().count())
+            let new = ((x.max(0.0) / 8.0).round() as usize)
+                .min(self.explorer_input.encode_utf16().count());
+            let old = self.explorer_selection.range.end;
+            self.explorer_selection = UTF16Selection {
+                range: new..new,
+                reversed: false,
+            };
+            if debug_input_enabled() && old != new {
+                tracing::info!(old, new, "[MODAL CARET]");
+            }
+            new
         } else if self.settings_visible && !self.command_palette_visible {
             self.settings_query.encode_utf16().count()
         } else {
