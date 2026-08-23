@@ -10,8 +10,8 @@ fn main() {
     #[cfg(target_os = "windows")]
     {
         // Se existir um arquivo de ícone, compila ele
-        if std::path::Path::new("assets/axiom.ico").exists() {
-            let _ = embed_resource::compile("assets/axiom.rc", embed_resource::NONE);
+        if std::path::Path::new("assets/icons/axiom.ico").exists() {
+            let _ = embed_resource::compile("assets/icons/axiom.rc", embed_resource::NONE);
         }
     }
 }

@@ -43,6 +43,7 @@ fn main() -> anyhow::Result<()> {
                             title: Some(SharedString::from("Axiom")),
                             ..Default::default()
                         }),
+                        app_id: Some("Axiom.IDE".to_owned()),
                         ..Default::default()
                     },
                     |_window, cx| {
