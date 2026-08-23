@@ -1250,10 +1250,13 @@ impl EditorView {
         let start = text[..cursor]
             .char_indices()
             .rev()
-            .take_while(|(_, ch)| ch.is_alphanumeric() || *ch == '_')
+            .take_while(|(_, ch)| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
             .last()
             .map_or(cursor, |(i, _)| i);
         let prefix = &text[start..cursor];
+        if prefix.starts_with('$') {
+            return self.local_variable_completions(&text[..cursor], prefix);
+        }
         let empty_prefix_context = before.ends_with("new ")
             || before.ends_with("extends ")
             || before.ends_with("implements ")
@@ -1402,6 +1405,40 @@ impl EditorView {
         items.into_iter().take(40).collect()
     }
 
+    fn local_variable_completions(&self, context: &str, prefix: &str) -> Vec<CompletionItem> {
+        let mut names = std::collections::BTreeSet::new();
+        for (offset, _) in context.match_indices('$') {
+            let tail = &context[offset..];
+            let name = tail
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                .collect::<String>();
+            if !name.is_empty() {
+                names.insert(format!("${name}"));
+            }
+        }
+        let mut items = names
+            .into_iter()
+            .filter(|name| name.starts_with(prefix))
+            .map(|name| {
+                let detail = self
+                    .resolve_native_type(&name, context)
+                    .map(|ty| ty.to_owned());
+                if debug_completion_enabled() {
+                    tracing::info!(variable = %name, prefix, "[VARIABLE COMPLETION]");
+                }
+                CompletionItem {
+                    label: name,
+                    detail,
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+        items.sort_by_key(|item| (!item.label.starts_with(prefix), item.label.clone()));
+        items.into_iter().take(40).collect()
+    }
+
     /// Builds a single additional edit for a Composer/project class. The edit
     /// is deliberately narrow: it only inserts a missing `use` statement and
     /// never rewrites or reformats the document.
@@ -1535,18 +1572,38 @@ impl EditorView {
     }
 
     fn qualify_type(&self, name: &str) -> String {
-        if name.starts_with('\\') || name.contains('\\') {
-            return name.to_owned();
+        self.resolve_class_name(name, &self.document.content())
+    }
+
+    fn resolve_class_name(&self, written: &str, context: &str) -> String {
+        let written = written.trim().trim_start_matches('\\');
+        if written.contains('\\') {
+            return written.to_owned();
         }
-        self.project_symbols
-            .as_ref()
-            .and_then(|index| index.read().ok())
-            .and_then(|index| {
-                index
-                    .find_class(name)
-                    .map(|symbol| symbol.fully_qualified_name.clone())
-            })
-            .unwrap_or_else(|| name.to_owned())
+        let mut imports = std::collections::HashMap::new();
+        for line in context.lines() {
+            let line = line.trim();
+            if let Some(value) = line.strip_prefix("use ") {
+                let value = value.trim_end_matches(';').trim();
+                let (fqn, alias) = value
+                    .split_once(" as ")
+                    .map(|(fqn, alias)| (fqn, alias.trim()))
+                    .unwrap_or((value, value.rsplit('\\').next().unwrap_or(value)));
+                imports.insert(alias.to_owned(), fqn.trim_start_matches('\\').to_owned());
+            }
+        }
+        if let Some(import) = imports.get(written) {
+            return import.clone();
+        }
+        let namespace = context.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("namespace ")
+                .map(|value| value.trim_end_matches(';').trim().to_owned())
+        });
+        namespace
+            .filter(|namespace| !namespace.is_empty())
+            .map(|namespace| format!("{namespace}\\{written}"))
+            .unwrap_or_else(|| written.to_owned())
     }
 
     fn hover_info(&mut self, _: &HoverInfo, _: &mut Window, _: &mut Context<Self>) {
