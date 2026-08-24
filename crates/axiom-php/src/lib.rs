@@ -91,6 +91,8 @@ pub struct Symbol {
     pub signature: Option<Signature>,
     pub documentation: Option<PhpDoc>,
     pub availability: Availability,
+    /// Whether a method is declared with the `static` modifier.
+    pub is_static: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,7 +291,7 @@ impl StubProvider {
     }
 }
 
-const STUB_CACHE_SCHEMA: u32 = 1;
+const STUB_CACHE_SCHEMA: u32 = 2;
 // Bump when symbol extraction changes so an old incremental cache cannot hide
 // newly indexed methods/properties from completion.
 const STUB_PARSER_VERSION: u32 = 3;
@@ -534,6 +536,7 @@ fn visit_node(
             signature,
             documentation,
             availability: extract_availability(node_text(node, text)),
+            is_static: kind == SymbolKind::Method && node_text(node, text).contains("static"),
         });
         if matches!(
             kind,
@@ -610,6 +613,7 @@ fn visit_node(
                     signature: None,
                     documentation: preceding_phpdoc(node, text).map(parse_phpdoc),
                     availability: extract_availability(node_text(node, text)),
+                    is_static: false,
                 });
             }
         }
@@ -646,6 +650,7 @@ fn member_symbol(
         signature: None,
         documentation,
         availability: Availability::default(),
+        is_static: false,
     }
 }
 

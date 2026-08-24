@@ -330,7 +330,7 @@ impl EditorView {
                         .unwrap_or(class_fqn.clone());
                     if let Some(symbol) = runtime
                         .methods_of(&runtime_class_fqn)
-                        .find(|symbol| symbol.name == name)
+                        .find(|symbol| symbol.name == name && symbol.is_static == is_static)
                     {
                         return self.resolve_location(
                             &symbol.location.file,
@@ -1391,17 +1391,22 @@ impl EditorView {
                         .or_else(|| runtime.find_class_by_short_name(prefix))
                         .map(|symbol| symbol.fqn.clone())
                         .unwrap_or_else(|| class_fqn.clone());
-                    items.extend(runtime.methods_of(&runtime_fqn).map(|symbol| {
-                        let call = runtime_call_insert_text(symbol)
-                            .unwrap_or_else(|| format!("{}()", symbol.name));
-                        CompletionItem {
-                            label: symbol.name.clone(),
-                            detail: Some(runtime_signature_detail(symbol)),
-                            kind: Some(CompletionItemKind::METHOD),
-                            insert_text: Some(format!("{prefix}::{call}")),
-                            ..Default::default()
-                        }
-                    }));
+                    items.extend(
+                        runtime
+                            .methods_of(&runtime_fqn)
+                            .filter(|symbol| symbol.is_static)
+                            .map(|symbol| {
+                                let call = runtime_call_insert_text(symbol)
+                                    .unwrap_or_else(|| format!("{}()", symbol.name));
+                                CompletionItem {
+                                    label: symbol.name.clone(),
+                                    detail: Some(runtime_signature_detail(symbol)),
+                                    kind: Some(CompletionItemKind::METHOD),
+                                    insert_text: Some(format!("{prefix}::{call}")),
+                                    ..Default::default()
+                                }
+                            }),
+                    );
                 }
                 if let (Some(project), Some(class_fqn)) =
                     (&self.project_symbols, class_fqn.as_ref())
@@ -1505,6 +1510,7 @@ impl EditorView {
                             .methods_of(&runtime_class_fqn)
                             .filter(|symbol| {
                                 symbol.name.starts_with(prefix)
+                                    && symbol.is_static == is_static
                                     && (is_static || !symbol.name.starts_with('_'))
                             })
                             .map(|symbol| {
