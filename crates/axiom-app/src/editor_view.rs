@@ -318,8 +318,17 @@ impl EditorView {
                     }
                 }
                 if let Some(runtime) = &self.runtime_symbols {
+                    let runtime_class_fqn = runtime
+                        .find_class(&class_fqn)
+                        .map(|symbol| symbol.fqn.clone())
+                        .or_else(|| {
+                            runtime
+                                .find_class_by_short_name(&class_fqn)
+                                .map(|symbol| symbol.fqn.clone())
+                        })
+                        .unwrap_or(class_fqn.clone());
                     if let Some(symbol) = runtime
-                        .methods_of(&class_fqn)
+                        .methods_of(&runtime_class_fqn)
                         .find(|symbol| symbol.name == name)
                     {
                         let content = if symbol.location.file == self.file_path {
@@ -338,6 +347,44 @@ impl EditorView {
                     }
                 }
             }
+        }
+        if let Some(runtime) = &self.runtime_symbols
+            && let Some(symbol) = runtime.find_function(name)
+        {
+            let content = if symbol.location.file == self.file_path {
+                text_at_cursor.clone()
+            } else {
+                std::fs::read_to_string(&symbol.location.file).ok()?
+            };
+            return Some((
+                symbol.location.file.clone(),
+                PositionCodec::offset_to_position(
+                    &content,
+                    symbol.location.range.start,
+                    self.lsp_encoding(),
+                ),
+            ));
+        }
+        if let Some(index) = &self.project_symbols
+            && let Ok(index) = index.read()
+            && let Some(symbol) = index
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind == ProjectSymbolKind::Function && symbol.name == name)
+        {
+            let content = if symbol.file == self.file_path {
+                text_at_cursor.clone()
+            } else {
+                std::fs::read_to_string(&symbol.file).ok()?
+            };
+            return Some((
+                symbol.file.clone(),
+                PositionCodec::offset_to_position(
+                    &content,
+                    symbol.range.start,
+                    self.lsp_encoding(),
+                ),
+            ));
         }
         let target = if let Some(index) = &self.project_symbols {
             let index = index.read().ok()?;
