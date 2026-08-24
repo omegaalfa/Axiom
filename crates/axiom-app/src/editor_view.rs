@@ -2160,22 +2160,24 @@ impl EditorView {
         let updated = axiom_lsp::apply_text_edits(&content, &edits, encoding);
         self.document.select_all();
         self.document.insert_text(&updated);
-        if call_like {
-            let inserted = inserted_text.trim_end_matches(')');
-            // Search from the edited range. Searching the whole document can
-            // select an earlier identical call and leave the caret inside an
-            // old completion context, causing the same item to reappear on
-            // the next Enter/newline.
-            let search_start = range.start.min(updated.len());
-            if let Some(relative) = updated[search_start..].find(inserted) {
-                let position = search_start + relative;
-                let caret = if inserted_text.ends_with("()") {
-                    position + inserted_text.len() - 1
-                } else {
-                    position + inserted_text.len()
-                };
-                self.document.move_cursor(caret.min(updated.len()));
-            }
+        let inserted = if call_like {
+            inserted_text.trim_end_matches(')')
+        } else {
+            inserted_text.as_str()
+        };
+        // Search from the edited range. Searching the whole document can
+        // select an earlier identical call and leave the caret inside an old
+        // completion context, causing the same item to reappear on the next
+        // Enter/newline.
+        let search_start = range.start.min(updated.len());
+        if let Some(relative) = updated[search_start..].find(inserted) {
+            let position = search_start + relative;
+            let caret = if call_like && inserted_text.ends_with("()") {
+                position + inserted_text.len() - 1
+            } else {
+                position + inserted_text.len()
+            };
+            self.document.move_cursor(caret.min(updated.len()));
         }
         self.completions.clear();
         self.after_edit(cx);
