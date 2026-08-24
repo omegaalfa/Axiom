@@ -313,6 +313,7 @@ impl VendorSymbolIndex {
     }
 
     pub fn symbols_of(&mut self, fqn: &str) -> Vec<ProjectSymbol> {
+        let started = Instant::now();
         let Some(path) = self.resolve_class(fqn) else {
             return Vec::new();
         };
@@ -328,7 +329,16 @@ impl VendorSymbolIndex {
                 == Some(*modified)
             && let Some(symbols) = self.parsed.get(fqn)
         {
+            if std::env::var_os("AXIOM_DEBUG_COMPOSER").is_some() {
+                eprintln!(
+                    "[VENDOR SYMBOL CACHE] hit=true fqn={fqn} elapsed_ms={}",
+                    started.elapsed().as_millis()
+                );
+            }
             return symbols.clone();
+        }
+        if std::env::var_os("AXIOM_DEBUG_COMPOSER").is_some() {
+            eprintln!("[DEFINITION VENDOR PARSE START] fqn={fqn} path={:?}", path);
         }
         let Ok(text) = fs::read_to_string(&path) else {
             return Vec::new();
@@ -421,6 +431,14 @@ impl VendorSymbolIndex {
                 .unwrap_or_default();
             self.parsed_files
                 .insert(fqn.to_owned(), (path, metadata.len(), modified));
+        }
+        if std::env::var_os("AXIOM_DEBUG_COMPOSER").is_some() {
+            eprintln!(
+                "[DEFINITION VENDOR PARSE END] fqn={fqn} symbols={} elapsed_ms={}",
+                symbols.len(),
+                started.elapsed().as_millis()
+            );
+            eprintln!("[VENDOR SYMBOL CACHE] hit=false fqn={fqn}");
         }
         symbols
     }

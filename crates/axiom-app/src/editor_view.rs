@@ -172,6 +172,14 @@ struct IndexUpdateRequest {
     revision: Arc<AtomicU64>,
 }
 
+#[derive(Clone)]
+pub struct VendorDefinitionRequest {
+    pub index: Arc<std::sync::RwLock<VendorSymbolIndex>>,
+    pub fqn: String,
+    pub member: Option<String>,
+    pub is_static: bool,
+}
+
 fn run_index_update_worker(receiver: mpsc::Receiver<IndexUpdateRequest>) {
     while let Ok(mut request) = receiver.recv() {
         if let Ok(next) = receiver.recv_timeout(Duration::from_millis(150)) {
@@ -455,6 +463,59 @@ impl EditorView {
             })
         })?;
         self.resolve_location(&target.0, target.1.start, &text_at_cursor)
+    }
+
+    /// Extracts a Vendor definition request without reading or parsing the
+    /// dependency file. The caller must resolve/parse it off the UI thread.
+    pub fn vendor_definition_request(&self) -> Option<VendorDefinitionRequest> {
+        let syntax = self.syntax.as_ref()?;
+        let token = syntax.token_at_byte(self.document.cursor_offset())?;
+        let text = self.document.content();
+        let before = &text[..token.range.start];
+        let (member, is_static, written) =
+            if let Some(operator) = before.rfind("->").or_else(|| before.rfind("::")) {
+                let is_static = before[operator..].starts_with("::");
+                let owner_end = operator;
+                let owner_start = before[..owner_end]
+                    .char_indices()
+                    .rev()
+                    .take_while(|(_, ch)| {
+                        ch.is_alphanumeric() || *ch == '_' || *ch == '$' || *ch == '\\'
+                    })
+                    .last()
+                    .map_or(owner_end, |(i, _)| i);
+                (
+                    Some(token.text.clone()),
+                    is_static,
+                    before[owner_start..owner_end]
+                        .trim_start_matches('$')
+                        .to_owned(),
+                )
+            } else {
+                (None, false, token.text.trim_start_matches('$').to_owned())
+            };
+        let fqn = if let Some(variable) = written.strip_prefix('$') {
+            let marker = format!("${variable} = new ");
+            text[..token.range.start]
+                .rfind(&marker)
+                .and_then(|pos| {
+                    let class = text[pos + marker.len()..]
+                        .chars()
+                        .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '\\')
+                        .collect::<String>();
+                    (!class.is_empty()).then(|| resolve_php_class_name(&class, &text))
+                })
+                .unwrap_or_else(|| resolve_php_class_name(&written, &text))
+        } else {
+            resolve_php_class_name(&written, &text)
+        };
+        let index = self.vendor_symbols.clone()?;
+        Some(VendorDefinitionRequest {
+            index,
+            fqn,
+            member,
+            is_static,
+        })
     }
 
     fn lsp_encoding(&self) -> PositionEncoding {

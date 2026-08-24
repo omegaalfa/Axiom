@@ -1686,7 +1686,132 @@ impl WorkspaceView {
         if debug_input_enabled() {
             tracing::info!(provider = "native", "[DEFINITION REQUEST]");
         }
+        if self.start_vendor_definition(cx) {
+            return;
+        }
         self.navigate_native_definition(cx);
+    }
+
+    fn start_vendor_definition(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(tab_index) = self.active else {
+            return false;
+        };
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return false;
+        };
+        let Some(request) = tab.editor.read(cx).vendor_definition_request() else {
+            return false;
+        };
+        let weak = cx.entity().downgrade();
+        self.status = "Resolving definition…".into();
+        if debug_input_enabled() {
+            tracing::info!(fqn = %request.fqn, "[DEFINITION NATIVE START]");
+        }
+        cx.spawn(async move |_, cx| {
+            let started = std::time::Instant::now();
+            let result = gpui::background_executor()
+                .spawn(async move {
+                    let mut index = request
+                        .index
+                        .write()
+                        .map_err(|_| "vendor index lock poisoned")?;
+                    let symbols = index.symbols_of(&request.fqn);
+                    let symbol = symbols.into_iter().find(|symbol| match &request.member {
+                        Some(member) => {
+                            symbol.name == *member
+                                && (request.is_static
+                                    == symbol.modifiers.iter().any(|m| m == "static"))
+                        }
+                        None => matches!(
+                            symbol.kind,
+                            axiom_index::ProjectSymbolKind::Class
+                                | axiom_index::ProjectSymbolKind::Interface
+                                | axiom_index::ProjectSymbolKind::Trait
+                                | axiom_index::ProjectSymbolKind::Enum
+                        ),
+                    });
+                    let Some(symbol) = symbol else {
+                        return Err("vendor symbol not found");
+                    };
+                    let path = symbol.file.clone();
+                    let offset = symbol.range.start;
+                    drop(index);
+                    let content =
+                        std::fs::read_to_string(&path).map_err(|_| "vendor file unreadable")?;
+                    Ok::<_, &'static str>((path, offset, content))
+                })
+                .await;
+            let _ = weak.update(cx, |workspace, cx| {
+                if debug_input_enabled() {
+                    tracing::info!(
+                        elapsed_ms = started.elapsed().as_millis(),
+                        result = result.is_ok(),
+                        "[DEFINITION NATIVE END]"
+                    );
+                }
+                match result {
+                    Ok((path, offset, content)) => {
+                        workspace.open_vendor_definition(path, offset, content, cx)
+                    }
+                    Err(error) => {
+                        workspace.status = format!("Definition not found: {error}").into();
+                        if debug_input_enabled() {
+                            tracing::info!(success = false, "[NAVIGATION RESULT]");
+                        }
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+        true
+    }
+
+    fn open_vendor_definition(
+        &mut self,
+        path: PathBuf,
+        offset: usize,
+        content: String,
+        cx: &mut Context<Self>,
+    ) {
+        let path = fs::canonicalize(&path).unwrap_or(path);
+        let position = axiom_lsp::PositionCodec::offset_to_position(
+            &content,
+            offset,
+            axiom_lsp::PositionEncoding::Utf8,
+        );
+        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+            self.active = Some(index);
+            self.tabs[index]
+                .editor
+                .update(cx, |editor, cx| editor.reveal_lsp_position(position, cx));
+        } else {
+            let mut document = Document::from_content(&content);
+            document.set_file_path(path.clone());
+            let editor = cx
+                .new(|cx| EditorView::from_document(path.clone(), document, self.lsp.clone(), cx));
+            if let Some(symbols) = &self._runtime_symbols {
+                editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
+            }
+            if let Some(index) = &self.project_index {
+                editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+            }
+            if let Some(vendor) = &self.vendor_index {
+                editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
+            }
+            self.tabs.push(OpenTab { path, editor });
+            self.active = Some(self.tabs.len() - 1);
+            let index = self.active.unwrap();
+            self.tabs[index]
+                .editor
+                .update(cx, |editor, cx| editor.reveal_lsp_position(position, cx));
+        }
+        self.status = "Definition resolved".into();
+        if debug_input_enabled() {
+            tracing::info!(success = true, "[DEFINITION TARGET]");
+            tracing::info!(success = true, "[NAVIGATION RESULT]");
+        }
+        cx.notify();
     }
 
     fn dispatch_editor_action<A: Action + Clone + 'static>(
