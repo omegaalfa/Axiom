@@ -14,7 +14,7 @@ use std::{
 };
 use tree_sitter::Node;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum ProjectSymbolKind {
     Class,
     Interface,
@@ -27,7 +27,7 @@ pub enum ProjectSymbolKind {
     ClassConstant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Visibility {
     Public,
     Protected,
@@ -35,7 +35,7 @@ pub enum Visibility {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectSymbol {
     pub name: String,
     pub fully_qualified_name: String,
@@ -63,6 +63,14 @@ pub struct ProjectSymbolIndex {
     ready: bool,
 }
 
+const PROJECT_CACHE_SCHEMA: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProjectCacheFile {
+    schema_version: u32,
+    files: BTreeMap<PathBuf, (u64, u128, Vec<ProjectSymbol>)>,
+}
+
 /// Composer metadata index. It records class locations without walking all of
 /// `vendor/`; declarations are parsed only when a class is queried.
 #[derive(Debug, Default)]
@@ -73,8 +81,11 @@ pub struct VendorSymbolIndex {
     parsed_files: BTreeMap<String, (PathBuf, u64, u128)>,
 }
 
+const VENDOR_CACHE_SCHEMA: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VendorMetadataCache {
+    schema_version: u32,
     classmap: BTreeMap<String, PathBuf>,
     psr4: Vec<(String, Vec<PathBuf>)>,
     fingerprint: Vec<(PathBuf, u64, u128)>,
@@ -177,8 +188,10 @@ impl VendorSymbolIndex {
         let cache_path = cache_path.as_ref();
         let fingerprint = metadata_fingerprint(root);
         let started = Instant::now();
+        let cache_exists = cache_path.is_file();
         if let Ok(text) = fs::read_to_string(cache_path)
             && let Ok(cache) = serde_json::from_str::<VendorMetadataCache>(&text)
+            && cache.schema_version == VENDOR_CACHE_SCHEMA
             && cache.fingerprint == fingerprint
         {
             if std::env::var_os("AXIOM_DEBUG_COMPOSER").is_some() {
@@ -199,6 +212,7 @@ impl VendorSymbolIndex {
             let _ = fs::create_dir_all(parent);
         }
         let cache = VendorMetadataCache {
+            schema_version: VENDOR_CACHE_SCHEMA,
             classmap: index.classmap.clone(),
             psr4: index.psr4.clone(),
             fingerprint,
@@ -206,7 +220,12 @@ impl VendorSymbolIndex {
         let _ = fs::write(cache_path, serde_json::to_vec(&cache).unwrap_or_default());
         if std::env::var_os("AXIOM_DEBUG_COMPOSER").is_some() {
             eprintln!(
-                "[VENDOR CACHE] hit=false reason=metadata-changed load_ms={}",
+                "[VENDOR CACHE] hit=false reason={} load_ms={}",
+                if cache_exists {
+                    "metadata-changed-or-schema"
+                } else {
+                    "missing"
+                },
                 started.elapsed().as_millis()
             );
         }
@@ -459,11 +478,11 @@ fn composer_path(root: &Path, value: &str) -> PathBuf {
             .unwrap_or(relative);
         return root
             .join("vendor")
-            .join(relative.trim_matches(['\'', '"', '/', '\\']));
+            .join(relative.trim_matches(['\'', '"', '/', '\\', ')', ']', ';']));
     }
     if let Some(start) = value.find("$baseDir . ") {
         let relative = &value[start + "$baseDir . ".len()..];
-        return root.join(relative.trim_matches(['\'', '"', '/', '\\']));
+        return root.join(relative.trim_matches(['\'', '"', '/', '\\', ')', ']', ';']));
     }
     let path = PathBuf::from(value);
     if path.is_absolute() {
@@ -476,7 +495,7 @@ fn composer_path(root: &Path, value: &str) -> PathBuf {
 /// Emits path provenance diagnostics without changing path behavior.
 #[cfg(debug_assertions)]
 pub fn trace_path(stage: &str, source: &str, path: &Path) {
-    if !std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
+    if !std::env::var_os("AXIOM_DEBUG_PATHS").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     }) {
         return;
@@ -518,7 +537,7 @@ pub fn trace_path(_: &str, _: &str, _: &Path) {}
 
 #[cfg(debug_assertions)]
 fn trace_symbol_insert(symbol: &ProjectSymbol, source: &str) {
-    if !std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
+    if !std::env::var_os("AXIOM_DEBUG_PATHS").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     }) {
         return;
@@ -600,6 +619,101 @@ impl ProjectSymbolIndex {
             let _ = self.index_file_with_source(&path, "InitialProjectScan");
         }
         self.ready = true;
+        Ok(self.report())
+    }
+
+    pub fn index_project_cached(
+        &mut self,
+        root: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
+    ) -> io::Result<IndexReport> {
+        let started = Instant::now();
+        let root = root.as_ref();
+        let mut discovered = Vec::new();
+        collect_php_files(root, &mut discovered)?;
+        let discovered: Vec<PathBuf> = discovered
+            .into_iter()
+            .filter_map(|path| fs::canonicalize(path).ok())
+            .collect();
+        let cached = fs::read_to_string(cache_path.as_ref())
+            .ok()
+            .and_then(|text| serde_json::from_str::<ProjectCacheFile>(&text).ok())
+            .filter(|cache| cache.schema_version == PROJECT_CACHE_SCHEMA);
+        let cached_files = cached
+            .as_ref()
+            .map(|cache| cache.files.len())
+            .unwrap_or_default();
+        self.files.clear();
+        self.symbols.clear();
+        self.ready = false;
+        let mut reparsed = 0usize;
+        for path in &discovered {
+            let metadata = fs::metadata(path)?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|v| v.as_nanos())
+                .unwrap_or_default();
+            let reused = cached
+                .as_ref()
+                .and_then(|cache| cache.files.get(path))
+                .filter(|(size, stamp, _)| *size == metadata.len() && *stamp == modified);
+            if let Some((_, _, symbols)) = reused {
+                self.files.insert(path.clone(), Arc::from(""));
+                self.symbols.extend(symbols.clone());
+            } else {
+                self.index_file_with_source(path, "InitialProjectScan")?;
+                reparsed += 1;
+            }
+        }
+        let removed = cached_files.saturating_sub(discovered.len());
+        self.ready = true;
+        let mut files = BTreeMap::new();
+        for path in &discovered {
+            let metadata = fs::metadata(path)?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|v| v.as_nanos())
+                .unwrap_or_default();
+            let symbols = self
+                .symbols
+                .iter()
+                .filter(|symbol| &symbol.file == path)
+                .cloned()
+                .collect();
+            files.insert(path.clone(), (metadata.len(), modified, symbols));
+        }
+        if let Some(parent) = cache_path.as_ref().parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let cache = ProjectCacheFile {
+            schema_version: PROJECT_CACHE_SCHEMA,
+            files,
+        };
+        let _ = fs::write(cache_path, serde_json::to_vec(&cache).unwrap_or_default());
+        if std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some() {
+            eprintln!(
+                "[PROJECT CACHE] hit={} reason={} load_ms={}",
+                cached.is_some() && reparsed == 0,
+                if cached.is_some() {
+                    "metadata"
+                } else {
+                    "missing"
+                },
+                started.elapsed().as_millis()
+            );
+            eprintln!(
+                "[PROJECT STARTUP] discovered_files={} cached_files={} reparsed_files={} removed_files={} elapsed_ms={}",
+                discovered.len(),
+                cached_files,
+                reparsed,
+                removed,
+                started.elapsed().as_millis()
+            );
+        }
         Ok(self.report())
     }
 
@@ -986,6 +1100,32 @@ mod tests {
         assert_eq!(
             first.resolve_class("Pkg\\Cached"),
             second.resolve_class("Pkg\\Cached")
+        );
+    }
+
+    #[test]
+    fn generated_psr4_array_resolves_vendor_dir_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let composer = dir.path().join("vendor/composer");
+        let source = dir
+            .path()
+            .join("vendor/omegaalfa/fiber-event-loop/src/FiberEventLoop.php");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(&composer).unwrap();
+        fs::write(
+            &source,
+            "<?php namespace Omegaalfa\\FiberEventLoop; class FiberEventLoop {}",
+        )
+        .unwrap();
+        fs::write(
+            composer.join("autoload_psr4.php"),
+            "'Omegaalfa\\\\FiberEventLoop\\\\' => array($vendorDir . '/omegaalfa/fiber-event-loop/src'),",
+        )
+        .unwrap();
+        let index = VendorSymbolIndex::load(dir.path()).unwrap();
+        assert_eq!(
+            index.resolve_class("Omegaalfa\\FiberEventLoop\\FiberEventLoop"),
+            Some(fs::canonicalize(source).unwrap())
         );
     }
 }

@@ -163,6 +163,19 @@ pub fn composer_vendor_cache_path(root: &std::path::Path) -> Option<PathBuf> {
     })
 }
 
+pub fn project_symbol_cache_path(root: &std::path::Path) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.to_string_lossy().hash(&mut hasher);
+    let key = format!("{:016x}", hasher.finish());
+    ProjectDirs::from("dev", "Axiom", "Axiom").map(|directories| {
+        directories
+            .cache_dir()
+            .join("project-symbols")
+            .join(format!("{key}.json"))
+    })
+}
+
 pub fn unix_timestamp_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -13,8 +13,8 @@ use std::{
 
 use axiom_app::commands::Keymap;
 use axiom_app::shell_state::{
-    RecentProjects, StartupTarget, composer_vendor_cache_path, recent_projects_path,
-    runtime_stubs_cache_path, runtime_stubs_default_path, unix_timestamp_now,
+    RecentProjects, StartupTarget, composer_vendor_cache_path, project_symbol_cache_path,
+    recent_projects_path, runtime_stubs_cache_path, runtime_stubs_default_path, unix_timestamp_now,
 };
 use axiom_editor::Document;
 use axiom_index::{ProjectSymbolIndex, VendorSymbolIndex};
@@ -1055,8 +1055,9 @@ impl WorkspaceView {
         let index_root = root.clone();
         thread::spawn(move || {
             let mut index = ProjectSymbolIndex::new();
-            let result = index
-                .index_project(&index_root)
+            let result = project_symbol_cache_path(&index_root)
+                .map(|cache| index.index_project_cached(&index_root, cache))
+                .unwrap_or_else(|| index.index_project(&index_root))
                 .map(|_| index)
                 .map_err(|error| error.to_string());
             let _ = sender.send((generation, result));

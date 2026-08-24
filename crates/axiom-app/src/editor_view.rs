@@ -1217,6 +1217,11 @@ impl EditorView {
     }
 
     fn add_native_inspections(&mut self, text: &str) {
+        // Do not publish definitive Unknown class diagnostics while either
+        // project or Composer metadata is still loading.
+        if self.project_symbols.is_none() || self.vendor_symbols.is_none() {
+            return;
+        }
         let project = self
             .project_symbols
             .as_ref()
