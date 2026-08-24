@@ -361,6 +361,19 @@ impl RuntimeSymbolIndex {
         self.class_definitions(fqn).first()
     }
 
+    /// Resolves an unqualified class name when the runtime index has exactly
+    /// one class with that short name (for example `ArrayIterator` declared as
+    /// `Axiom\Test\ArrayIterator`).
+    pub fn find_class_by_short_name(&self, name: &str) -> Option<&Symbol> {
+        let mut matches = self
+            .classes
+            .values()
+            .flat_map(|symbols| symbols.iter())
+            .filter(|symbol| symbol.name.eq_ignore_ascii_case(name));
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
     pub fn class_definitions(&self, fqn: &str) -> &[Symbol] {
         self.classes
             .get(&fold_name(fqn))

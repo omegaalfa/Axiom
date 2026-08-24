@@ -1649,6 +1649,11 @@ impl EditorView {
         if global_exists {
             return written.to_owned();
         }
+        if let Some(runtime) = self.runtime_symbols.as_ref()
+            && let Some(symbol) = runtime.find_class_by_short_name(written)
+        {
+            return symbol.fqn.clone();
+        }
         qualified
     }
 
