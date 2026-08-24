@@ -1218,6 +1218,13 @@ impl EditorView {
     fn complete(&mut self, _: &Complete, _: &mut Window, cx: &mut Context<Self>) {
         self.completions.clear();
         let native = self.native_completions();
+        if debug_completion_enabled() {
+            tracing::info!(
+                native_count = native.len(),
+                cursor = self.document.cursor_offset(),
+                "[COMPLETION REQUEST]"
+            );
+        }
         if let (Some(lsp), Some(uri), Some(position)) =
             (&self.lsp, &self.lsp_uri, self.lsp_position())
         {
@@ -1609,10 +1616,40 @@ impl EditorView {
                 .strip_prefix("namespace ")
                 .map(|value| value.trim_end_matches(';').trim().to_owned())
         });
-        namespace
+        let qualified = namespace
             .filter(|namespace| !namespace.is_empty())
             .map(|namespace| format!("{namespace}\\{written}"))
-            .unwrap_or_else(|| written.to_owned())
+            .unwrap_or_else(|| written.to_owned());
+
+        // A PHP file namespace does not automatically qualify global runtime
+        // classes. Prefer the contextual FQN when it exists, then fall back to
+        // the global class (for example `ArrayIterator`) when the runtime
+        // index contains only that definition.
+        let contextual_exists = self
+            .runtime_symbols
+            .as_ref()
+            .is_some_and(|index| index.find_class(&qualified).is_some())
+            || self
+                .project_symbols
+                .as_ref()
+                .and_then(|index| index.read().ok())
+                .is_some_and(|index| index.find_class(&qualified).is_some());
+        if contextual_exists {
+            return qualified;
+        }
+        let global_exists = self
+            .runtime_symbols
+            .as_ref()
+            .is_some_and(|index| index.find_class(written).is_some())
+            || self
+                .project_symbols
+                .as_ref()
+                .and_then(|index| index.read().ok())
+                .is_some_and(|index| index.find_class(written).is_some());
+        if global_exists {
+            return written.to_owned();
+        }
+        qualified
     }
 
     fn hover_info(&mut self, _: &HoverInfo, _: &mut Window, _: &mut Context<Self>) {
