@@ -1308,9 +1308,25 @@ impl EditorView {
                     );
                 }
                 if let Some(index) = &self.runtime_symbols {
+                    let runtime_class_fqn = index
+                        .find_class(&class_fqn)
+                        .map(|symbol| symbol.fqn.clone())
+                        .or_else(|| {
+                            index
+                                .find_class_by_short_name(owner)
+                                .map(|symbol| symbol.fqn.clone())
+                        })
+                        .unwrap_or_else(|| class_fqn.clone());
+                    if runtime_class_fqn != class_fqn && debug_completion_enabled() {
+                        tracing::info!(
+                            written = %class_fqn,
+                            resolved = %runtime_class_fqn,
+                            "[RUNTIME CLASS RESOLVE]"
+                        );
+                    }
                     members.extend(
                         index
-                            .methods_of(&class_fqn)
+                            .methods_of(&runtime_class_fqn)
                             .filter(|symbol| {
                                 symbol.name.starts_with(prefix)
                                     && (is_static || !symbol.name.starts_with('_'))
