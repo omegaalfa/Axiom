@@ -1353,6 +1353,7 @@ impl EditorView {
             .last()
             .map_or(cursor, |(i, _)| i);
         let prefix = &text[start..cursor];
+        let preceded_by_new = before[..start].trim_end().ends_with("new");
         if prefix.starts_with('$') {
             return self.local_variable_completions(&text[..cursor], prefix);
         }
@@ -1362,6 +1363,90 @@ impl EditorView {
             || before.ends_with("use ");
         if prefix.is_empty() && member_operator.is_none() && !empty_prefix_context {
             return Vec::new();
+        }
+        // A class name by itself is also a static-access completion context.
+        // This lets `CustomRuntime` expand directly to
+        // `CustomRuntime::hello($name, $age)` without requiring `::` first.
+        if member_operator.is_none()
+            && !prefix.is_empty()
+            && !empty_prefix_context
+            && !preceded_by_new
+        {
+            let class_exists = self.runtime_symbols.as_ref().is_some_and(|index| {
+                index.find_class(prefix).is_some()
+                    || index.find_class_by_short_name(prefix).is_some()
+            }) || self
+                .project_symbols
+                .as_ref()
+                .and_then(|index| index.read().ok())
+                .is_some_and(|index| index.find_class(prefix).is_some());
+            if class_exists {
+                let class_fqn = self.resolve_native_type(prefix, before);
+                let mut items = Vec::new();
+                if let (Some(runtime), Some(class_fqn)) =
+                    (&self.runtime_symbols, class_fqn.as_ref())
+                {
+                    let runtime_fqn = runtime
+                        .find_class(class_fqn)
+                        .or_else(|| runtime.find_class_by_short_name(prefix))
+                        .map(|symbol| symbol.fqn.clone())
+                        .unwrap_or_else(|| class_fqn.clone());
+                    items.extend(runtime.methods_of(&runtime_fqn).map(|symbol| {
+                        let call = runtime_call_insert_text(symbol)
+                            .unwrap_or_else(|| format!("{}()", symbol.name));
+                        CompletionItem {
+                            label: symbol.name.clone(),
+                            detail: Some(runtime_signature_detail(symbol)),
+                            kind: Some(CompletionItemKind::METHOD),
+                            insert_text: Some(format!("{prefix}::{call}")),
+                            ..Default::default()
+                        }
+                    }));
+                }
+                if let (Some(project), Some(class_fqn)) =
+                    (&self.project_symbols, class_fqn.as_ref())
+                    && let Ok(project) = project.read()
+                {
+                    items.extend(
+                        project
+                            .find_methods(class_fqn)
+                            .into_iter()
+                            .filter(|symbol| {
+                                symbol.modifiers.iter().any(|modifier| modifier == "static")
+                            })
+                            .map(|symbol| {
+                                let detail = project_method_detail(symbol);
+                                let signature = detail
+                                    .find('(')
+                                    .and_then(|open| {
+                                        detail.rfind(')').map(|close| &detail[open..=close])
+                                    })
+                                    .unwrap_or("()")
+                                    .to_owned();
+                                CompletionItem {
+                                    label: symbol.name.clone(),
+                                    detail: Some(detail),
+                                    kind: Some(CompletionItemKind::METHOD),
+                                    insert_text: Some(format!(
+                                        "{prefix}::{}{signature}",
+                                        symbol.name
+                                    )),
+                                    ..Default::default()
+                                }
+                            }),
+                    );
+                }
+                if items.is_empty() {
+                    items.push(CompletionItem {
+                        label: "class".to_owned(),
+                        detail: Some("Class name • Runtime".to_owned()),
+                        kind: Some(CompletionItemKind::KEYWORD),
+                        insert_text: Some(format!("{prefix}::class")),
+                        ..Default::default()
+                    });
+                }
+                return items.into_iter().take(40).collect();
+            }
         }
         if let Some((operator_start, is_static)) = member_operator {
             let owner_end = operator_start;
