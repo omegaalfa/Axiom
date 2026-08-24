@@ -2629,6 +2629,9 @@ impl EditorView {
         if !self.is_in_text_area(event.position) {
             return;
         }
+        // Claim focus as part of the same mouse gesture. Ctrl-click below
+        // must not be lost when a tab was just reactivated or reopened.
+        window.focus(&self.focus);
         let line = self.mouse_line(event.position);
         self.ctrl_hover_range = None;
         let offset = self.mouse_offset(line, event.position.x, window);
@@ -2660,7 +2663,6 @@ impl EditorView {
         self.context_menu = None;
         self.completions.clear();
         self.hover_popup = None;
-        window.focus(&self.focus);
         if event.click_count >= 3 {
             let start = self.document.offset_of_line(line);
             let end = start + self.document.line_content(line).len();
