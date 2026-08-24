@@ -508,6 +508,8 @@ name = "axiom-index"
 version = "0.1.0"
 dependencies = [
  "axiom-syntax",
+ "serde",
+ "serde_json",
  "tempfile",
  "tree-sitter",
 ]

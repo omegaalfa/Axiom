@@ -13,7 +13,7 @@ use std::{
 };
 
 use axiom_editor::Document;
-use axiom_index::{ProjectSymbolIndex, ProjectSymbolKind};
+use axiom_index::{ProjectSymbolIndex, ProjectSymbolKind, VendorSymbolIndex};
 use axiom_lsp::{PositionCodec, PositionEncoding, path_to_uri};
 use axiom_php::{RuntimeSymbolIndex, Symbol as RuntimeSymbol, SymbolKind as RuntimeKind};
 use axiom_project::is_php_file;
@@ -151,6 +151,7 @@ pub struct EditorView {
     line_layouts: RefCell<HashMap<usize, CachedLineLayout>>,
     runtime_symbols: Option<Arc<RuntimeSymbolIndex>>,
     project_symbols: Option<Arc<std::sync::RwLock<ProjectSymbolIndex>>>,
+    vendor_symbols: Option<Arc<std::sync::RwLock<VendorSymbolIndex>>>,
     project_index_revision: Option<Arc<AtomicU64>>,
     index_update_sender: Option<Sender<IndexUpdateRequest>>,
     last_completion_layout: Option<(u32, u32, u32, u32, bool)>,
@@ -260,6 +261,7 @@ impl EditorView {
             line_layouts: RefCell::new(HashMap::new()),
             runtime_symbols: None,
             project_symbols: None,
+            vendor_symbols: None,
             project_index_revision: None,
             index_update_sender: Some(index_update_sender),
             last_completion_layout: None,
@@ -361,6 +363,20 @@ impl EditorView {
                         );
                     }
                 }
+                if let Some(index) = &self.vendor_symbols
+                    && let Ok(mut index) = index.write()
+                    && let Some(symbol) = index.symbols_of(&class_fqn).into_iter().find(|symbol| {
+                        symbol.name == name
+                            && (is_static
+                                == symbol.modifiers.iter().any(|modifier| modifier == "static"))
+                    })
+                {
+                    return self.resolve_location(
+                        &symbol.file,
+                        symbol.range.start,
+                        &text_at_cursor,
+                    );
+                }
                 if let Some(runtime) = &self.runtime_symbols {
                     let runtime_class_fqn = runtime
                         .find_class(&class_fqn)
@@ -411,6 +427,26 @@ impl EditorView {
             None
         }
         .or_else(|| {
+            self.vendor_symbols.as_ref().and_then(|index| {
+                let mut index = index.write().ok()?;
+                let resolved = self.resolve_class_name(name, &text_at_cursor);
+                index
+                    .symbols_of(&resolved)
+                    .into_iter()
+                    .find(|symbol| {
+                        matches!(
+                            symbol.kind,
+                            ProjectSymbolKind::Class
+                                | ProjectSymbolKind::Interface
+                                | ProjectSymbolKind::Trait
+                                | ProjectSymbolKind::Enum
+                        )
+                    })
+                    .map(|symbol| (symbol.file, symbol.range))
+                    .or_else(|| index.resolve_class(&resolved).map(|file| (file, 0..0)))
+            })
+        })
+        .or_else(|| {
             self.runtime_symbols.as_ref().and_then(|index| {
                 index
                     .find_class(name)
@@ -436,6 +472,11 @@ impl EditorView {
     pub fn set_project_symbols(&mut self, symbols: Arc<std::sync::RwLock<ProjectSymbolIndex>>) {
         self.project_symbols = Some(symbols);
         self.project_index_revision = Some(Arc::new(AtomicU64::new(0)));
+        self.sync_syntax();
+    }
+
+    pub fn set_vendor_symbols(&mut self, symbols: Arc<std::sync::RwLock<VendorSymbolIndex>>) {
+        self.vendor_symbols = Some(symbols);
         self.sync_syntax();
     }
 
@@ -1176,11 +1217,11 @@ impl EditorView {
     }
 
     fn add_native_inspections(&mut self, text: &str) {
-        let Some(index) = &self.project_symbols else {
-            return;
-        };
-        let Ok(index) = index.read() else { return };
-        if !index.is_ready() {
+        let project = self
+            .project_symbols
+            .as_ref()
+            .and_then(|index| index.read().ok());
+        if project.as_ref().is_some_and(|index| !index.is_ready()) {
             return;
         }
         let mut offset = 0;
@@ -1200,14 +1241,15 @@ impl EditorView {
                 let written = &text[start..end];
                 let name = written.trim_start_matches('\\');
                 let resolved = self.resolve_class_name(written, text);
-                let project_symbol = index.find_class(&resolved);
+                let project_symbol = project
+                    .as_ref()
+                    .and_then(|index| index.find_class(&resolved));
                 let known_project = project_symbol.is_some();
-                let composer_found = project_symbol.is_some_and(|symbol| {
-                    symbol
-                        .modifiers
-                        .iter()
-                        .any(|modifier| modifier == "composer")
-                });
+                let composer_found = self
+                    .vendor_symbols
+                    .as_ref()
+                    .and_then(|vendor| vendor.read().ok())
+                    .is_some_and(|vendor| vendor.resolve_class(&resolved).is_some());
                 let known_runtime = self.runtime_symbols.as_ref().is_some_and(|runtime| {
                     runtime.find_class(&resolved).is_some()
                         || runtime.find_class_by_short_name(name).is_some()
@@ -1220,7 +1262,7 @@ impl EditorView {
                 // LSP readiness is reported for diagnostics, but it does not
                 // prove that this class exists. Native/project/runtime indexes
                 // remain the source of truth for this local inspection.
-                let diagnostic = !known_project && !known_runtime && !special;
+                let diagnostic = !known_project && !composer_found && !known_runtime && !special;
                 if debug_completion_enabled() {
                     let via = if resolved == name {
                         if text[..start].contains("namespace ") {
@@ -1265,6 +1307,9 @@ impl EditorView {
             (&str, ProjectSymbolKind),
             std::collections::HashSet<&Path>,
         > = std::collections::HashMap::new();
+        let Some(index) = project.as_ref() else {
+            return;
+        };
         for symbol in index.symbols() {
             symbol_files
                 .entry((symbol.fully_qualified_name.as_str(), symbol.kind))
@@ -1337,8 +1382,9 @@ impl EditorView {
             })
             .map(|symbol| (symbol.name.clone(), symbol.fully_qualified_name.clone()))
             .collect();
-        drop(index);
+        let _ = index;
         let runtime_symbols = self.runtime_symbols.clone();
+        drop(project);
         self.add_unknown_constant_inspections(text, &constant_names, runtime_symbols.as_ref());
     }
 
@@ -1627,6 +1673,25 @@ impl EditorView {
                             }),
                     );
                 }
+                if let Some(index) = &self.vendor_symbols
+                    && let Ok(mut index) = index.write()
+                {
+                    members.extend(
+                        index
+                            .symbols_of(&class_fqn)
+                            .into_iter()
+                            .filter(|symbol| {
+                                symbol.name.starts_with(prefix)
+                                    && (is_static == symbol.modifiers.iter().any(|m| m == "static"))
+                            })
+                            .map(|symbol| CompletionItem {
+                                label: symbol.name,
+                                detail: symbol.parameters.clone(),
+                                kind: Some(CompletionItemKind::METHOD),
+                                ..Default::default()
+                            }),
+                    );
+                }
                 if let Some(index) = &self.runtime_symbols {
                     let runtime_class_fqn = index
                         .find_class(&class_fqn)
@@ -1749,6 +1814,21 @@ impl EditorView {
                         | ProjectSymbolKind::Enum => CompletionItemKind::CLASS,
                         _ => CompletionItemKind::VALUE,
                     }),
+                    additional_text_edits: import.map(|edit| vec![edit]),
+                    ..Default::default()
+                }
+            }));
+        }
+        if let Some(index) = &self.vendor_symbols
+            && let Ok(index) = index.read()
+        {
+            items.extend(index.classes_matching(prefix).into_iter().map(|fqn| {
+                let label = fqn.rsplit('\\').next().unwrap_or(&fqn).to_owned();
+                let import = self.composer_import_edit(&fqn);
+                CompletionItem {
+                    label,
+                    detail: Some(format!("{fqn} • Vendor")),
+                    kind: Some(CompletionItemKind::CLASS),
                     additional_text_edits: import.map(|edit| vec![edit]),
                     ..Default::default()
                 }
@@ -1954,7 +2034,12 @@ impl EditorView {
                 .as_ref()
                 .and_then(|index| index.read().ok())
                 .is_some_and(|index| index.find_class(&candidate).is_some());
-        if contextual_exists {
+        let vendor_exists = self
+            .vendor_symbols
+            .as_ref()
+            .and_then(|index| index.read().ok())
+            .is_some_and(|index| index.resolve_class(&candidate).is_some());
+        if contextual_exists || vendor_exists {
             return candidate;
         }
         let global_exists = self

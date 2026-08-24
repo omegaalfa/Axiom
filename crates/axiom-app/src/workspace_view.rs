@@ -13,11 +13,11 @@ use std::{
 
 use axiom_app::commands::Keymap;
 use axiom_app::shell_state::{
-    RecentProjects, StartupTarget, recent_projects_path, runtime_stubs_cache_path,
-    runtime_stubs_default_path, unix_timestamp_now,
+    RecentProjects, StartupTarget, composer_vendor_cache_path, recent_projects_path,
+    runtime_stubs_cache_path, runtime_stubs_default_path, unix_timestamp_now,
 };
 use axiom_editor::Document;
-use axiom_index::ProjectSymbolIndex;
+use axiom_index::{ProjectSymbolIndex, VendorSymbolIndex};
 use axiom_lsp::{ServerStatus, uri_to_path};
 use axiom_php::{RuntimeSymbolIndex, StubProvider};
 use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_content};
@@ -242,6 +242,9 @@ pub struct WorkspaceView {
     project_index: Option<Arc<RwLock<ProjectSymbolIndex>>>,
     index_generation: u64,
     index_results: Option<Receiver<(u64, Result<ProjectSymbolIndex, String>)>>,
+    vendor_index: Option<Arc<RwLock<VendorSymbolIndex>>>,
+    vendor_index_generation: u64,
+    vendor_index_results: Option<Receiver<(u64, Result<VendorSymbolIndex, String>)>>,
     indexing_phase: u8,
     keymap: Keymap,
     command_palette_visible: bool,
@@ -747,6 +750,9 @@ impl WorkspaceView {
             project_index: None,
             index_generation: 0,
             index_results: None,
+            vendor_index: None,
+            vendor_index_generation: 0,
+            vendor_index_results: None,
             indexing_phase: 0,
             keymap,
             command_palette_visible: false,
@@ -785,6 +791,7 @@ impl WorkspaceView {
                             cx.notify();
                         }
                         this.poll_index(cx);
+                        this.poll_vendor_index(cx);
                         this.poll_project_load(cx);
                         this.poll_runtime_stub_load(cx);
                         this.poll_runtime_watcher(cx);
@@ -1043,6 +1050,7 @@ impl WorkspaceView {
         let (sender, receiver) = mpsc::channel();
         self.index_results = Some(receiver);
         self.project_index = None;
+        self.vendor_index = None;
         self.status = "Project opened — indexing...".into();
         let index_root = root.clone();
         thread::spawn(move || {
@@ -1052,6 +1060,18 @@ impl WorkspaceView {
                 .map(|_| index)
                 .map_err(|error| error.to_string());
             let _ = sender.send((generation, result));
+        });
+        self.vendor_index_generation = self.vendor_index_generation.wrapping_add(1);
+        let vendor_generation = self.vendor_index_generation;
+        let (vendor_sender, vendor_receiver) = mpsc::channel();
+        self.vendor_index_results = Some(vendor_receiver);
+        let vendor_root = root.clone();
+        thread::spawn(move || {
+            let result = composer_vendor_cache_path(&vendor_root)
+                .map(|cache| VendorSymbolIndex::load_cached(&vendor_root, cache))
+                .unwrap_or_else(|| VendorSymbolIndex::load(&vendor_root))
+                .map_err(|error| error.to_string());
+            let _ = vendor_sender.send((vendor_generation, result));
         });
         self.explorer = entries
             .into_iter()
@@ -1072,6 +1092,37 @@ impl WorkspaceView {
             tracing::warn!("failed to persist recent projects: {error}");
         }
         self.lsp = Some(lsp);
+        cx.notify();
+    }
+
+    fn poll_vendor_index(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = self.vendor_index_results.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.vendor_index_results = None;
+                return;
+            }
+        };
+        self.vendor_index_results = None;
+        let (generation, result) = result;
+        if generation != self.vendor_index_generation || self.project.is_none() {
+            return;
+        }
+        match result {
+            Ok(index) => {
+                let shared = Arc::new(RwLock::new(index));
+                self.vendor_index = Some(shared.clone());
+                for tab in &self.tabs {
+                    tab.editor
+                        .update(cx, |editor, _| editor.set_vendor_symbols(shared.clone()));
+                }
+            }
+            Err(error) => self.status = format!("Composer metadata unavailable: {error}").into(),
+        }
         cx.notify();
     }
 
@@ -3050,6 +3101,9 @@ impl WorkspaceView {
         }
         if let Some(index) = &self.project_index {
             editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+            if let Some(vendor) = &self.vendor_index {
+                editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
+            }
         }
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
         self.tabs.push(OpenTab { path, editor });
@@ -3099,6 +3153,9 @@ impl WorkspaceView {
         }
         if let Some(index) = &self.project_index {
             editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+            if let Some(vendor) = &self.vendor_index {
+                editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
+            }
         }
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
         self.tabs.push(OpenTab { path, editor });
@@ -3355,6 +3412,9 @@ impl WorkspaceView {
             }
             if let Some(index) = &self.project_index {
                 editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+                if let Some(vendor) = &self.vendor_index {
+                    editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
+                }
             }
             cx.observe(&editor, |_, _, cx| cx.notify()).detach();
             self.tabs.push(OpenTab { path, editor });
@@ -3450,6 +3510,9 @@ impl WorkspaceView {
             }
             if let Some(index) = &self.project_index {
                 editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+                if let Some(vendor) = &self.vendor_index {
+                    editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
+                }
             }
             cx.observe(&editor, |_, _, cx| cx.notify()).detach();
             self.tabs.push(OpenTab { path, editor });
