@@ -73,8 +73,11 @@ struct ProjectCacheFile {
 
 /// Composer metadata index. It records class locations without walking all of
 /// `vendor/`; declarations are parsed only when a class is queried.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct VendorSymbolIndex {
+    /// Canonical project vendor directory. Composer mappings outside this
+    /// directory belong to the workspace and must not be exposed as Vendor.
+    vendor_root: Option<PathBuf>,
     classmap: BTreeMap<String, PathBuf>,
     psr4: Vec<(String, Vec<PathBuf>)>,
     parsed: BTreeMap<String, Vec<ProjectSymbol>>,
@@ -96,7 +99,10 @@ impl VendorSymbolIndex {
         let root = root.as_ref();
         let started = Instant::now();
         let composer = root.join("vendor/composer");
-        let mut index = Self::default();
+        let mut index = Self {
+            vendor_root: Some(canonical_or(root.join("vendor"))),
+            ..Self::default()
+        };
         let classmap = composer.join("autoload_classmap.php");
         if let Ok(text) = fs::read_to_string(&classmap) {
             for line in text.lines() {
@@ -201,6 +207,7 @@ impl VendorSymbolIndex {
                 );
             }
             return Ok(Self {
+                vendor_root: Some(canonical_or(root.join("vendor"))),
                 classmap: cache.classmap,
                 psr4: cache.psr4,
                 parsed: BTreeMap::new(),
@@ -275,6 +282,12 @@ impl VendorSymbolIndex {
     }
 
     pub fn resolve_class(&self, fqn: &str) -> Option<PathBuf> {
+        let is_vendor_path = |path: &Path| {
+            let Some(root) = &self.vendor_root else {
+                return true;
+            };
+            canonical_or(path.to_path_buf()).starts_with(root)
+        };
         if let Some(path) = self.classmap.get(fqn) {
             if std::env::var_os("AXIOM_DEBUG_COMPOSER").is_some() {
                 eprintln!(
@@ -283,7 +296,7 @@ impl VendorSymbolIndex {
                     path.is_file()
                 );
             }
-            return Some(path.clone());
+            return is_vendor_path(path).then(|| path.clone());
         }
         let (prefix, tail, _) = self
             .psr4
@@ -305,7 +318,7 @@ impl VendorSymbolIndex {
                     path.is_file()
                 );
             }
-            if path.is_file() {
+            if path.is_file() && is_vendor_path(&path) {
                 return Some(path);
             }
         }
@@ -441,6 +454,20 @@ impl VendorSymbolIndex {
             eprintln!("[VENDOR SYMBOL CACHE] hit=false fqn={fqn}");
         }
         symbols
+    }
+
+    /// Publishes parsed entries from an off-lock snapshot. Only cache maps are
+    /// copied; Composer metadata remains unchanged and is read-only here.
+    pub fn merge_parsed_cache(&mut self, snapshot: &Self) {
+        self.parsed.extend(snapshot.parsed.clone());
+        self.parsed_files.extend(snapshot.parsed_files.clone());
+    }
+
+    /// Returns symbols already parsed for a class without touching the
+    /// filesystem. This is safe for UI-side completion when the lock is held
+    /// only briefly by the caller.
+    pub fn cached_symbols(&self, fqn: &str) -> Vec<ProjectSymbol> {
+        self.parsed.get(fqn).cloned().unwrap_or_default()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -911,11 +938,18 @@ fn walk(
                     .unwrap_or_default()
                     .to_owned()
             });
-            let return_type = node.child_by_field_name("return_type").map(|node| {
-                node.utf8_text(text.as_bytes())
-                    .unwrap_or_default()
-                    .to_owned()
-            });
+            let return_type = node
+                .child_by_field_name("return_type")
+                .map(|node| {
+                    node.utf8_text(text.as_bytes())
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .or_else(|| {
+                    (kind == ProjectSymbolKind::Property)
+                        .then(|| property_declared_type(node, name_node, text))
+                        .flatten()
+                });
             let fqn = match (class, kind) {
                 (
                     Some(parent),
@@ -969,6 +1003,15 @@ fn walk(
     }
 }
 
+fn property_declared_type(node: Node<'_>, name: Node<'_>, text: &str) -> Option<String> {
+    let source = &text[node.start_byte()..name.start_byte().min(text.len())];
+    let ty = source.split_whitespace().last()?.trim_matches(['?', '&']);
+    (ty.chars()
+        .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '\\' | '|'))
+        && !ty.is_empty())
+    .then(|| ty.to_owned())
+}
+
 fn declaration_modifiers(node: Node<'_>, text: &str) -> (Visibility, Vec<String>) {
     let source = &text[node.start_byte()..node.end_byte().min(text.len())];
     let mut modifiers = Vec::new();
@@ -1014,8 +1057,29 @@ fn symbol_node(node: Node<'_>) -> Option<(ProjectSymbolKind, Node<'_>)> {
         _ => return None,
     };
     let field = node.child_by_field_name("name").or_else(|| {
-        node.named_children(&mut node.walk())
-            .find(|child| child.kind() == "variable_name" || child.kind() == "name")
+        if kind == ProjectSymbolKind::Property {
+            if let Some(element) = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "property_element")
+            {
+                return element.child_by_field_name("name").or_else(|| {
+                    element
+                        .named_children(&mut element.walk())
+                        .find(|child| child.kind() == "variable_name" || child.kind() == "name")
+                });
+            }
+        }
+        node.named_children(&mut node.walk()).find_map(|child| {
+            if child.kind() == "variable_name" || child.kind() == "name" {
+                Some(child)
+            } else {
+                child.child_by_field_name("name").or_else(|| {
+                    child
+                        .named_children(&mut child.walk())
+                        .find(|nested| nested.kind() == "variable_name" || nested.kind() == "name")
+                })
+            }
+        })
     })?;
     Some((kind, field))
 }
@@ -1052,6 +1116,25 @@ mod tests {
     }
 
     #[test]
+    fn indexes_typed_property_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Client.php");
+        fs::write(
+            &path,
+            "<?php\nclass Client {\n    private FiberEventLoop $loop;\n}\n",
+        )
+        .unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_file(&path).unwrap();
+        let property = index
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.kind == ProjectSymbolKind::Property)
+            .unwrap();
+        assert_eq!(property.return_type.as_deref(), Some("FiberEventLoop"));
+    }
+
+    #[test]
     fn composer_classmap_resolves_without_executing_php() {
         let dir = tempfile::tempdir().unwrap();
         let composer = dir.path().join("vendor/composer");
@@ -1082,20 +1165,24 @@ mod tests {
     }
 
     #[test]
-    fn composer_json_psr4_is_used_as_fallback() {
+    fn composer_root_psr4_is_not_misclassified_as_vendor() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("src/Thing.php");
+        let vendor_source = dir.path().join("vendor/acme/pkg/src/Thing.php");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(vendor_source.parent().unwrap()).unwrap();
         fs::write(&source, "<?php namespace Acme; class Thing {}").unwrap();
+        fs::write(&vendor_source, "<?php namespace Vendor; class Thing {}").unwrap();
         fs::write(
             dir.path().join("composer.json"),
-            r#"{"autoload":{"psr-4":{"Acme\\":"src/"}}}"#,
+            r#"{"autoload":{"psr-4":{"Acme\\":"src/","Vendor\\":"vendor/acme/pkg/src/"}}}"#,
         )
         .unwrap();
         let index = VendorSymbolIndex::load(dir.path()).unwrap();
+        assert!(index.resolve_class("Acme\\Thing").is_none());
         assert_eq!(
-            index.resolve_class("Acme\\Thing").unwrap(),
-            fs::canonicalize(source).unwrap()
+            index.resolve_class("Vendor\\Thing"),
+            Some(fs::canonicalize(vendor_source).unwrap())
         );
     }
 

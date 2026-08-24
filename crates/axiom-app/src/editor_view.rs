@@ -343,17 +343,12 @@ impl EditorView {
         {
             let is_static = text_at_cursor[operator..].starts_with("::");
             let owner_end = operator;
-            let owner_start = text_at_cursor[..owner_end]
-                .char_indices()
-                .rev()
-                .take_while(|(_, ch)| ch.is_alphanumeric() || *ch == '_' || *ch == '$')
-                .last()
-                .map_or(owner_end, |(i, _)| i);
-            let owner = text_at_cursor[owner_start..owner_end].trim_start_matches('$');
-            if let Some(class_fqn) = self.resolve_native_type(owner, &text_at_cursor[..owner_start])
+            let (_, owner_expression) = extract_owner_expression(&text_at_cursor, owner_end);
+            if let Some(class_fqn) =
+                self.resolve_receiver_type(&owner_expression, &text_at_cursor[..owner_end])
             {
                 if let Some(index) = &self.project_symbols
-                    && let Ok(index) = index.read()
+                    && let Ok(index) = index.try_read()
                 {
                     if let Some(symbol) =
                         index.find_methods(&class_fqn).into_iter().find(|symbol| {
@@ -387,20 +382,9 @@ impl EditorView {
                         );
                     }
                 }
-                if let Some(index) = &self.vendor_symbols
-                    && let Ok(mut index) = index.write()
-                    && let Some(symbol) = index.symbols_of(&class_fqn).into_iter().find(|symbol| {
-                        symbol.name == name
-                            && (is_static
-                                == symbol.modifiers.iter().any(|modifier| modifier == "static"))
-                    })
-                {
-                    return self.resolve_location(
-                        &symbol.file,
-                        symbol.range.start,
-                        &text_at_cursor,
-                    );
-                }
+                // Vendor members are resolved by the asynchronous definition
+                // pipeline. This legacy synchronous path must never parse or
+                // lock the Vendor index on the UI thread.
                 if let Some(runtime) = &self.runtime_symbols {
                     let runtime_class_fqn = runtime
                         .find_class(&class_fqn)
@@ -434,7 +418,7 @@ impl EditorView {
             );
         }
         if let Some(index) = &self.project_symbols
-            && let Ok(index) = index.read()
+            && let Ok(index) = index.try_read()
             && let Some(symbol) = index
                 .symbols()
                 .iter()
@@ -443,7 +427,7 @@ impl EditorView {
             return self.resolve_location(&symbol.file, symbol.range.start, &text_at_cursor);
         }
         let target = if let Some(index) = &self.project_symbols {
-            let index = index.read().ok()?;
+            let index = index.try_read().ok()?;
             index
                 .find_class(name)
                 .map(|symbol| (symbol.file.clone(), symbol.range.clone()))
@@ -451,24 +435,10 @@ impl EditorView {
             None
         }
         .or_else(|| {
-            self.vendor_symbols.as_ref().and_then(|index| {
-                let mut index = index.write().ok()?;
-                let resolved = self.resolve_class_name(name, &text_at_cursor);
-                index
-                    .symbols_of(&resolved)
-                    .into_iter()
-                    .find(|symbol| {
-                        matches!(
-                            symbol.kind,
-                            ProjectSymbolKind::Class
-                                | ProjectSymbolKind::Interface
-                                | ProjectSymbolKind::Trait
-                                | ProjectSymbolKind::Enum
-                        )
-                    })
-                    .map(|symbol| (symbol.file, symbol.range))
-                    .or_else(|| index.resolve_class(&resolved).map(|file| (file, 0..0)))
-            })
+            let resolved = self.resolve_class_name(name, &text_at_cursor);
+            self.vendor_symbols
+                .as_ref()
+                .and_then(|index| resolve_vendor_definition_target(index, &resolved))
         })
         .or_else(|| {
             self.runtime_symbols.as_ref().and_then(|index| {
@@ -491,17 +461,9 @@ impl EditorView {
         if let Some(operator) = before.rfind("->").or_else(|| before.rfind("::")) {
             let is_static = before[operator..].starts_with("::");
             let owner_end = operator;
-            let owner_start = before[..owner_end]
-                .char_indices()
-                .rev()
-                .take_while(|(_, ch)| {
-                    ch.is_alphanumeric() || *ch == '_' || *ch == '$' || *ch == '\\'
-                })
-                .last()
-                .map_or(owner_end, |(i, _)| i);
-            let written_owner = before[owner_start..owner_end].to_owned();
+            let (_, written_owner) = extract_owner_expression(before, owner_end);
             let owner_fqn = if written_owner.starts_with('$') {
-                self.resolve_native_type(&written_owner, before)?
+                self.resolve_receiver_type(&written_owner, before)?
             } else {
                 resolve_php_class_name(&written_owner, &text)
             };
@@ -549,7 +511,7 @@ impl EditorView {
             DefinitionQuery::Function { .. } => return None,
         };
         let index = self.vendor_symbols.clone()?;
-        let path = index.read().ok()?.resolve_class(&fqn);
+        let path = index.try_read().ok()?.resolve_class(&fqn);
         if debug_completion_enabled() {
             tracing::info!(fqn = %fqn, found = path.is_some(), path = ?path, "[VENDOR PREFLIGHT]");
         }
@@ -569,7 +531,7 @@ impl EditorView {
     pub fn project_definition_location(&self) -> Option<(PathBuf, lsp_types::Position)> {
         let text = self.document.content();
         let query = self.definition_query()?;
-        let index = self.project_symbols.as_ref()?.read().ok()?;
+        let index = self.project_symbols.as_ref()?.try_read().ok()?;
         let symbol = match query {
             DefinitionQuery::Method {
                 owner_fqn,
@@ -1304,14 +1266,16 @@ impl EditorView {
                     })
             });
             let signature_info = runtime_signature.or_else(|| {
-                let project = project.as_ref()?.read().ok()?;
-                let symbol = callable
+                let resolved_owner = callable
                     .rsplit_once("::")
                     .or_else(|| callable.rsplit_once("->"))
-                    .and_then(|(owner, _)| {
-                        let owner = self.resolve_native_type(owner.trim(), &text[..open])?;
+                    .and_then(|(owner, _)| self.resolve_receiver_type(owner.trim(), &text[..open]));
+                let project = project.as_ref()?.try_read().ok()?;
+                let symbol = resolved_owner
+                    .as_deref()
+                    .and_then(|owner| {
                         project
-                            .find_methods(&owner)
+                            .find_methods(owner)
                             .into_iter()
                             .find(|symbol| symbol.name == name)
                     })
@@ -1355,11 +1319,12 @@ impl EditorView {
         if self.project_symbols.is_none() || self.vendor_symbols.is_none() {
             return;
         }
-        let project = self
+        if self
             .project_symbols
             .as_ref()
-            .and_then(|index| index.read().ok());
-        if project.as_ref().is_some_and(|index| !index.is_ready()) {
+            .and_then(|index| index.try_read().ok())
+            .is_some_and(|index| !index.is_ready())
+        {
             return;
         }
         let mut offset = 0;
@@ -1379,14 +1344,16 @@ impl EditorView {
                 let written = &text[start..end];
                 let name = written.trim_start_matches('\\');
                 let resolved = self.resolve_class_name(written, text);
-                let project_symbol = project
+                let project_symbol = self
+                    .project_symbols
                     .as_ref()
-                    .and_then(|index| index.find_class(&resolved));
+                    .and_then(|index| index.try_read().ok())
+                    .and_then(|index| index.find_class(&resolved).cloned());
                 let known_project = project_symbol.is_some();
                 let composer_found = self
                     .vendor_symbols
                     .as_ref()
-                    .and_then(|vendor| vendor.read().ok())
+                    .and_then(|vendor| vendor.try_read().ok())
                     .is_some_and(|vendor| vendor.resolve_class(&resolved).is_some());
                 let known_runtime = self.runtime_symbols.as_ref().is_some_and(|runtime| {
                     runtime.find_class(&resolved).is_some()
@@ -1445,9 +1412,14 @@ impl EditorView {
             (&str, ProjectSymbolKind),
             std::collections::HashSet<&Path>,
         > = std::collections::HashMap::new();
-        let Some(index) = project.as_ref() else {
+        let Some(project_guard) = self
+            .project_symbols
+            .as_ref()
+            .and_then(|index| index.try_read().ok())
+        else {
             return;
         };
+        let index = &project_guard;
         for symbol in index.symbols() {
             symbol_files
                 .entry((symbol.fully_qualified_name.as_str(), symbol.kind))
@@ -1522,7 +1494,7 @@ impl EditorView {
             .collect();
         let _ = index;
         let runtime_symbols = self.runtime_symbols.clone();
-        drop(project);
+        drop(project_guard);
         self.add_unknown_constant_inspections(text, &constant_names, runtime_symbols.as_ref());
     }
 
@@ -1701,7 +1673,7 @@ impl EditorView {
             }) || self
                 .project_symbols
                 .as_ref()
-                .and_then(|index| index.read().ok())
+                .and_then(|index| index.try_read().ok())
                 .is_some_and(|index| index.find_class(prefix).is_some());
             if class_exists {
                 let class_fqn = self.resolve_native_type(prefix, before);
@@ -1733,7 +1705,7 @@ impl EditorView {
                 }
                 if let (Some(project), Some(class_fqn)) =
                     (&self.project_symbols, class_fqn.as_ref())
-                    && let Ok(project) = project.read()
+                    && let Ok(project) = project.try_read()
                 {
                     items.extend(
                         project
@@ -1778,20 +1750,20 @@ impl EditorView {
         }
         if let Some((operator_start, is_static)) = member_operator {
             let owner_end = operator_start;
-            let owner_start = text[..owner_end]
-                .char_indices()
-                .rev()
-                .take_while(|(_, ch)| ch.is_alphanumeric() || *ch == '_' || *ch == '$')
-                .last()
-                .map_or(owner_end, |(i, _)| i);
-            let owner = text[owner_start..owner_end].trim_start_matches('$');
-            if let Some(class_fqn) = self.resolve_native_type(owner, &text[..owner_end]) {
+            let (_, owner_expression) = extract_owner_expression(&text, owner_end);
+            let owner = owner_expression.trim_start_matches('$');
+            if debug_completion_enabled() && owner_expression.contains("->") {
+                tracing::info!(owner = %owner_expression, "[DEFINITION RECEIVER CHAIN]");
+            }
+            if let Some(class_fqn) =
+                self.resolve_receiver_type(&owner_expression, &text[..owner_end])
+            {
                 if debug_completion_enabled() {
                     tracing::info!(trigger = "MemberAccess", receiver_type = %class_fqn, "[COMPLETION CONTEXT]");
                 }
                 let mut members = Vec::new();
                 if let Some(index) = &self.project_symbols
-                    && let Ok(index) = index.read()
+                    && let Ok(index) = index.try_read()
                 {
                     members.extend(
                         index
@@ -1812,11 +1784,11 @@ impl EditorView {
                     );
                 }
                 if let Some(index) = &self.vendor_symbols
-                    && let Ok(mut index) = index.write()
+                    && let Ok(index) = index.try_read()
                 {
                     members.extend(
                         index
-                            .symbols_of(&class_fqn)
+                            .cached_symbols(&class_fqn)
                             .into_iter()
                             .filter(|symbol| {
                                 symbol.name.starts_with(prefix)
@@ -1928,7 +1900,7 @@ impl EditorView {
             })
             .unwrap_or_default();
         if let Some(index) = &self.project_symbols
-            && let Ok(index) = index.read()
+            && let Ok(index) = index.try_read()
         {
             items.extend(index.search_prefix(prefix).into_iter().map(|symbol| {
                 let import = matches!(
@@ -1958,7 +1930,7 @@ impl EditorView {
             }));
         }
         if let Some(index) = &self.vendor_symbols
-            && let Ok(index) = index.read()
+            && let Ok(index) = index.try_read()
         {
             items.extend(index.classes_matching(prefix).into_iter().map(|fqn| {
                 let label = fqn.rsplit('\\').next().unwrap_or(&fqn).to_owned();
@@ -2144,13 +2116,36 @@ impl EditorView {
         }
         self.project_symbols
             .as_ref()
-            .and_then(|index| index.read().ok())
+            .and_then(|index| index.try_read().ok())
             .and_then(|index| {
                 index
                     .find_class(&candidate)
                     .map(|symbol| symbol.fully_qualified_name.clone())
             })
             .or_else(|| (!lower.is_empty()).then_some(candidate))
+    }
+
+    /// Resolves a receiver expression, including the common two-level
+    /// `$this->property->method()` form. Property declarations are read from
+    /// the current document so completion/definition can use their declared
+    /// type without guessing from a variable name.
+    fn resolve_receiver_type(&self, owner: &str, context: &str) -> Option<String> {
+        let owner = owner.trim();
+        if let Some((base, property)) = owner.rsplit_once("->") {
+            let base_type = if base.trim() == "$this" {
+                declared_class_fqn(context)
+            } else {
+                self.resolve_receiver_type(base, context)
+                    .or_else(|| self.resolve_native_type(base, context))
+            }?;
+            let property_type = property_type_in_context(context, property.trim())?;
+            let resolved = self.resolve_class_name(&property_type, context);
+            if debug_completion_enabled() {
+                tracing::info!(owner, property, base_type = %base_type, resolved = %resolved, "[DEFINITION RECEIVER]");
+            }
+            return Some(resolved);
+        }
+        self.resolve_native_type(owner, context)
     }
 
     fn qualify_type(&self, name: &str) -> String {
@@ -2170,12 +2165,12 @@ impl EditorView {
             || self
                 .project_symbols
                 .as_ref()
-                .and_then(|index| index.read().ok())
+                .and_then(|index| index.try_read().ok())
                 .is_some_and(|index| index.find_class(&candidate).is_some());
         let vendor_exists = self
             .vendor_symbols
             .as_ref()
-            .and_then(|index| index.read().ok())
+            .and_then(|index| index.try_read().ok())
             .is_some_and(|index| index.resolve_class(&candidate).is_some());
         if contextual_exists || vendor_exists {
             return candidate;
@@ -2187,7 +2182,7 @@ impl EditorView {
             || self
                 .project_symbols
                 .as_ref()
-                .and_then(|index| index.read().ok())
+                .and_then(|index| index.try_read().ok())
                 .is_some_and(|index| index.find_class(written).is_some());
         if global_exists {
             return written.to_owned();
@@ -2275,21 +2270,19 @@ impl EditorView {
         let name = callable.rsplit("::").next().unwrap_or(callable);
         let receiver = callable
             .rsplit_once("::")
-            .map(|(owner, _)| owner)
+            .map(|(owner, _)| owner.to_owned())
             .or_else(|| {
-                before[..open].rsplit_once("->").map(|(owner, _)| {
+                before[..open].rfind("->").map(|operator| {
+                    let (_, owner) = extract_owner_expression(before, operator);
                     owner
-                        .trim()
-                        .rsplit(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '$')
-                        .next()
-                        .unwrap_or(owner)
                 })
             });
         if let Some(index) = &self.project_symbols {
-            let owner = receiver;
-            if let Some(owner) =
-                owner.and_then(|owner| self.resolve_native_type(owner, &text[..open]))
-                && let Ok(index) = index.read()
+            let owner = receiver.clone();
+            if let Some(owner) = owner
+                .as_deref()
+                .and_then(|owner| self.resolve_receiver_type(owner, &text[..open]))
+                && let Ok(index) = index.try_read()
                 && let Some(method) = index
                     .find_methods(&owner)
                     .into_iter()
@@ -2310,7 +2303,7 @@ impl EditorView {
                 .or_else(|| index.find_function(&format!("\\{name}")))
                 .or_else(|| {
                     receiver.and_then(|owner| {
-                        let owner = self.resolve_native_type(owner, &text[..open])?;
+                        let owner = self.resolve_receiver_type(owner.as_str(), &text[..open])?;
                         let owner = index
                             .find_class(&owner)
                             .map(|symbol| symbol.fqn.clone())
@@ -2970,8 +2963,36 @@ impl EditorView {
     }
 }
 
+#[cfg(test)]
+fn resolve_vendor_definition_target(
+    index: &Arc<std::sync::RwLock<VendorSymbolIndex>>,
+    resolved: &str,
+) -> Option<(PathBuf, Range<usize>)> {
+    let mut index = index.write().ok()?;
+    index
+        .symbols_of(resolved)
+        .into_iter()
+        .find(|symbol| {
+            matches!(
+                symbol.kind,
+                ProjectSymbolKind::Class
+                    | ProjectSymbolKind::Interface
+                    | ProjectSymbolKind::Trait
+                    | ProjectSymbolKind::Enum
+            )
+        })
+        .map(|symbol| (symbol.file, symbol.range))
+        .or_else(|| index.resolve_class(resolved).map(|file| (file, 0..0)))
+}
+
 fn resolve_php_class_name(written: &str, context: &str) -> String {
     let written = written.trim().trim_start_matches('\\');
+    if matches!(written, "self" | "static") {
+        return declared_class_fqn(context).unwrap_or_else(|| written.to_owned());
+    }
+    if written == "parent" {
+        return declared_parent_fqn(context).unwrap_or_else(|| written.to_owned());
+    }
     if written.contains('\\') {
         return written.to_owned();
     }
@@ -2980,7 +3001,7 @@ fn resolve_php_class_name(written: &str, context: &str) -> String {
         let Some(value) = line.strip_prefix("use ") else {
             continue;
         };
-        let value = value.trim_end_matches(';').trim();
+        let value = value.split(';').next().unwrap_or(value).trim();
         let (fqn, alias) = value
             .split_once(" as ")
             .map(|(fqn, alias)| (fqn, alias.trim()))
@@ -2999,6 +3020,76 @@ fn resolve_php_class_name(written: &str, context: &str) -> String {
         })
         .map(|namespace| format!("{namespace}\\{written}"))
         .unwrap_or_else(|| written.to_owned())
+}
+
+fn extract_owner_expression(text: &str, owner_end: usize) -> (usize, String) {
+    let prefix = &text[..owner_end];
+    let mut start = owner_end;
+    for (index, ch) in prefix.char_indices().rev() {
+        if ch.is_alphanumeric() || matches!(ch, '_' | '$' | '\\' | '-' | '>') {
+            start = index;
+        } else {
+            break;
+        }
+    }
+    (start, prefix[start..].trim().to_owned())
+}
+
+fn current_namespace(context: &str) -> String {
+    context
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("namespace ")
+                .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned())
+        })
+        .unwrap_or_default()
+}
+
+fn declared_class_fqn(context: &str) -> Option<String> {
+    let class = context.lines().find_map(|line| {
+        let line = line.trim();
+        let pos = line.find("class ")?;
+        let name = line[pos + 6..]
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+            .next()?;
+        (!name.is_empty()).then_some(name.to_owned())
+    })?;
+    let namespace = current_namespace(context);
+    Some(if namespace.is_empty() {
+        class
+    } else {
+        format!("{namespace}\\{class}")
+    })
+}
+
+fn declared_parent_fqn(context: &str) -> Option<String> {
+    let parent = context.lines().find_map(|line| {
+        let line = line.trim();
+        let pos = line.find("extends ")?;
+        let name = line[pos + 8..]
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '\\')
+            .next()?;
+        (!name.is_empty()).then_some(name.to_owned())
+    })?;
+    Some(resolve_php_class_name(&parent, context))
+}
+
+fn property_type_in_context(context: &str, property: &str) -> Option<String> {
+    let needle = format!("${property}");
+    context.lines().find_map(|line| {
+        let line = line.trim();
+        let pos = line.find(&needle)?;
+        let before = line[..pos].trim();
+        let ty = before
+            .split_whitespace()
+            .last()?
+            .trim_start_matches(['?', '&']);
+        (ty.chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '\\' | '|'))
+            && !ty.is_empty())
+        .then(|| ty.split('|').next().unwrap_or(ty).to_owned())
+    })
 }
 
 fn native_format_php(text: &str) -> String {
@@ -4006,8 +4097,13 @@ fn shape(window: &mut Window, text: &str) -> gpui::ShapedLine {
 
 #[cfg(test)]
 mod formatter_tests {
-    use super::{completion_presentation, native_format_php, resolve_php_class_name};
+    use super::{
+        Arc, VendorSymbolIndex, completion_presentation, declared_class_fqn, declared_parent_fqn,
+        extract_owner_expression, native_format_php, property_type_in_context,
+        resolve_php_class_name, resolve_vendor_definition_target,
+    };
     use lsp_types::CompletionItem;
+    use std::time::Duration;
 
     #[test]
     fn indents_nested_php_blocks() {
@@ -4120,5 +4216,72 @@ mod formatter_tests {
             resolve_php_class_name("Missing", "namespace App\\Service;"),
             "App\\Service\\Missing"
         );
+    }
+
+    #[test]
+    fn self_and_static_resolve_to_declared_class() {
+        let text =
+            "namespace App\\Http; class Client { function f() { self::run(); new static(); } }";
+        assert_eq!(
+            declared_class_fqn(text).as_deref(),
+            Some("App\\Http\\Client")
+        );
+        assert_eq!(resolve_php_class_name("self", text), "App\\Http\\Client");
+        assert_eq!(resolve_php_class_name("static", text), "App\\Http\\Client");
+    }
+
+    #[test]
+    fn parent_resolves_extends_and_is_safe_without_extends() {
+        let text = "namespace App\\Http;\nuse Base\\Client as ParentClient;\nclass Child extends ParentClient {}";
+        assert_eq!(declared_parent_fqn(text).as_deref(), Some("Base\\Client"));
+        assert_eq!(resolve_php_class_name("parent", text), "Base\\Client");
+        assert_eq!(
+            resolve_php_class_name("parent", "namespace App; class Child {}"),
+            "parent"
+        );
+    }
+
+    #[test]
+    fn receiver_chain_and_typed_property_resolve() {
+        let text = "namespace App;\nuse Vendor\\FiberEventLoop\\FiberEventLoop;\nclass Client {\n private FiberEventLoop $loop;\n function f() { $this->loop->run(); }\n}";
+        let operator = text.find("$this->loop->run").unwrap() + "$this->loop".len();
+        let (_, owner) = extract_owner_expression(text, operator);
+        assert_eq!(owner, "$this->loop");
+        assert_eq!(
+            property_type_in_context(text, "loop").as_deref(),
+            Some("FiberEventLoop")
+        );
+        assert_eq!(
+            resolve_php_class_name("FiberEventLoop", text),
+            "Vendor\\FiberEventLoop\\FiberEventLoop"
+        );
+    }
+
+    #[test]
+    fn vendor_definition_target_does_not_deadlock_on_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let composer = dir.path().join("vendor/composer");
+        let file = dir.path().join("vendor/acme/pkg/src/FiberEventLoop.php");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&composer).unwrap();
+        std::fs::write(&file, "<?php namespace Acme; class FiberEventLoop {}").unwrap();
+        std::fs::write(
+            composer.join("autoload_classmap.php"),
+            "<?php return ['Acme\\\\FiberEventLoop' => $vendorDir . '/acme/pkg/src/FiberEventLoop.php'];",
+        )
+        .unwrap();
+        let index = Arc::new(std::sync::RwLock::new(
+            VendorSymbolIndex::load(dir.path()).unwrap(),
+        ));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_index = index.clone();
+        std::thread::spawn(move || {
+            let result = resolve_vendor_definition_target(&worker_index, "Acme\\FiberEventLoop");
+            let _ = sender.send(result);
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("vendor definition resolution timed out (possible RwLock deadlock)");
+        assert!(result.is_some());
     }
 }

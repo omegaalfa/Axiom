@@ -265,6 +265,7 @@ pub struct WorkspaceView {
     project_load_results: Option<Receiver<(u64, Result<ProjectLoadPayload, String>)>>,
     lsp_generations: HashMap<(lsp_types::Uri, LspRequestKind), u64>,
     explorer_fs_busy: bool,
+    vendor_definition_inflight: HashSet<String>,
 }
 
 impl WorkspaceView {
@@ -773,6 +774,7 @@ impl WorkspaceView {
             project_load_results: None,
             lsp_generations: HashMap::new(),
             explorer_fs_busy: false,
+            vendor_definition_inflight: HashSet::new(),
         };
         workspace.begin_runtime_stub_load(cx, false);
         workspace.start_runtime_watcher(cx);
@@ -1418,7 +1420,7 @@ impl WorkspaceView {
         if let Some(mode) = &self.command_palette_mode {
             let query = self.command_palette_query.to_ascii_lowercase();
             if let Some(index) = &self.project_index
-                && let Ok(index) = index.read()
+                && let Ok(index) = index.try_read()
             {
                 return index
                     .symbols()
@@ -1730,10 +1732,17 @@ impl WorkspaceView {
         let Some(request) = tab.editor.read(cx).vendor_definition_request() else {
             return false;
         };
+        if !self.vendor_definition_inflight.insert(request.fqn.clone()) {
+            if debug_input_enabled() {
+                tracing::info!(fqn = %request.fqn, deduplicated = true, "[VENDOR REQUEST]");
+            }
+            return true;
+        }
         if debug_input_enabled() {
             tracing::info!(attempted = true, fqn = %request.fqn, "[DEFINITION VENDOR]");
         }
         let weak = cx.entity().downgrade();
+        let request_fqn = request.fqn.clone();
         self.status = "Resolving definition…".into();
         if debug_input_enabled() {
             tracing::info!(fqn = %request.fqn, "[DEFINITION NATIVE START]");
@@ -1742,11 +1751,15 @@ impl WorkspaceView {
             let started = std::time::Instant::now();
             let result = gpui::background_executor()
                 .spawn(async move {
-                    let mut index = request
+                    // Clone metadata/cache under a short lock. Parsing and all
+                    // filesystem work happen on the private clone, never while
+                    // the shared Vendor RwLock is held.
+                    let mut parser = request
                         .index
-                        .write()
-                        .map_err(|_| "vendor index lock poisoned")?;
-                    let symbols = index.symbols_of(&request.fqn);
+                        .read()
+                        .map_err(|_| "vendor index lock poisoned")?
+                        .clone();
+                    let symbols = parser.symbols_of(&request.fqn);
                     let symbol = symbols.into_iter().find(|symbol| match &request.member {
                         Some(member) => {
                             symbol.name == *member
@@ -1766,13 +1779,16 @@ impl WorkspaceView {
                     };
                     let path = symbol.file.clone();
                     let offset = symbol.range.start;
-                    drop(index);
+                    if let Ok(mut index) = request.index.write() {
+                        index.merge_parsed_cache(&parser);
+                    }
                     let content =
                         std::fs::read_to_string(&path).map_err(|_| "vendor file unreadable")?;
                     Ok::<_, &'static str>((path, offset, content))
                 })
                 .await;
             let _ = weak.update(cx, |workspace, cx| {
+                workspace.vendor_definition_inflight.remove(&request_fqn);
                 if debug_input_enabled() {
                     tracing::info!(
                         elapsed_ms = started.elapsed().as_millis(),
@@ -6166,6 +6182,7 @@ mod modifier_tests {
         utf16_to_byte_offset,
     };
     use gpui::Modifiers;
+    use std::collections::HashSet;
 
     #[test]
     fn preserves_plain_control_shift_and_alt() {
@@ -6239,6 +6256,16 @@ mod modifier_tests {
             .map(|(basename, _)| basename.encode_utf16().count())
             .unwrap();
         assert_eq!(basename_len, 4);
+    }
+
+    #[test]
+    fn vendor_definition_requests_deduplicate_loading_and_allow_ready_retry() {
+        let mut inflight = HashSet::new();
+        let fqn = "Omegaalfa\\FiberEventLoop\\FiberEventLoop".to_owned();
+        assert!(inflight.insert(fqn.clone()));
+        assert!(!inflight.insert(fqn.clone()));
+        inflight.remove(&fqn);
+        assert!(inflight.insert(fqn));
     }
 
     #[test]
