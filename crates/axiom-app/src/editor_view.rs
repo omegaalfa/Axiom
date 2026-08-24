@@ -2008,6 +2008,7 @@ impl EditorView {
             && content_before[..range.start].trim_end().ends_with("new"));
         let has_open = content_before[range.end..].starts_with('(')
             || text.ends_with('(')
+            || text.ends_with(')')
             || text.contains("()");
         if call_like && !has_open {
             text.push('(');
