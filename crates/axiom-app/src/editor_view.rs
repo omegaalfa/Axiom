@@ -156,6 +156,23 @@ struct ByteDiagnostic {
 }
 
 impl EditorView {
+    fn resolve_location(
+        &self,
+        file: &Path,
+        offset: usize,
+        current_text: &str,
+    ) -> Option<(PathBuf, lsp_types::Position)> {
+        let content = if file == self.file_path {
+            current_text.to_owned()
+        } else {
+            fs::read_to_string(file).ok()?
+        };
+        Some((
+            file.to_path_buf(),
+            PositionCodec::offset_to_position(&content, offset, self.lsp_encoding()),
+        ))
+    }
+
     pub fn from_document(
         path: PathBuf,
         document: Document,
@@ -276,19 +293,11 @@ impl EditorView {
                                     == symbol.modifiers.iter().any(|modifier| modifier == "static"))
                         })
                     {
-                        let content = if symbol.file == self.file_path {
-                            text_at_cursor.clone()
-                        } else {
-                            std::fs::read_to_string(&symbol.file).ok()?
-                        };
-                        return Some((
-                            symbol.file.clone(),
-                            PositionCodec::offset_to_position(
-                                &content,
-                                symbol.range.start,
-                                self.lsp_encoding(),
-                            ),
-                        ));
+                        return self.resolve_location(
+                            &symbol.file,
+                            symbol.range.start,
+                            &text_at_cursor,
+                        );
                     }
                     // Keep navigation useful when a variable's type could not
                     // be inferred from a local assignment. A unique method
@@ -302,19 +311,11 @@ impl EditorView {
                         .collect();
                     if matches.len() == 1 {
                         let symbol = matches[0];
-                        let content = if symbol.file == self.file_path {
-                            text_at_cursor.clone()
-                        } else {
-                            std::fs::read_to_string(&symbol.file).ok()?
-                        };
-                        return Some((
-                            symbol.file.clone(),
-                            PositionCodec::offset_to_position(
-                                &content,
-                                symbol.range.start,
-                                self.lsp_encoding(),
-                            ),
-                        ));
+                        return self.resolve_location(
+                            &symbol.file,
+                            symbol.range.start,
+                            &text_at_cursor,
+                        );
                     }
                 }
                 if let Some(runtime) = &self.runtime_symbols {
@@ -331,19 +332,11 @@ impl EditorView {
                         .methods_of(&runtime_class_fqn)
                         .find(|symbol| symbol.name == name)
                     {
-                        let content = if symbol.location.file == self.file_path {
-                            text_at_cursor.clone()
-                        } else {
-                            std::fs::read_to_string(&symbol.location.file).ok()?
-                        };
-                        return Some((
-                            symbol.location.file.clone(),
-                            PositionCodec::offset_to_position(
-                                &content,
-                                symbol.location.range.start,
-                                self.lsp_encoding(),
-                            ),
-                        ));
+                        return self.resolve_location(
+                            &symbol.location.file,
+                            symbol.location.range.start,
+                            &text_at_cursor,
+                        );
                     }
                 }
             }
@@ -351,19 +344,11 @@ impl EditorView {
         if let Some(runtime) = &self.runtime_symbols
             && let Some(symbol) = runtime.find_function(name)
         {
-            let content = if symbol.location.file == self.file_path {
-                text_at_cursor.clone()
-            } else {
-                std::fs::read_to_string(&symbol.location.file).ok()?
-            };
-            return Some((
-                symbol.location.file.clone(),
-                PositionCodec::offset_to_position(
-                    &content,
-                    symbol.location.range.start,
-                    self.lsp_encoding(),
-                ),
-            ));
+            return self.resolve_location(
+                &symbol.location.file,
+                symbol.location.range.start,
+                &text_at_cursor,
+            );
         }
         if let Some(index) = &self.project_symbols
             && let Ok(index) = index.read()
@@ -372,19 +357,7 @@ impl EditorView {
                 .iter()
                 .find(|symbol| symbol.kind == ProjectSymbolKind::Function && symbol.name == name)
         {
-            let content = if symbol.file == self.file_path {
-                text_at_cursor.clone()
-            } else {
-                std::fs::read_to_string(&symbol.file).ok()?
-            };
-            return Some((
-                symbol.file.clone(),
-                PositionCodec::offset_to_position(
-                    &content,
-                    symbol.range.start,
-                    self.lsp_encoding(),
-                ),
-            ));
+            return self.resolve_location(&symbol.file, symbol.range.start, &text_at_cursor);
         }
         let target = if let Some(index) = &self.project_symbols {
             let index = index.read().ok()?;
@@ -401,15 +374,7 @@ impl EditorView {
                     .map(|symbol| (symbol.location.file.clone(), symbol.location.range.clone()))
             })
         })?;
-        let text = if target.0 == self.file_path {
-            self.document.content()
-        } else {
-            std::fs::read_to_string(&target.0).ok()?
-        };
-        Some((
-            target.0,
-            PositionCodec::offset_to_position(&text, target.1.start, self.lsp_encoding()),
-        ))
+        self.resolve_location(&target.0, target.1.start, &text_at_cursor)
     }
 
     fn lsp_encoding(&self) -> PositionEncoding {
@@ -973,6 +938,36 @@ impl EditorView {
         });
     }
 
+    /// Returns false for offsets contained in PHP comments or string-like
+    /// literals. Native inspections still use byte ranges for precise edits,
+    /// but this AST guard prevents text scans from interpreting prose as code.
+    fn is_code_offset(&self, offset: usize) -> bool {
+        let Some(syntax) = &self.syntax else {
+            return true;
+        };
+        if offset >= syntax.text().len() {
+            return false;
+        }
+        let Some(mut node) = syntax
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(offset, offset + 1)
+        else {
+            return true;
+        };
+        loop {
+            if matches!(
+                node.kind(),
+                "comment" | "string" | "encapsed_string" | "heredoc" | "nowdoc"
+            ) {
+                return false;
+            }
+            let Some(parent) = node.parent() else { break };
+            node = parent;
+        }
+        true
+    }
+
     fn maybe_trigger_completion(&self) {
         let Some((lsp, uri, position)) = self
             .lsp
@@ -1028,6 +1023,10 @@ impl EditorView {
         let mut search = 0;
         while let Some(relative_open) = text[search..].find('(') {
             let open = search + relative_open;
+            if !self.is_code_offset(open) {
+                search = open.saturating_add(1);
+                continue;
+            }
             let Some(close) = matching_paren(text, open) else {
                 break;
             };
@@ -1135,6 +1134,10 @@ impl EditorView {
         let mut offset = 0;
         while let Some(relative) = text[offset..].find("new ") {
             let start = offset + relative + 4;
+            if !self.is_code_offset(start) {
+                offset = start.max(offset + 1);
+                continue;
+            }
             let end = start
                 + text[start..]
                     .chars()
@@ -1162,16 +1165,25 @@ impl EditorView {
                 break;
             }
         }
+        let mut symbol_files: std::collections::HashMap<
+            (&str, ProjectSymbolKind),
+            std::collections::HashSet<&Path>,
+        > = std::collections::HashMap::new();
+        for symbol in index.symbols() {
+            symbol_files
+                .entry((symbol.fully_qualified_name.as_str(), symbol.kind))
+                .or_default()
+                .insert(symbol.file.as_path());
+        }
         for symbol in index
             .symbols()
             .iter()
             .filter(|symbol| symbol.file == self.file_path)
         {
-            if index.symbols().iter().any(|other| {
-                other.file != symbol.file
-                    && other.fully_qualified_name == symbol.fully_qualified_name
-                    && other.kind == symbol.kind
-            }) {
+            if symbol_files
+                .get(&(symbol.fully_qualified_name.as_str(), symbol.kind))
+                .is_some_and(|files| files.len() > 1)
+            {
                 self.diagnostics.push(ByteDiagnostic {
                     range: symbol.range.clone(),
                     severity: Some(DiagnosticSeverity::ERROR),
@@ -1220,6 +1232,10 @@ impl EditorView {
         let mut offset = 0;
         while let Some(relative) = text[offset..].find("echo ") {
             let start = offset + relative + 5;
+            if !self.is_code_offset(start) {
+                offset = start.max(offset + 1);
+                continue;
+            }
             let name_end = start
                 + text[start..]
                     .chars()
@@ -2516,6 +2532,7 @@ fn native_format_php(text: &str) -> String {
     let mut indent = 0usize;
     let mut block_comment = false;
     let mut quote: Option<char> = None;
+    let mut heredoc: Option<String> = None;
     for (line_index, raw_line) in text.lines().enumerate() {
         let trimmed = raw_line.trim();
         if trimmed.is_empty() {
@@ -2524,6 +2541,37 @@ fn native_format_php(text: &str) -> String {
             }
             continue;
         }
+        if let Some(delimiter) = heredoc.as_ref() {
+            if line_index > 0 {
+                result.push('\n');
+            }
+            result.push_str(raw_line);
+            if trimmed == delimiter || trimmed == format!("{delimiter};") {
+                heredoc = None;
+            }
+            continue;
+        }
+        let heredoc_start = trimmed
+            .find("<<<")
+            .and_then(|marker| {
+                let value = trimmed[marker + 3..].trim_start();
+                let value = value
+                    .strip_prefix('\'')
+                    .or_else(|| value.strip_prefix('"'))?;
+                let quote = value.chars().next_back()?;
+                if quote == '\'' || quote == '"' {
+                    return None;
+                }
+                Some(value.to_owned())
+            })
+            .or_else(|| {
+                let value = trimmed.strip_prefix("<<<")?.trim_start();
+                let delimiter = value
+                    .split(|ch: char| ch.is_whitespace() || ch == ';')
+                    .next()
+                    .filter(|value| !value.is_empty())?;
+                Some(delimiter.trim_matches(['\'', '"']).to_owned())
+            });
         let closes =
             trimmed.starts_with('}') || trimmed.starts_with(']') || trimmed.starts_with(')');
         if closes {
@@ -2534,6 +2582,10 @@ fn native_format_php(text: &str) -> String {
         }
         result.push_str(&"    ".repeat(indent));
         result.push_str(trimmed);
+        if let Some(delimiter) = heredoc_start.filter(|delimiter| !delimiter.is_empty()) {
+            heredoc = Some(delimiter);
+            continue;
+        }
         let mut chars = trimmed.chars().peekable();
         let mut opens = 0usize;
         let mut closes_on_line = 0usize;
@@ -2628,9 +2680,12 @@ fn project_method_detail(symbol: &axiom_index::ProjectSymbol) -> String {
     let signature = fs::read_to_string(&symbol.file)
         .ok()
         .and_then(|text| {
-            let needle = format!("function {}", symbol.name);
-            let start = text.find(&needle)?;
-            let tail = &text[start + needle.len()..];
+            let name_start = symbol.range.start.min(text.len());
+            let tail = &text[name_start..];
+            if !tail.starts_with(&symbol.name) {
+                return None;
+            }
+            let tail = &tail[symbol.name.len()..];
             let open = tail.find('(')?;
             let close = tail[open + 1..].find(')')? + open + 1;
             let after = &tail[close + 1..];
@@ -3371,9 +3426,10 @@ fn matching_paren(text: &str, open: usize) -> Option<usize> {
 
 fn project_callable_detail(symbol: &axiom_index::ProjectSymbol) -> Option<String> {
     let text = std::fs::read_to_string(&symbol.file).ok()?;
-    let needle = format!("function {}", symbol.name);
-    let start = text.find(&needle)?;
-    let tail = &text[start + needle.len()..];
+    let name_start = symbol.range.start.min(text.len());
+    let tail = &text[name_start..];
+    tail.strip_prefix(&symbol.name)?;
+    let tail = &tail[symbol.name.len()..];
     let open = tail.find('(')?;
     let close = matching_paren(tail, open)?;
     let suffix = tail[close + 1..]
@@ -3498,6 +3554,14 @@ mod formatter_tests {
         assert!(output.contains("    $text = \"{ not a block }\";"));
         assert!(output.contains("    // } remains a comment"));
         assert!(output.contains("    return $text;"));
+    }
+
+    #[test]
+    fn heredoc_content_does_not_change_block_indentation() {
+        let input = "<?php\nfunction render(){\n$value = <<<EOT\n{ not a PHP block }\nEOT;\nreturn $value;\n}\n";
+        let output = native_format_php(input);
+        assert!(output.contains("EOT;\n    return $value;"));
+        assert!(!output.contains("        return $value;"));
     }
 
     #[test]
