@@ -1295,9 +1295,19 @@ impl EditorView {
             .find_map(|(index, ch)| (ch == '>' || ch == ':').then_some((index, ch)))
             .and_then(|(index, ch)| {
                 if ch == '>' && before[..index].ends_with('-') {
-                    Some((index.saturating_sub(1), false))
+                    let operator_start = index.saturating_sub(1);
+                    let suffix = &before[index + 1..];
+                    suffix
+                        .chars()
+                        .all(|character| character.is_alphanumeric() || character == '_')
+                        .then_some((operator_start, false))
                 } else if ch == ':' && before[..index].ends_with(':') {
-                    Some((index.saturating_sub(1), true))
+                    let operator_start = index.saturating_sub(1);
+                    let suffix = &before[index + 1..];
+                    suffix
+                        .chars()
+                        .all(|character| character.is_alphanumeric() || character == '_')
+                        .then_some((operator_start, true))
                 } else {
                     None
                 }
