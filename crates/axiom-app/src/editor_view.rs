@@ -2877,13 +2877,21 @@ impl Render for EditorView {
                                         .enumerate()
                                         .zip(presentations.iter())
                                         .map(|((index, item), presentation)| {
+                                            let editor = cx.entity();
                                             div()
+                                                .id(("completion-item", index))
                                                 .h(row_height)
                                                 .w_full()
                                                 .px_2()
                                                 .flex()
                                                 .items_center()
                                                 .overflow_hidden()
+                                                .on_click(move |_, _, cx| {
+                                                    editor.update(cx, |this, cx| {
+                                                        this.completion_selected = index;
+                                                        this.accept_completion(cx);
+                                                    });
+                                                })
                                                 .bg(if index == self.completion_selected {
                                                     t.selection
                                                 } else {
