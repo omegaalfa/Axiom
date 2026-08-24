@@ -371,6 +371,7 @@ impl EditorView {
             self.runtime_symbols.as_ref().and_then(|index| {
                 index
                     .find_class(name)
+                    .or_else(|| index.find_class_by_short_name(name))
                     .map(|symbol| (symbol.location.file.clone(), symbol.location.range.clone()))
             })
         })?;
@@ -1147,10 +1148,10 @@ impl EditorView {
             if end > start {
                 let name = text[start..end].trim_start_matches('\\');
                 let known_project = index.find_class(name).is_some();
-                let known_runtime = self
-                    .runtime_symbols
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.find_class(name).is_some());
+                let known_runtime = self.runtime_symbols.as_ref().is_some_and(|runtime| {
+                    runtime.find_class(name).is_some()
+                        || runtime.find_class_by_short_name(name).is_some()
+                });
                 if !known_project && !known_runtime && !matches!(name, "self" | "static" | "parent")
                 {
                     self.diagnostics.push(ByteDiagnostic {
