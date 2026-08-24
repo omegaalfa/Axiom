@@ -505,6 +505,9 @@ impl EditorView {
             } else {
                 resolve_php_class_name(&written_owner, &text)
             };
+            if debug_completion_enabled() {
+                tracing::info!(token = %token.text, kind = "Method", written = %written_owner, resolved = %owner_fqn, via = "receiver-type", "[DEFINITION QUERY]");
+            }
             return Some(DefinitionQuery::Method {
                 owner_fqn,
                 name: token.text.trim_start_matches('$').to_owned(),
@@ -512,13 +515,25 @@ impl EditorView {
             });
         }
         let name = token.text.trim_start_matches('$').to_owned();
-        if text[token.range.end..].starts_with('(') {
+        let is_new = text[..token.range.start].trim_end().ends_with("new");
+        if !is_new && text[token.range.end..].starts_with('(') {
             return Some(DefinitionQuery::Function { name });
         }
-        Some(DefinitionQuery::Name {
-            fqn: resolve_php_class_name(&name, &text),
-            written: name,
-        })
+        let fqn = resolve_php_class_name(&name, &text);
+        if debug_completion_enabled() {
+            let via = if text
+                .lines()
+                .any(|line| line.trim_start().starts_with("use ") && line.contains(&name))
+            {
+                "import"
+            } else if name.contains('\\') {
+                "fqn"
+            } else {
+                "namespace-or-global"
+            };
+            tracing::info!(token = %name, kind = "Name", written = %name, resolved = %fqn, via, "[DEFINITION QUERY]");
+        }
+        Some(DefinitionQuery::Name { fqn, written: name })
     }
 
     pub fn vendor_definition_request(&self) -> Option<VendorDefinitionRequest> {
@@ -534,7 +549,11 @@ impl EditorView {
             DefinitionQuery::Function { .. } => return None,
         };
         let index = self.vendor_symbols.clone()?;
-        if !index.read().ok()?.resolve_class(&fqn).is_some() {
+        let path = index.read().ok()?.resolve_class(&fqn);
+        if debug_completion_enabled() {
+            tracing::info!(fqn = %fqn, found = path.is_some(), path = ?path, "[VENDOR PREFLIGHT]");
+        }
+        if path.is_none() {
             return None;
         }
         Some(VendorDefinitionRequest {
