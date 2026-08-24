@@ -107,6 +107,16 @@ struct DefinitionTarget {
     position: lsp_types::Position,
 }
 
+fn definition_cache_lookup(
+    cache: &HashMap<String, DefinitionTarget>,
+    key: &str,
+) -> Option<DefinitionTarget> {
+    cache
+        .get(key)
+        .filter(|target| target.path.is_file())
+        .cloned()
+}
+
 #[derive(Clone)]
 struct ExplorerItem {
     path: PathBuf,
@@ -239,6 +249,7 @@ pub struct WorkspaceView {
     navigation_back: Vec<NavigationLocation>,
     navigation_forward: Vec<NavigationLocation>,
     definition_targets: Vec<DefinitionTarget>,
+    definition_cache: HashMap<String, DefinitionTarget>,
     project_index: Option<Arc<RwLock<ProjectSymbolIndex>>>,
     index_generation: u64,
     index_results: Option<Receiver<(u64, Result<ProjectSymbolIndex, String>)>>,
@@ -748,6 +759,7 @@ impl WorkspaceView {
             navigation_back: Vec::new(),
             navigation_forward: Vec::new(),
             definition_targets: Vec::new(),
+            definition_cache: HashMap::new(),
             project_index: None,
             index_generation: 0,
             index_results: None,
@@ -1354,21 +1366,16 @@ impl WorkspaceView {
                     errors.push(format!("{}: {error}", editor.title()));
                 }
             });
-            if let Some(index) = &self.project_index {
-                let editor = tab.editor.read(cx);
-                if let Some(path) = editor.document_path() {
-                    if let Ok(mut index) = index.write() {
-                        let _ =
-                            index.index_file_text_with_source(path, editor.document_text(), "Save");
-                    }
-                }
-            }
+            // Dirty editors already enqueue a debounced background index
+            // update. Never parse a saved file while holding the shared
+            // ProjectSymbolIndex lock on the UI thread.
         }
         self.status = if errors.is_empty() {
             "All files saved".into()
         } else {
             format!("Save All failed: {}", errors.join("; ")).into()
         };
+        self.definition_cache.clear();
         cx.notify();
         errors.is_empty()
     }
@@ -1717,11 +1724,37 @@ impl WorkspaceView {
         let Some(tab) = self.tabs.get(tab_index) else {
             return false;
         };
+        let query_key = tab
+            .editor
+            .read(cx)
+            .definition_query()
+            .map(|query| format!("{}::{query:?}", tab.path.display()));
+        if let Some(key) = query_key.as_deref()
+            && let Some(target) = definition_cache_lookup(&self.definition_cache, key)
+        {
+            if debug_input_enabled() {
+                tracing::info!(kind = "definition", symbol = %key, source = "Project|Vendor", hit = true, "[DEFINITION CACHE]");
+            }
+            self.navigate_to_definition(target, cx);
+            return true;
+        }
+        if debug_input_enabled() {
+            tracing::info!(kind = "definition", symbol = ?query_key, source = "Project|Vendor", hit = false, "[DEFINITION CACHE]");
+        }
         if let Some((path, position)) = tab.editor.read(cx).project_definition_location() {
             if debug_input_enabled() {
                 tracing::info!(found = true, path = %path.display(), "[DEFINITION PROJECT]");
                 tracing::info!(attempted = false, found = false, "[DEFINITION VENDOR]");
                 tracing::info!(source = "Project", path = %path.display(), "[DEFINITION TARGET]");
+            }
+            if let Some(key) = query_key.as_ref() {
+                self.definition_cache.insert(
+                    key.clone(),
+                    DefinitionTarget {
+                        path: path.clone(),
+                        position,
+                    },
+                );
             }
             self.navigate_to_definition(DefinitionTarget { path, position }, cx);
             return true;
@@ -1743,6 +1776,7 @@ impl WorkspaceView {
         }
         let weak = cx.entity().downgrade();
         let request_fqn = request.fqn.clone();
+        let cache_key = query_key.clone();
         self.status = "Resolving definition…".into();
         if debug_input_enabled() {
             tracing::info!(fqn = %request.fqn, "[DEFINITION NATIVE START]");
@@ -1798,6 +1832,20 @@ impl WorkspaceView {
                 }
                 match result {
                     Ok((path, offset, content)) => {
+                        if let Some(key) = cache_key.as_ref() {
+                            let position = axiom_lsp::PositionCodec::offset_to_position(
+                                &content,
+                                offset,
+                                axiom_lsp::PositionEncoding::Utf8,
+                            );
+                            workspace.definition_cache.insert(
+                                key.clone(),
+                                DefinitionTarget {
+                                    path: path.clone(),
+                                    position,
+                                },
+                            );
+                        }
                         workspace.open_vendor_definition(path, offset, content, cx)
                     }
                     Err(error) => {
@@ -1829,6 +1877,7 @@ impl WorkspaceView {
         );
         if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
             self.active = Some(index);
+            self.focus_active_editor = true;
             self.tabs[index]
                 .editor
                 .update(cx, |editor, cx| editor.reveal_lsp_position(position, cx));
@@ -1846,8 +1895,12 @@ impl WorkspaceView {
             if let Some(vendor) = &self.vendor_index {
                 editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
             }
-            self.tabs.push(OpenTab { path, editor });
+            self.tabs.push(OpenTab {
+                path: path.clone(),
+                editor,
+            });
             self.active = Some(self.tabs.len() - 1);
+            self.focus_active_editor = true;
             let index = self.active.unwrap();
             self.tabs[index]
                 .editor
@@ -3255,6 +3308,7 @@ impl WorkspaceView {
         };
         if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
             self.active = Some(index);
+            self.focus_active_editor = true;
             cx.notify();
             return;
         }
@@ -3340,7 +3394,18 @@ impl WorkspaceView {
         if let Some(tab) = self.tabs.get(index) {
             let title = tab.editor.read(cx).title();
             self.active = Some(index);
+            let focus_before = tab.editor.read(cx).focus_handle(cx).is_focused(window);
             window.focus(&tab.editor.read(cx).focus_handle(cx));
+            let focus_after = tab.editor.read(cx).focus_handle(cx).is_focused(window);
+            if debug_input_enabled() {
+                tracing::info!(
+                    path = %tab.path.display(),
+                    focus_before,
+                    focus_after,
+                    ready_for_input = focus_after,
+                    "[EDITOR ACTIVATE]"
+                );
+            }
             cx.notify();
             let activation = started.elapsed();
             window.on_next_frame(move |_, _| {
@@ -3570,7 +3635,9 @@ impl WorkspaceView {
         let index = if let Some(index) = existing {
             index
         } else {
+            let open_started = Instant::now();
             axiom_index::trace_path("document_load_request", "Other", &path);
+            let disk_started = Instant::now();
             let document = match Document::from_file(&path) {
                 Ok(document) => document,
                 Err(error) => {
@@ -3578,8 +3645,11 @@ impl WorkspaceView {
                     return;
                 }
             };
+            let disk_read_us = disk_started.elapsed().as_micros();
             let lsp = self.lsp.clone();
+            let editor_started = Instant::now();
             let editor = cx.new(|cx| EditorView::from_document(path.clone(), document, lsp, cx));
+            let editor_create_us = editor_started.elapsed().as_micros();
             if let Some(symbols) = &self._runtime_symbols {
                 editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
             }
@@ -3590,10 +3660,32 @@ impl WorkspaceView {
                 }
             }
             cx.observe(&editor, |_, _, cx| cx.notify()).detach();
-            self.tabs.push(OpenTab { path, editor });
+            self.tabs.push(OpenTab {
+                path: path.clone(),
+                editor,
+            });
+            if debug_completion_enabled() {
+                let source = if path
+                    .components()
+                    .any(|component| component.as_os_str() == "vendor")
+                {
+                    "Vendor"
+                } else {
+                    "Project"
+                };
+                tracing::info!(
+                    source,
+                    path = %path.display(),
+                    disk_read_us,
+                    editor_create_us,
+                    total_us = open_started.elapsed().as_micros(),
+                    "[EDITOR OPEN PERF]"
+                );
+            }
             self.tabs.len() - 1
         };
         self.active = Some(index);
+        self.focus_active_editor = true;
         self.tabs[index].editor.update(cx, |editor, cx| {
             editor.reveal_lsp_position(target.position, cx)
         });
@@ -3692,6 +3784,7 @@ impl WorkspaceView {
             self.tabs.len() - 1
         };
         self.active = Some(index);
+        self.focus_active_editor = true;
         self.tabs[index]
             .editor
             .update(cx, |editor, cx| editor.reveal_lsp_position(position, cx));
@@ -5386,7 +5479,18 @@ impl Render for WorkspaceView {
             .map(|tab| tab.editor.clone());
         if self.focus_active_editor {
             if let Some(editor) = active_editor.as_ref() {
-                window.focus(&editor.read(cx).focus_handle(cx));
+                let handle = editor.read(cx).focus_handle(cx);
+                let focus_before = handle.is_focused(window);
+                window.focus(&handle);
+                if debug_input_enabled() {
+                    tracing::info!(
+                        path = %editor.read(cx).document_path().unwrap_or_else(|| Path::new("<untitled>")).display(),
+                        focus_before,
+                        focus_after = handle.is_focused(window),
+                        ready_for_input = handle.is_focused(window),
+                        "[EDITOR ACTIVATE]"
+                    );
+                }
             }
             self.focus_active_editor = false;
         }
@@ -6182,6 +6286,7 @@ mod modifier_tests {
         utf16_to_byte_offset,
     };
     use gpui::Modifiers;
+    use std::collections::HashMap;
     use std::collections::HashSet;
 
     #[test]
@@ -6266,6 +6371,23 @@ mod modifier_tests {
         assert!(!inflight.insert(fqn.clone()));
         inflight.remove(&fqn);
         assert!(inflight.insert(fqn));
+    }
+
+    #[test]
+    fn definition_cache_reuses_existing_target_after_tab_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AsyncHttpClient.php");
+        std::fs::write(&path, "<?php class AsyncHttpClient {}").unwrap();
+        let mut cache = HashMap::new();
+        cache.insert(
+            "project::AsyncHttpClient".to_owned(),
+            super::DefinitionTarget {
+                path: path.clone(),
+                position: lsp_types::Position::new(0, 7),
+            },
+        );
+        let target = super::definition_cache_lookup(&cache, "project::AsyncHttpClient");
+        assert_eq!(target.map(|target| target.path), Some(path));
     }
 
     #[test]

@@ -240,19 +240,23 @@ impl EditorView {
         lsp: Option<Arc<LspBridge>>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let open_started = std::time::Instant::now();
         axiom_index::trace_path("document_open", "Document", &path);
         let (index_update_sender, index_update_receiver) = mpsc::channel::<IndexUpdateRequest>();
         background_executor()
             .spawn(async move { run_index_update_worker(index_update_receiver) })
             .detach();
+        let syntax_started = std::time::Instant::now();
         let syntax = is_php_file(&path)
             .then(|| PhpSyntax::parse(document.content()))
             .transpose()
             .expect("the PHP grammar and highlight query were validated at startup");
+        let syntax_us = syntax_started.elapsed().as_micros();
         let last_lsp_text = document.content();
         let lsp_uri = is_php_file(&path)
             .then(|| path_to_uri(&path).ok())
             .flatten();
+        let lsp_started = std::time::Instant::now();
         if let (Some(lsp), Some(uri)) = (&lsp, &lsp_uri) {
             lsp.with_server(|server| {
                 if let Err(error) = server.did_open(uri.clone(), 1, last_lsp_text.clone()) {
@@ -260,6 +264,7 @@ impl EditorView {
                 }
             });
         }
+        let lsp_setup_us = lsp_started.elapsed().as_micros();
         let mut view = Self {
             document,
             syntax,
@@ -269,7 +274,7 @@ impl EditorView {
             preferred_x: None,
             marked_range: None,
             selecting: false,
-            file_path: path,
+            file_path: path.clone(),
             status: None,
             lsp,
             lsp_uri,
@@ -290,7 +295,32 @@ impl EditorView {
             index_update_sender: Some(index_update_sender),
             last_completion_layout: None,
         };
+        let inspections_started = std::time::Instant::now();
         view.sync_syntax();
+        let native_inspections_us = inspections_started.elapsed().as_micros();
+        if debug_completion_enabled() {
+            let source = if path
+                .components()
+                .any(|component| component.as_os_str() == "vendor")
+            {
+                "Vendor"
+            } else {
+                "Project"
+            };
+            tracing::info!(
+                source,
+                path = %path.display(),
+                disk_read_us = 0_u128,
+                editor_create_us = open_started.elapsed().as_micros(),
+                syntax_us,
+                native_inspections_us,
+                completion_setup_us = 0_u128,
+                lsp_setup_us,
+                first_frame_us = 0_u128,
+                total_us = open_started.elapsed().as_micros(),
+                "[EDITOR OPEN PERF]"
+            );
+        }
         view
     }
 
@@ -304,10 +334,6 @@ impl EditorView {
 
     pub fn document_path(&self) -> Option<&Path> {
         self.document.file_path()
-    }
-
-    pub fn document_text(&self) -> String {
-        self.document.content()
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -438,7 +464,9 @@ impl EditorView {
             let resolved = self.resolve_class_name(name, &text_at_cursor);
             self.vendor_symbols
                 .as_ref()
-                .and_then(|index| resolve_vendor_definition_target(index, &resolved))
+                .and_then(|index| index.try_read().ok())
+                .and_then(|index| index.resolve_class(&resolved))
+                .map(|path| (path, 0..0))
         })
         .or_else(|| {
             self.runtime_symbols.as_ref().and_then(|index| {
@@ -1350,11 +1378,14 @@ impl EditorView {
                     .and_then(|index| index.try_read().ok())
                     .and_then(|index| index.find_class(&resolved).cloned());
                 let known_project = project_symbol.is_some();
-                let composer_found = self
-                    .vendor_symbols
-                    .as_ref()
-                    .and_then(|vendor| vendor.try_read().ok())
-                    .is_some_and(|vendor| vendor.resolve_class(&resolved).is_some());
+                let composer_found = if vendor_lookup_needed(known_project) {
+                    self.vendor_symbols
+                        .as_ref()
+                        .and_then(|vendor| vendor.try_read().ok())
+                        .is_some_and(|vendor| vendor.resolve_class(&resolved).is_some())
+                } else {
+                    false
+                };
                 let known_runtime = self.runtime_symbols.as_ref().is_some_and(|runtime| {
                     runtime.find_class(&resolved).is_some()
                         || runtime.find_class_by_short_name(name).is_some()
@@ -2963,6 +2994,10 @@ impl EditorView {
     }
 }
 
+fn vendor_lookup_needed(project_found: bool) -> bool {
+    !project_found
+}
+
 #[cfg(test)]
 fn resolve_vendor_definition_target(
     index: &Arc<std::sync::RwLock<VendorSymbolIndex>>,
@@ -4100,7 +4135,7 @@ mod formatter_tests {
     use super::{
         Arc, VendorSymbolIndex, completion_presentation, declared_class_fqn, declared_parent_fqn,
         extract_owner_expression, native_format_php, property_type_in_context,
-        resolve_php_class_name, resolve_vendor_definition_target,
+        resolve_php_class_name, resolve_vendor_definition_target, vendor_lookup_needed,
     };
     use lsp_types::CompletionItem;
     use std::time::Duration;
@@ -4283,5 +4318,11 @@ mod formatter_tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("vendor definition resolution timed out (possible RwLock deadlock)");
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn project_hit_short_circuits_vendor_lookup() {
+        assert!(!vendor_lookup_needed(true));
+        assert!(vendor_lookup_needed(false));
     }
 }
