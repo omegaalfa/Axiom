@@ -1436,6 +1436,15 @@ impl EditorView {
                             }),
                     );
                 }
+                if is_static && members.is_empty() && prefix.is_empty() {
+                    members.push(CompletionItem {
+                        label: "class".to_owned(),
+                        detail: Some("Class name • Runtime".to_owned()),
+                        kind: Some(CompletionItemKind::KEYWORD),
+                        insert_text: Some("class".to_owned()),
+                        ..Default::default()
+                    });
+                }
                 let mut seen = std::collections::HashSet::new();
                 members.retain(|item| seen.insert(item.label.to_ascii_lowercase()));
                 if debug_completion_enabled() {
@@ -1899,7 +1908,17 @@ impl EditorView {
                 .or_else(|| index.find_function(&format!("\\{name}")))
                 .or_else(|| {
                     receiver.and_then(|owner| {
-                        index.methods_of(owner).find(|symbol| symbol.name == name)
+                        let owner = self.resolve_native_type(owner, &text[..open])?;
+                        let owner = index
+                            .find_class(&owner)
+                            .map(|symbol| symbol.fqn.clone())
+                            .or_else(|| {
+                                index
+                                    .find_class_by_short_name(owner.as_str())
+                                    .map(|symbol| symbol.fqn.clone())
+                            })
+                            .unwrap_or(owner);
+                        index.methods_of(&owner).find(|symbol| symbol.name == name)
                     })
                 })
         })?;
