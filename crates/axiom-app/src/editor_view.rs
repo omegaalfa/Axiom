@@ -1032,7 +1032,7 @@ impl EditorView {
 
     fn sync_syntax_text(&mut self, text: &str) {
         if let Some(syntax) = &mut self.syntax
-            && let Err(error) = syntax.update_text(&text)
+            && let Err(error) = syntax.update_text(text)
         {
             self.status = Some(format!("Falha ao atualizar sintaxe PHP: {error}").into());
         }
@@ -1051,8 +1051,8 @@ impl EditorView {
                     .collect()
             })
             .unwrap_or_default();
-        self.add_native_inspections(&text);
-        self.add_native_argument_inspections(&text);
+        self.add_native_inspections(text);
+        self.add_native_argument_inspections(text);
     }
 
     fn add_native_argument_inspections(&mut self, text: &str) {
