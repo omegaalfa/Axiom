@@ -180,6 +180,22 @@ pub struct VendorDefinitionRequest {
     pub is_static: bool,
 }
 
+#[derive(Clone, Debug)]
+pub enum DefinitionQuery {
+    Name {
+        fqn: String,
+        written: String,
+    },
+    Method {
+        owner_fqn: String,
+        name: String,
+        is_static: bool,
+    },
+    Function {
+        name: String,
+    },
+}
+
 fn run_index_update_worker(receiver: mpsc::Receiver<IndexUpdateRequest>) {
     while let Ok(mut request) = receiver.recv() {
         if let Ok(next) = receiver.recv_timeout(Duration::from_millis(150)) {
@@ -467,49 +483,60 @@ impl EditorView {
 
     /// Extracts a Vendor definition request without reading or parsing the
     /// dependency file. The caller must resolve/parse it off the UI thread.
-    pub fn vendor_definition_request(&self) -> Option<VendorDefinitionRequest> {
+    pub fn definition_query(&self) -> Option<DefinitionQuery> {
         let syntax = self.syntax.as_ref()?;
         let token = syntax.token_at_byte(self.document.cursor_offset())?;
         let text = self.document.content();
         let before = &text[..token.range.start];
-        let (member, is_static, written) =
-            if let Some(operator) = before.rfind("->").or_else(|| before.rfind("::")) {
-                let is_static = before[operator..].starts_with("::");
-                let owner_end = operator;
-                let owner_start = before[..owner_end]
-                    .char_indices()
-                    .rev()
-                    .take_while(|(_, ch)| {
-                        ch.is_alphanumeric() || *ch == '_' || *ch == '$' || *ch == '\\'
-                    })
-                    .last()
-                    .map_or(owner_end, |(i, _)| i);
-                (
-                    Some(token.text.clone()),
-                    is_static,
-                    before[owner_start..owner_end]
-                        .trim_start_matches('$')
-                        .to_owned(),
-                )
-            } else {
-                (None, false, token.text.trim_start_matches('$').to_owned())
-            };
-        let fqn = if let Some(variable) = written.strip_prefix('$') {
-            let marker = format!("${variable} = new ");
-            text[..token.range.start]
-                .rfind(&marker)
-                .and_then(|pos| {
-                    let class = text[pos + marker.len()..]
-                        .chars()
-                        .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '\\')
-                        .collect::<String>();
-                    (!class.is_empty()).then(|| resolve_php_class_name(&class, &text))
+        if let Some(operator) = before.rfind("->").or_else(|| before.rfind("::")) {
+            let is_static = before[operator..].starts_with("::");
+            let owner_end = operator;
+            let owner_start = before[..owner_end]
+                .char_indices()
+                .rev()
+                .take_while(|(_, ch)| {
+                    ch.is_alphanumeric() || *ch == '_' || *ch == '$' || *ch == '\\'
                 })
-                .unwrap_or_else(|| resolve_php_class_name(&written, &text))
-        } else {
-            resolve_php_class_name(&written, &text)
+                .last()
+                .map_or(owner_end, |(i, _)| i);
+            let written_owner = before[owner_start..owner_end].to_owned();
+            let owner_fqn = if written_owner.starts_with('$') {
+                self.resolve_native_type(&written_owner, before)?
+            } else {
+                resolve_php_class_name(&written_owner, &text)
+            };
+            return Some(DefinitionQuery::Method {
+                owner_fqn,
+                name: token.text.trim_start_matches('$').to_owned(),
+                is_static,
+            });
+        }
+        let name = token.text.trim_start_matches('$').to_owned();
+        if text[token.range.end..].starts_with('(') {
+            return Some(DefinitionQuery::Function { name });
+        }
+        Some(DefinitionQuery::Name {
+            fqn: resolve_php_class_name(&name, &text),
+            written: name,
+        })
+    }
+
+    pub fn vendor_definition_request(&self) -> Option<VendorDefinitionRequest> {
+        let query = self.definition_query()?;
+        let (fqn, member, is_static) = match query {
+            DefinitionQuery::Method {
+                owner_fqn,
+                name,
+                is_static,
+                ..
+            } => (owner_fqn, Some(name), is_static),
+            DefinitionQuery::Name { fqn, .. } => (fqn, None, false),
+            DefinitionQuery::Function { .. } => return None,
         };
         let index = self.vendor_symbols.clone()?;
+        if !index.read().ok()?.resolve_class(&fqn).is_some() {
+            return None;
+        }
         Some(VendorDefinitionRequest {
             index,
             fqn,
@@ -521,54 +548,25 @@ impl EditorView {
     /// Project-only lookup. Composer is deliberately not consulted here so
     /// workspace symbols always take precedence over Vendor metadata.
     pub fn project_definition_location(&self) -> Option<(PathBuf, lsp_types::Position)> {
-        let syntax = self.syntax.as_ref()?;
-        let token = syntax.token_at_byte(self.document.cursor_offset())?;
         let text = self.document.content();
-        let before = &text[..token.range.start];
-        let (name, owner) =
-            if let Some(operator) = before.rfind("->").or_else(|| before.rfind("::")) {
-                let owner_end = operator;
-                let owner_start = before[..owner_end]
-                    .char_indices()
-                    .rev()
-                    .take_while(|(_, ch)| {
-                        ch.is_alphanumeric() || *ch == '_' || *ch == '$' || *ch == '\\'
-                    })
-                    .last()
-                    .map_or(owner_end, |(i, _)| i);
-                (
-                    token.text.trim_start_matches('$').to_owned(),
-                    Some(
-                        before[owner_start..owner_end]
-                            .trim_start_matches('$')
-                            .to_owned(),
-                    ),
-                )
-            } else {
-                (token.text.trim_start_matches('$').to_owned(), None)
-            };
+        let query = self.definition_query()?;
         let index = self.project_symbols.as_ref()?.read().ok()?;
-        let symbol = if let Some(owner) = owner {
-            let owner_fqn = owner
-                .strip_prefix('$')
-                .and_then(|variable| {
-                    let marker = format!("${variable} = new ");
-                    text[..token.range.start].rfind(&marker).and_then(|pos| {
-                        let class = text[pos + marker.len()..]
-                            .chars()
-                            .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '\\')
-                            .collect::<String>();
-                        (!class.is_empty()).then(|| resolve_php_class_name(&class, &text))
-                    })
-                })
-                .unwrap_or_else(|| resolve_php_class_name(&owner, &text));
-            index
-                .find_methods(&owner_fqn)
-                .into_iter()
-                .find(|symbol| symbol.name == name)
-        } else {
-            let fqn = resolve_php_class_name(&name, &text);
-            index.find_class(&fqn).or_else(|| index.find_class(&name))
+        let symbol = match query {
+            DefinitionQuery::Method {
+                owner_fqn,
+                name,
+                is_static,
+                ..
+            } => index.find_methods(&owner_fqn).into_iter().find(|symbol| {
+                symbol.name == name && symbol.modifiers.iter().any(|m| m == "static") == is_static
+            }),
+            DefinitionQuery::Name { fqn, written } => index
+                .find_class(&fqn)
+                .or_else(|| index.find_class(&written)),
+            DefinitionQuery::Function { name } => index
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind == ProjectSymbolKind::Function && symbol.name == name),
         }?;
         self.resolve_location(&symbol.file, symbol.range.start, &text)
     }
