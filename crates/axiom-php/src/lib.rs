@@ -290,7 +290,9 @@ impl StubProvider {
 }
 
 const STUB_CACHE_SCHEMA: u32 = 1;
-const STUB_PARSER_VERSION: u32 = 1;
+// Bump when symbol extraction changes so an old incremental cache cannot hide
+// newly indexed methods/properties from completion.
+const STUB_PARSER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StubCache {
@@ -862,6 +864,11 @@ mod tests {
         assert!(index.find_class("PDOStatement").is_some());
         assert!(index.find_class("ReflectionClass").is_some());
         assert!(index.find_class("ArrayIterator").is_some());
+        assert!(
+            index
+                .methods_of("ArrayIterator")
+                .any(|symbol| symbol.name == "current")
+        );
     }
 
     #[test]
