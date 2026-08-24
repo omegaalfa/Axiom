@@ -15,7 +15,7 @@ use std::{
 use axiom_editor::Document;
 use axiom_index::{ProjectSymbolIndex, ProjectSymbolKind};
 use axiom_lsp::{PositionCodec, PositionEncoding, path_to_uri};
-use axiom_php::{RuntimeSymbolIndex, SymbolKind as RuntimeKind};
+use axiom_php::{RuntimeSymbolIndex, Symbol as RuntimeSymbol, SymbolKind as RuntimeKind};
 use axiom_project::is_php_file;
 use axiom_syntax::PhpSyntax;
 use gpui::{
@@ -1413,6 +1413,7 @@ impl EditorView {
                                     label: symbol.name.clone(),
                                     detail: Some(runtime_signature_detail(symbol)),
                                     kind: Some(CompletionItemKind::METHOD),
+                                    insert_text: runtime_call_insert_text(symbol),
                                     ..Default::default()
                                 }
                             }),
@@ -1459,6 +1460,7 @@ impl EditorView {
                             | RuntimeKind::Enum => CompletionItemKind::CLASS,
                             _ => CompletionItemKind::VALUE,
                         }),
+                        insert_text: runtime_call_insert_text(symbol),
                         additional_text_edits: import.map(|edit| vec![edit]),
                         ..Default::default()
                         }
@@ -2602,6 +2604,23 @@ fn runtime_signature_detail(symbol: &axiom_php::Symbol) -> String {
         })
         .unwrap_or_default();
     format!("{}{} • {:?}", symbol.name, signature, symbol.origin)
+}
+
+fn runtime_call_insert_text(symbol: &RuntimeSymbol) -> Option<String> {
+    let signature = symbol.signature.as_ref()?;
+    let parameters = signature
+        .parameters
+        .iter()
+        .map(|parameter| {
+            let mut name = parameter.name.trim_start_matches('$').to_owned();
+            if parameter.variadic {
+                name.insert_str(0, "...");
+            }
+            format!("${name}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{}({parameters})", symbol.name))
 }
 
 fn project_method_detail(symbol: &axiom_index::ProjectSymbol) -> String {
