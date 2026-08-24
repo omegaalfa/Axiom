@@ -2192,34 +2192,10 @@ impl EditorView {
     }
 
     fn definition(&mut self, _: &Definition, window: &mut Window, cx: &mut Context<Self>) {
-        if let (Some(lsp), Some(uri), Some(position)) =
-            (&self.lsp, &self.lsp_uri, self.lsp_position())
-        {
-            if lsp.status() == axiom_lsp::ServerStatus::Ready {
-                if debug_input_enabled() {
-                    tracing::info!(document = ?uri, "[DEFINITION REQUEST]");
-                }
-                lsp.request_definition(uri.clone(), position);
-            } else {
-                if debug_input_enabled() {
-                    tracing::info!(
-                        provider = "native",
-                        reason = "lsp_not_ready",
-                        "[DEFINITION REQUEST]"
-                    );
-                }
-                window.dispatch_action(NativeDefinition.boxed_clone(), cx);
-            }
-        } else {
-            if debug_input_enabled() {
-                tracing::info!(
-                    provider = "native",
-                    reason = "lsp_unavailable",
-                    "[DEFINITION REQUEST]"
-                );
-            }
-            window.dispatch_action(NativeDefinition.boxed_clone(), cx);
+        if debug_input_enabled() {
+            tracing::info!(provider = "native-first", "[DEFINITION REQUEST]");
         }
+        window.dispatch_action(NativeDefinition.boxed_clone(), cx);
     }
 
     fn references(&mut self, _: &References, _: &mut Window, cx: &mut Context<Self>) {

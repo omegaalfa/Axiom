@@ -1655,7 +1655,7 @@ impl WorkspaceView {
         self.execute_command("navigate.symbol", window, cx);
     }
 
-    fn navigate_native_definition(&mut self, cx: &mut Context<Self>) {
+    fn navigate_native_definition(&mut self, cx: &mut Context<Self>) -> bool {
         let native = self
             .active
             .and_then(|index| self.tabs.get(index))
@@ -1665,6 +1665,7 @@ impl WorkspaceView {
                 tracing::info!(path = %path.display(), line = position.line, character = position.character, "[NAVIGATION TARGET]");
             }
             self.navigate_to_definition(DefinitionTarget { path, position }, cx);
+            return true;
         } else {
             self.status = "Definition não encontrada".into();
             if debug_input_enabled() {
@@ -1675,6 +1676,7 @@ impl WorkspaceView {
                 );
             }
         }
+        false
     }
 
     fn native_definition_action(
@@ -1689,7 +1691,21 @@ impl WorkspaceView {
         if self.start_vendor_definition(cx) {
             return;
         }
-        self.navigate_native_definition(cx);
+        if self.navigate_native_definition(cx) {
+            return;
+        }
+        if let (Some(lsp), Some(uri), Some(position)) = (
+            &self.lsp,
+            self.active
+                .and_then(|index| self.tabs.get(index))
+                .and_then(|tab| tab.editor.read(cx).lsp_uri())
+                .cloned(),
+            self.active
+                .and_then(|index| self.tabs.get(index))
+                .and_then(|tab| tab.editor.read(cx).current_lsp_position()),
+        ) {
+            lsp.request_definition(uri, position);
+        }
     }
 
     fn start_vendor_definition(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1702,6 +1718,7 @@ impl WorkspaceView {
         if let Some((path, position)) = tab.editor.read(cx).project_definition_location() {
             if debug_input_enabled() {
                 tracing::info!(found = true, path = %path.display(), "[DEFINITION PROJECT]");
+                tracing::info!(attempted = false, found = false, "[DEFINITION VENDOR]");
                 tracing::info!(source = "Project", path = %path.display(), "[DEFINITION TARGET]");
             }
             self.navigate_to_definition(DefinitionTarget { path, position }, cx);
