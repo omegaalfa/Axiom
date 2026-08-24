@@ -1699,9 +1699,23 @@ impl WorkspaceView {
         let Some(tab) = self.tabs.get(tab_index) else {
             return false;
         };
+        if let Some((path, position)) = tab.editor.read(cx).project_definition_location() {
+            if debug_input_enabled() {
+                tracing::info!(found = true, path = %path.display(), "[DEFINITION PROJECT]");
+                tracing::info!(source = "Project", path = %path.display(), "[DEFINITION TARGET]");
+            }
+            self.navigate_to_definition(DefinitionTarget { path, position }, cx);
+            return true;
+        }
+        if debug_input_enabled() {
+            tracing::info!(found = false, "[DEFINITION PROJECT]");
+        }
         let Some(request) = tab.editor.read(cx).vendor_definition_request() else {
             return false;
         };
+        if debug_input_enabled() {
+            tracing::info!(attempted = true, fqn = %request.fqn, "[DEFINITION VENDOR]");
+        }
         let weak = cx.entity().downgrade();
         self.status = "Resolving definition…".into();
         if debug_input_enabled() {

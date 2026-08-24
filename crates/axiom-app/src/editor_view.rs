@@ -518,6 +518,61 @@ impl EditorView {
         })
     }
 
+    /// Project-only lookup. Composer is deliberately not consulted here so
+    /// workspace symbols always take precedence over Vendor metadata.
+    pub fn project_definition_location(&self) -> Option<(PathBuf, lsp_types::Position)> {
+        let syntax = self.syntax.as_ref()?;
+        let token = syntax.token_at_byte(self.document.cursor_offset())?;
+        let text = self.document.content();
+        let before = &text[..token.range.start];
+        let (name, owner) =
+            if let Some(operator) = before.rfind("->").or_else(|| before.rfind("::")) {
+                let owner_end = operator;
+                let owner_start = before[..owner_end]
+                    .char_indices()
+                    .rev()
+                    .take_while(|(_, ch)| {
+                        ch.is_alphanumeric() || *ch == '_' || *ch == '$' || *ch == '\\'
+                    })
+                    .last()
+                    .map_or(owner_end, |(i, _)| i);
+                (
+                    token.text.trim_start_matches('$').to_owned(),
+                    Some(
+                        before[owner_start..owner_end]
+                            .trim_start_matches('$')
+                            .to_owned(),
+                    ),
+                )
+            } else {
+                (token.text.trim_start_matches('$').to_owned(), None)
+            };
+        let index = self.project_symbols.as_ref()?.read().ok()?;
+        let symbol = if let Some(owner) = owner {
+            let owner_fqn = owner
+                .strip_prefix('$')
+                .and_then(|variable| {
+                    let marker = format!("${variable} = new ");
+                    text[..token.range.start].rfind(&marker).and_then(|pos| {
+                        let class = text[pos + marker.len()..]
+                            .chars()
+                            .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '\\')
+                            .collect::<String>();
+                        (!class.is_empty()).then(|| resolve_php_class_name(&class, &text))
+                    })
+                })
+                .unwrap_or_else(|| resolve_php_class_name(&owner, &text));
+            index
+                .find_methods(&owner_fqn)
+                .into_iter()
+                .find(|symbol| symbol.name == name)
+        } else {
+            let fqn = resolve_php_class_name(&name, &text);
+            index.find_class(&fqn).or_else(|| index.find_class(&name))
+        }?;
+        self.resolve_location(&symbol.file, symbol.range.start, &text)
+    }
+
     fn lsp_encoding(&self) -> PositionEncoding {
         self.lsp
             .as_ref()
