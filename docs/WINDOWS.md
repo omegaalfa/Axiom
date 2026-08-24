@@ -11,10 +11,13 @@ adapter for which `D3D11CreateDevice` succeeds. There is no NVIDIA, RTX, CUDA,
 or vendor-specific filter in this path, so Intel and AMD adapters are eligible
 when their driver supports the requested Direct3D feature levels.
 
-GPUI requests feature levels 11.1, 11.0, and 10.1, in that order. The source
-does not enumerate a WARP adapter or call `D3D11CreateDevice` with
-`D3D_DRIVER_TYPE_WARP`; there is no software-renderer fallback in this GPUI
-version.
+GPUI requests feature levels 11.1, 11.0, and 10.1, in that order. The
+selection loop does not inspect or reject `DXGI_ADAPTER_FLAG_SOFTWARE`, and
+the source does not explicitly enumerate WARP or call
+`D3D11CreateDevice` with `D3D_DRIVER_TYPE_WARP`. Consequently, the Microsoft
+Basic Render Driver could be accepted by the same loop if it is returned by
+DXGI and successfully creates a device; GPUI does not label that case as a
+software fallback in its logs.
 
 If no enumerated adapter can create a device at one of those levels, the
 renderer initialization returns an error. Axiom currently does not wrap GPUI's
@@ -36,4 +39,8 @@ The source audit confirms support is not restricted to dedicated GPUs, but no
 Intel/AMD/WARP hardware is available in this environment for runtime testing.
 The existing log line reports the selected adapter name; GPUI 0.2.2 does not
 expose a public adapter-selection hook that Axiom can use to add vendor,
-feature-level, and fallback fields without changing GPUI itself.
+feature-level, device-type, and fallback fields without changing GPUI itself.
+
+The Axiom binary also does not export `NvOptimusEnablement` or
+`AmdPowerXpressRequestHighPerformance`. On hybrid laptops, adapter choice can
+therefore still be influenced by Windows or the manufacturer's driver panel.
