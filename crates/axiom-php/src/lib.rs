@@ -292,7 +292,7 @@ impl StubProvider {
 const STUB_CACHE_SCHEMA: u32 = 1;
 // Bump when symbol extraction changes so an old incremental cache cannot hide
 // newly indexed methods/properties from completion.
-const STUB_PARSER_VERSION: u32 = 2;
+const STUB_PARSER_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StubCache {
@@ -468,9 +468,7 @@ fn discover_php_files(root: &Path, directory: &Path, files: &mut Vec<StubFile>) 
 
 fn extract_symbols(text: &str, file: &Path, extension: &str) -> Result<Vec<Symbol>, String> {
     let syntax = PhpSyntax::parse(text.to_owned()).map_err(|error| error.to_string())?;
-    if syntax.has_errors() {
-        return Err("stub contains PHP syntax errors".into());
-    }
+    let had_errors = syntax.has_errors();
     let namespace = syntax
         .symbols()
         .iter()
@@ -481,6 +479,13 @@ fn extract_symbols(text: &str, file: &Path, extension: &str) -> Result<Vec<Symbo
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         visit_node(child, text, file, extension, namespace, None, &mut symbols);
+    }
+    // PHP distributions frequently ship stubs containing newer attributes or
+    // annotations that an older grammar flags while still producing valid
+    // declaration nodes. Keep those declarations; reject only files where no
+    // symbols could be recovered at all.
+    if had_errors && symbols.is_empty() {
+        return Err("stub contains PHP syntax errors".into());
     }
     Ok(symbols)
 }
