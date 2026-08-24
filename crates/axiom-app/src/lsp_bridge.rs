@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -17,33 +18,52 @@ pub enum IdeLspEvent {
     Completion {
         uri: Uri,
         items: Vec<lsp_types::CompletionItem>,
+        generation: u64,
     },
     Formatting {
         uri: Uri,
         edits: Vec<lsp_types::TextEdit>,
+        generation: u64,
     },
     SignatureHelp {
         uri: Uri,
         text: Option<String>,
+        generation: u64,
     },
     Hover {
         uri: Uri,
         text: Option<String>,
+        generation: u64,
     },
     Definition {
+        uri: Uri,
         locations: Vec<Location>,
+        generation: u64,
     },
     References {
+        uri: Uri,
         count: usize,
+        generation: u64,
     },
     Error(String),
     Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LspRequestKind {
+    Completion,
+    Hover,
+    Definition,
+    References,
+    Formatting,
+    SignatureHelp,
 }
 
 pub struct LspBridge {
     server: Option<Arc<Mutex<LanguageServer>>>,
     status: Mutex<ServerStatus>,
     pending_events: Arc<Mutex<Vec<IdeLspEvent>>>,
+    generations: Mutex<HashMap<(Uri, LspRequestKind), u64>>,
 }
 
 impl LspBridge {
@@ -54,6 +74,7 @@ impl LspBridge {
                     server: Some(Arc::new(Mutex::new(server))),
                     status: Mutex::new(ServerStatus::Ready),
                     pending_events: Arc::new(Mutex::new(Vec::new())),
+                    generations: Mutex::new(HashMap::new()),
                 }),
                 Err(error) => Arc::new(Self {
                     server: None,
@@ -61,17 +82,20 @@ impl LspBridge {
                     pending_events: Arc::new(Mutex::new(vec![IdeLspEvent::Error(
                         error.to_string(),
                     )])),
+                    generations: Mutex::new(HashMap::new()),
                 }),
             },
             Err(axiom_lsp::LspError::ServerNotFound) => Arc::new(Self {
                 server: None,
                 status: Mutex::new(ServerStatus::NotFound),
                 pending_events: Arc::new(Mutex::new(Vec::new())),
+                generations: Mutex::new(HashMap::new()),
             }),
             Err(error) => Arc::new(Self {
                 server: None,
                 status: Mutex::new(ServerStatus::Stopped),
                 pending_events: Arc::new(Mutex::new(vec![IdeLspEvent::Error(error.to_string())])),
+                generations: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -101,7 +125,15 @@ impl LspBridge {
         }
     }
 
+    fn next_generation(&self, uri: &Uri, kind: LspRequestKind) -> u64 {
+        let mut generations = self.generations.lock().expect("generation lock poisoned");
+        let generation = generations.entry((uri.clone(), kind)).or_insert(0);
+        *generation += 1;
+        *generation
+    }
+
     pub fn request_completion(&self, uri: Uri, position: Position) {
+        let generation = self.next_generation(&uri, LspRequestKind::Completion);
         let Some(server) = &self.server else { return };
         let pending = match server
             .lock()
@@ -122,6 +154,7 @@ impl LspBridge {
                         Ok(response) => IdeLspEvent::Completion {
                             uri,
                             items: normalize_completions(response),
+                            generation,
                         },
                         Err(error) => IdeLspEvent::Error(error.to_string()),
                     };
@@ -131,6 +164,7 @@ impl LspBridge {
     }
 
     pub fn request_hover(&self, uri: Uri, position: Position) {
+        let generation = self.next_generation(&uri, LspRequestKind::Hover);
         let Some(server) = &self.server else { return };
         let pending = match server
             .lock()
@@ -150,6 +184,7 @@ impl LspBridge {
                     Ok(response) => IdeLspEvent::Hover {
                         uri,
                         text: hover_text(response),
+                        generation,
                     },
                     Err(error) => IdeLspEvent::Error(error.to_string()),
                 };
@@ -159,11 +194,12 @@ impl LspBridge {
     }
 
     pub fn request_definition(&self, uri: Uri, position: Position) {
+        let generation = self.next_generation(&uri, LspRequestKind::Definition);
         let Some(server) = &self.server else { return };
         let pending = match server
             .lock()
             .expect("LSP lock poisoned")
-            .definition(uri, position)
+            .definition(uri.clone(), position)
         {
             Ok(pending) => pending,
             Err(error) => {
@@ -177,7 +213,9 @@ impl LspBridge {
                 let event =
                     match pending.recv::<Option<GotoDefinitionResponse>>(DEFAULT_REQUEST_TIMEOUT) {
                         Ok(response) => IdeLspEvent::Definition {
+                            uri,
                             locations: definition_locations(response),
+                            generation,
                         },
                         Err(error) => IdeLspEvent::Error(error.to_string()),
                     };
@@ -187,11 +225,12 @@ impl LspBridge {
     }
 
     pub fn request_references(&self, uri: Uri, position: Position) {
+        let generation = self.next_generation(&uri, LspRequestKind::References);
         let Some(server) = &self.server else { return };
         let pending = match server
             .lock()
             .expect("LSP lock poisoned")
-            .references(uri, position)
+            .references(uri.clone(), position)
         {
             Ok(pending) => pending,
             Err(error) => {
@@ -204,7 +243,9 @@ impl LspBridge {
             .spawn(async move {
                 let event = match pending.recv::<Option<Vec<Location>>>(DEFAULT_REQUEST_TIMEOUT) {
                     Ok(response) => IdeLspEvent::References {
+                        uri,
                         count: response.unwrap_or_default().len(),
+                        generation,
                     },
                     Err(error) => IdeLspEvent::Error(error.to_string()),
                 };
@@ -214,6 +255,7 @@ impl LspBridge {
     }
 
     pub fn request_formatting(&self, uri: Uri, tab_size: u32, insert_spaces: bool) {
+        let generation = self.next_generation(&uri, LspRequestKind::Formatting);
         let Some(server) = &self.server else { return };
         let pending = match server.lock().expect("LSP lock poisoned").formatting(
             uri.clone(),
@@ -235,6 +277,7 @@ impl LspBridge {
                     Ok(edits) => IdeLspEvent::Formatting {
                         uri,
                         edits: edits.unwrap_or_default(),
+                        generation,
                     },
                     Err(error) => IdeLspEvent::Error(error.to_string()),
                 };
@@ -244,6 +287,7 @@ impl LspBridge {
     }
 
     pub fn request_signature_help(&self, uri: Uri, position: Position) {
+        let generation = self.next_generation(&uri, LspRequestKind::SignatureHelp);
         let Some(server) = &self.server else { return };
         let pending = match server
             .lock()
@@ -265,6 +309,7 @@ impl LspBridge {
                     Ok(help) => IdeLspEvent::SignatureHelp {
                         uri,
                         text: help.map(signature_help_text),
+                        generation,
                     },
                     Err(error) => IdeLspEvent::Error(error.to_string()),
                 };
@@ -308,6 +353,27 @@ fn signature_help_text(help: lsp_types::SignatureHelp) -> String {
             .as_ref()
             .map_or_else(String::new, |doc| format!("{doc:?}")),
         label => label.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn accept_generation(last: &mut u64, generation: u64) -> bool {
+        if generation < *last {
+            return false;
+        }
+        *last = generation;
+        true
+    }
+
+    #[test]
+    fn newer_lsp_response_wins_over_out_of_order_older_response() {
+        let mut last = 0;
+        assert!(accept_generation(&mut last, 2));
+        assert!(!accept_generation(&mut last, 1));
+        assert_eq!(last, 2);
+        assert!(accept_generation(&mut last, 3));
+        assert_eq!(last, 3);
     }
 }
 

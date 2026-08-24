@@ -4,11 +4,11 @@ use std::{
     fs,
     ops::Range,
     path::{Path, PathBuf},
+    sync::mpsc::{self, Sender},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    thread,
     time::Duration,
 };
 
@@ -18,6 +18,7 @@ use axiom_lsp::{PositionCodec, PositionEncoding, path_to_uri};
 use axiom_php::{RuntimeSymbolIndex, Symbol as RuntimeSymbol, SymbolKind as RuntimeKind};
 use axiom_project::is_php_file;
 use axiom_syntax::PhpSyntax;
+use gpui::background_executor;
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
@@ -145,6 +146,7 @@ pub struct EditorView {
     runtime_symbols: Option<Arc<RuntimeSymbolIndex>>,
     project_symbols: Option<Arc<std::sync::RwLock<ProjectSymbolIndex>>>,
     project_index_revision: Option<Arc<AtomicU64>>,
+    index_update_sender: Option<Sender<IndexUpdateRequest>>,
     last_completion_layout: Option<(u32, u32, u32, u32, bool)>,
 }
 
@@ -153,6 +155,33 @@ struct ByteDiagnostic {
     range: Range<usize>,
     severity: Option<DiagnosticSeverity>,
     message: String,
+}
+
+struct IndexUpdateRequest {
+    generation: u64,
+    path: PathBuf,
+    text: String,
+    index: Arc<std::sync::RwLock<ProjectSymbolIndex>>,
+    revision: Arc<AtomicU64>,
+}
+
+fn run_index_update_worker(receiver: mpsc::Receiver<IndexUpdateRequest>) {
+    while let Ok(mut request) = receiver.recv() {
+        if let Ok(next) = receiver.recv_timeout(Duration::from_millis(150)) {
+            request = next;
+            while let Ok(next) = receiver.try_recv() {
+                request = next;
+            }
+        }
+        if request.revision.load(Ordering::SeqCst) != request.generation {
+            continue;
+        }
+        if let Ok(mut index) = request.index.write()
+            && request.revision.load(Ordering::SeqCst) == request.generation
+        {
+            let _ = index.index_file_text(request.path, request.text);
+        }
+    }
 }
 
 impl EditorView {
@@ -179,6 +208,10 @@ impl EditorView {
         lsp: Option<Arc<LspBridge>>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (index_update_sender, index_update_receiver) = mpsc::channel::<IndexUpdateRequest>();
+        background_executor()
+            .spawn(async move { run_index_update_worker(index_update_receiver) })
+            .detach();
         let syntax = is_php_file(&path)
             .then(|| PhpSyntax::parse(document.content()))
             .transpose()
@@ -219,6 +252,7 @@ impl EditorView {
             runtime_symbols: None,
             project_symbols: None,
             project_index_revision: None,
+            index_update_sender: Some(index_update_sender),
             last_completion_layout: None,
         };
         view.sync_syntax();
@@ -927,17 +961,15 @@ impl EditorView {
         let generation = revision.fetch_add(1, Ordering::SeqCst) + 1;
         let path = self.file_path.clone();
         let text = text.to_owned();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(150));
-            if revision.load(Ordering::SeqCst) != generation {
-                return;
-            }
-            if let Ok(mut index) = index.write()
-                && revision.load(Ordering::SeqCst) == generation
-            {
-                let _ = index.index_file_text(path, text);
-            }
-        });
+        if let Some(sender) = &self.index_update_sender {
+            let _ = sender.send(IndexUpdateRequest {
+                generation,
+                path,
+                text,
+                index,
+                revision,
+            });
+        }
     }
 
     /// Returns false for offsets contained in PHP comments or string-like
@@ -3699,5 +3731,13 @@ mod formatter_tests {
         assert!(row_height > 0.0 && row_height <= 32.0);
         assert!((280.0..=700.0).contains(&max_width));
         assert_eq!(row_height, 28.0);
+    }
+
+    #[test]
+    fn debounce_worker_exits_when_editor_channel_is_dropped() {
+        let (sender, receiver) = std::sync::mpsc::channel::<super::IndexUpdateRequest>();
+        let worker = std::thread::spawn(|| super::run_index_update_worker(receiver));
+        drop(sender);
+        worker.join().expect("debounce worker should terminate");
     }
 }

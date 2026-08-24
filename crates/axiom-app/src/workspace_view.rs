@@ -31,7 +31,7 @@ use gpui::{
 
 use crate::{
     editor_view::EditorView,
-    lsp_bridge::{IdeLspEvent, LspBridge},
+    lsp_bridge::{IdeLspEvent, LspBridge, LspRequestKind},
     terminal_view::TerminalView,
     ui::{
         components::tooltip,
@@ -128,6 +128,12 @@ enum ExplorerOperation {
     },
     NewDirectory(PathBuf),
     Rename(PathBuf),
+}
+
+enum ExplorerFsResult {
+    Create(Option<PathBuf>),
+    Rename { old: PathBuf, new: PathBuf },
+    Delete(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -251,6 +257,8 @@ pub struct WorkspaceView {
     project_dialog_open: bool,
     project_load_generation: u64,
     project_load_results: Option<Receiver<(u64, Result<ProjectLoadPayload, String>)>>,
+    lsp_generations: HashMap<(lsp_types::Uri, LspRequestKind), u64>,
+    explorer_fs_busy: bool,
 }
 
 impl WorkspaceView {
@@ -753,6 +761,8 @@ impl WorkspaceView {
             project_dialog_open: false,
             project_load_generation: 0,
             project_load_results: None,
+            lsp_generations: HashMap::new(),
+            explorer_fs_busy: false,
         };
         workspace.begin_runtime_stub_load(cx, false);
         workspace.start_runtime_watcher(cx);
@@ -2432,6 +2442,11 @@ impl WorkspaceView {
     }
 
     fn new_file(&mut self, directory: PathBuf, _: &mut Window, cx: &mut Context<Self>) {
+        if self.explorer_fs_busy {
+            self.status = "Another file operation is in progress".into();
+            cx.notify();
+            return;
+        }
         if self.explorer_context.is_some() && debug_input_enabled() {
             tracing::info!(selected_path = ?self.selected_path, reason = "action", "[CONTEXT MENU CLOSE]");
         }
@@ -2486,6 +2501,11 @@ impl WorkspaceView {
     }
 
     fn new_php_file(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
+        if self.explorer_fs_busy {
+            self.status = "Another file operation is in progress".into();
+            cx.notify();
+            return;
+        }
         if self.explorer_context.is_some() && debug_input_enabled() {
             tracing::info!(selected_path = ?self.selected_path, reason = "action", "[CONTEXT MENU CLOSE]");
         }
@@ -2504,6 +2524,11 @@ impl WorkspaceView {
     }
 
     fn new_directory(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
+        if self.explorer_fs_busy {
+            self.status = "Another file operation is in progress".into();
+            cx.notify();
+            return;
+        }
         if self.explorer_context.is_some() && debug_input_enabled() {
             tracing::info!(selected_path = ?self.selected_path, reason = "action", "[CONTEXT MENU CLOSE]");
         }
@@ -2522,6 +2547,11 @@ impl WorkspaceView {
     }
 
     fn new_php_item(&mut self, directory: PathBuf, keyword: &'static str, cx: &mut Context<Self>) {
+        if self.explorer_fs_busy {
+            self.status = "Another file operation is in progress".into();
+            cx.notify();
+            return;
+        }
         if self.explorer_context.is_some() && debug_input_enabled() {
             tracing::info!(selected_path = ?self.selected_path, reason = "action", "[CONTEXT MENU CLOSE]");
         }
@@ -2547,6 +2577,11 @@ impl WorkspaceView {
     }
 
     fn rename_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.explorer_fs_busy {
+            self.status = "Another file operation is in progress".into();
+            cx.notify();
+            return;
+        }
         if debug_input_enabled() {
             tracing::info!(selected_path = %path.display(), popup_open = true, "[RENAME DIALOG]");
         }
@@ -2721,6 +2756,11 @@ impl WorkspaceView {
     }
 
     fn confirm_explorer_operation(&mut self, cx: &mut Context<Self>) {
+        if self.explorer_fs_busy {
+            self.status = "Another file operation is in progress".into();
+            cx.notify();
+            return;
+        }
         let Some(operation) = self.explorer_operation.take() else {
             return;
         };
@@ -2733,20 +2773,18 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
-        let Some(project) = self.project.as_ref() else {
+        let Some(project) = self.project.clone() else {
             return;
         };
-        let result = match operation {
-            ExplorerOperation::NewFile(directory) => {
-                project.create_file(&directory, &name).map(Some)
-            }
+        let operation = match operation {
+            ExplorerOperation::NewFile(directory) => (directory, name, None),
             ExplorerOperation::NewPhpFile(directory) => {
                 let name = if name.ends_with(".php") {
                     name
                 } else {
                     format!("{name}.php")
                 };
-                project.create_file(&directory, &name).map(Some)
+                (directory, name, None)
             }
             ExplorerOperation::NewPhp { directory, keyword } => {
                 let name = if name.ends_with(".php") {
@@ -2777,37 +2815,104 @@ impl WorkspaceView {
                 };
                 let declaration = format!("{keyword} {symbol}{inheritance}");
                 let body = format!("<?php\n{namespace_line}\n{declaration}\n{{\n}}\n");
-                project.create_file(&directory, &name).map(|path| {
-                    let _ = fs::write(&path, body);
-                    Some(path)
-                })
+                (directory, name, Some(body))
             }
             ExplorerOperation::NewDirectory(directory) => {
-                project.create_directory(&directory, &name).map(|_| None)
+                self.explorer_fs_busy = true;
+                cx.spawn(async move |this, cx| {
+                    let result = gpui::background_executor()
+                        .spawn(async move {
+                            project
+                                .create_directory(&directory, &name)
+                                .map(|_| ExplorerFsResult::Create(None))
+                                .map_err(|e| e.to_string())
+                        })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.explorer_fs_busy = false;
+                        match result {
+                            Ok(_) => {
+                                this.refresh_explorer(cx);
+                                this.status = "Directory created".into();
+                            }
+                            Err(error) => this.status = format!("Operation failed: {error}").into(),
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+                return;
             }
-            ExplorerOperation::Rename(path) => project.rename(&path, &name).map(|destination| {
-                for tab in &mut self.tabs {
-                    if let Ok(relative) = tab.path.strip_prefix(&path) {
-                        tab.path = destination.join(relative);
-                        tab.editor
-                            .update(cx, |editor, _| editor.relocate_path(&path, &destination));
-                    }
-                }
-                None
-            }),
+            ExplorerOperation::Rename(path) => {
+                self.explorer_fs_busy = true;
+                cx.spawn(async move |this, cx| {
+                    let result = gpui::background_executor()
+                        .spawn(async move {
+                            project
+                                .rename(&path, &name)
+                                .map(|new| ExplorerFsResult::Rename { old: path, new })
+                                .map_err(|e| e.to_string())
+                        })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.explorer_fs_busy = false;
+                        match result {
+                            Ok(ExplorerFsResult::Rename { old, new }) => {
+                                for tab in &mut this.tabs {
+                                    if let Ok(relative) = tab.path.strip_prefix(&old) {
+                                        tab.path = new.join(relative);
+                                        tab.editor.update(cx, |editor, _| {
+                                            editor.relocate_path(&old, &new)
+                                        });
+                                    }
+                                }
+                                this.refresh_explorer(cx);
+                                this.status = "Renamed".into();
+                            }
+                            _ => this.status = "Operation failed".into(),
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+                return;
+            }
         };
-        match result {
-            Ok(Some(path)) => {
-                self.refresh_explorer(cx);
-                self.open_file_background(path, cx);
-            }
-            Ok(None) => self.refresh_explorer(cx),
-            Err(error) => self.status = format!("Operation failed: {error}").into(),
-        }
-        cx.notify();
+        self.explorer_fs_busy = true;
+        cx.spawn(async move |this, cx| {
+            let result = gpui::background_executor()
+                .spawn(async move {
+                    let path = project
+                        .create_file(&operation.0, &operation.1)
+                        .map_err(|e| e.to_string())?;
+                    if let Some(body) = operation.2 {
+                        fs::write(&path, body).map_err(|e| e.to_string())?;
+                    }
+                    Ok::<_, String>(ExplorerFsResult::Create(Some(path)))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.explorer_fs_busy = false;
+                match result {
+                    Ok(ExplorerFsResult::Create(Some(path))) => {
+                        this.refresh_explorer(cx);
+                        this.open_file_background(path, cx);
+                    }
+                    Ok(_) => this.refresh_explorer(cx),
+                    Err(error) => this.status = format!("Operation failed: {error}").into(),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn request_delete(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.explorer_fs_busy {
+            self.status = "Another file operation is in progress".into();
+            cx.notify();
+            return;
+        }
         if debug_input_enabled() {
             tracing::info!(path = %path.display(), "[EXPLORER ACTION] action=delete");
         }
@@ -2833,41 +2938,62 @@ impl WorkspaceView {
     }
 
     fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        if self.explorer_fs_busy {
+            self.status = "Another file operation is in progress".into();
+            cx.notify();
+            return;
+        }
         let Some(path) = self.pending_delete.take() else {
             return;
         };
         self.delete_focus_pending = false;
         self.pending_delete_is_directory = false;
-        let Some(project) = self.project.as_ref() else {
+        let Some(project) = self.project.clone() else {
             self.status = "No project open".into();
             cx.notify();
             return;
         };
-        match project.delete(&path) {
-            Ok(()) => {
-                if debug_input_enabled() {
-                    tracing::info!(success = true, "[DELETE RESULT]");
+        self.explorer_fs_busy = true;
+        cx.spawn(async move |this, cx| {
+            let result = gpui::background_executor()
+                .spawn(async move {
+                    project
+                        .delete(&path)
+                        .map(|_| ExplorerFsResult::Delete(path))
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.explorer_fs_busy = false;
+                match result {
+                    Ok(ExplorerFsResult::Delete(path)) => {
+                        if debug_input_enabled() {
+                            tracing::info!(success = true, "[DELETE RESULT]");
+                        }
+                        for tab in this.tabs.iter().filter(|tab| tab.path.starts_with(&path)) {
+                            tab.editor.read(cx).close_lsp_document();
+                        }
+                        this.tabs.retain(|tab| !tab.path.starts_with(&path));
+                        this.active = if this.tabs.is_empty() {
+                            None
+                        } else {
+                            Some(this.active.unwrap_or(0).min(this.tabs.len() - 1))
+                        };
+                        this.refresh_explorer(cx);
+                        this.status = "Entry deleted".into();
+                    }
+                    Err(error) => {
+                        if debug_input_enabled() {
+                            tracing::info!(success = false, error = %error, "[DELETE RESULT]");
+                        }
+                        this.status = format!("Falha ao excluir: {error}").into();
+                    }
+                    _ => {}
                 }
-                for tab in self.tabs.iter().filter(|tab| tab.path.starts_with(&path)) {
-                    tab.editor.read(cx).close_lsp_document();
-                }
-                self.tabs.retain(|tab| !tab.path.starts_with(&path));
-                self.active = if self.tabs.is_empty() {
-                    None
-                } else {
-                    Some(self.active.unwrap_or(0).min(self.tabs.len() - 1))
-                };
-                self.refresh_explorer(cx);
-                self.status = "Entry deleted".into();
-            }
-            Err(error) => {
-                if debug_input_enabled() {
-                    tracing::info!(success = false, error = %error, "[DELETE RESULT]");
-                }
-                self.status = format!("Falha ao excluir: {error}").into();
                 cx.notify();
-            }
-        }
+            });
+        })
+        .detach();
     }
 
     fn copy_path(&mut self, path: &Path, cx: &mut Context<Self>) {
@@ -3026,7 +3152,14 @@ impl WorkspaceView {
                         });
                     }
                 }
-                IdeLspEvent::Completion { uri, items } => {
+                IdeLspEvent::Completion {
+                    uri,
+                    items,
+                    generation,
+                } => {
+                    if !self.accept_lsp_generation(&uri, LspRequestKind::Completion, generation) {
+                        continue;
+                    }
                     if let Some(tab) = self
                         .tabs
                         .iter()
@@ -3036,7 +3169,14 @@ impl WorkspaceView {
                             .update(cx, |editor, cx| editor.set_completions(items, cx));
                     }
                 }
-                IdeLspEvent::Formatting { uri, edits } => {
+                IdeLspEvent::Formatting {
+                    uri,
+                    edits,
+                    generation,
+                } => {
+                    if !self.accept_lsp_generation(&uri, LspRequestKind::Formatting, generation) {
+                        continue;
+                    }
                     if let Some(tab) = self
                         .tabs
                         .iter()
@@ -3046,7 +3186,15 @@ impl WorkspaceView {
                             .update(cx, |editor, cx| editor.apply_formatting(&edits, cx));
                     }
                 }
-                IdeLspEvent::SignatureHelp { uri, text } => {
+                IdeLspEvent::SignatureHelp {
+                    uri,
+                    text,
+                    generation,
+                } => {
+                    if !self.accept_lsp_generation(&uri, LspRequestKind::SignatureHelp, generation)
+                    {
+                        continue;
+                    }
                     if let Some(tab) = self
                         .tabs
                         .iter()
@@ -3056,7 +3204,14 @@ impl WorkspaceView {
                             .update(cx, |editor, cx| editor.set_signature_help(text, cx));
                     }
                 }
-                IdeLspEvent::Hover { uri, text } => {
+                IdeLspEvent::Hover {
+                    uri,
+                    text,
+                    generation,
+                } => {
+                    if !self.accept_lsp_generation(&uri, LspRequestKind::Hover, generation) {
+                        continue;
+                    }
                     if let Some(tab) = self
                         .tabs
                         .iter()
@@ -3066,7 +3221,14 @@ impl WorkspaceView {
                             .update(cx, |editor, cx| editor.set_hover(text, cx));
                     }
                 }
-                IdeLspEvent::Definition { locations } => {
+                IdeLspEvent::Definition {
+                    uri,
+                    locations,
+                    generation,
+                } => {
+                    if !self.accept_lsp_generation(&uri, LspRequestKind::Definition, generation) {
+                        continue;
+                    }
                     self.definition_targets = locations
                         .iter()
                         .filter_map(|location| {
@@ -3103,7 +3265,14 @@ impl WorkspaceView {
                         }
                     }
                 }
-                IdeLspEvent::References { count } => {
+                IdeLspEvent::References {
+                    uri,
+                    count,
+                    generation,
+                } => {
+                    if !self.accept_lsp_generation(&uri, LspRequestKind::References, generation) {
+                        continue;
+                    }
                     self.status = format!("{count} referência(s) encontrada(s)").into();
                 }
                 IdeLspEvent::Error(error) => {
@@ -3183,6 +3352,20 @@ impl WorkspaceView {
             );
             tracing::info!(success = true, "[NAVIGATION RESULT]");
         }
+    }
+
+    fn accept_lsp_generation(
+        &mut self,
+        uri: &lsp_types::Uri,
+        kind: LspRequestKind,
+        generation: u64,
+    ) -> bool {
+        let last = self.lsp_generations.entry((uri.clone(), kind)).or_insert(0);
+        if generation < *last {
+            return false;
+        }
+        *last = generation;
+        true
     }
 
     fn navigate_back(&mut self, _: &NavigateBack, _: &mut Window, cx: &mut Context<Self>) {
