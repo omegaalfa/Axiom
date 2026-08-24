@@ -866,21 +866,20 @@ impl EditorView {
         let text = self.document.content();
         let cursor = self.document.cursor_offset();
         let before = &text[..cursor];
-        if !before.ends_with('-')
-            || before[..before.len() - 1]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_whitespace)
-        {
+        if before.is_empty() || before.chars().next_back().is_some_and(char::is_whitespace) {
             return false;
         }
-        let owner_start = before[..before.len() - 1]
+        // EntityInputHandler is called before the typed `-` is inserted. The
+        // receiver therefore ends at the current caret, not at a trailing
+        // dash. Keep the check here so `$obj -` remains subtraction while
+        // `$obj-` can be rewritten as `$obj->`.
+        let owner_start = before
             .char_indices()
             .rev()
             .take_while(|(_, ch)| ch.is_alphanumeric() || matches!(ch, '_' | '$' | '\\'))
             .last()
-            .map_or(before.len() - 1, |(index, _)| index);
-        let owner = &before[owner_start..before.len() - 1];
+            .map_or(before.len(), |(index, _)| index);
+        let owner = &before[owner_start..];
         if owner == "$this" {
             return before[..owner_start].contains("class ");
         }
@@ -3025,7 +3024,11 @@ impl EntityInputHandler for EditorView {
         let smart_arrow =
             text == "-" && range.start == range.end && self.should_expand_member_dash();
         if smart_arrow && debug_completion_enabled() {
-            tracing::info!(converted = true, "[SMART ARROW]");
+            tracing::info!(
+                converted = true,
+                receiver = "previous-token",
+                "[SMART ARROW]"
+            );
         }
         self.document.set_selection(range.start, range.end);
         let insertion = if smart_arrow { "->" } else { text };
