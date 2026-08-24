@@ -2005,7 +2005,13 @@ impl EditorView {
         self.document.insert_text(&updated);
         if call_like {
             let inserted = inserted_text.trim_end_matches(')');
-            if let Some(position) = updated.find(inserted) {
+            // Search from the edited range. Searching the whole document can
+            // select an earlier identical call and leave the caret inside an
+            // old completion context, causing the same item to reappear on
+            // the next Enter/newline.
+            let search_start = range.start.min(updated.len());
+            if let Some(relative) = updated[search_start..].find(inserted) {
+                let position = search_start + relative;
                 let caret = if inserted_text.ends_with("()") {
                     position + inserted_text.len() - 1
                 } else {
