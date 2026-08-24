@@ -8,7 +8,7 @@ use gpui::{
     relative,
 };
 
-use crate::ui::{metrics, theme};
+use crate::ui::{metrics, metrics::CODE_FONT_FAMILY, theme};
 use crate::workspace_view::WorkspaceView;
 
 actions!(
@@ -346,7 +346,7 @@ impl Render for TerminalView {
             .track_focus(&self.focus)
             .bg(t.editor_background)
             .text_color(t.text_primary)
-            .font_family("Cascadia Mono")
+            .font_family(CODE_FONT_FAMILY)
             .text_size(m.editor_font_size)
             .line_height(m.editor_line_height)
             .on_action(cx.listener(Self::enter))

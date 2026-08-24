@@ -26,7 +26,7 @@ use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
     LayoutId, Modifiers, MouseButton, Pixels, Point, SharedString, Style, TextRun, Timer,
-    UTF16Selection, Window, actions, div, font, prelude::*, px, relative,
+    UTF16Selection, Window, actions, div, prelude::*, px, relative,
 };
 
 use crate::{
@@ -36,7 +36,9 @@ use crate::{
     ui::{
         components::tooltip,
         icons::{ActivityIcon, activity_icon, file_icon},
-        metrics, theme,
+        metrics,
+        metrics::{CODE_FONT_FAMILY, code_font},
+        theme,
     },
 };
 
@@ -240,6 +242,7 @@ pub struct WorkspaceView {
     project_index: Option<Arc<RwLock<ProjectSymbolIndex>>>,
     index_generation: u64,
     index_results: Option<Receiver<(u64, Result<ProjectSymbolIndex, String>)>>,
+    indexing_phase: u8,
     keymap: Keymap,
     command_palette_visible: bool,
     command_palette_query: String,
@@ -744,6 +747,7 @@ impl WorkspaceView {
             project_index: None,
             index_generation: 0,
             index_results: None,
+            indexing_phase: 0,
             keymap,
             command_palette_visible: false,
             command_palette_query: String::new(),
@@ -776,6 +780,10 @@ impl WorkspaceView {
                 if this
                     .update(cx, |this, cx| {
                         this.poll_lsp(cx);
+                        if this.index_results.is_some() {
+                            this.indexing_phase = this.indexing_phase.wrapping_add(6) % 100;
+                            cx.notify();
+                        }
                         this.poll_index(cx);
                         this.poll_project_load(cx);
                         this.poll_runtime_stub_load(cx);
@@ -1296,7 +1304,8 @@ impl WorkspaceView {
                 let editor = tab.editor.read(cx);
                 if let Some(path) = editor.document_path() {
                     if let Ok(mut index) = index.write() {
-                        let _ = index.index_file_text(path, editor.document_text());
+                        let _ =
+                            index.index_file_text_with_source(path, editor.document_text(), "Save");
                     }
                 }
             }
@@ -2822,6 +2831,11 @@ impl WorkspaceView {
                 cx.spawn(async move |this, cx| {
                     let result = gpui::background_executor()
                         .spawn(async move {
+                            axiom_index::trace_path(
+                                "explorer_create_directory",
+                                "Create",
+                                &directory,
+                            );
                             project
                                 .create_directory(&directory, &name)
                                 .map(|_| ExplorerFsResult::Create(None))
@@ -2848,6 +2862,7 @@ impl WorkspaceView {
                 cx.spawn(async move |this, cx| {
                     let result = gpui::background_executor()
                         .spawn(async move {
+                            axiom_index::trace_path("explorer_rename", "Rename", &path);
                             project
                                 .rename(&path, &name)
                                 .map(|new| ExplorerFsResult::Rename { old: path, new })
@@ -2882,6 +2897,7 @@ impl WorkspaceView {
         cx.spawn(async move |this, cx| {
             let result = gpui::background_executor()
                 .spawn(async move {
+                    axiom_index::trace_path("explorer_create_file", "Create", &operation.0);
                     let path = project
                         .create_file(&operation.0, &operation.1)
                         .map_err(|e| e.to_string())?;
@@ -2957,6 +2973,7 @@ impl WorkspaceView {
         cx.spawn(async move |this, cx| {
             let result = gpui::background_executor()
                 .spawn(async move {
+                    axiom_index::trace_path("explorer_delete", "Other", &path);
                     project
                         .delete(&path)
                         .map(|_| ExplorerFsResult::Delete(path))
@@ -3017,6 +3034,7 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
+        axiom_index::trace_path("document_load_request", "Other", &path);
         let document = match Document::from_file(&path) {
             Ok(document) => document,
             Err(error) => {
@@ -3065,6 +3083,7 @@ impl WorkspaceView {
             self.activate(index, window, cx);
             return;
         }
+        axiom_index::trace_path("document_load_request", "Other", &path);
         let document = match Document::from_file(&path) {
             Ok(document) => document,
             Err(error) => {
@@ -3321,6 +3340,7 @@ impl WorkspaceView {
         let index = if let Some(index) = existing {
             index
         } else {
+            axiom_index::trace_path("document_load_request", "Other", &path);
             let document = match Document::from_file(&path) {
                 Ok(document) => document,
                 Err(error) => {
@@ -3418,6 +3438,7 @@ impl WorkspaceView {
         let index = if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
             index
         } else {
+            axiom_index::trace_path("document_load_request", "Other", &path);
             let Ok(document) = Document::from_file(&path) else {
                 self.status = "Navigation target could not be opened".into();
                 return;
@@ -4145,7 +4166,7 @@ impl WorkspaceView {
                             .relative()
                             .flex_1()
                             .h_full()
-                            .font_family("Cascadia Mono")
+                            .font_family(CODE_FONT_FAMILY)
                             .child(
                                 div()
                                     .flex()
@@ -5375,6 +5396,62 @@ impl Render for WorkspaceView {
                         .child("INPUT TEST ACTIVE"),
                 )
             })
+            .when(self.index_results.is_some(), |this| {
+                this.child(
+                    div()
+                        .id("project-indexing-overlay")
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::rgba(0x00000066))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .w(px(360.))
+                                .p_5()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_2()
+                                .rounded(m.border_radius_medium)
+                                .bg(t.popup_background)
+                                .border_1()
+                                .border_color(t.accent)
+                                .shadow_lg()
+                                .text_color(t.text_primary)
+                                .child(div().text_size(px(16.)).child("Indexing project"))
+                                .child(
+                                    div()
+                                        .relative()
+                                        .w(px(300.))
+                                        .h(px(5.))
+                                        .rounded(px(3.))
+                                        .bg(t.border_subtle)
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(px(self.indexing_phase as f32 * 2.2))
+                                                .top(px(0.))
+                                                .w(px(80.))
+                                                .h(px(5.))
+                                                .rounded(px(3.))
+                                                .bg(t.accent),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(t.text_muted)
+                                        .child("Preparing completion and navigation…"),
+                                ),
+                        ),
+                )
+            })
     }
 }
 
@@ -5675,7 +5752,7 @@ fn modal_text_line(window: &mut Window, text: &str) -> gpui::ShapedLine {
     let text: SharedString = text.to_owned().into();
     let run = TextRun {
         len: text.len(),
-        font: font("Cascadia Mono"),
+        font: code_font(),
         color: window.text_style().color,
         background_color: None,
         underline: None,
@@ -5707,16 +5784,28 @@ fn utf16_slice(text: &str, start: usize, end: usize) -> String {
     text[start_byte..end_byte].to_owned()
 }
 
+#[cfg(debug_assertions)]
 fn debug_keys_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_KEYS").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
 }
 
+#[cfg(not(debug_assertions))]
+fn debug_keys_enabled() -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
 fn debug_input_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_input_enabled() -> bool {
+    false
 }
 
 #[derive(Default)]
@@ -5813,10 +5902,17 @@ fn copy_stub_tree(source: &Path, target: &Path) -> std::io::Result<StubImportRep
 }
 
 #[allow(dead_code)]
+#[cfg(debug_assertions)]
 fn debug_completion_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
+}
+
+#[allow(dead_code)]
+#[cfg(not(debug_assertions))]
+fn debug_completion_enabled() -> bool {
+    false
 }
 
 #[allow(dead_code)]

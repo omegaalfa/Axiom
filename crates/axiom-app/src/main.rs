@@ -16,6 +16,7 @@ use ui::icons::AxiomAssets;
 use workspace_view::WorkspaceView;
 
 fn main() -> anyhow::Result<()> {
+    install_graphics_error_hook();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -63,4 +64,26 @@ fn main() -> anyhow::Result<()> {
         });
 
     Ok(())
+}
+
+fn install_graphics_error_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        #[cfg(target_os = "windows")]
+        {
+            let message = info.to_string();
+            if message.contains("DirectX")
+                || message.contains("D3D11")
+                || message.contains("adapter")
+                || message.contains("feature level")
+            {
+                eprintln!(concat!(
+                    "[GRAPHICS] Axiom could not initialize the Windows Direct3D 11 renderer. ",
+                    "Required: D3D feature level 10.1 and StructuredBuffer/compute-shader support. ",
+                    "Update the graphics driver or use an adapter that supports these features."
+                ));
+            }
+        }
+        default_hook(info);
+    }));
 }

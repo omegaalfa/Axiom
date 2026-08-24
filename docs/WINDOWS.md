@@ -20,9 +20,10 @@ DXGI and successfully creates a device; GPUI does not label that case as a
 software fallback in its logs.
 
 If no enumerated adapter can create a device at one of those levels, the
-renderer initialization returns an error. Axiom currently does not wrap GPUI's
-startup with a dedicated graphics error screen, so the final user-facing
-failure remains controlled by the GPUI/Application startup path.
+renderer initialization returns an error. Axiom emits a clear `[GRAPHICS]`
+startup message describing the required Direct3D 11 capabilities before the
+normal panic/error report. Axiom does not implement its own WARP or alternate
+renderer fallback.
 
 ## Debug layer
 
@@ -44,3 +45,16 @@ feature-level, device-type, and fallback fields without changing GPUI itself.
 The Axiom binary also does not export `NvOptimusEnablement` or
 `AmdPowerXpressRequestHighPerformance`. On hybrid laptops, adapter choice can
 therefore still be influenced by Windows or the manufacturer's driver panel.
+
+## Editor and terminal fonts
+
+Code and terminal rendering use the shared Axiom font policy:
+
+1. Cascadia Mono
+2. Consolas
+3. DejaVu Sans Mono
+4. GPUI's platform fallback stack
+
+The first three families are preferences, not distribution requirements. If
+Cascadia Mono is absent, DirectWrite/GPUI selects the next available family;
+the application does not bundle or install fonts.

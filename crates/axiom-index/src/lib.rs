@@ -61,19 +61,131 @@ pub struct ProjectSymbolIndex {
     ready: bool,
 }
 
+/// Emits path provenance diagnostics without changing path behavior.
+#[cfg(debug_assertions)]
+pub fn trace_path(stage: &str, source: &str, path: &Path) {
+    if !std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    }) {
+        return;
+    }
+    let display = path.display().to_string();
+    let exists = path.exists();
+    let canonical = fs::canonicalize(path);
+    let suspicious = display.contains("wsl$")
+        || display
+            .chars()
+            .any(|character| ('\u{e000}'..='\u{f8ff}').contains(&character));
+    eprintln!(
+        "[PATH TRACE] stage={stage} source={source} path_debug={path:?} path_display={display:?} exists={exists} canonical={:?} canonicalize_error={:?}",
+        canonical.as_ref().ok(),
+        canonical.as_ref().err().map(ToString::to_string),
+    );
+    if suspicious || canonical.is_err() || !exists {
+        let units = path_utf16_units(path)
+            .into_iter()
+            .map(|unit| format!("U+{unit:04X}"))
+            .collect::<Vec<_>>();
+        eprintln!("[PATH TRACE UTF16] stage={stage} source={source} units={units:?}");
+        if let Some(backtrace) = std::env::var_os("AXIOM_DEBUG_PATH_BACKTRACE") {
+            if !matches!(
+                backtrace.to_string_lossy().as_ref(),
+                "" | "0" | "false" | "off"
+            ) {
+                eprintln!(
+                    "[PATH TRACE BACKTRACE] {:?}",
+                    std::backtrace::Backtrace::capture()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub fn trace_path(_: &str, _: &str, _: &Path) {}
+
+#[cfg(debug_assertions)]
+fn trace_symbol_insert(symbol: &ProjectSymbol, source: &str) {
+    if !std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    }) {
+        return;
+    }
+    let path = &symbol.file;
+    let display = path.display().to_string();
+    let canonical = fs::canonicalize(path);
+    let suspicious = display.contains("wsl$")
+        || display
+            .chars()
+            .any(|character| ('\u{e000}'..='\u{f8ff}').contains(&character));
+    eprintln!(
+        "[SYMBOL INSERT] symbol={} source={} path_debug={path:?} exists={} canonical={:?}",
+        symbol.fully_qualified_name,
+        source,
+        path.exists(),
+        canonical.as_ref().ok(),
+    );
+    if suspicious || canonical.is_err() || !path.exists() {
+        let units = path_utf16_units(path)
+            .into_iter()
+            .map(|unit| format!("U+{unit:04X}"))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[SUSPICIOUS SYMBOL INSERT] symbol={} source={} path_debug={path:?} exists={} canonical={:?} canonicalize_error={:?} UTF16={units:?} backtrace={:?}",
+            symbol.fully_qualified_name,
+            source,
+            path.exists(),
+            canonical.as_ref().ok(),
+            canonical.as_ref().err().map(ToString::to_string),
+            std::backtrace::Backtrace::capture(),
+        );
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn trace_symbol_insert(_: &ProjectSymbol, _: &str) {}
+
+#[cfg(debug_assertions)]
+pub fn trace_path_join(root: &Path, child: &Path, result: &Path, source: &str) {
+    if !std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    }) {
+        return;
+    }
+    eprintln!(
+        "[PATH JOIN] source={source} root={root:?} child={child:?} child_is_absolute={} result={result:?}",
+        child.is_absolute(),
+    );
+}
+
+#[cfg(not(debug_assertions))]
+pub fn trace_path_join(_: &Path, _: &Path, _: &Path, _: &str) {}
+
+#[cfg(all(debug_assertions, windows))]
+fn path_utf16_units(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().collect()
+}
+
+#[cfg(all(debug_assertions, not(windows)))]
+fn path_utf16_units(path: &Path) -> Vec<u16> {
+    path.to_string_lossy().encode_utf16().collect()
+}
+
 impl ProjectSymbolIndex {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn index_project(&mut self, root: impl AsRef<Path>) -> io::Result<IndexReport> {
+        trace_path("project_root", "InitialProjectScan", root.as_ref());
         self.files.clear();
         self.symbols.clear();
         self.ready = false;
         let mut paths = Vec::new();
         collect_php_files(root.as_ref(), &mut paths)?;
         for path in paths {
-            let _ = self.index_file(&path);
+            let _ = self.index_file_with_source(&path, "InitialProjectScan");
         }
         self.index_composer_classmap(root.as_ref());
         self.ready = true;
@@ -85,6 +197,12 @@ impl ProjectSymbolIndex {
     /// form emitted by Composer.
     fn index_composer_classmap(&mut self, root: &Path) {
         let path = root.join("vendor/composer/autoload_classmap.php");
+        trace_path_join(
+            root,
+            Path::new("vendor/composer/autoload_classmap.php"),
+            &path,
+            "Composer",
+        );
         let Ok(text) = fs::read_to_string(&path) else {
             return;
         };
@@ -101,10 +219,16 @@ impl ProjectSymbolIndex {
             let file = file.trim_start_matches('/');
             let target = path
                 .parent()
-                .map(|composer| composer.join(file))
+                .map(|composer| {
+                    let child = Path::new(file);
+                    let result = composer.join(child);
+                    trace_path_join(composer, child, &result, "Composer");
+                    result
+                })
                 .filter(|candidate| candidate.is_file());
             let Some(file) = target else { continue };
-            self.symbols.push(ProjectSymbol {
+            trace_path("composer_classmap", "Other", &file);
+            let symbol = ProjectSymbol {
                 name: name.rsplit('\\').next().unwrap_or(name).to_owned(),
                 fully_qualified_name: name.to_owned(),
                 kind: ProjectSymbolKind::Class,
@@ -119,14 +243,26 @@ impl ProjectSymbolIndex {
                 modifiers: vec!["composer".to_owned()],
                 parameters: None,
                 return_type: None,
-            });
+            };
+            trace_symbol_insert(&symbol, "Other");
+            self.symbols.push(symbol);
         }
     }
 
     pub fn index_file(&mut self, path: impl AsRef<Path>) -> io::Result<usize> {
+        self.index_file_with_source(path, "Other")
+    }
+
+    fn index_file_with_source(
+        &mut self,
+        path: impl AsRef<Path>,
+        source: &str,
+    ) -> io::Result<usize> {
+        trace_path("index_file_input", source, path.as_ref());
         let path = fs::canonicalize(path.as_ref())?;
+        trace_path("index_file_canonical", source, &path);
         let text = fs::read_to_string(&path)?;
-        self.index_file_text(path, text)
+        self.index_file_text_with_source(path, text, source)
     }
 
     /// Incrementally replaces one indexed file from an in-memory document.
@@ -136,7 +272,18 @@ impl ProjectSymbolIndex {
         path: impl AsRef<Path>,
         text: impl Into<String>,
     ) -> io::Result<usize> {
+        self.index_file_text_with_source(path, text, "Other")
+    }
+
+    pub fn index_file_text_with_source(
+        &mut self,
+        path: impl AsRef<Path>,
+        text: impl Into<String>,
+        source: &str,
+    ) -> io::Result<usize> {
+        trace_path("index_file_text_input", source, path.as_ref());
         let path = fs::canonicalize(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
+        trace_path("index_file_text_stored", source, &path);
         let text = text.into();
         self.remove_file(&path);
         let syntax = PhpSyntax::parse(text.clone())
@@ -150,6 +297,7 @@ impl ProjectSymbolIndex {
             &namespace,
             None,
             &mut output,
+            source,
         );
         let count = output.len();
         self.files.insert(path, Arc::from(text));
@@ -266,6 +414,7 @@ fn walk(
     namespace: &str,
     class: Option<&str>,
     out: &mut Vec<ProjectSymbol>,
+    source: &str,
 ) {
     if let Some((kind, name_node)) = symbol_node(node) {
         if let Ok(name) = name_node.utf8_text(text.as_bytes()) {
@@ -291,7 +440,7 @@ fn walk(
                 _ if namespace.is_empty() => name.clone(),
                 _ => format!("{namespace}\\{name}"),
             };
-            out.push(ProjectSymbol {
+            let symbol = ProjectSymbol {
                 name,
                 fully_qualified_name: fqn,
                 kind,
@@ -302,7 +451,9 @@ fn walk(
                 modifiers,
                 parameters,
                 return_type,
-            });
+            };
+            trace_symbol_insert(&symbol, source);
+            out.push(symbol);
             let next_class = matches!(
                 kind,
                 ProjectSymbolKind::Class
@@ -313,14 +464,22 @@ fn walk(
             .then_some(name_node.utf8_text(text.as_bytes()).unwrap_or(""));
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                walk(child, text, file, namespace, next_class.or(class), out);
+                walk(
+                    child,
+                    text,
+                    file,
+                    namespace,
+                    next_class.or(class),
+                    out,
+                    source,
+                );
             }
             return;
         }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk(child, text, file, namespace, class, out);
+        walk(child, text, file, namespace, class, out, source);
     }
 }
 

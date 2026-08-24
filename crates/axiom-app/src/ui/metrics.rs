@@ -1,6 +1,22 @@
 use std::sync::OnceLock;
 
-use gpui::{Pixels, px};
+use gpui::{Font, FontFallbacks, Pixels, font, px};
+
+pub const CODE_FONT_FAMILY: &str = "Cascadia Mono";
+pub const CODE_FONT_FALLBACKS: &[&str] = &["Consolas", "DejaVu Sans Mono"];
+
+/// The shared code/terminal font. GPUI adds its own platform fallback stack
+/// after these explicitly preferred monospace families.
+pub fn code_font() -> Font {
+    let mut value = font(CODE_FONT_FAMILY);
+    value.fallbacks = Some(FontFallbacks::from_fonts(
+        CODE_FONT_FALLBACKS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
+    ));
+    value
+}
 
 #[allow(dead_code)] // Shared contract keeps editor interaction constants visually synchronized.
 pub struct UiMetrics {

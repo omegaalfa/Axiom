@@ -24,7 +24,7 @@ use gpui::{
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     ScrollStrategy, SharedString, Style, TextRun, UTF16Selection, UniformListScrollHandle, Window,
-    actions, div, font, prelude::*, px, relative, uniform_list,
+    actions, div, prelude::*, px, relative, uniform_list,
 };
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
@@ -34,7 +34,12 @@ use lsp_types::{
 use crate::{
     lsp_bridge::LspBridge,
     syntax_theme::styled_segment,
-    ui::{components::separator, metrics, theme},
+    ui::{
+        components::separator,
+        metrics,
+        metrics::{CODE_FONT_FAMILY, code_font},
+        theme,
+    },
 };
 
 actions!(
@@ -139,6 +144,7 @@ pub struct EditorView {
     completions: Vec<CompletionItem>,
     completion_selected: usize,
     hover_popup: Option<String>,
+    hover_anchor: Option<Point<Pixels>>,
     diagnostics: Vec<ByteDiagnostic>,
     context_menu: Option<Point<Pixels>>,
     ctrl_hover_range: Option<Range<usize>>,
@@ -179,7 +185,8 @@ fn run_index_update_worker(receiver: mpsc::Receiver<IndexUpdateRequest>) {
         if let Ok(mut index) = request.index.write()
             && request.revision.load(Ordering::SeqCst) == request.generation
         {
-            let _ = index.index_file_text(request.path, request.text);
+            let _ =
+                index.index_file_text_with_source(request.path, request.text, "EditorDirtyUpdate");
         }
     }
 }
@@ -208,6 +215,7 @@ impl EditorView {
         lsp: Option<Arc<LspBridge>>,
         cx: &mut Context<Self>,
     ) -> Self {
+        axiom_index::trace_path("document_open", "Document", &path);
         let (index_update_sender, index_update_receiver) = mpsc::channel::<IndexUpdateRequest>();
         background_executor()
             .spawn(async move { run_index_update_worker(index_update_receiver) })
@@ -245,6 +253,7 @@ impl EditorView {
             completions: Vec::new(),
             completion_selected: 0,
             hover_popup: None,
+            hover_anchor: None,
             diagnostics: Vec::new(),
             context_menu: None,
             ctrl_hover_range: None,
@@ -888,6 +897,9 @@ impl EditorView {
     }
 
     fn debug_keydown(&mut self, event: &KeyDownEvent, _: &mut Window, _: &mut Context<Self>) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
         if std::env::var_os("AXIOM_DEBUG_KEYS").is_some_and(|value| {
             !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
         }) {
@@ -912,6 +924,7 @@ impl EditorView {
         let content = self.document.content();
         if cursor > 0 && matches!(content[..cursor].chars().next_back(), Some('(' | ',')) {
             self.hover_popup = self.native_signature_help();
+            self.hover_anchor = None;
         }
         let native = self.native_completions();
         if native.is_empty() {
@@ -960,6 +973,7 @@ impl EditorView {
         };
         let generation = revision.fetch_add(1, Ordering::SeqCst) + 1;
         let path = self.file_path.clone();
+        axiom_index::trace_path("incremental_request", "EditorDirtyUpdate", &path);
         let text = text.to_owned();
         if let Some(sender) = &self.index_update_sender {
             let _ = sender.send(IndexUpdateRequest {
@@ -1183,14 +1197,58 @@ impl EditorView {
                     .map(char::len_utf8)
                     .sum::<usize>();
             if end > start {
-                let name = text[start..end].trim_start_matches('\\');
-                let known_project = index.find_class(name).is_some();
+                let written = &text[start..end];
+                let name = written.trim_start_matches('\\');
+                let resolved = self.resolve_class_name(written, text);
+                let project_symbol = index.find_class(&resolved);
+                let known_project = project_symbol.is_some();
+                let composer_found = project_symbol.is_some_and(|symbol| {
+                    symbol
+                        .modifiers
+                        .iter()
+                        .any(|modifier| modifier == "composer")
+                });
                 let known_runtime = self.runtime_symbols.as_ref().is_some_and(|runtime| {
-                    runtime.find_class(name).is_some()
+                    runtime.find_class(&resolved).is_some()
                         || runtime.find_class_by_short_name(name).is_some()
                 });
-                if !known_project && !known_runtime && !matches!(name, "self" | "static" | "parent")
-                {
+                let lsp_found = self
+                    .lsp
+                    .as_ref()
+                    .is_some_and(|lsp| lsp.status() == axiom_lsp::ServerStatus::Ready);
+                let special = matches!(name, "self" | "static" | "parent");
+                // LSP readiness is reported for diagnostics, but it does not
+                // prove that this class exists. Native/project/runtime indexes
+                // remain the source of truth for this local inspection.
+                let diagnostic = !known_project && !known_runtime && !special;
+                if debug_completion_enabled() {
+                    let via = if resolved == name {
+                        if text[..start].contains("namespace ") {
+                            "namespace-or-global"
+                        } else {
+                            "fqn-or-global"
+                        }
+                    } else if text[..start]
+                        .lines()
+                        .any(|line| line.trim_start().starts_with("use ") && line.contains(name))
+                    {
+                        "import"
+                    } else {
+                        "namespace"
+                    };
+                    tracing::info!(
+                        written,
+                        resolved = %resolved,
+                        via,
+                        project_found = known_project,
+                        composer_found,
+                        runtime_found = known_runtime,
+                        lsp_found,
+                        diagnostic,
+                        "[CLASS RESOLUTION]"
+                    );
+                }
+                if diagnostic {
                     self.diagnostics.push(ByteDiagnostic {
                         range: start..end,
                         severity: Some(DiagnosticSeverity::ERROR),
@@ -1222,6 +1280,44 @@ impl EditorView {
                 .get(&(symbol.fully_qualified_name.as_str(), symbol.kind))
                 .is_some_and(|files| files.len() > 1)
             {
+                if debug_completion_enabled() {
+                    let paths = symbol_files
+                        .get(&(symbol.fully_qualified_name.as_str(), symbol.kind))
+                        .into_iter()
+                        .flat_map(|files| files.iter())
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>();
+                    let candidates = symbol_files
+                        .get(&(symbol.fully_qualified_name.as_str(), symbol.kind))
+                        .into_iter()
+                        .flat_map(|files| files.iter())
+                        .enumerate()
+                        .map(|(index, path)| {
+                            let canonical = std::fs::canonicalize(path);
+                            let source = if *path == self.file_path {
+                                "EditorDirtyUpdate/Document"
+                            } else {
+                                "InitialProjectScan/Other"
+                            };
+                            format!(
+                                "candidate_{}_source={source} path={:?} exists={} canonical={:?} canonicalize_error={:?}",
+                                index + 1,
+                                path,
+                                path.exists(),
+                                canonical.as_ref().ok(),
+                                canonical.as_ref().err().map(ToString::to_string),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    tracing::warn!(
+                        symbol = %symbol.fully_qualified_name,
+                        kind = ?symbol.kind,
+                        current = %symbol.file.display(),
+                        candidates = ?paths,
+                        candidate_details = ?candidates,
+                        "[DUPLICATE CLASS PATHS]"
+                    );
+                }
                 self.diagnostics.push(ByteDiagnostic {
                     range: symbol.range.clone(),
                     severity: Some(DiagnosticSeverity::ERROR),
@@ -1844,50 +1940,22 @@ impl EditorView {
     }
 
     fn resolve_class_name(&self, written: &str, context: &str) -> String {
+        let candidate = resolve_php_class_name(written, context);
         let written = written.trim().trim_start_matches('\\');
         if written.contains('\\') {
-            return written.to_owned();
+            return candidate;
         }
-        let mut imports = std::collections::HashMap::new();
-        for line in context.lines() {
-            let line = line.trim();
-            if let Some(value) = line.strip_prefix("use ") {
-                let value = value.trim_end_matches(';').trim();
-                let (fqn, alias) = value
-                    .split_once(" as ")
-                    .map(|(fqn, alias)| (fqn, alias.trim()))
-                    .unwrap_or((value, value.rsplit('\\').next().unwrap_or(value)));
-                imports.insert(alias.to_owned(), fqn.trim_start_matches('\\').to_owned());
-            }
-        }
-        if let Some(import) = imports.get(written) {
-            return import.clone();
-        }
-        let namespace = context.lines().find_map(|line| {
-            line.trim()
-                .strip_prefix("namespace ")
-                .map(|value| value.trim_end_matches(';').trim().to_owned())
-        });
-        let qualified = namespace
-            .filter(|namespace| !namespace.is_empty())
-            .map(|namespace| format!("{namespace}\\{written}"))
-            .unwrap_or_else(|| written.to_owned());
-
-        // A PHP file namespace does not automatically qualify global runtime
-        // classes. Prefer the contextual FQN when it exists, then fall back to
-        // the global class (for example `ArrayIterator`) when the runtime
-        // index contains only that definition.
         let contextual_exists = self
             .runtime_symbols
             .as_ref()
-            .is_some_and(|index| index.find_class(&qualified).is_some())
+            .is_some_and(|index| index.find_class(&candidate).is_some())
             || self
                 .project_symbols
                 .as_ref()
                 .and_then(|index| index.read().ok())
-                .is_some_and(|index| index.find_class(&qualified).is_some());
+                .is_some_and(|index| index.find_class(&candidate).is_some());
         if contextual_exists {
-            return qualified;
+            return candidate;
         }
         let global_exists = self
             .runtime_symbols
@@ -1901,15 +1969,15 @@ impl EditorView {
         if global_exists {
             return written.to_owned();
         }
-        if let Some(runtime) = self.runtime_symbols.as_ref()
-            && let Some(symbol) = runtime.find_class_by_short_name(written)
-        {
-            return symbol.fqn.clone();
-        }
-        qualified
+        self.runtime_symbols
+            .as_ref()
+            .and_then(|runtime| runtime.find_class_by_short_name(written))
+            .map(|symbol| symbol.fqn.clone())
+            .unwrap_or(candidate)
     }
 
     fn hover_info(&mut self, _: &HoverInfo, _: &mut Window, _: &mut Context<Self>) {
+        self.hover_anchor = None;
         if let (Some(lsp), Some(uri), Some(position)) =
             (&self.lsp, &self.lsp_uri, self.lsp_position())
         {
@@ -1986,6 +2054,7 @@ impl EditorView {
     fn signature_help(&mut self, _: &SignatureHelp, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.native_signature_help() {
             self.hover_popup = Some(text);
+            self.hover_anchor = None;
             cx.notify();
         }
         if let (Some(lsp), Some(uri), Some(position)) =
@@ -2138,12 +2207,14 @@ impl EditorView {
 
     pub fn set_signature_help(&mut self, text: Option<String>, cx: &mut Context<Self>) {
         self.hover_popup = text;
+        self.hover_anchor = None;
         cx.notify();
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
         self.completions.clear();
         self.hover_popup = None;
+        self.hover_anchor = None;
         self.context_menu = None;
         self.ctrl_hover_range = None;
         cx.notify();
@@ -2249,6 +2320,7 @@ impl EditorView {
 
     pub fn set_hover(&mut self, text: Option<String>, cx: &mut Context<Self>) {
         self.hover_popup = text;
+        self.hover_anchor = None;
         cx.notify();
     }
 
@@ -2409,12 +2481,27 @@ impl EditorView {
                     .map(|diagnostic| format!("{}\nAxiom PHP Parser", diagnostic.message));
                 if self.hover_popup != next {
                     self.hover_popup = next;
+                    self.hover_anchor = self.hover_popup.as_ref().map(|_| {
+                        let line_start = self.document.offset_of_line(line);
+                        let raw_line = self.document.line_content(line);
+                        let line_text = trim_eol(raw_line.as_ref());
+                        let column = offset.saturating_sub(line_start).min(line_text.len());
+                        let caret_x = self
+                            .line_layout(line, line_text, window)
+                            .x_for_index(column);
+                        let scroll_y = self.scroll.0.borrow().base_handle.offset().y;
+                        gpui::point(
+                            px(GUTTER_WIDTH + TEXT_PADDING) + caret_x,
+                            px(line as f32 * LINE_HEIGHT) - scroll_y,
+                        )
+                    });
                     cx.notify();
                 }
             }
             return;
         }
         self.hover_popup = None;
+        self.hover_anchor = None;
         let line = self.mouse_line(event.position);
         let offset = self.mouse_offset(line, event.position.x, window);
         let next = self.syntax.as_ref().and_then(|syntax| {
@@ -2492,6 +2579,7 @@ impl EditorView {
         ));
         self.completions.clear();
         self.hover_popup = None;
+        self.hover_anchor = None;
         self.ctrl_hover_range = None;
         cx.notify();
     }
@@ -2588,7 +2676,7 @@ impl EditorView {
             .h(px(LINE_HEIGHT))
             .line_height(px(LINE_HEIGHT))
             .text_size(px(FONT_SIZE))
-            .font_family("Cascadia Mono")
+            .font_family(CODE_FONT_FAMILY)
             .text_color(t.text_primary)
             .bg(if cursor_here {
                 t.active_line
@@ -2681,6 +2769,37 @@ impl EditorView {
             })
             .child(label)
     }
+}
+
+fn resolve_php_class_name(written: &str, context: &str) -> String {
+    let written = written.trim().trim_start_matches('\\');
+    if written.contains('\\') {
+        return written.to_owned();
+    }
+    for line in context.lines() {
+        let line = line.trim();
+        let Some(value) = line.strip_prefix("use ") else {
+            continue;
+        };
+        let value = value.trim_end_matches(';').trim();
+        let (fqn, alias) = value
+            .split_once(" as ")
+            .map(|(fqn, alias)| (fqn, alias.trim()))
+            .unwrap_or((value, value.rsplit('\\').next().unwrap_or(value)));
+        if alias == written {
+            return fqn.trim_start_matches('\\').to_owned();
+        }
+    }
+    context
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("namespace ")
+                .map(|value| value.trim_end_matches(';').trim())
+                .filter(|namespace| !namespace.is_empty())
+        })
+        .map(|namespace| format!("{namespace}\\{written}"))
+        .unwrap_or_else(|| written.to_owned())
 }
 
 fn native_format_php(text: &str) -> String {
@@ -2925,14 +3044,26 @@ fn completion_icon(kind: Option<CompletionItemKind>) -> &'static str {
     }
 }
 
+#[cfg(debug_assertions)]
 fn debug_input_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT").is_some()
 }
 
+#[cfg(not(debug_assertions))]
+fn debug_input_enabled() -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
 fn debug_completion_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_completion_enabled() -> bool {
+    false
 }
 
 impl Render for EditorView {
@@ -2990,10 +3121,15 @@ impl Render for EditorView {
             .min((viewport_width - 16.0).max(180.0)));
         let mut popup_x = viewport.left() + px(GUTTER_WIDTH + TEXT_PADDING) + caret_x;
         popup_x = popup_x.min((viewport.right() - popup_width).max(viewport.left()));
-        let below_y = viewport.top() + px((line as f32 + 1.0) * LINE_HEIGHT)
+        let mut below_y = viewport.top() + px((line as f32 + 1.0) * LINE_HEIGHT)
             - self.scroll.0.borrow().base_handle.offset().y;
         let row_height = px(28.);
         let popup_height = px((presentations.len() as f32 * 28.0).min(224.0));
+        if let Some(anchor) = self.hover_anchor {
+            popup_x = anchor.x.max(viewport.left());
+            popup_x = popup_x.min((viewport.right() - popup_width).max(viewport.left()));
+            below_y = (anchor.y + px(LINE_HEIGHT)).min(viewport.bottom());
+        }
         let opens_above = below_y + popup_height > viewport.bottom();
         let popup_y = if opens_above {
             (below_y - popup_height - px(4.)).max(viewport.top())
@@ -3660,7 +3796,7 @@ fn shape(window: &mut Window, text: &str) -> gpui::ShapedLine {
     let text: SharedString = text.to_owned().into();
     let run = TextRun {
         len: text.len(),
-        font: font("Cascadia Mono"),
+        font: code_font(),
         color: style.color,
         background_color: None,
         underline: None,
@@ -3671,7 +3807,7 @@ fn shape(window: &mut Window, text: &str) -> gpui::ShapedLine {
 
 #[cfg(test)]
 mod formatter_tests {
-    use super::{completion_presentation, native_format_php};
+    use super::{completion_presentation, native_format_php, resolve_php_class_name};
     use lsp_types::CompletionItem;
 
     #[test]
@@ -3739,5 +3875,51 @@ mod formatter_tests {
         let worker = std::thread::spawn(|| super::run_index_update_worker(receiver));
         drop(sender);
         worker.join().expect("debounce worker should terminate");
+    }
+
+    #[test]
+    fn imported_class_not_unknown() {
+        assert_eq!(
+            resolve_php_class_name(
+                "FiberEventLoop",
+                "namespace Omegaalfa\\HttpClient\\Http;\nuse Omegaalfa\\FiberEventLoop\\FiberEventLoop;"
+            ),
+            "Omegaalfa\\FiberEventLoop\\FiberEventLoop"
+        );
+    }
+
+    #[test]
+    fn aliased_import_not_unknown() {
+        assert_eq!(
+            resolve_php_class_name(
+                "Loop",
+                "use Omegaalfa\\FiberEventLoop\\FiberEventLoop as Loop;"
+            ),
+            "Omegaalfa\\FiberEventLoop\\FiberEventLoop"
+        );
+    }
+
+    #[test]
+    fn same_namespace_class_not_unknown() {
+        assert_eq!(
+            resolve_php_class_name("UserService", "namespace App\\Service;"),
+            "App\\Service\\UserService"
+        );
+    }
+
+    #[test]
+    fn fully_qualified_class_not_unknown() {
+        assert_eq!(
+            resolve_php_class_name("\\Vendor\\Package\\Thing", "namespace App;"),
+            "Vendor\\Package\\Thing"
+        );
+    }
+
+    #[test]
+    fn actually_unknown_class_remains_qualified() {
+        assert_eq!(
+            resolve_php_class_name("Missing", "namespace App\\Service;"),
+            "App\\Service\\Missing"
+        );
     }
 }
