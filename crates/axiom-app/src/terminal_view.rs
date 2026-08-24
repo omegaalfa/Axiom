@@ -4,7 +4,7 @@ use axiom_terminal::{TerminalLink, TerminalSession, detect_links};
 use gpui::{
     App, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, Focusable, GlobalElementId, IntoElement, KeyBinding, LayoutId, Pixels, Point,
-    Render, SharedString, Style, UTF16Selection, WeakEntity, Window, actions, div, prelude::*,
+    Render, SharedString, Style, UTF16Selection, WeakEntity, Window, actions, div, prelude::*, px,
     relative,
 };
 
@@ -47,7 +47,11 @@ pub struct TerminalView {
     context_menu_open: bool,
     context_position: Point<Pixels>,
     select_all: bool,
+    last_terminal_size: Option<(u16, u16)>,
 }
+
+const TERMINAL_CELL_WIDTH: f32 = 8.4;
+const TERMINAL_CONTEXT_MENU_SIZE: (f32, f32) = (180.0, 120.0);
 
 impl TerminalView {
     pub fn new(
@@ -68,6 +72,7 @@ impl TerminalView {
             context_menu_open: false,
             context_position: Point::default(),
             select_all: false,
+            last_terminal_size: None,
         };
         view.refresh();
         cx.spawn(async move |this, cx| {
@@ -323,8 +328,16 @@ impl TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
+        let context_x = self
+            .context_position
+            .x
+            .min((window.viewport_size().width - px(TERMINAL_CONTEXT_MENU_SIZE.0)).max(px(0.)));
+        let context_y = self
+            .context_position
+            .y
+            .min((window.viewport_size().height - px(TERMINAL_CONTEXT_MENU_SIZE.1)).max(px(0.)));
         let m = metrics();
         div()
             .relative()
@@ -375,8 +388,8 @@ impl Render for TerminalView {
             .child(
                 div()
                     .absolute()
-                    .left(self.context_position.x)
-                    .top(self.context_position.y)
+                    .left(context_x)
+                    .top(context_y)
                     .when_some(self.context_menu.clone(), |menu, link| {
                         menu.child(
                             div()
@@ -575,16 +588,22 @@ impl Element for TerminalInputElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus = {
+        let (rows, cols, focus) = {
             let terminal = self.terminal.read(cx);
-            let rows =
-                (f32::from(bounds.size.height) / f32::from(metrics().editor_line_height)) as u16;
-            let cols = (f32::from(bounds.size.width) / 8.4) as u16;
-            if let Err(error) = terminal.session.resize(rows, cols) {
-                tracing::warn!("terminal resize failed: {error}");
-            }
-            terminal.focus.clone()
+            (
+                (f32::from(bounds.size.height) / f32::from(metrics().editor_line_height)) as u16,
+                (f32::from(bounds.size.width) / TERMINAL_CELL_WIDTH) as u16,
+                terminal.focus.clone(),
+            )
         };
+        self.terminal.update(cx, |terminal, _| {
+            if terminal.last_terminal_size != Some((rows, cols)) {
+                if let Err(error) = terminal.session.resize(rows, cols) {
+                    tracing::warn!("terminal resize failed: {error}");
+                }
+                terminal.last_terminal_size = Some((rows, cols));
+            }
+        });
         window.handle_input(
             &focus,
             ElementInputHandler::new(bounds, self.terminal.clone()),

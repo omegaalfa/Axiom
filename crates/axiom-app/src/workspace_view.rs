@@ -1035,31 +1035,26 @@ impl WorkspaceView {
                 .map_err(|error| error.to_string());
             let _ = sender.send((generation, result));
         });
-        match Ok::<_, axiom_project::ProjectError>(entries) {
-            Ok(entries) => {
-                self.explorer = entries
-                    .into_iter()
-                    .map(|entry| ExplorerItem {
-                        path: entry.path,
-                        name: entry.name,
-                        kind: entry.kind,
-                        depth: 0,
-                    })
-                    .collect();
-                self.expanded.clear();
-                self.status = "Project opened — indexing...".into();
-                self.project = Some(project);
-                self.recent_projects.add(&root, unix_timestamp_now());
-                if let Some(path) = &self.recent_path
-                    && let Err(error) = self.recent_projects.save(path)
-                {
-                    tracing::warn!("failed to persist recent projects: {error}");
-                }
-                self.lsp = Some(lsp);
-                cx.notify();
-            }
-            Err(error) => self.status = format!("Falha ao ler projeto: {error}").into(),
+        self.explorer = entries
+            .into_iter()
+            .map(|entry| ExplorerItem {
+                path: entry.path,
+                name: entry.name,
+                kind: entry.kind,
+                depth: 0,
+            })
+            .collect();
+        self.expanded.clear();
+        self.status = "Project opened — indexing...".into();
+        self.project = Some(project);
+        self.recent_projects.add(&root, unix_timestamp_now());
+        if let Some(path) = &self.recent_path
+            && let Err(error) = self.recent_projects.save(path)
+        {
+            tracing::warn!("failed to persist recent projects: {error}");
         }
+        self.lsp = Some(lsp);
+        cx.notify();
     }
 
     fn poll_index(&mut self, cx: &mut Context<Self>) {
@@ -2841,12 +2836,12 @@ impl WorkspaceView {
         };
         self.delete_focus_pending = false;
         self.pending_delete_is_directory = false;
-        match self
-            .project
-            .as_ref()
-            .expect("project is open")
-            .delete(&path)
-        {
+        let Some(project) = self.project.as_ref() else {
+            self.status = "No project open".into();
+            cx.notify();
+            return;
+        };
+        match project.delete(&path) {
             Ok(()) => {
                 if debug_input_enabled() {
                     tracing::info!(success = true, "[DELETE RESULT]");
