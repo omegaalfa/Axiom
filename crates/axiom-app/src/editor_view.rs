@@ -495,6 +495,23 @@ impl EditorView {
             })
     }
 
+    fn completion_replacement_range(&self) -> Range<usize> {
+        if self.document.selection_offsets().is_some() {
+            return self.selected_range();
+        }
+        let content = self.document.content();
+        let cursor = self.document.cursor_offset().min(content.len());
+        let start = content[..cursor]
+            .char_indices()
+            .rev()
+            .take_while(|(_, character)| {
+                character.is_alphanumeric() || matches!(character, '_' | '$' | '\\')
+            })
+            .last()
+            .map_or(cursor, |(index, _)| index);
+        start..cursor
+    }
+
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.document.move_cursor(offset);
         self.selection_anchor = None;
@@ -1972,7 +1989,7 @@ impl EditorView {
                 (self.lsp_range_to_bytes(edit.replace), edit.new_text)
             }
             None => (
-                self.selected_range(),
+                self.completion_replacement_range(),
                 item.insert_text.unwrap_or_else(|| item.label.clone()),
             ),
         };
