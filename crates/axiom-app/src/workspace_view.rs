@@ -1682,15 +1682,14 @@ impl WorkspaceView {
                 .pick_folder()
                 .await
                 .map(|handle| handle.path().to_path_buf());
-            let result = selected.map_or_else(
-                || Ok(None),
-                |source| {
-                    if source == target {
-                        return Ok(Some(StubImportReport::default()));
-                    }
-                    copy_stub_tree(&source, &target).map(Some)
-                },
-            );
+            let result = match selected {
+                None => Ok(None),
+                Some(source) if source == target => Ok(Some(StubImportReport::default())),
+                Some(source) => gpui::background_executor()
+                    .spawn(async move { copy_stub_tree(&source, &target) })
+                    .await
+                    .map(Some),
+            };
             if debug_stubs_enabled() {
                 match &result {
                     Ok(Some(report)) => tracing::info!(
@@ -1742,10 +1741,13 @@ impl WorkspaceView {
                         .map(|file| file.path().to_path_buf())
                         .collect::<Vec<_>>()
                 });
-            let result = selected.map_or_else(
-                || Ok(None),
-                |files| copy_stub_files(&files, &target).map(Some),
-            );
+            let result = match selected {
+                None => Ok(None),
+                Some(files) => gpui::background_executor()
+                    .spawn(async move { copy_stub_files(&files, &target) })
+                    .await
+                    .map(Some),
+            };
             if debug_stubs_enabled() {
                 match &result {
                     Ok(Some(report)) => tracing::info!(

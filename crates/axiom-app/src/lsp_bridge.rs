@@ -1,8 +1,9 @@
 use std::{
     path::Path,
     sync::{Arc, Mutex},
-    thread,
 };
+
+use gpui::background_executor;
 
 use axiom_lsp::{
     DEFAULT_REQUEST_TIMEOUT, LanguageServer, ServerEvent, ServerStatus, definition_locations,
@@ -114,16 +115,19 @@ impl LspBridge {
             }
         };
         let events = self.pending_events.clone();
-        thread::spawn(move || {
-            let event = match pending.recv::<Option<CompletionResponse>>(DEFAULT_REQUEST_TIMEOUT) {
-                Ok(response) => IdeLspEvent::Completion {
-                    uri,
-                    items: normalize_completions(response),
-                },
-                Err(error) => IdeLspEvent::Error(error.to_string()),
-            };
-            events.lock().expect("event lock poisoned").push(event);
-        });
+        background_executor()
+            .spawn(async move {
+                let event =
+                    match pending.recv::<Option<CompletionResponse>>(DEFAULT_REQUEST_TIMEOUT) {
+                        Ok(response) => IdeLspEvent::Completion {
+                            uri,
+                            items: normalize_completions(response),
+                        },
+                        Err(error) => IdeLspEvent::Error(error.to_string()),
+                    };
+                events.lock().expect("event lock poisoned").push(event);
+            })
+            .detach();
     }
 
     pub fn request_hover(&self, uri: Uri, position: Position) {
@@ -140,16 +144,18 @@ impl LspBridge {
             }
         };
         let events = self.pending_events.clone();
-        thread::spawn(move || {
-            let event = match pending.recv::<Option<Hover>>(DEFAULT_REQUEST_TIMEOUT) {
-                Ok(response) => IdeLspEvent::Hover {
-                    uri,
-                    text: hover_text(response),
-                },
-                Err(error) => IdeLspEvent::Error(error.to_string()),
-            };
-            events.lock().expect("event lock poisoned").push(event);
-        });
+        background_executor()
+            .spawn(async move {
+                let event = match pending.recv::<Option<Hover>>(DEFAULT_REQUEST_TIMEOUT) {
+                    Ok(response) => IdeLspEvent::Hover {
+                        uri,
+                        text: hover_text(response),
+                    },
+                    Err(error) => IdeLspEvent::Error(error.to_string()),
+                };
+                events.lock().expect("event lock poisoned").push(event);
+            })
+            .detach();
     }
 
     pub fn request_definition(&self, uri: Uri, position: Position) {
@@ -166,16 +172,18 @@ impl LspBridge {
             }
         };
         let events = self.pending_events.clone();
-        thread::spawn(move || {
-            let event =
-                match pending.recv::<Option<GotoDefinitionResponse>>(DEFAULT_REQUEST_TIMEOUT) {
-                    Ok(response) => IdeLspEvent::Definition {
-                        locations: definition_locations(response),
-                    },
-                    Err(error) => IdeLspEvent::Error(error.to_string()),
-                };
-            events.lock().expect("event lock poisoned").push(event);
-        });
+        background_executor()
+            .spawn(async move {
+                let event =
+                    match pending.recv::<Option<GotoDefinitionResponse>>(DEFAULT_REQUEST_TIMEOUT) {
+                        Ok(response) => IdeLspEvent::Definition {
+                            locations: definition_locations(response),
+                        },
+                        Err(error) => IdeLspEvent::Error(error.to_string()),
+                    };
+                events.lock().expect("event lock poisoned").push(event);
+            })
+            .detach();
     }
 
     pub fn request_references(&self, uri: Uri, position: Position) {
@@ -192,15 +200,17 @@ impl LspBridge {
             }
         };
         let events = self.pending_events.clone();
-        thread::spawn(move || {
-            let event = match pending.recv::<Option<Vec<Location>>>(DEFAULT_REQUEST_TIMEOUT) {
-                Ok(response) => IdeLspEvent::References {
-                    count: response.unwrap_or_default().len(),
-                },
-                Err(error) => IdeLspEvent::Error(error.to_string()),
-            };
-            events.lock().expect("event lock poisoned").push(event);
-        });
+        background_executor()
+            .spawn(async move {
+                let event = match pending.recv::<Option<Vec<Location>>>(DEFAULT_REQUEST_TIMEOUT) {
+                    Ok(response) => IdeLspEvent::References {
+                        count: response.unwrap_or_default().len(),
+                    },
+                    Err(error) => IdeLspEvent::Error(error.to_string()),
+                };
+                events.lock().expect("event lock poisoned").push(event);
+            })
+            .detach();
     }
 
     pub fn request_formatting(&self, uri: Uri, tab_size: u32, insert_spaces: bool) {
@@ -217,17 +227,20 @@ impl LspBridge {
             }
         };
         let events = self.pending_events.clone();
-        thread::spawn(move || {
-            let event =
-                match pending.recv::<Option<Vec<lsp_types::TextEdit>>>(DEFAULT_REQUEST_TIMEOUT) {
+        background_executor()
+            .spawn(async move {
+                let event = match pending
+                    .recv::<Option<Vec<lsp_types::TextEdit>>>(DEFAULT_REQUEST_TIMEOUT)
+                {
                     Ok(edits) => IdeLspEvent::Formatting {
                         uri,
                         edits: edits.unwrap_or_default(),
                     },
                     Err(error) => IdeLspEvent::Error(error.to_string()),
                 };
-            events.lock().expect("event lock poisoned").push(event);
-        });
+                events.lock().expect("event lock poisoned").push(event);
+            })
+            .detach();
     }
 
     pub fn request_signature_help(&self, uri: Uri, position: Position) {
@@ -244,17 +257,20 @@ impl LspBridge {
             }
         };
         let events = self.pending_events.clone();
-        thread::spawn(move || {
-            let event =
-                match pending.recv::<Option<lsp_types::SignatureHelp>>(DEFAULT_REQUEST_TIMEOUT) {
+        background_executor()
+            .spawn(async move {
+                let event = match pending
+                    .recv::<Option<lsp_types::SignatureHelp>>(DEFAULT_REQUEST_TIMEOUT)
+                {
                     Ok(help) => IdeLspEvent::SignatureHelp {
                         uri,
                         text: help.map(signature_help_text),
                     },
                     Err(error) => IdeLspEvent::Error(error.to_string()),
                 };
-            events.lock().expect("event lock poisoned").push(event);
-        });
+                events.lock().expect("event lock poisoned").push(event);
+            })
+            .detach();
     }
 
     pub fn drain_events(&self) -> Vec<IdeLspEvent> {

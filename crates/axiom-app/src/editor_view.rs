@@ -869,9 +869,10 @@ impl EditorView {
     }
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
-        self.sync_syntax();
-        self.sync_lsp();
-        self.schedule_incremental_index_update();
+        let text = self.document.content();
+        self.sync_syntax_text(&text);
+        self.sync_lsp_text(&text);
+        self.schedule_incremental_index_update(&text);
         self.maybe_trigger_completion();
         let cursor = self.document.cursor_offset();
         let content = self.document.content();
@@ -916,7 +917,7 @@ impl EditorView {
         self.resolve_native_type(owner, before).is_some()
     }
 
-    fn schedule_incremental_index_update(&self) {
+    fn schedule_incremental_index_update(&self, text: &str) {
         let (Some(index), Some(revision)) = (
             self.project_symbols.clone(),
             self.project_index_revision.clone(),
@@ -925,7 +926,7 @@ impl EditorView {
         };
         let generation = revision.fetch_add(1, Ordering::SeqCst) + 1;
         let path = self.file_path.clone();
-        let text = self.document.content();
+        let text = text.to_owned();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(150));
             if revision.load(Ordering::SeqCst) != generation {
@@ -994,6 +995,10 @@ impl EditorView {
 
     fn sync_syntax(&mut self) {
         let text = self.document.content();
+        self.sync_syntax_text(&text);
+    }
+
+    fn sync_syntax_text(&mut self, text: &str) {
         if let Some(syntax) = &mut self.syntax
             && let Err(error) = syntax.update_text(&text)
         {
@@ -1273,14 +1278,20 @@ impl EditorView {
 
     fn sync_lsp(&mut self) {
         let text = self.document.content();
+        self.sync_lsp_text(&text);
+    }
+
+    fn sync_lsp_text(&mut self, text: &str) {
         if text == self.last_lsp_text {
             return;
         }
-        self.last_lsp_text.clone_from(&text);
+        self.last_lsp_text = text.to_owned();
         self.lsp_version = self.lsp_version.saturating_add(1);
         if let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) {
             lsp.with_server(|server| {
-                if let Err(error) = server.did_change(uri.clone(), self.lsp_version, text) {
+                if let Err(error) =
+                    server.did_change(uri.clone(), self.lsp_version, text.to_owned())
+                {
                     tracing::warn!("didChange failed: {error}");
                 }
             });
@@ -2790,28 +2801,13 @@ fn runtime_call_insert_text(symbol: &RuntimeSymbol) -> Option<String> {
 }
 
 fn project_method_detail(symbol: &axiom_index::ProjectSymbol) -> String {
-    let signature = fs::read_to_string(&symbol.file)
-        .ok()
-        .and_then(|text| {
-            let name_start = symbol.range.start.min(text.len());
-            let tail = &text[name_start..];
-            if !tail.starts_with(&symbol.name) {
-                return None;
-            }
-            let tail = &tail[symbol.name.len()..];
-            let open = tail.find('(')?;
-            let close = tail[open + 1..].find(')')? + open + 1;
-            let after = &tail[close + 1..];
-            let return_type = after
-                .trim_start()
-                .strip_prefix(':')
-                .and_then(|value| value.split_whitespace().next())
-                .map(|value| format!(": {value}"))
-                .unwrap_or_default();
-            Some(format!("{}{}", &tail[open..=close], return_type))
-        })
+    let signature = symbol.parameters.clone().unwrap_or_else(|| "()".to_owned());
+    let return_type = symbol
+        .return_type
+        .as_deref()
+        .map(|value| format!(": {value}"))
         .unwrap_or_default();
-    format!("{}{} • Project", symbol.name, signature)
+    format!("{}{}{} • Project", symbol.name, signature, return_type)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3538,22 +3534,16 @@ fn matching_paren(text: &str, open: usize) -> Option<usize> {
 }
 
 fn project_callable_detail(symbol: &axiom_index::ProjectSymbol) -> Option<String> {
-    let text = std::fs::read_to_string(&symbol.file).ok()?;
-    let name_start = symbol.range.start.min(text.len());
-    let tail = &text[name_start..];
-    tail.strip_prefix(&symbol.name)?;
-    let tail = &tail[symbol.name.len()..];
-    let open = tail.find('(')?;
-    let close = matching_paren(tail, open)?;
-    let suffix = tail[close + 1..]
-        .trim_start()
-        .strip_prefix(':')
-        .and_then(|value| value.split(['{', '\n']).next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(": {value}"))
-        .unwrap_or_default();
-    Some(format!("{}{}{}", symbol.name, &tail[open..=close], suffix))
+    Some(format!(
+        "{}{}{}",
+        symbol.name,
+        symbol.parameters.as_deref().unwrap_or("()"),
+        symbol
+            .return_type
+            .as_deref()
+            .map(|value| format!(": {value}"))
+            .unwrap_or_default()
+    ))
 }
 
 fn signature_counts_from_detail(detail: &str) -> (usize, usize, bool) {

@@ -43,6 +43,8 @@ pub struct ProjectSymbol {
     pub namespace: String,
     pub visibility: Visibility,
     pub modifiers: Vec<String>,
+    pub parameters: Option<String>,
+    pub return_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -115,6 +117,8 @@ impl ProjectSymbolIndex {
                     .to_owned(),
                 visibility: Visibility::Unknown,
                 modifiers: vec!["composer".to_owned()],
+                parameters: None,
+                return_type: None,
             });
         }
     }
@@ -267,6 +271,16 @@ fn walk(
         if let Ok(name) = name_node.utf8_text(text.as_bytes()) {
             let name = name.to_owned();
             let (visibility, modifiers) = declaration_modifiers(node, text);
+            let parameters = node.child_by_field_name("parameters").map(|node| {
+                node.utf8_text(text.as_bytes())
+                    .unwrap_or_default()
+                    .to_owned()
+            });
+            let return_type = node.child_by_field_name("return_type").map(|node| {
+                node.utf8_text(text.as_bytes())
+                    .unwrap_or_default()
+                    .to_owned()
+            });
             let fqn = match (class, kind) {
                 (
                     Some(parent),
@@ -286,6 +300,8 @@ fn walk(
                 namespace: namespace.to_owned(),
                 visibility,
                 modifiers,
+                parameters,
+                return_type,
             });
             let next_class = matches!(
                 kind,
