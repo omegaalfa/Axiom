@@ -1250,7 +1250,7 @@ impl EditorView {
                 .char_indices()
                 .rev()
                 .take_while(|(_, ch)| {
-                    ch.is_alphanumeric() || matches!(ch, '_' | '$' | '\\' | ':' | '-')
+                    ch.is_alphanumeric() || matches!(ch, '_' | '$' | '\\' | ':' | '-' | '>')
                 })
                 .last()
                 .map_or(open, |(index, _)| index);
@@ -1261,6 +1261,7 @@ impl EditorView {
                 .map(|(_, name)| name)
                 .unwrap_or(callable)
                 .trim_start_matches('$');
+            let has_receiver = callable.contains("->") || callable.contains("::");
             if name.is_empty() {
                 search = close.saturating_add(1);
                 continue;
@@ -1275,7 +1276,11 @@ impl EditorView {
                             .methods_of(&owner)
                             .find(|symbol| symbol.name == name)
                     })
-                    .or_else(|| runtime.find_function(name))
+                    .or_else(|| {
+                        (!has_receiver)
+                            .then(|| runtime.find_function(name))
+                            .flatten()
+                    })
                     .and_then(|symbol| {
                         symbol.signature.as_ref().map(|signature| {
                             (
@@ -1308,9 +1313,14 @@ impl EditorView {
                             .find(|symbol| symbol.name == name)
                     })
                     .or_else(|| {
-                        project.symbols().iter().find(|symbol| {
-                            symbol.kind == ProjectSymbolKind::Function && symbol.name == name
-                        })
+                        (!has_receiver)
+                            .then(|| {
+                                project.symbols().iter().find(|symbol| {
+                                    symbol.kind == ProjectSymbolKind::Function
+                                        && symbol.name == name
+                                })
+                            })
+                            .flatten()
                     });
                 let detail = project_callable_detail(symbol?)?;
                 let (required, maximum, variadic) = signature_counts_from_detail(&detail);
@@ -2198,6 +2208,12 @@ impl EditorView {
                 .as_ref()
                 .and_then(|index| index.try_read().ok())
                 .is_some_and(|index| index.find_class(&candidate).is_some());
+        // Workspace symbols are authoritative. This keeps project-file
+        // activation off the Composer path, which otherwise performs repeated
+        // filesystem probes for every imported project type.
+        if contextual_exists {
+            return candidate;
+        }
         let vendor_exists = self
             .vendor_symbols
             .as_ref()

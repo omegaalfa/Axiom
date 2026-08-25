@@ -207,6 +207,8 @@ pub struct WorkspaceView {
     active: Option<usize>,
     focus: FocusHandle,
     status: SharedString,
+    definition_loading: bool,
+    definition_loading_tick: u8,
     lsp: Option<std::sync::Arc<LspBridge>>,
     runtime_stubs: RuntimeStubStatus,
     runtime_stub_path: PathBuf,
@@ -715,6 +717,8 @@ impl WorkspaceView {
             active: None,
             focus: cx.focus_handle(),
             status: "Abra um arquivo no painel Project".into(),
+            definition_loading: false,
+            definition_loading_tick: 0,
             lsp: None,
             runtime_stubs: RuntimeStubStatus::Loading,
             runtime_stub_path: Self::runtime_stub_path(),
@@ -802,6 +806,11 @@ impl WorkspaceView {
                         this.poll_lsp(cx);
                         if this.index_results.is_some() {
                             this.indexing_phase = this.indexing_phase.wrapping_add(6) % 100;
+                            cx.notify();
+                        }
+                        if this.definition_loading {
+                            this.definition_loading_tick =
+                                this.definition_loading_tick.wrapping_add(1) % 4;
                             cx.notify();
                         }
                         this.poll_index(cx);
@@ -1762,7 +1771,13 @@ impl WorkspaceView {
         if debug_input_enabled() {
             tracing::info!(found = false, "[DEFINITION PROJECT]");
         }
+        self.definition_loading = true;
+        self.definition_loading_tick = 0;
+        self.status = "Resolving definition…".into();
+        cx.notify();
         let Some(request) = tab.editor.read(cx).vendor_definition_request() else {
+            self.definition_loading = false;
+            cx.notify();
             return false;
         };
         if !self.vendor_definition_inflight.insert(request.fqn.clone()) {
@@ -1777,7 +1792,6 @@ impl WorkspaceView {
         let weak = cx.entity().downgrade();
         let request_fqn = request.fqn.clone();
         let cache_key = query_key.clone();
-        self.status = "Resolving definition…".into();
         if debug_input_enabled() {
             tracing::info!(fqn = %request.fqn, "[DEFINITION NATIVE START]");
         }
@@ -1846,9 +1860,12 @@ impl WorkspaceView {
                                 },
                             );
                         }
-                        workspace.open_vendor_definition(path, offset, content, cx)
+                        workspace.open_vendor_definition(path, offset, content, cx);
+                        workspace.definition_loading = false;
+                        cx.notify();
                     }
                     Err(error) => {
+                        workspace.definition_loading = false;
                         workspace.status = format!("Definition not found: {error}").into();
                         if debug_input_enabled() {
                             tracing::info!(success = false, "[NAVIGATION RESULT]");
@@ -5543,6 +5560,10 @@ impl Render for WorkspaceView {
             Some(ServerStatus::NotFound) | None => "Not Found",
         };
         let runtime_stub_status = self.runtime_stubs.label();
+        let definition_loading_message = format!(
+            "Loading definition{}",
+            ".".repeat(usize::from(self.definition_loading_tick))
+        );
         div()
             .size_full()
             .flex()
@@ -5719,6 +5740,25 @@ impl Render for WorkspaceView {
             })
             .when(self.settings_visible, |this| this.child(self.render_settings(cx)))
             .when(self.features_visible, |this| this.child(self.render_features(cx)))
+            .when(self.definition_loading, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(54.))
+                        .right(px(24.))
+                        .w(px(260.))
+                        .p_3()
+                        .flex()
+                        .items_center()
+                        .rounded(m.border_radius_medium)
+                        .bg(t.popup_background)
+                        .border_1()
+                        .border_color(t.accent)
+                        .shadow_lg()
+                        .text_color(t.text_primary)
+                        .child(definition_loading_message),
+                )
+            })
             .when(self.debug_overlay_visible, |this| {
                 this.child(
                     div()
