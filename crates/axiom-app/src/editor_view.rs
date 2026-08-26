@@ -545,14 +545,17 @@ impl EditorView {
         // Only inspect the current expression. Looking through the entire
         // document prefix lets an earlier `$this->...` make an unrelated
         // `new Future` token look like a method member.
-        let expression_start = before
-            .rfind(|ch: char| matches!(ch, ';' | '{' | '}' | '\n'))
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        let expression = &before[expression_start..];
-        if let Some(relative_operator) = expression.rfind("->").or_else(|| expression.rfind("::")) {
-            let operator = expression_start + relative_operator;
-            let is_static = before[operator..].starts_with("::");
+        // A member query is valid only when the token immediately follows the
+        // member operator.  Looking for any earlier `->` misclassified the
+        // RHS of expressions such as `$this->loop = $loop ?? new FiberEventLoop()`
+        // as a method on `$this`.
+        let member_operator = before
+            .trim_end()
+            .strip_suffix("->")
+            .map(|_| ("->", false))
+            .or_else(|| before.trim_end().strip_suffix("::").map(|_| ("::", true)));
+        if let Some((operator_text, is_static)) = member_operator {
+            let operator = before.trim_end().len() - operator_text.len();
             let owner_end = operator;
             let (_, written_owner) = extract_owner_expression(before, owner_end);
             let owner_fqn = if written_owner.starts_with('$') {
@@ -4629,6 +4632,36 @@ mod formatter_tests {
                     if fqn == "Omegaalfa\\FiberEventLoop\\Future" && written == "Future"
             ),
             "unexpected imported type query: {query:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn definition_query_does_not_treat_new_rhs_after_member_assignment_as_method(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "<?php\nnamespace Omegaalfa\\HttpClient\\Http;\nuse Omegaalfa\\FiberEventLoop\\FiberEventLoop;\nfinal class AsyncHttpClient\n{\n    private FiberEventLoop $loop;\n    public function __construct(?FiberEventLoop $loop = null): void\n    {\n        $this->loop = $loop ?? new FiberEventLoop();\n    }\n}\n";
+        let path = std::env::temp_dir().join("axiom-new-after-member-assignment.php");
+        let source_for_view = source.to_owned();
+        let path_for_view = path.clone();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_document(
+                path_for_view,
+                axiom_editor::Document::from_content(&source_for_view),
+                None,
+                cx,
+            )
+        });
+        let offset = source.rfind("FiberEventLoop();").unwrap() + 2;
+        view.update(cx, |editor, _| editor.document.move_cursor(offset));
+        let query = view.update(cx, |editor, _| editor.definition_query());
+        assert!(
+            matches!(
+                &query,
+                Some(DefinitionQuery::Name { fqn, written })
+                    if fqn == "Omegaalfa\\FiberEventLoop\\FiberEventLoop"
+                        && written == "FiberEventLoop"
+            ),
+            "unexpected new-expression query: {query:?}"
         );
     }
 
