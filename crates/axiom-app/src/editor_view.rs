@@ -165,6 +165,7 @@ pub struct EditorView {
     editor_scroll_drag_axis: Option<EditorScrollAxis>,
     editor_scroll_drag_start: Point<Pixels>,
     editor_scroll_drag_start_offset: Point<Pixels>,
+    content_width: Pixels,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,6 +316,7 @@ impl EditorView {
             editor_scroll_drag_axis: None,
             editor_scroll_drag_start: Point::default(),
             editor_scroll_drag_start_offset: Point::default(),
+            content_width: px(0.),
         };
         let inspections_started = std::time::Instant::now();
         view.sync_syntax();
@@ -3110,7 +3112,9 @@ impl EditorView {
             .id(line)
             .relative()
             .flex()
-            .w(px(GUTTER_WIDTH + TEXT_PADDING) + shaped_width)
+            .w(self
+                .content_width
+                .max(px(GUTTER_WIDTH + TEXT_PADDING) + shaped_width))
             .h(px(LINE_HEIGHT))
             .line_height(px(LINE_HEIGHT))
             .text_size(px(FONT_SIZE))
@@ -3698,6 +3702,17 @@ impl Render for EditorView {
         let offset = scroll_handle.offset();
         let offset_x: f32 = (-offset.x).into();
         let offset_y: f32 = (-offset.y).into();
+        let mut content_width = viewport.size.width;
+        for line in 0..self.document.line_count() {
+            let raw = self.document.line_content(line);
+            let text = trim_eol(raw.as_ref());
+            let width =
+                px(GUTTER_WIDTH + TEXT_PADDING) + self.line_layout(line, text, window).width;
+            if width > content_width {
+                content_width = width;
+            }
+        }
+        self.content_width = content_width;
         let vertical_top = if max_y > 0.0 {
             offset_y / max_y * (viewport_h - vertical_thumb).max(0.0)
         } else {
