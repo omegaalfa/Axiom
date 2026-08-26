@@ -17,16 +17,20 @@ use axiom_app::shell_state::{
     recent_projects_path, runtime_stubs_cache_path, runtime_stubs_default_path, unix_timestamp_now,
 };
 use axiom_editor::Document;
-use axiom_index::{ProjectSymbolIndex, VendorSymbolIndex};
-use axiom_lsp::{ServerStatus, uri_to_path};
+use axiom_index::{
+    DefinitionConfidence, FindUsagesOptions, ProjectSymbolIndex, ReferenceRole, SemanticEngine,
+    SemanticRevision, VendorSymbolIndex,
+};
+use axiom_lsp::{PositionCodec, ServerStatus, uri_to_path};
 use axiom_php::{RuntimeSymbolIndex, StubProvider};
 use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_content};
 use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSession};
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
-    LayoutId, Modifiers, MouseButton, Pixels, Point, SharedString, Style, TextRun, Timer,
-    UTF16Selection, Window, actions, div, prelude::*, px, relative,
+    LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollHandle, SharedString, Style, TextRun, Timer, UTF16Selection, Window, actions, div,
+    prelude::*, px, relative,
 };
 
 use crate::{
@@ -107,6 +111,23 @@ struct DefinitionTarget {
     position: lsp_types::Position,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FindUsageTarget {
+    file: PathBuf,
+    span: std::ops::Range<usize>,
+    role: ReferenceRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefinitionSource {
+    Semantic,
+    LegacyProject,
+    LegacyVendor,
+    LegacyRuntime,
+    Lsp,
+    Unresolved,
+}
+
 fn definition_cache_lookup(
     cache: &HashMap<String, DefinitionTarget>,
     key: &str,
@@ -182,6 +203,7 @@ enum PendingOperation {
 }
 
 type ProjectLoadPayload = (Project, Vec<ProjectEntry>, Arc<LspBridge>);
+type SemanticIndexPayload = (ProjectSymbolIndex, Arc<SemanticEngine>);
 type RuntimeLoadResult = (
     u64,
     Result<(RuntimeStubStatus, Arc<RuntimeSymbolIndex>), String>,
@@ -241,6 +263,15 @@ pub struct WorkspaceView {
     modal_focus_pending: bool,
     delete_focus_pending: bool,
     explorer_selection: UTF16Selection,
+    explorer_scroll: ScrollHandle,
+    explorer_scroll_dragging: bool,
+    explorer_scroll_drag_start_y: f32,
+    explorer_scroll_drag_start_offset: f32,
+    explorer_scroll_hovered: bool,
+    project_panel_width: Pixels,
+    project_panel_resizing: bool,
+    project_panel_resize_start_x: f32,
+    project_panel_resize_start_width: f32,
     explorer_undo: Vec<(String, UTF16Selection)>,
     pending_delete: Option<PathBuf>,
     pending_delete_is_directory: bool,
@@ -254,7 +285,8 @@ pub struct WorkspaceView {
     definition_cache: HashMap<String, DefinitionTarget>,
     project_index: Option<Arc<RwLock<ProjectSymbolIndex>>>,
     index_generation: u64,
-    index_results: Option<Receiver<(u64, Result<ProjectSymbolIndex, String>)>>,
+    index_results: Option<Receiver<(u64, Result<SemanticIndexPayload, String>)>>,
+    semantic_engine: Option<Arc<SemanticEngine>>,
     vendor_index: Option<Arc<RwLock<VendorSymbolIndex>>>,
     vendor_index_generation: u64,
     vendor_index_results: Option<Receiver<(u64, Result<VendorSymbolIndex, String>)>>,
@@ -279,6 +311,9 @@ pub struct WorkspaceView {
     lsp_generations: HashMap<(lsp_types::Uri, LspRequestKind), u64>,
     explorer_fs_busy: bool,
     vendor_definition_inflight: HashSet<String>,
+    find_usages: Vec<FindUsageTarget>,
+    find_usages_visible: bool,
+    find_usages_source: crate::editor_view::FindUsagesSource,
 }
 
 impl WorkspaceView {
@@ -395,6 +430,7 @@ impl WorkspaceView {
             .child(
                 div()
                     .flex_1()
+                    .min_h(px(0.))
                     .flex()
                     .child(
                         div()
@@ -753,6 +789,15 @@ impl WorkspaceView {
                 range: 0..0,
                 reversed: false,
             },
+            explorer_scroll: ScrollHandle::new(),
+            explorer_scroll_dragging: false,
+            explorer_scroll_drag_start_y: 0.0,
+            explorer_scroll_drag_start_offset: 0.0,
+            explorer_scroll_hovered: false,
+            project_panel_width: px(244.),
+            project_panel_resizing: false,
+            project_panel_resize_start_x: 0.0,
+            project_panel_resize_start_width: 244.0,
             explorer_undo: Vec::new(),
             pending_delete: None,
             pending_delete_is_directory: false,
@@ -767,6 +812,7 @@ impl WorkspaceView {
             project_index: None,
             index_generation: 0,
             index_results: None,
+            semantic_engine: None,
             vendor_index: None,
             vendor_index_generation: 0,
             vendor_index_results: None,
@@ -791,6 +837,9 @@ impl WorkspaceView {
             lsp_generations: HashMap::new(),
             explorer_fs_busy: false,
             vendor_definition_inflight: HashSet::new(),
+            find_usages: Vec::new(),
+            find_usages_visible: false,
+            find_usages_source: crate::editor_view::FindUsagesSource::LegacyOrLsp,
         };
         workspace.begin_runtime_stub_load(cx, false);
         workspace.start_runtime_watcher(cx);
@@ -1073,6 +1122,7 @@ impl WorkspaceView {
         let (sender, receiver) = mpsc::channel();
         self.index_results = Some(receiver);
         self.project_index = None;
+        self.semantic_engine = None;
         self.vendor_index = None;
         self.status = "Project opened — indexing...".into();
         let index_root = root.clone();
@@ -1081,7 +1131,13 @@ impl WorkspaceView {
             let result = project_symbol_cache_path(&index_root)
                 .map(|cache| index.index_project_cached(&index_root, cache))
                 .unwrap_or_else(|| index.index_project(&index_root))
-                .map(|_| index)
+                .map(|_| {
+                    let snapshot = axiom_index::SemanticSnapshot::from_project_index(
+                        &index,
+                        SemanticRevision(generation),
+                    );
+                    (index, Arc::new(SemanticEngine::from_snapshot(snapshot)))
+                })
                 .map_err(|error| error.to_string());
             let _ = sender.send((generation, result));
         });
@@ -1169,9 +1225,17 @@ impl WorkspaceView {
         }
         match result {
             Ok(index) => {
+                let (index, semantic_engine) = index;
                 let report = index.report();
                 let shared = Arc::new(RwLock::new(index));
                 self.project_index = Some(shared.clone());
+                self.semantic_engine = Some(semantic_engine);
+                if let Some(engine) = &self.semantic_engine {
+                    for tab in &self.tabs {
+                        tab.editor
+                            .update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
+                    }
+                }
                 for tab in &self.tabs {
                     tab.editor
                         .update(cx, |editor, _| editor.set_project_symbols(shared.clone()));
@@ -1225,6 +1289,7 @@ impl WorkspaceView {
         self.expanded.clear();
         self.project = None;
         self.project_index = None;
+        self.semantic_engine = None;
         self.lsp = None;
         if let Some(session) = self.terminal_session.take() {
             let _ = session.terminate();
@@ -1697,6 +1762,86 @@ impl WorkspaceView {
         false
     }
 
+    fn navigate_semantic_definition(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(engine) = self.semantic_engine.clone() else {
+            return false;
+        };
+        let Some(tab_index) = self.active else {
+            return false;
+        };
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return false;
+        };
+        let editor = tab.editor.read(cx);
+        let path = tab.path.clone();
+        let offset = editor.current_cursor_offset();
+        let text = editor.document_content();
+        if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+            let token = axiom_syntax::PhpSyntax::parse(text.clone())
+                .ok()
+                .and_then(|syntax| syntax.token_at_byte(offset));
+            tracing::info!(
+                offset,
+                token_text = ?token.as_ref().map(|token| token.text.as_str()),
+                token_kind = ?token.as_ref().map(|token| token.kind.as_str()),
+                token_range = ?token.as_ref().map(|token| token.range.clone()),
+                "[DEFINITION INPUT]"
+            );
+        }
+        let snapshot = engine.snapshot();
+        let context = axiom_index::DefinitionQueryContext {
+            document_version: None,
+            semantic_revision: snapshot.revision,
+        };
+        let detailed = snapshot.definition_at_detailed(&path, &text, offset, context);
+        if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+            tracing::info!(outcome = ?detailed.outcome, result = ?detailed.result, "[DEFINITION RESULT]");
+        }
+        let axiom_index::DefinitionResult::Resolved(candidate) = &detailed.result else {
+            if debug_input_enabled() {
+                tracing::info!(
+                    source = ?DefinitionSource::Unresolved,
+                    outcome = ?detailed.outcome,
+                    result = ?detailed.result,
+                    "[DEFINITION SEMANTIC]"
+                );
+            }
+            return false;
+        };
+        if !matches!(
+            candidate.confidence,
+            DefinitionConfidence::Exact | DefinitionConfidence::High
+        ) {
+            return false;
+        }
+        let target_path = candidate.location.file.clone();
+        let Ok(target_text) = fs::read_to_string(&target_path) else {
+            return false;
+        };
+        let position = PositionCodec::offset_to_position(
+            &target_text,
+            candidate.location.span.start,
+            Default::default(),
+        );
+        if debug_input_enabled() {
+            tracing::info!(
+                source = ?DefinitionSource::Semantic,
+                outcome = ?detailed.outcome,
+                path = %target_path.display(),
+                span_start = candidate.location.span.start,
+                "[DEFINITION SEMANTIC]"
+            );
+        }
+        self.navigate_to_definition(
+            DefinitionTarget {
+                path: target_path,
+                position,
+            },
+            cx,
+        );
+        true
+    }
+
     fn native_definition_action(
         &mut self,
         _: &crate::editor_view::NativeDefinition,
@@ -1706,10 +1851,40 @@ impl WorkspaceView {
         if debug_input_enabled() {
             tracing::info!(provider = "native", "[DEFINITION REQUEST]");
         }
-        if self.start_vendor_definition(cx) {
+        let semantic_result = self.navigate_semantic_definition(cx);
+        if debug_input_enabled() {
+            tracing::info!(
+                called = true,
+                result = semantic_result,
+                "[DEFINITION SEMANTIC PATH]"
+            );
+        }
+        if semantic_result {
             return;
         }
-        if self.navigate_native_definition(cx) {
+        let vendor_result = self.start_vendor_definition(cx);
+        if debug_input_enabled() {
+            tracing::info!(
+                called = true,
+                result = vendor_result,
+                "[DEFINITION VENDOR PATH]"
+            );
+        }
+        if vendor_result {
+            return;
+        }
+        let native_result = self.navigate_native_definition(cx);
+        if debug_input_enabled() {
+            tracing::info!(
+                called = true,
+                result = native_result,
+                "[DEFINITION LEGACY PATH]"
+            );
+        }
+        if native_result {
+            if debug_input_enabled() {
+                tracing::info!(source = ?DefinitionSource::LegacyRuntime, "[DEFINITION SOURCE]");
+            }
             return;
         }
         if let (Some(lsp), Some(uri), Some(position)) = (
@@ -1722,7 +1897,12 @@ impl WorkspaceView {
                 .and_then(|index| self.tabs.get(index))
                 .and_then(|tab| tab.editor.read(cx).current_lsp_position()),
         ) {
+            if debug_input_enabled() {
+                tracing::info!(source = ?DefinitionSource::Lsp, "[DEFINITION SOURCE]");
+            }
             lsp.request_definition(uri, position);
+        } else if debug_input_enabled() {
+            tracing::info!(source = ?DefinitionSource::Unresolved, "[DEFINITION SOURCE]");
         }
     }
 
@@ -1742,7 +1922,13 @@ impl WorkspaceView {
             && let Some(target) = definition_cache_lookup(&self.definition_cache, key)
         {
             if debug_input_enabled() {
-                tracing::info!(kind = "definition", symbol = %key, source = "Project|Vendor", hit = true, "[DEFINITION CACHE]");
+                tracing::info!(
+                    kind = "definition",
+                    symbol = %key,
+                    source = ?DefinitionSource::LegacyProject,
+                    hit = true,
+                    "[DEFINITION CACHE]"
+                );
             }
             self.navigate_to_definition(target, cx);
             return true;
@@ -1755,6 +1941,7 @@ impl WorkspaceView {
                 tracing::info!(found = true, path = %path.display(), "[DEFINITION PROJECT]");
                 tracing::info!(attempted = false, found = false, "[DEFINITION VENDOR]");
                 tracing::info!(source = "Project", path = %path.display(), "[DEFINITION TARGET]");
+                tracing::info!(source = ?DefinitionSource::LegacyProject, "[DEFINITION SOURCE]");
             }
             if let Some(key) = query_key.as_ref() {
                 self.definition_cache.insert(
@@ -1787,7 +1974,12 @@ impl WorkspaceView {
             return true;
         }
         if debug_input_enabled() {
-            tracing::info!(attempted = true, fqn = %request.fqn, "[DEFINITION VENDOR]");
+            tracing::info!(
+                attempted = true,
+                fqn = %request.fqn,
+                source = ?DefinitionSource::LegacyVendor,
+                "[DEFINITION VENDOR]"
+            );
         }
         let weak = cx.entity().downgrade();
         let request_fqn = request.fqn.clone();
@@ -1909,6 +2101,9 @@ impl WorkspaceView {
             if let Some(index) = &self.project_index {
                 editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
             }
+            if let Some(engine) = &self.semantic_engine {
+                editor.update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
+            }
             if let Some(vendor) = &self.vendor_index {
                 editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
             }
@@ -1929,6 +2124,72 @@ impl WorkspaceView {
             tracing::info!(success = true, "[NAVIGATION RESULT]");
         }
         cx.notify();
+    }
+
+    fn find_usages_action(
+        &mut self,
+        _: &crate::editor_view::References,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_usages.clear();
+        self.find_usages_visible = false;
+        let Some(tab_index) = self.active else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return;
+        };
+        let editor = tab.editor.read(cx);
+        let path = tab.path.clone();
+        let offset = editor.current_cursor_offset();
+        let uri = editor.lsp_uri().cloned();
+        let position = editor.current_lsp_position();
+        if let Some(engine) = &self.semantic_engine {
+            let result = engine.find_usages_at(&path, offset, FindUsagesOptions::default());
+            let source = crate::editor_view::find_usages_source(result.status);
+            self.find_usages_source = source;
+            if matches!(source, crate::editor_view::FindUsagesSource::Semantic) {
+                self.find_usages = result
+                    .usages
+                    .into_iter()
+                    .map(|usage| FindUsageTarget {
+                        file: PathBuf::from(usage.file.normalized_path),
+                        span: usage.span,
+                        role: usage.role,
+                    })
+                    .collect();
+                self.find_usages.sort_by(|left, right| {
+                    left.file
+                        .cmp(&right.file)
+                        .then_with(|| left.span.start.cmp(&right.span.start))
+                        .then_with(|| left.span.end.cmp(&right.span.end))
+                });
+                self.find_usages_visible = !self.find_usages.is_empty();
+                self.status =
+                    format!("{} referência(s) encontrada(s)", self.find_usages.len()).into();
+                cx.notify();
+                return;
+            }
+        }
+        self.find_usages_source = crate::editor_view::FindUsagesSource::LegacyOrLsp;
+        if let (Some(lsp), Some(uri), Some(position)) = (&self.lsp, uri, position) {
+            lsp.request_references(uri, position);
+        } else {
+            self.status = "No references found (language server unavailable)".into();
+            cx.notify();
+        }
+    }
+
+    fn open_find_usage(&mut self, target: FindUsageTarget, cx: &mut Context<Self>) {
+        let path = target.file.clone();
+        let Ok(text) = fs::read_to_string(&path) else {
+            return;
+        };
+        let position =
+            PositionCodec::offset_to_position(&text, target.span.start, Default::default());
+        self.find_usages_visible = false;
+        self.navigate_to_definition(DefinitionTarget { path, position }, cx);
     }
 
     fn dispatch_editor_action<A: Action + Clone + 'static>(
@@ -3349,6 +3610,9 @@ impl WorkspaceView {
                 editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
             }
         }
+        if let Some(engine) = &self.semantic_engine {
+            editor.update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
+        }
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
         self.tabs.push(OpenTab { path, editor });
         self.active = Some(self.tabs.len() - 1);
@@ -3400,6 +3664,9 @@ impl WorkspaceView {
             if let Some(vendor) = &self.vendor_index {
                 editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
             }
+        }
+        if let Some(engine) = &self.semantic_engine {
+            editor.update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
         }
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
         self.tabs.push(OpenTab { path, editor });
@@ -3598,13 +3865,44 @@ impl WorkspaceView {
                 }
                 IdeLspEvent::References {
                     uri,
-                    count,
+                    locations,
                     generation,
                 } => {
                     if !self.accept_lsp_generation(&uri, LspRequestKind::References, generation) {
                         continue;
                     }
-                    self.status = format!("{count} referência(s) encontrada(s)").into();
+                    self.find_usages_source = crate::editor_view::FindUsagesSource::LegacyOrLsp;
+                    self.find_usages = locations
+                        .into_iter()
+                        .filter_map(|location| {
+                            let path = uri_to_path(&location.uri).ok()?;
+                            let text = fs::read_to_string(&path).ok()?;
+                            let start = PositionCodec::position_to_offset(
+                                &text,
+                                location.range.start,
+                                Default::default(),
+                            );
+                            let end = PositionCodec::position_to_offset(
+                                &text,
+                                location.range.end,
+                                Default::default(),
+                            );
+                            Some(FindUsageTarget {
+                                file: path,
+                                span: start..end,
+                                role: ReferenceRole::MethodCall,
+                            })
+                        })
+                        .collect();
+                    self.find_usages.sort_by(|left, right| {
+                        left.file
+                            .cmp(&right.file)
+                            .then_with(|| left.span.start.cmp(&right.span.start))
+                            .then_with(|| left.span.end.cmp(&right.span.end))
+                    });
+                    self.find_usages_visible = !self.find_usages.is_empty();
+                    self.status =
+                        format!("{} referência(s) encontrada(s)", self.find_usages.len()).into();
                 }
                 IdeLspEvent::Error(error) => {
                     self.status = format!("Language Server: {error}").into();
@@ -3675,6 +3973,9 @@ impl WorkspaceView {
                 if let Some(vendor) = &self.vendor_index {
                     editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
                 }
+            }
+            if let Some(engine) = &self.semantic_engine {
+                editor.update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
             }
             cx.observe(&editor, |_, _, cx| cx.notify()).detach();
             self.tabs.push(OpenTab {
@@ -3795,6 +4096,9 @@ impl WorkspaceView {
                 if let Some(vendor) = &self.vendor_index {
                     editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
                 }
+            }
+            if let Some(engine) = &self.semantic_engine {
+                editor.update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
             }
             cx.observe(&editor, |_, _, cx| cx.notify()).detach();
             self.tabs.push(OpenTab { path, editor });
@@ -3929,6 +4233,104 @@ impl WorkspaceView {
             .child(div().flex_1())
     }
 
+    fn render_find_usages(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        div()
+            .absolute()
+            .top(px(48.))
+            .right(px(24.))
+            .w(px(520.))
+            .max_h(px(360.))
+            .flex()
+            .flex_col()
+            .bg(t.popup_background)
+            .border_1()
+            .border_color(t.border)
+            .rounded(m.border_radius_medium)
+            .shadow_lg()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .child(format!("Find Usages ({})", self.find_usages.len())),
+            )
+            .children(
+                self.find_usages
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, target)| {
+                        let workspace = workspace.clone();
+                        let (line, character) = fs::read_to_string(&target.file)
+                            .ok()
+                            .map(|text| {
+                                let position = PositionCodec::offset_to_position(
+                                    &text,
+                                    target.span.start,
+                                    Default::default(),
+                                );
+                                (position.line + 1, position.character + 1)
+                            })
+                            .unwrap_or((0, 0));
+                        let label = format!("{}:{}:{}", target.file.display(), line, character);
+                        div()
+                            .id(("find-usage", index))
+                            .h(m.toolbar_height)
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .text_color(t.text_primary)
+                            .hover(move |style| style.bg(t.hover))
+                            .on_click(move |_, _, cx| {
+                                workspace.update(cx, |this, cx| {
+                                    this.open_find_usage(target.clone(), cx)
+                                });
+                            })
+                            .child(label)
+                    }),
+            )
+    }
+
+    fn project_panel_resize_start(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_panel_resizing = true;
+        self.project_panel_resize_start_x = event.position.x.into();
+        self.project_panel_resize_start_width = self.project_panel_width.into();
+        cx.notify();
+    }
+
+    fn project_panel_resize_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.project_panel_resizing {
+            return;
+        }
+        let x: f32 = event.position.x.into();
+        let width = (self.project_panel_resize_start_width + x - self.project_panel_resize_start_x)
+            .clamp(180.0, 520.0);
+        self.project_panel_width = px(width);
+        cx.notify();
+    }
+
+    fn project_panel_resize_end(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_panel_resizing = false;
+        cx.notify();
+    }
+
     fn render_explorer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
@@ -3946,12 +4348,46 @@ impl WorkspaceView {
             .active
             .and_then(|index| self.tabs.get(index))
             .map(|tab| tab.path.clone());
+        // Keep the tree viewport constrained by the sidebar while giving its
+        // content a natural width. This enables GPUI's horizontal scrollbar
+        // for deep trees and long names instead of shrinking/clipping rows.
+        let tree_content_width = self
+            .explorer
+            .iter()
+            .map(|item| {
+                12.0 + item.depth as f32 * 16.0 + 28.0 + item.name.chars().count() as f32 * 8.0
+            })
+            .fold(180.0_f32, f32::max);
+        let scroll_max: f32 = self.explorer_scroll.max_offset().height.into();
+        let viewport_height: f32 = self.explorer_scroll.bounds().size.height.into();
+        let content_height = (viewport_height + scroll_max).max(1.0);
+        let thumb_height = (viewport_height * viewport_height / content_height)
+            .max(24.0)
+            .min(viewport_height.max(24.0));
+        let offset_y: f32 = self.explorer_scroll.offset().y.into();
+        let thumb_top = if scroll_max > 0.0 {
+            (offset_y / scroll_max) * (viewport_height - thumb_height).max(0.0)
+        } else {
+            0.0
+        };
         div()
-            .w(m.sidebar_default_width)
+            .id("explorer-sidebar")
+            .w(self.project_panel_width)
             .min_w(px(180.))
             .h_full()
+            .min_h(px(0.))
             .flex()
             .flex_col()
+            .relative()
+            .on_hover({
+                let workspace = workspace.clone();
+                move |hovered, _, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.explorer_scroll_hovered = *hovered;
+                        cx.notify();
+                    });
+                }
+            })
             .bg(t.sidebar_background)
             .border_r_1()
             .border_color(t.border_subtle)
@@ -4071,69 +4507,173 @@ impl WorkspaceView {
                 div()
                     .id("explorer-scroll")
                     .flex_1()
-                    .overflow_y_scroll()
-                    .children(self.explorer.iter().enumerate().map(|(index, item)| {
-                        let item = item.clone();
-                        let workspace = workspace.clone();
-                        let context_workspace = workspace.clone();
-                        let context_item = item.clone();
-                        let is_expanded = self.expanded.contains(&item.path);
-                        let is_active = active_path.as_ref() == Some(&item.path);
-                        let icon =
-                            file_icon(&item.path, item.kind == EntryKind::Directory, is_expanded)
-                                .glyph();
-                        div()
-                            .id(("explorer", index))
-                            .h(px(24.))
-                            .pl(px(12. + item.depth as f32 * 16.))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_size(m.ui_font_size)
-                            .text_color(if is_active {
-                                t.text_primary
-                            } else {
-                                t.text_secondary
-                            })
-                            .bg(if is_active {
-                                t.pressed
-                            } else {
-                                t.sidebar_background
-                            })
-                            .hover(move |style| style.bg(t.hover))
-                            .on_click(move |_, window, cx| {
-                                workspace.update(cx, |this, cx| {
-                                    window.focus(&this.focus);
-                                    if item.kind == EntryKind::Directory {
-                                        this.selected_path = Some(item.path.clone());
-                                        this.toggle_directory(index, cx);
-                                    } else {
-                                        this.selected_path = Some(item.path.clone());
-                                        this.open_file(item.path.clone(), window, cx);
-                                    }
-                                });
-                            })
-                            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                                context_workspace.update(cx, |this, cx| {
-                                    window.focus(&this.focus);
-                                    this.open_context_menu(
-                                        context_item.path.clone(),
-                                        context_item.kind,
-                                        event.position,
-                                        cx,
-                                    );
-                                });
-                                cx.stop_propagation();
-                            })
-                            .child(
-                                div()
-                                    .w(m.icon_size)
-                                    .text_color(if is_active { t.accent } else { t.text_muted })
-                                    .child(icon),
+                    .min_h(px(0.))
+                    .min_w(px(0.))
+                    .overflow_scroll()
+                    .scrollbar_width(px(8.))
+                    .track_scroll(&self.explorer_scroll)
+                    .on_mouse_move(cx.listener(Self::explorer_scroll_drag_move))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(Self::explorer_scroll_drag_end),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(Self::explorer_scroll_drag_end),
+                    )
+                    .child(div().w(px(tree_content_width)).flex().flex_col().children(
+                        self.explorer.iter().enumerate().map(|(index, item)| {
+                            let item = item.clone();
+                            let workspace = workspace.clone();
+                            let context_workspace = workspace.clone();
+                            let context_item = item.clone();
+                            let is_expanded = self.expanded.contains(&item.path);
+                            let is_active = active_path.as_ref() == Some(&item.path);
+                            let icon = file_icon(
+                                &item.path,
+                                item.kind == EntryKind::Directory,
+                                is_expanded,
                             )
-                            .child(item.name)
-                    })),
+                            .glyph();
+                            div()
+                                .id(("explorer", index))
+                                .w_full()
+                                .h(px(24.))
+                                .pl(px(12. + item.depth as f32 * 16.))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_size(m.ui_font_size)
+                                .text_color(if is_active {
+                                    t.text_primary
+                                } else {
+                                    t.text_secondary
+                                })
+                                .bg(if is_active {
+                                    t.pressed
+                                } else {
+                                    t.sidebar_background
+                                })
+                                .hover(move |style| style.bg(t.hover))
+                                .on_click(move |_, window, cx| {
+                                    workspace.update(cx, |this, cx| {
+                                        window.focus(&this.focus);
+                                        if item.kind == EntryKind::Directory {
+                                            this.selected_path = Some(item.path.clone());
+                                            this.toggle_directory(index, cx);
+                                        } else {
+                                            this.selected_path = Some(item.path.clone());
+                                            this.open_file(item.path.clone(), window, cx);
+                                        }
+                                    });
+                                })
+                                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                    context_workspace.update(cx, |this, cx| {
+                                        window.focus(&this.focus);
+                                        this.open_context_menu(
+                                            context_item.path.clone(),
+                                            context_item.kind,
+                                            event.position,
+                                            cx,
+                                        );
+                                    });
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    div()
+                                        .w(m.icon_size)
+                                        .text_color(if is_active { t.accent } else { t.text_muted })
+                                        .child(icon),
+                                )
+                                .child(item.name)
+                        }),
+                    ))
+                    .when(scroll_max > 0.0 && self.explorer_scroll_hovered, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .right(px(1.))
+                                .top(px(1.))
+                                .bottom(px(1.))
+                                .w(px(6.))
+                                .opacity(0.0)
+                                .hover(|style| style.opacity(1.0))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(Self::explorer_scroll_drag_start),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(0.))
+                                        .right(px(0.))
+                                        .top(px(thumb_top))
+                                        .h(px(thumb_height))
+                                        .rounded(px(3.))
+                                        .bg(t.scrollbar_hover),
+                                ),
+                        )
+                    }),
             )
+            .child(
+                div()
+                    .id("explorer-resize-divider")
+                    .absolute()
+                    .right(px(-2.))
+                    .top(px(0.))
+                    .bottom(px(0.))
+                    .w(px(4.))
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .hover(|style| style.bg(theme().accent))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(Self::project_panel_resize_start),
+                    ),
+            )
+    }
+
+    fn explorer_scroll_drag_start(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.explorer_scroll_dragging = true;
+        self.explorer_scroll_drag_start_y = event.position.y.into();
+        let offset: f32 = self.explorer_scroll.offset().y.into();
+        self.explorer_scroll_drag_start_offset = -offset;
+        cx.notify();
+    }
+
+    fn explorer_scroll_drag_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        if !self.explorer_scroll_dragging {
+            return;
+        }
+        let viewport: f32 = self.explorer_scroll.bounds().size.height.into();
+        let max: f32 = self.explorer_scroll.max_offset().height.into();
+        let thumb = (viewport * viewport / (viewport + max).max(1.0)).max(24.0);
+        let track = (viewport - thumb).max(1.0);
+        let delta: f32 = event.position.y.into();
+        let delta = delta - self.explorer_scroll_drag_start_y;
+        let position =
+            (self.explorer_scroll_drag_start_offset + delta * max / track).clamp(0.0, max);
+        self.explorer_scroll
+            .set_offset(Point::new(px(0.), px(-position)));
+    }
+
+    fn explorer_scroll_drag_end(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.explorer_scroll_dragging = false;
+        cx.notify();
     }
 
     fn render_explorer_context(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5594,6 +6134,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::go_to_class))
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::native_definition_action))
+            .on_action(cx.listener(Self::find_usages_action))
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::settings))
             .on_action(cx.listener(Self::debug_input))
@@ -5628,8 +6169,28 @@ impl Render for WorkspaceView {
             ))
             .when(self.project.is_some(), |this| this.child(
                 div()
+                    .id("workspace-project-area")
                     .flex_1()
+                    .min_h(px(0.))
                     .flex()
+                    .on_mouse_move(cx.listener(Self::project_panel_resize_move))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(Self::project_panel_resize_end),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(Self::project_panel_resize_end),
+                    )
+                    .on_hover({
+                        let workspace = workspace.clone();
+                        move |hovered, _, cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.explorer_scroll_hovered = *hovered;
+                                cx.notify();
+                            });
+                        }
+                    })
                     .child(self.render_activity_bar(cx))
                     .when(self.project_panel_visible, |this| {
                         this.child(self.render_explorer(cx))
@@ -5694,6 +6255,9 @@ impl Render for WorkspaceView {
                             }
                         })),
                 )
+            })
+            .when(self.find_usages_visible, |this| {
+                this.child(self.render_find_usages(cx))
             })
             .when(self.explorer_context.is_some(), |this| {
                 this.child(

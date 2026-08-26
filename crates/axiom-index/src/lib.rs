@@ -14,6 +14,26 @@ use std::{
 };
 use tree_sitter::Node;
 
+mod semantic;
+mod source;
+
+pub use semantic::{
+    BuiltinType, DeclaredType, DefinitionCandidate, DefinitionConfidence, DefinitionLocation,
+    DefinitionQueryContext, DefinitionResult, Expression, ExpressionResolver, FileId, FileRecord,
+    FindUsagesOptions, FindUsagesResult, FindUsagesStatus, ImportBinding, ImportKind, ImportTable,
+    MemberAccess, MemberKind, MemberResolution, MemberResolver, PersistentFileKey,
+    PersistentSymbolKey, ReferenceConfidence, ReferenceId, ReferenceLocation, ReferenceProvider,
+    ReferenceRole, ReferenceTarget, Scope, ScopeId, ScopeKind, ScopeStore,
+    SemanticDefinitionOutcome, SemanticDefinitionResult, SemanticEngine, SemanticReference,
+    SemanticRevision, SemanticSnapshot, SemanticSymbol, SnapshotBuilder, SourceOrigin, SymbolId,
+    UsageLocation, VariableBinding,
+};
+pub use source::{
+    ComposerSource, DeferredSource, RuntimeSource, SourceCandidate, SourceError, SourceFile,
+    SourceFingerprint, SourceKind, SourceProvider, SourceRegistry, SourceResolution,
+    SourceResolutionPolicy, WorkspaceSource,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum ProjectSymbolKind {
     Class,
@@ -116,13 +136,7 @@ impl VendorSymbolIndex {
                     continue;
                 };
                 let path = if right.contains("$vendorDir") || right.contains("$baseDir") {
-                    composer_path(
-                        root,
-                        right
-                            .trim()
-                            .trim_end_matches(|c| matches!(c, ',' | ']' | ';'))
-                            .trim(),
-                    )
+                    composer_path(root, right.trim())
                 } else {
                     composer_path(root, file)
                 };
@@ -281,7 +295,10 @@ impl VendorSymbolIndex {
         }
     }
 
-    pub fn resolve_class(&self, fqn: &str) -> Option<PathBuf> {
+    /// Returns every Composer metadata candidate for a class. The most
+    /// specific PSR-4 prefix is selected, while all directories registered
+    /// for that prefix are retained so callers can surface ambiguity.
+    pub fn resolve_class_candidates(&self, fqn: &str) -> Vec<PathBuf> {
         let is_vendor_path = |path: &Path| {
             let Some(root) = &self.vendor_root else {
                 return true;
@@ -296,19 +313,29 @@ impl VendorSymbolIndex {
                     path.is_file()
                 );
             }
-            return is_vendor_path(path).then(|| path.clone());
+            return is_vendor_path(path)
+                .then(|| path.clone())
+                .into_iter()
+                .collect();
         }
-        let (prefix, tail, _) = self
+        let Some((prefix, tail, _)) = self
             .psr4
             .iter()
             .filter_map(|(prefix, bases)| {
                 fqn.strip_prefix(prefix).map(|tail| (prefix, tail, bases))
             })
-            .max_by_key(|(prefix, _, _)| prefix.len())?;
+            .max_by_key(|(prefix, _, _)| prefix.len())
+        else {
+            return Vec::new();
+        };
         let relative = tail
             .trim_start_matches('\\')
             .replace('\\', std::path::MAIN_SEPARATOR_STR);
-        for base in &self.psr4.iter().find(|(p, _)| p == prefix)?.1 {
+        let mut candidates = Vec::new();
+        let Some((_, bases)) = self.psr4.iter().find(|(p, _)| p == prefix) else {
+            return candidates;
+        };
+        for base in bases {
             let path = base.join(format!("{relative}.php"));
             if std::env::var_os("AXIOM_DEBUG_COMPOSER").is_some() {
                 eprintln!(
@@ -319,10 +346,38 @@ impl VendorSymbolIndex {
                 );
             }
             if path.is_file() && is_vendor_path(&path) {
-                return Some(path);
+                let path = canonical_or(path);
+                if !candidates.contains(&path) {
+                    candidates.push(path);
+                }
             }
         }
-        None
+        candidates
+    }
+
+    pub fn resolve_class(&self, fqn: &str) -> Option<PathBuf> {
+        self.resolve_class_candidates(fqn).into_iter().next()
+    }
+
+    /// Reports whether Composer metadata can account for a class without
+    /// probing or parsing its source file. This is suitable for lightweight
+    /// editor diagnostics while the actual resolution remains asynchronous.
+    pub fn has_class_metadata(&self, fqn: &str) -> bool {
+        self.classmap.contains_key(fqn)
+            || self.psr4.iter().any(|(prefix, _)| {
+                fqn == prefix.trim_end_matches('\\')
+                    || fqn.starts_with(&format!("{}\\", prefix.trim_end_matches('\\')))
+            })
+    }
+
+    /// Stable metadata-only fingerprint used by source providers to decide
+    /// whether Composer resolution needs to be refreshed.
+    pub fn metadata_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.classmap.hash(&mut hasher);
+        self.psr4.hash(&mut hasher);
+        hasher.finish()
     }
 
     pub fn symbols_of(&mut self, fqn: &str) -> Vec<ProjectSymbol> {
@@ -433,6 +488,72 @@ impl VendorSymbolIndex {
                     });
                 }
             }
+            // Capture declared properties as well as methods. This is needed
+            // for `$this->nextId` and similar accesses inside vendor traits.
+            let has_visibility = ["public", "protected", "private", "var"]
+                .iter()
+                .any(|modifier| trimmed.split_whitespace().any(|word| word == *modifier));
+            if has_visibility {
+                if let Some(dollar) = trimmed.find('$') {
+                    let name = trimmed[dollar + 1..]
+                        .chars()
+                        .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                        .collect::<String>();
+                    if !name.is_empty() {
+                        let start = offset + line.len() - trimmed.len() + dollar + 1;
+                        symbols.push(ProjectSymbol {
+                            name: name.clone(),
+                            fully_qualified_name: format!("{fqn}::{name}"),
+                            kind: ProjectSymbolKind::Property,
+                            file: path.clone(),
+                            range: start..start + name.len(),
+                            namespace: namespace.clone(),
+                            visibility: if trimmed.contains("private") {
+                                Visibility::Private
+                            } else if trimmed.contains("protected") {
+                                Visibility::Protected
+                            } else {
+                                Visibility::Public
+                            },
+                            modifiers: vec!["composer".into()],
+                            parameters: None,
+                            return_type: None,
+                        });
+                    }
+                }
+            }
+        }
+        // Methods supplied by traits are callable on the consuming class.
+        // Load only explicitly used traits, on the background worker, and
+        // retain their symbols in the same class result for member lookup.
+        let trait_names: Vec<String> = text
+            .lines()
+            .filter_map(|line| {
+                let value = line
+                    .trim()
+                    .strip_prefix("use ")?
+                    .trim_end_matches(';')
+                    .trim();
+                (value
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '\\')))
+                .then(|| value.to_owned())
+            })
+            .collect();
+        for trait_name in trait_names {
+            let trait_fqn = if trait_name.starts_with('\\') || trait_name.contains('\\') {
+                trait_name.trim_start_matches('\\').to_owned()
+            } else if namespace.is_empty() {
+                trait_name
+            } else {
+                format!("{namespace}\\{trait_name}")
+            };
+            let trait_symbols = self.symbols_of(&trait_fqn);
+            symbols.extend(
+                trait_symbols
+                    .into_iter()
+                    .filter(|symbol| symbol.kind == ProjectSymbolKind::Method),
+            );
         }
         self.parsed.insert(fqn.to_owned(), symbols.clone());
         if let Ok(metadata) = fs::metadata(&path) {
@@ -832,6 +953,9 @@ impl ProjectSymbolIndex {
     pub fn symbols(&self) -> &[ProjectSymbol] {
         &self.symbols
     }
+    pub fn indexed_files(&self) -> impl Iterator<Item = &Path> {
+        self.files.keys().map(PathBuf::as_path)
+    }
     pub fn report(&self) -> IndexReport {
         let mut names = std::collections::HashSet::new();
         let duplicates = self
@@ -955,6 +1079,7 @@ fn walk(
                     Some(parent),
                     ProjectSymbolKind::Method
                     | ProjectSymbolKind::Property
+                    | ProjectSymbolKind::Constant
                     | ProjectSymbolKind::ClassConstant,
                 ) => format!("{namespace}\\{parent}::{name}"),
                 _ if namespace.is_empty() => name.clone(),
@@ -1231,6 +1356,43 @@ mod tests {
         assert_eq!(
             index.resolve_class("Omegaalfa\\FiberEventLoop\\FiberEventLoop"),
             Some(fs::canonicalize(source).unwrap())
+        );
+    }
+
+    #[test]
+    fn vendor_symbols_include_methods_from_used_traits() {
+        let dir = tempfile::tempdir().unwrap();
+        let composer = dir.path().join("vendor/composer");
+        let src = dir.path().join("vendor/pkg/src");
+        fs::create_dir_all(&composer).unwrap();
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("FiberEventLoop.php"),
+            "<?php\nnamespace Pkg;\nuse Pkg\\Traits\\LoopTrait;\nclass FiberEventLoop\n{\n    protected $loop;\n    use LoopTrait;\n}\n",
+        )
+        .unwrap();
+        fs::create_dir_all(src.join("Traits")).unwrap();
+        fs::write(
+            src.join("Traits/LoopTrait.php"),
+            "<?php\nnamespace Pkg\\Traits;\ntrait LoopTrait\n{\n    public function next(): void {}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            composer.join("autoload_psr4.php"),
+            "'Pkg\\\\' => array($vendorDir . '/pkg/src'),",
+        )
+        .unwrap();
+        let mut index = VendorSymbolIndex::load(dir.path()).unwrap();
+        let symbols = index.symbols_of("Pkg\\FiberEventLoop");
+        assert!(
+            symbols.iter().any(|symbol| {
+                symbol.kind == ProjectSymbolKind::Method && symbol.name == "next"
+            })
+        );
+        assert!(
+            symbols.iter().any(|symbol| {
+                symbol.kind == ProjectSymbolKind::Property && symbol.name == "loop"
+            })
         );
     }
 }

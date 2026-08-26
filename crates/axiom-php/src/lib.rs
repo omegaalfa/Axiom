@@ -419,6 +419,19 @@ impl RuntimeSymbolIndex {
             .collect()
     }
 
+    /// Iterates over every runtime declaration. This is intentionally a
+    /// snapshot of references into the index; callers that need ownership can
+    /// clone the selected symbols while the index remains immutable.
+    pub fn symbols(&self) -> Vec<&Symbol> {
+        self.classes
+            .values()
+            .chain(self.functions.values())
+            .chain(self.constants.values())
+            .chain(self.members.values())
+            .flat_map(|items| items.iter())
+            .collect()
+    }
+
     pub fn methods_of(&self, class_fqn: &str) -> impl Iterator<Item = &Symbol> {
         self.members_of(class_fqn)
             .iter()

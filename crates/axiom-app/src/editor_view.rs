@@ -13,7 +13,9 @@ use std::{
 };
 
 use axiom_editor::Document;
-use axiom_index::{ProjectSymbolIndex, ProjectSymbolKind, VendorSymbolIndex};
+use axiom_index::{
+    FindUsagesStatus, ProjectSymbolIndex, ProjectSymbolKind, SemanticEngine, VendorSymbolIndex,
+};
 use axiom_lsp::{PositionCodec, PositionEncoding, path_to_uri};
 use axiom_php::{RuntimeSymbolIndex, Symbol as RuntimeSymbol, SymbolKind as RuntimeKind};
 use axiom_project::is_php_file;
@@ -22,9 +24,9 @@ use gpui::background_executor;
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollStrategy, SharedString, Style, TextRun, UTF16Selection, UniformListScrollHandle, Window,
-    actions, div, prelude::*, px, relative, uniform_list,
+    LayoutId, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollStrategy, SharedString, Style, TextRun, UTF16Selection,
+    UniformListScrollHandle, Window, actions, div, prelude::*, px, relative, uniform_list,
 };
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
@@ -150,11 +152,25 @@ pub struct EditorView {
     ctrl_hover_range: Option<Range<usize>>,
     line_layouts: RefCell<HashMap<usize, CachedLineLayout>>,
     runtime_symbols: Option<Arc<RuntimeSymbolIndex>>,
+    // LIMITATION: poisoned project/vendor locks are treated as unavailable.
+    // Recovering with PoisonError::into_inner could expose an index whose
+    // invariants were broken by the panic that poisoned a write guard.
     project_symbols: Option<Arc<std::sync::RwLock<ProjectSymbolIndex>>>,
     vendor_symbols: Option<Arc<std::sync::RwLock<VendorSymbolIndex>>>,
+    semantic_engine: Option<Arc<SemanticEngine>>,
     project_index_revision: Option<Arc<AtomicU64>>,
     index_update_sender: Option<Sender<IndexUpdateRequest>>,
     last_completion_layout: Option<(u32, u32, u32, u32, bool)>,
+    editor_scroll_hovered: bool,
+    editor_scroll_drag_axis: Option<EditorScrollAxis>,
+    editor_scroll_drag_start: Point<Pixels>,
+    editor_scroll_drag_start_offset: Point<Pixels>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorScrollAxis {
+    Vertical,
+    Horizontal,
 }
 
 #[derive(Clone)]
@@ -291,9 +307,14 @@ impl EditorView {
             runtime_symbols: None,
             project_symbols: None,
             vendor_symbols: None,
+            semantic_engine: None,
             project_index_revision: None,
             index_update_sender: Some(index_update_sender),
             last_completion_layout: None,
+            editor_scroll_hovered: false,
+            editor_scroll_drag_axis: None,
+            editor_scroll_drag_start: Point::default(),
+            editor_scroll_drag_start_offset: Point::default(),
         };
         let inspections_started = std::time::Instant::now();
         view.sync_syntax();
@@ -334,6 +355,14 @@ impl EditorView {
 
     pub fn document_path(&self) -> Option<&Path> {
         self.document.file_path()
+    }
+
+    pub fn document_content(&self) -> String {
+        self.document.content()
+    }
+
+    pub fn current_cursor_offset(&self) -> usize {
+        self.document.cursor_offset()
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -461,14 +490,6 @@ impl EditorView {
             None
         }
         .or_else(|| {
-            let resolved = self.resolve_class_name(name, &text_at_cursor);
-            self.vendor_symbols
-                .as_ref()
-                .and_then(|index| index.try_read().ok())
-                .and_then(|index| index.resolve_class(&resolved))
-                .map(|path| (path, 0..0))
-        })
-        .or_else(|| {
             self.runtime_symbols.as_ref().and_then(|index| {
                 index
                     .find_class(name)
@@ -483,10 +504,52 @@ impl EditorView {
     /// dependency file. The caller must resolve/parse it off the UI thread.
     pub fn definition_query(&self) -> Option<DefinitionQuery> {
         let syntax = self.syntax.as_ref()?;
-        let token = syntax.token_at_byte(self.document.cursor_offset())?;
+        let cursor_offset = self.document.cursor_offset();
+        if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+            tracing::info!(cursor_offset, "[DEFINITION QUERY INPUT]");
+        }
+        let token = syntax.token_at_byte(cursor_offset)?;
+        if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+            let node = syntax
+                .tree()
+                .root_node()
+                .descendant_for_byte_range(token.range.start, token.range.end);
+            tracing::info!(
+                token_text = %token.text,
+                token_kind = %token.kind,
+                token_range = ?token.range,
+                node_kind = ?node.as_ref().map(|node| node.kind()),
+                node_range = ?node.as_ref().map(|node| node.byte_range()),
+                node_text = ?node.as_ref().and_then(|node| {
+                    node.utf8_text(self.document.content().as_bytes())
+                        .ok()
+                        .map(str::to_owned)
+                }),
+                keyword = syntax.is_keyword_at_byte(cursor_offset),
+                "[DEFINITION QUERY TOKEN]"
+            );
+        }
+        // A keyword is never a definition query.  This guard keeps legacy
+        // project/vendor fallback from turning `return` (or another control
+        // keyword) into a namespaced class such as `Namespace\\return`.
+        if syntax.is_keyword_at_byte(cursor_offset) {
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                tracing::info!(branch = "KeywordNone", "[DEFINITION QUERY BRANCH]");
+            }
+            return None;
+        }
         let text = self.document.content();
         let before = &text[..token.range.start];
-        if let Some(operator) = before.rfind("->").or_else(|| before.rfind("::")) {
+        // Only inspect the current expression. Looking through the entire
+        // document prefix lets an earlier `$this->...` make an unrelated
+        // `new Future` token look like a method member.
+        let expression_start = before
+            .rfind(|ch: char| matches!(ch, ';' | '{' | '}' | '\n'))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let expression = &before[expression_start..];
+        if let Some(relative_operator) = expression.rfind("->").or_else(|| expression.rfind("::")) {
+            let operator = expression_start + relative_operator;
             let is_static = before[operator..].starts_with("::");
             let owner_end = operator;
             let (_, written_owner) = extract_owner_expression(before, owner_end);
@@ -498,6 +561,9 @@ impl EditorView {
             if debug_completion_enabled() {
                 tracing::info!(token = %token.text, kind = "Method", written = %written_owner, resolved = %owner_fqn, via = "receiver-type", "[DEFINITION QUERY]");
             }
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                tracing::info!(branch = "Method", "[DEFINITION QUERY BRANCH]");
+            }
             return Some(DefinitionQuery::Method {
                 owner_fqn,
                 name: token.text.trim_start_matches('$').to_owned(),
@@ -507,6 +573,9 @@ impl EditorView {
         let name = token.text.trim_start_matches('$').to_owned();
         let is_new = text[..token.range.start].trim_end().ends_with("new");
         if !is_new && text[token.range.end..].starts_with('(') {
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                tracing::info!(branch = "Function", "[DEFINITION QUERY BRANCH]");
+            }
             return Some(DefinitionQuery::Function { name });
         }
         let fqn = resolve_php_class_name(&name, &text);
@@ -522,6 +591,9 @@ impl EditorView {
                 "namespace-or-global"
             };
             tracing::info!(token = %name, kind = "Name", written = %name, resolved = %fqn, via, "[DEFINITION QUERY]");
+        }
+        if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+            tracing::info!(branch = "Name", "[DEFINITION QUERY BRANCH]");
         }
         Some(DefinitionQuery::Name { fqn, written: name })
     }
@@ -539,13 +611,8 @@ impl EditorView {
             DefinitionQuery::Function { .. } => return None,
         };
         let index = self.vendor_symbols.clone()?;
-        let path = index.try_read().ok()?.resolve_class(&fqn);
-        if debug_completion_enabled() {
-            tracing::info!(fqn = %fqn, found = path.is_some(), path = ?path, "[VENDOR PREFLIGHT]");
-        }
-        if path.is_none() {
-            return None;
-        }
+        // Vendor metadata and dependency files are resolved by the background
+        // worker. Never perform UNC filesystem probes on the UI thread.
         Some(VendorDefinitionRequest {
             index,
             fqn,
@@ -601,6 +668,10 @@ impl EditorView {
     pub fn set_vendor_symbols(&mut self, symbols: Arc<std::sync::RwLock<VendorSymbolIndex>>) {
         self.vendor_symbols = Some(symbols);
         self.sync_syntax();
+    }
+
+    pub fn set_semantic_engine(&mut self, engine: Arc<SemanticEngine>) {
+        self.semantic_engine = Some(engine);
     }
 
     pub fn close_lsp_document(&self) {
@@ -1388,14 +1459,14 @@ impl EditorView {
                     .and_then(|index| index.try_read().ok())
                     .and_then(|index| index.find_class(&resolved).cloned());
                 let known_project = project_symbol.is_some();
-                let composer_found = if vendor_lookup_needed(known_project) {
-                    self.vendor_symbols
-                        .as_ref()
-                        .and_then(|vendor| vendor.try_read().ok())
-                        .is_some_and(|vendor| vendor.resolve_class(&resolved).is_some())
-                } else {
-                    false
-                };
+                let known_vendor = self
+                    .vendor_symbols
+                    .as_ref()
+                    .and_then(|index| index.try_read().ok())
+                    .is_some_and(|index| index.has_class_metadata(&resolved));
+                // Composer resolution performs filesystem probes. Completion
+                // must not perform those probes synchronously on the UI thread.
+                let composer_found = false;
                 let known_runtime = self.runtime_symbols.as_ref().is_some_and(|runtime| {
                     runtime.find_class(&resolved).is_some()
                         || runtime.find_class_by_short_name(name).is_some()
@@ -1408,7 +1479,11 @@ impl EditorView {
                 // LSP readiness is reported for diagnostics, but it does not
                 // prove that this class exists. Native/project/runtime indexes
                 // remain the source of truth for this local inspection.
-                let diagnostic = !known_project && !composer_found && !known_runtime && !special;
+                let diagnostic = !known_project
+                    && !known_vendor
+                    && !composer_found
+                    && !known_runtime
+                    && !special;
                 if debug_completion_enabled() {
                     let via = if resolved == name {
                         if text[..start].contains("namespace ") {
@@ -1429,6 +1504,7 @@ impl EditorView {
                         resolved = %resolved,
                         via,
                         project_found = known_project,
+                        vendor_found = known_vendor,
                         composer_found,
                         runtime_found = known_runtime,
                         lsp_found,
@@ -2049,15 +2125,8 @@ impl EditorView {
         {
             return None;
         }
-        for line in text.lines() {
-            let normalized = line.trim().trim_end_matches(';');
-            let use_name = normalized
-                .strip_prefix("use ")
-                .and_then(|value| value.split_whitespace().next())
-                .map(|value| value.trim_matches('\\'));
-            if use_name == Some(fqn) || normalized.ends_with(&format!("\\{short} as {short}")) {
-                return None;
-            }
+        if has_import(&text, fqn) {
+            return None;
         }
         let mut last_use_end = None;
         let mut namespace_end = None;
@@ -2105,9 +2174,20 @@ impl EditorView {
     }
 
     fn resolve_native_type(&self, owner: &str, context: &str) -> Option<String> {
-        let mut candidate = owner.trim().trim_start_matches('$').to_owned();
-        if candidate == "this" {
-            candidate = self.file_path.file_stem()?.to_string_lossy().into_owned();
+        let owner = owner.trim();
+        if owner == "$this" {
+            let resolved = declared_class_fqn(context);
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                eprintln!(
+                    "[DEFINITION RECEIVER TYPE] owner={owner:?} candidate={:?} final={:?}",
+                    "this", resolved
+                );
+            }
+            return resolved;
+        }
+        let candidate = owner.trim_start_matches('$').to_owned();
+        if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+            eprintln!("[DEFINITION RECEIVER TYPE] owner={owner:?} candidate={candidate:?}");
         }
         let variable = format!("${candidate}");
         let patterns = [
@@ -2132,14 +2212,31 @@ impl EditorView {
                 }
             }
         }
-        if let Some(pos) = context.rfind(&format!("${candidate}")) {
+        let variable_name = format!("${candidate}");
+        let occurrences: Vec<_> = context.match_indices(&variable_name).collect();
+        for (pos, _) in occurrences.into_iter().rev() {
+            let suffix = &context[pos + variable_name.len()..];
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                eprintln!(
+                    "[DEFINITION RECEIVER OCCURRENCE] owner={owner:?} pos={pos} suffix={suffix:?}"
+                );
+            }
+            // A usage in `$future->await` is not a declaration. The old
+            // rfind-based heuristic selected this occurrence and read the
+            // preceding statement word (`return`) as its type.
+            if suffix.trim_start().starts_with("->") || suffix.trim_start().starts_with("::") {
+                continue;
+            }
             let declaration = &context[..pos];
             let ty = declaration
-                .split_whitespace()
-                .last()
+                .rsplit(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '_' | '\\' | '?' | '|')))
+                .find(|part| !part.is_empty())
                 .unwrap_or_default()
                 .trim_start_matches('?')
                 .trim_matches('|');
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                eprintln!("[DEFINITION RECEIVER TYPE] declaration={declaration:?} ty={ty:?}");
+            }
             if !ty.is_empty()
                 && ty
                     .chars()
@@ -2155,7 +2252,8 @@ impl EditorView {
         }) {
             return Some(candidate);
         }
-        self.project_symbols
+        let resolved = self
+            .project_symbols
             .as_ref()
             .and_then(|index| index.try_read().ok())
             .and_then(|index| {
@@ -2163,7 +2261,11 @@ impl EditorView {
                     .find_class(&candidate)
                     .map(|symbol| symbol.fully_qualified_name.clone())
             })
-            .or_else(|| (!lower.is_empty()).then_some(candidate))
+            .or_else(|| (!lower.is_empty()).then_some(candidate));
+        if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+            eprintln!("[DEFINITION RECEIVER TYPE] owner={owner:?} final={resolved:?}");
+        }
+        resolved
     }
 
     /// Resolves a receiver expression, including the common two-level
@@ -2214,14 +2316,6 @@ impl EditorView {
         if contextual_exists {
             return candidate;
         }
-        let vendor_exists = self
-            .vendor_symbols
-            .as_ref()
-            .and_then(|index| index.try_read().ok())
-            .is_some_and(|index| index.resolve_class(&candidate).is_some());
-        if contextual_exists || vendor_exists {
-            return candidate;
-        }
         let global_exists = self
             .runtime_symbols
             .as_ref()
@@ -2255,17 +2349,6 @@ impl EditorView {
             tracing::info!(provider = "native-first", "[DEFINITION REQUEST]");
         }
         window.dispatch_action(NativeDefinition.boxed_clone(), cx);
-    }
-
-    fn references(&mut self, _: &References, _: &mut Window, cx: &mut Context<Self>) {
-        if let (Some(lsp), Some(uri), Some(position)) =
-            (&self.lsp, &self.lsp_uri, self.lsp_position())
-        {
-            lsp.request_references(uri.clone(), position);
-        } else {
-            self.status = Some("No references found (language server unavailable)".into());
-            cx.notify();
-        }
     }
 
     fn reformat(&mut self, _: &Reformat, _: &mut Window, cx: &mut Context<Self>) {
@@ -2651,6 +2734,40 @@ impl EditorView {
         let line = self.mouse_line(event.position);
         self.ctrl_hover_range = None;
         let offset = self.mouse_offset(line, event.position.x, window);
+        if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() && event.modifiers.control {
+            let token = self
+                .syntax
+                .as_ref()
+                .and_then(|syntax| syntax.token_at_byte(offset));
+            let ast_node = self.syntax.as_ref().and_then(|syntax| {
+                token.as_ref().and_then(|token| {
+                    syntax
+                        .tree()
+                        .root_node()
+                        .descendant_for_byte_range(token.range.start, token.range.end)
+                })
+            });
+            let line_start = self.document.offset_of_line(line);
+            let line_text = trim_eol(self.document.line_content(line).as_ref()).to_owned();
+            let await_range = line_text
+                .find("await")
+                .map(|start| line_start + start..line_start + start + "await".len());
+            tracing::info!(
+                line,
+                x = ?event.position.x,
+                y = ?event.position.y,
+                mouse_byte = offset,
+                line_start,
+                line_text = %line_text,
+                await_range = ?await_range,
+                token_text = ?token.as_ref().map(|token| token.text.as_str()),
+                token_kind = ?token.as_ref().map(|token| token.kind.as_str()),
+                token_range = ?token.as_ref().map(|token| token.range.clone()),
+                ast_node_kind = ?ast_node.as_ref().map(|node| node.kind()),
+                ast_node_range = ?ast_node.as_ref().map(|node| node.byte_range()),
+                "[DEFINITION MOUSE INPUT]"
+            );
+        }
         if event.modifiers.control {
             if debug_input_enabled() {
                 tracing::info!(
@@ -2671,6 +2788,12 @@ impl EditorView {
                 }
             }
             self.move_to(offset, cx);
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                tracing::info!(
+                    cursor_after_move = self.document.cursor_offset(),
+                    "[DEFINITION CURSOR]"
+                );
+            }
             self.selecting = false;
             window.dispatch_action(Definition.boxed_clone(), cx);
             return;
@@ -2786,6 +2909,78 @@ impl EditorView {
         self.selecting = false;
     }
 
+    fn editor_scroll_hover(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor_scroll_hovered = *hovered;
+        cx.notify();
+    }
+
+    fn editor_scroll_drag_start(
+        &mut self,
+        axis: EditorScrollAxis,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = self.scroll.0.borrow().base_handle.offset();
+        self.editor_scroll_drag_axis = Some(axis);
+        self.editor_scroll_drag_start = event.position;
+        self.editor_scroll_drag_start_offset = offset;
+        cx.notify();
+    }
+
+    fn editor_scroll_drag_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        let Some(axis) = self.editor_scroll_drag_axis else {
+            return;
+        };
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let bounds = handle.bounds();
+        let max = handle.max_offset();
+        let delta = event.position - self.editor_scroll_drag_start;
+        let (viewport, maximum, thumb) = match axis {
+            EditorScrollAxis::Vertical => {
+                let viewport: f32 = bounds.size.height.into();
+                let maximum: f32 = max.height.into();
+                let thumb = (viewport * viewport / (viewport + maximum).max(1.0)).max(24.0);
+                (viewport, maximum, thumb)
+            }
+            EditorScrollAxis::Horizontal => {
+                let viewport: f32 = bounds.size.width.into();
+                let maximum: f32 = max.width.into();
+                let thumb = (viewport * viewport / (viewport + maximum).max(1.0)).max(36.0);
+                (viewport, maximum, thumb)
+            }
+        };
+        let track = (viewport - thumb).max(1.0);
+        let position = match axis {
+            EditorScrollAxis::Vertical => {
+                let start: f32 = (-self.editor_scroll_drag_start_offset.y).into();
+                let movement: f32 = delta.y.into();
+                (start + movement * maximum / track).clamp(0.0, maximum)
+            }
+            EditorScrollAxis::Horizontal => {
+                let start: f32 = (-self.editor_scroll_drag_start_offset.x).into();
+                let movement: f32 = delta.x.into();
+                (start + movement * maximum / track).clamp(0.0, maximum)
+            }
+        };
+        let mut next = self.editor_scroll_drag_start_offset;
+        match axis {
+            EditorScrollAxis::Vertical => next.y = px(-position),
+            EditorScrollAxis::Horizontal => next.x = px(-position),
+        }
+        handle.set_offset(next);
+    }
+
+    fn editor_scroll_drag_end(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor_scroll_drag_axis = None;
+        cx.notify();
+    }
+
     fn right_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -2829,6 +3024,7 @@ impl EditorView {
         let t = theme();
         let raw = self.document.line_content(line);
         let text = trim_eol(raw.as_ref()).to_owned();
+        let shaped_width = self.line_layout(line, &text, window).width;
         let start = self.document.offset_of_line(line);
         let end = start + text.len();
         let selection = self.document.selection_offsets();
@@ -2914,6 +3110,7 @@ impl EditorView {
             .id(line)
             .relative()
             .flex()
+            .w(px(GUTTER_WIDTH + TEXT_PADDING) + shaped_width)
             .h(px(LINE_HEIGHT))
             .line_height(px(LINE_HEIGHT))
             .text_size(px(FONT_SIZE))
@@ -2952,7 +3149,9 @@ impl EditorView {
                         line + 1
                     )),
             )
-            .child(div().flex_1().h_full().pl_3().child(content))
+            // Keep the code column at its shaped text width so the
+            // unconstrained uniform list can expose horizontal scrolling.
+            .child(div().flex_none().h_full().pl_3().child(content))
             .when_some(hover, |this, (from, to)| {
                 this.child(
                     div()
@@ -3012,6 +3211,21 @@ impl EditorView {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FindUsagesSource {
+    Semantic,
+    LegacyOrLsp,
+}
+
+pub(crate) fn find_usages_source(status: FindUsagesStatus) -> FindUsagesSource {
+    if matches!(status, FindUsagesStatus::Complete) {
+        FindUsagesSource::Semantic
+    } else {
+        FindUsagesSource::LegacyOrLsp
+    }
+}
+
+#[cfg(test)]
 fn vendor_lookup_needed(project_found: bool) -> bool {
     !project_found
 }
@@ -3049,18 +3263,9 @@ fn resolve_php_class_name(written: &str, context: &str) -> String {
     if written.contains('\\') {
         return written.to_owned();
     }
-    for line in context.lines() {
-        let line = line.trim();
-        let Some(value) = line.strip_prefix("use ") else {
-            continue;
-        };
-        let value = value.split(';').next().unwrap_or(value).trim();
-        let (fqn, alias) = value
-            .split_once(" as ")
-            .map(|(fqn, alias)| (fqn, alias.trim()))
-            .unwrap_or((value, value.rsplit('\\').next().unwrap_or(value)));
+    for (fqn, alias) in context.lines().flat_map(parse_use_imports) {
         if alias == written {
-            return fqn.trim_start_matches('\\').to_owned();
+            return fqn;
         }
     }
     context
@@ -3073,6 +3278,49 @@ fn resolve_php_class_name(written: &str, context: &str) -> String {
         })
         .map(|namespace| format!("{namespace}\\{written}"))
         .unwrap_or_else(|| written.to_owned())
+}
+
+/// Returns `(fully-qualified import, local binding)` pairs for PHP `use`
+/// declarations, including grouped imports.
+fn parse_use_imports(line: &str) -> Vec<(String, String)> {
+    let Some(value) = line.trim().strip_prefix("use ") else {
+        return Vec::new();
+    };
+    let value = value.split(';').next().unwrap_or(value).trim();
+    if let Some((prefix, members)) = value.split_once('{') {
+        let prefix = prefix.trim().trim_end_matches('\\');
+        return members
+            .trim_end_matches('}')
+            .split(',')
+            .filter_map(|member| {
+                let member = member.trim();
+                if member.is_empty() {
+                    return None;
+                }
+                let (name, alias) = member
+                    .split_once(" as ")
+                    .map(|(name, alias)| (name.trim(), alias.trim()))
+                    .unwrap_or((member, member.rsplit('\\').next().unwrap_or(member)));
+                let fqn = format!("{prefix}\\{}", name.trim_matches('\\'));
+                Some((fqn, alias.to_owned()))
+            })
+            .collect();
+    }
+    let (fqn, alias) = value
+        .split_once(" as ")
+        .map(|(fqn, alias)| (fqn.trim(), alias.trim().to_owned()))
+        .unwrap_or_else(|| {
+            let fqn = value.trim();
+            (fqn, fqn.rsplit('\\').next().unwrap_or(fqn).to_owned())
+        });
+    vec![(fqn.trim_matches('\\').to_owned(), alias)]
+}
+
+fn has_import(context: &str, fqn: &str) -> bool {
+    context
+        .lines()
+        .flat_map(parse_use_imports)
+        .any(|(import, _)| import == fqn)
 }
 
 fn extract_owner_expression(text: &str, owner_end: usize) -> (usize, String) {
@@ -3100,19 +3348,26 @@ fn current_namespace(context: &str) -> String {
 }
 
 fn declared_class_fqn(context: &str) -> Option<String> {
-    let class = context.lines().find_map(|line| {
+    let declared = context.lines().find_map(|line| {
         let line = line.trim();
-        let pos = line.find("class ")?;
-        let name = line[pos + 6..]
-            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-            .next()?;
-        (!name.is_empty()).then_some(name.to_owned())
+        // `$this` inside a trait resolves in the trait's lexical context.
+        // Keep the same owner-FQN path for all PHP type declarations rather
+        // than only recognizing classes.
+        ["class ", "trait ", "interface ", "enum "]
+            .into_iter()
+            .find_map(|keyword| {
+                let pos = line.find(keyword)?;
+                let name = line[pos + keyword.len()..]
+                    .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                    .next()?;
+                (!name.is_empty()).then_some(name.to_owned())
+            })
     })?;
     let namespace = current_namespace(context);
     Some(if namespace.is_empty() {
-        class
+        declared
     } else {
-        format!("{namespace}\\{class}")
+        format!("{namespace}\\{declared}")
     })
 }
 
@@ -3428,6 +3683,31 @@ impl Render for EditorView {
         let has_selection = self.document.selection_offsets().is_some();
         let php_navigation = is_php_file(&self.file_path) && self.lsp.is_some();
         let viewport = self.scroll.0.borrow().base_handle.bounds();
+        let scroll_handle = self.scroll.0.borrow().base_handle.clone();
+        let scroll_max = scroll_handle.max_offset();
+        let viewport_w: f32 = viewport.size.width.into();
+        let viewport_h: f32 = viewport.size.height.into();
+        let max_x: f32 = scroll_max.width.into();
+        let max_y: f32 = scroll_max.height.into();
+        let vertical_thumb = (viewport_h * viewport_h / (viewport_h + max_y).max(1.0))
+            .max(24.0)
+            .min(viewport_h.max(24.0));
+        let horizontal_thumb = (viewport_w * viewport_w / (viewport_w + max_x).max(1.0))
+            .max(36.0)
+            .min(viewport_w.max(36.0));
+        let offset = scroll_handle.offset();
+        let offset_x: f32 = (-offset.x).into();
+        let offset_y: f32 = (-offset.y).into();
+        let vertical_top = if max_y > 0.0 {
+            offset_y / max_y * (viewport_h - vertical_thumb).max(0.0)
+        } else {
+            0.0
+        };
+        let horizontal_left = if max_x > 0.0 {
+            offset_x / max_x * (viewport_w - horizontal_thumb).max(0.0)
+        } else {
+            0.0
+        };
         let line = self.document.line_of_offset(self.document.cursor_offset());
         let line_start = self.document.offset_of_line(line);
         let line_content = self.document.line_content(line);
@@ -3542,7 +3822,6 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::complete))
             .on_action(cx.listener(Self::hover_info))
             .on_action(cx.listener(Self::definition))
-            .on_action(cx.listener(Self::references))
             .on_action(cx.listener(Self::reformat))
             .on_action(cx.listener(Self::signature_help))
             .on_action(cx.listener(Self::complete_statement))
@@ -3552,8 +3831,13 @@ impl Render for EditorView {
             .on_mouse_move(cx.listener(Self::mouse_move))
             .child(
                 div()
+                    .id("editor-viewport")
                     .relative()
                     .flex_1()
+                    .on_hover(cx.listener(Self::editor_scroll_hover))
+                    .on_mouse_move(cx.listener(Self::editor_scroll_drag_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::editor_scroll_drag_end))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::editor_scroll_drag_end))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event, window, cx| {
@@ -3580,9 +3864,76 @@ impl Render for EditorView {
                                 range.map(|line| this.render_line(line, window)).collect()
                             }),
                         )
+                        .with_horizontal_sizing_behavior(
+                            ListHorizontalSizingBehavior::Unconstrained,
+                        )
                         .track_scroll(self.scroll.clone())
                         .h_full(),
                     )
+                    .when(self.editor_scroll_hovered && max_y > 0.0, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .right(px(2.))
+                                .top(px(0.))
+                                .bottom(px(8.))
+                                .w(px(8.))
+                                .bg(t.scrollbar)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event, window, cx| {
+                                        this.editor_scroll_drag_start(
+                                            EditorScrollAxis::Vertical,
+                                            event,
+                                            window,
+                                            cx,
+                                        )
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(1.))
+                                        .right(px(1.))
+                                        .top(px(vertical_top))
+                                        .h(px(vertical_thumb))
+                                        .rounded(px(4.))
+                                        .bg(t.scrollbar_hover),
+                                ),
+                        )
+                    })
+                    .when(self.editor_scroll_hovered && max_x > 0.0, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .left(px(0.))
+                                .right(px(8.))
+                                .bottom(px(2.))
+                                .h(px(8.))
+                                .bg(t.scrollbar)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event, window, cx| {
+                                        this.editor_scroll_drag_start(
+                                            EditorScrollAxis::Horizontal,
+                                            event,
+                                            window,
+                                            cx,
+                                        )
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(horizontal_left))
+                                        .top(px(1.))
+                                        .bottom(px(1.))
+                                        .w(px(horizontal_thumb))
+                                        .rounded(px(4.))
+                                        .bg(t.scrollbar_hover),
+                                ),
+                        )
+                    })
                     .when(!self.completions.is_empty(), |this| {
                         this.child(
                             div()
@@ -4151,12 +4502,150 @@ fn shape(window: &mut Window, text: &str) -> gpui::ShapedLine {
 #[cfg(test)]
 mod formatter_tests {
     use super::{
-        Arc, VendorSymbolIndex, completion_presentation, declared_class_fqn, declared_parent_fqn,
-        extract_owner_expression, native_format_php, property_type_in_context,
-        resolve_php_class_name, resolve_vendor_definition_target, vendor_lookup_needed,
+        Arc, DefinitionQuery, EditorView, FindUsagesSource, ProjectSymbolIndex, VendorSymbolIndex,
+        completion_presentation, declared_class_fqn, declared_parent_fqn, extract_owner_expression,
+        find_usages_source, native_format_php, property_type_in_context, resolve_php_class_name,
+        resolve_vendor_definition_target, vendor_lookup_needed,
     };
+    use axiom_index::FindUsagesStatus;
     use lsp_types::CompletionItem;
     use std::time::Duration;
+
+    #[gpui::test]
+    fn definition_query_uses_method_at_real_editor_cursor(cx: &mut gpui::TestAppContext) {
+        let source = "<?php\nnamespace Omegaalfa\\HttpClient\\Http;\nuse Omegaalfa\\FiberEventLoop\\Future;\nfunction await(Future $future): mixed\n{\n    return $future->await();\n}\n";
+        let path = std::env::temp_dir().join("axiom-definition-query-integration.php");
+        let source_for_view = source.to_owned();
+        let path_for_view = path.clone();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_document(
+                path_for_view,
+                axiom_editor::Document::from_content(&source_for_view),
+                None,
+                cx,
+            )
+        });
+        let offset = source.rfind("await").unwrap() + 2;
+        view.update(cx, |editor, _| editor.document.move_cursor(offset));
+        let query = view.update(cx, |editor, _| editor.definition_query());
+        assert!(
+            matches!(
+                &query,
+                Some(DefinitionQuery::Method {
+                    owner_fqn,
+                    name,
+                    is_static: false,
+                }) if owner_fqn == "Omegaalfa\\FiberEventLoop\\Future" && name == "await"
+            ),
+            "unexpected definition query: {query:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn definition_query_uses_declared_fqn_for_this_receiver(cx: &mut gpui::TestAppContext) {
+        let source = "<?php\nnamespace Omegaalfa\\FiberEventLoop;\nclass Future {\n    protected $loop;\n    public function await(): mixed {\n        $this->loop->next();\n    }\n}\n";
+        let path = std::env::temp_dir().join("Future.php");
+        let source_for_view = source.to_owned();
+        let path_for_view = path.clone();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_document(
+                path_for_view,
+                axiom_editor::Document::from_content(&source_for_view),
+                None,
+                cx,
+            )
+        });
+        let offset = source.rfind("loop->next").unwrap();
+        view.update(cx, |editor, _| editor.document.move_cursor(offset));
+        let query = view.update(cx, |editor, _| editor.definition_query());
+        assert!(
+            matches!(
+                &query,
+                Some(DefinitionQuery::Method { owner_fqn, name, .. })
+                    if owner_fqn == "Omegaalfa\\FiberEventLoop\\Future" && name == "loop"
+            ),
+            "unexpected $this receiver query: {query:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn definition_query_resolves_trait_members_and_imported_new_types(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "<?php\nnamespace Omegaalfa\\FiberEventLoop\\Traits;\nuse Omegaalfa\\FiberEventLoop\\Future;\ntrait FiberManagerTrait\n{\n    protected int $nextId = 1;\n    protected function generateId(): int\n    {\n        return $this->nextId++;\n    }\n    public function defer(callable $callable): int\n    {\n        $id = $this->generateId();\n        return $id;\n    }\n    public function async(callable $callable): Future\n    {\n        $future = new Future($this);\n        return $future;\n    }\n}\n";
+        let path = std::env::temp_dir().join("axiom-trait-definition-query.php");
+        let source_for_view = source.to_owned();
+        let path_for_view = path.clone();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_document(
+                path_for_view,
+                axiom_editor::Document::from_content(&source_for_view),
+                None,
+                cx,
+            )
+        });
+
+        let mut assert_method = |offset: usize, name: &str| {
+            view.update(cx, |editor, _| editor.document.move_cursor(offset));
+            let query = view.update(cx, |editor, _| editor.definition_query());
+            assert!(
+                matches!(
+                    &query,
+                    Some(DefinitionQuery::Method { owner_fqn, name: actual, .. })
+                        if owner_fqn == "Omegaalfa\\FiberEventLoop\\Traits\\FiberManagerTrait"
+                            && actual == name
+                ),
+                "unexpected trait query for {name}: {query:?}"
+            );
+        };
+
+        let generate = source.find("$this->generateId").unwrap() + "$this->".len();
+        assert_method(generate, "generateId");
+        let next_id = source.find("$this->nextId").unwrap() + "$this->".len();
+        assert_method(next_id, "nextId");
+
+        let future = source.find("new Future").unwrap() + "new ".len() + 2;
+        view.update(cx, |editor, _| editor.document.move_cursor(future));
+        let query = view.update(cx, |editor, _| editor.definition_query());
+        assert!(
+            matches!(
+                &query,
+                Some(DefinitionQuery::Name { fqn, written })
+                    if fqn == "Omegaalfa\\FiberEventLoop\\Future" && written == "Future"
+            ),
+            "unexpected imported type query: {query:?}"
+        );
+    }
+
+    #[test]
+    fn declared_owner_fqn_supports_interfaces_and_traits() {
+        let interface = "<?php\nnamespace Example;\ninterface Contract {\n    public function run(): void;\n}\n";
+        assert_eq!(
+            declared_class_fqn(interface).as_deref(),
+            Some("Example\\Contract")
+        );
+        let trait_source = "<?php\nnamespace Example;\ntrait Helpers {\n    protected function run(): void {}\n}\n";
+        assert_eq!(
+            declared_class_fqn(trait_source).as_deref(),
+            Some("Example\\Helpers")
+        );
+    }
+
+    #[test]
+    fn find_usages_source_policy_routes_only_complete_to_semantic() {
+        assert_eq!(
+            find_usages_source(FindUsagesStatus::Complete),
+            FindUsagesSource::Semantic
+        );
+        for status in [
+            FindUsagesStatus::Partial,
+            FindUsagesStatus::Ambiguous,
+            FindUsagesStatus::Deferred,
+            FindUsagesStatus::Stale,
+        ] {
+            assert_eq!(find_usages_source(status), FindUsagesSource::LegacyOrLsp);
+        }
+    }
 
     #[test]
     fn indents_nested_php_blocks() {
@@ -4234,6 +4723,35 @@ mod formatter_tests {
             ),
             "Omegaalfa\\FiberEventLoop\\FiberEventLoop"
         );
+    }
+
+    #[test]
+    fn group_import_resolves_members_and_aliases() {
+        let context = r#"use Foo\Bar\{Baz, Qux as Q};"#;
+        assert_eq!(resolve_php_class_name("Baz", context), "Foo\\Bar\\Baz");
+        assert_eq!(resolve_php_class_name("Q", context), "Foo\\Bar\\Qux");
+    }
+
+    #[test]
+    fn simple_import_forms_remain_unchanged() {
+        assert_eq!(resolve_php_class_name("Bar", "use Foo\\Bar;"), "Foo\\Bar");
+        assert_eq!(
+            resolve_php_class_name("Alias", "use Foo\\Bar as Alias;"),
+            "Foo\\Bar"
+        );
+        assert!(super::has_import("use Foo\\Bar\\{Baz};", "Foo\\Bar\\Baz"));
+    }
+
+    #[test]
+    fn poisoned_project_index_read_is_currently_discarded() {
+        let index = std::sync::Arc::new(std::sync::RwLock::new(ProjectSymbolIndex::new()));
+        let poisoned = index.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.write().expect("write lock");
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(index.try_read().is_err());
     }
 
     #[test]

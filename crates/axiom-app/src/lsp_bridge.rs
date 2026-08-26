@@ -42,7 +42,7 @@ pub enum IdeLspEvent {
     },
     References {
         uri: Uri,
-        count: usize,
+        locations: Vec<Location>,
         generation: u64,
     },
     Error(String),
@@ -244,7 +244,7 @@ impl LspBridge {
                 let event = match pending.recv::<Option<Vec<Location>>>(DEFAULT_REQUEST_TIMEOUT) {
                     Ok(response) => IdeLspEvent::References {
                         uri,
-                        count: response.unwrap_or_default().len(),
+                        locations: response.unwrap_or_default(),
                         generation,
                     },
                     Err(error) => IdeLspEvent::Error(error.to_string()),

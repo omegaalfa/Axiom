@@ -166,6 +166,24 @@ impl PhpSyntax {
         })
     }
 
+    /// Tree-sitter represents many PHP keywords as anonymous nodes. In those
+    /// cases `token_at_byte` returns the containing construct; use its first
+    /// named child to distinguish the keyword prefix from a real name.
+    pub fn is_keyword_at_byte(&self, offset: usize) -> bool {
+        let Some(token) = self.token_at_byte(offset) else {
+            return false;
+        };
+        let Some(node) = self
+            .tree
+            .root_node()
+            .descendant_for_byte_range(token.range.start, token.range.end)
+        else {
+            return false;
+        };
+        node.named_child(0)
+            .is_some_and(|child| offset < child.start_byte())
+    }
+
     pub fn diagnostics(&self) -> Vec<SyntaxDiagnostic> {
         let mut result = Vec::new();
         let mut stack = vec![self.tree.root_node()];
@@ -419,6 +437,20 @@ mod tests {
         let token = syntax.token_at_byte(offset).unwrap();
         assert_eq!(token.text, "UserService");
         assert_eq!(token.kind, "name");
+    }
+
+    #[test]
+    fn token_lookup_keeps_php_keywords_out_of_name_resolution() {
+        let source = "<?php return new Foo; function f() { if (true) { foreach ([] as $x) {} } } class Bar {}";
+        let syntax = assert_clean(source);
+        for keyword in ["return", "new", "function", "if", "foreach", "class"] {
+            let offset = source.find(keyword).unwrap();
+            assert!(syntax.is_keyword_at_byte(offset), "keyword={keyword}");
+        }
+        let await_source = "<?php $future->await();";
+        let await_syntax = assert_clean(await_source);
+        let await_offset = await_source.find("await").unwrap();
+        assert!(!await_syntax.is_keyword_at_byte(await_offset));
     }
 
     #[test]
