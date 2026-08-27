@@ -976,6 +976,9 @@ impl<'a> MemberResolver<'a> {
             }
             chain.push((current.clone(), depth, rank));
             let traits = self.traits_of(&current);
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() && !traits.is_empty() {
+                eprintln!("[INHERIT TRACE] owner={current} traits_used={traits:?}");
+            }
             for trait_name in traits {
                 queue.push((trait_name, depth + 1, 1));
             }
@@ -1015,18 +1018,16 @@ impl<'a> MemberResolver<'a> {
             .records
             .iter()
             .find(|scope| {
-                matches!(scope.kind, ScopeKind::Class | ScopeKind::Trait)
+                scope.file.is_some()
+                    && matches!(scope.kind, ScopeKind::Class | ScopeKind::Trait)
                     && scope.class_name.as_deref() == Some(class_name)
             })
             .map(|scope| scope.traits_used.clone())
             .unwrap_or_default();
         if names.is_empty() {
-            let class_scope = self
-                .snapshot
-                .scopes
-                .records
-                .iter()
-                .find(|scope| scope.class_name.as_deref() == Some(class_name));
+            let class_scope = self.snapshot.scopes.records.iter().find(|scope| {
+                scope.file.is_some() && scope.class_name.as_deref() == Some(class_name)
+            });
             if let Some(owner) = self
                 .snapshot
                 .symbols_for_fqn(class_name)
@@ -3145,6 +3146,43 @@ fn node_text<'a>(node: tree_sitter::Node<'a>, text: &'a str) -> &'a str {
     node.utf8_text(text.as_bytes()).unwrap_or("")
 }
 
+fn collect_trait_names(
+    builder: &SnapshotBuilder,
+    node: tree_sitter::Node<'_>,
+    scope: ScopeId,
+    text: &str,
+    output: &mut Vec<String>,
+) {
+    if node.kind() == "use_declaration" {
+        for name in node_text(node, text)
+            .trim()
+            .trim_end_matches(';')
+            .strip_prefix("use")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            output.push(resolve_builder_name(
+                builder,
+                scope,
+                name,
+                ImportKind::Class,
+            ));
+        }
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "function_definition" | "method_declaration" | "anonymous_function"
+    ) {
+        return;
+    }
+    for child in node.named_children(&mut node.walk()) {
+        collect_trait_names(builder, child, scope, text, output);
+    }
+}
+
 fn extract_scopes(
     builder: &mut SnapshotBuilder,
     node: tree_sitter::Node<'_>,
@@ -3246,23 +3284,14 @@ fn extract_scopes(
                 }
             }
             if matches!(kind, "class_declaration" | "trait_declaration") {
-                let traits = node
-                    .named_children(&mut node.walk())
-                    .filter(|child| child.kind() == "use_declaration")
-                    .flat_map(|use_node| {
-                        node_text(use_node, text)
-                            .trim()
-                            .strip_prefix("use")
-                            .unwrap_or_default()
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|name| !name.is_empty())
-                            .map(|name| {
-                                resolve_builder_name(builder, scope, name, ImportKind::Class)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
+                let mut traits = Vec::new();
+                collect_trait_names(builder, node, scope, text, &mut traits);
+                if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                    eprintln!(
+                        "[TRAIT RELATION BUILD] phase=extract owner={:?} traits_resolved={traits:?}",
+                        name
+                    );
+                }
                 builder.scopes.records[child.0 as usize].traits_used = traits;
             }
             mark_scope(builder, child, node);

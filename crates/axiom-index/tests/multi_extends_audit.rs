@@ -104,3 +104,73 @@ fn inherited_class_trait_supplies_method_property_and_constant() {
     assert_eq!(method.outcome, SemanticDefinitionOutcome::Resolved);
     assert_eq!(constant.outcome, SemanticDefinitionOutcome::Resolved);
 }
+
+#[test]
+fn direct_receiver_trait_namespace_alias_regression() {
+    let text = "<?php namespace Shared; trait T { public function run(): void {} public string $name; public const VERSION = '1'; } namespace Model; use Shared\\T as Runnable; class C { use Runnable; } function test(C $c): void { $c->run(); $c->name; } $v = C::VERSION;";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("direct-trait.php");
+    fs::write(&path, text).unwrap();
+    let mut index = ProjectSymbolIndex::new();
+    index.index_project(dir.path()).unwrap();
+    let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(5));
+    let run = snapshot.definition_at_detailed(
+        &path,
+        text,
+        text.find("$c->run").unwrap() + 4,
+        context(&snapshot),
+    );
+    assert_eq!(run.outcome, SemanticDefinitionOutcome::Resolved);
+    let name = snapshot.definition_at_detailed(
+        &path,
+        text,
+        text.find("$c->name").unwrap() + 4,
+        context(&snapshot),
+    );
+    let version = snapshot.definition_at_detailed(
+        &path,
+        text,
+        text.rfind("VERSION").unwrap(),
+        context(&snapshot),
+    );
+    assert_eq!(name.outcome, SemanticDefinitionOutcome::Resolved);
+    assert_eq!(version.outcome, SemanticDefinitionOutcome::Resolved);
+}
+
+#[test]
+fn incremental_replace_preserves_direct_trait_relation() {
+    let dir = tempfile::tempdir().unwrap();
+    let trait_path = dir.path().join("T.php");
+    let class_path = dir.path().join("C.php");
+    let test_path = dir.path().join("test.php");
+    let trait_text = "<?php namespace N; trait T { public function run(): void {} }";
+    let class_before = "<?php namespace N; class C {}";
+    let class_after = "<?php namespace N; class C { use T; }";
+    let use_text = "<?php namespace N; function test(C $c): void { $c->run(); }";
+    fs::write(&trait_path, trait_text).unwrap();
+    fs::write(&class_path, class_before).unwrap();
+    fs::write(&test_path, use_text).unwrap();
+    let mut index = ProjectSymbolIndex::new();
+    index.index_project(dir.path()).unwrap();
+    let base = SemanticSnapshot::from_project_index(&index, SemanticRevision(6));
+    let mut builder = axiom_index::SnapshotBuilder::from_snapshot(&base);
+    builder.replace_workspace_file(&class_path, class_after);
+    let changed = builder.finish();
+    let result = changed.definition_at_detailed(
+        &test_path,
+        use_text,
+        use_text.find("run").unwrap(),
+        context(&changed),
+    );
+    assert_eq!(result.outcome, SemanticDefinitionOutcome::Resolved);
+    let mut remove_builder = axiom_index::SnapshotBuilder::from_snapshot(&changed);
+    remove_builder.replace_workspace_file(&class_path, class_before);
+    let removed = remove_builder.finish();
+    let result = removed.definition_at_detailed(
+        &test_path,
+        use_text,
+        use_text.find("run").unwrap(),
+        context(&removed),
+    );
+    assert_eq!(result.outcome, SemanticDefinitionOutcome::MissingSymbol);
+}
