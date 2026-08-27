@@ -2041,7 +2041,7 @@ impl WorkspaceView {
                 token_text = ?token.as_ref().map(|token| token.text.as_str()),
                 token_kind = ?token.as_ref().map(|token| token.kind.as_str()),
                 token_range = ?token.as_ref().map(|token| token.range.clone()),
-                "[DEFINITION INPUT]"
+                "\n\n\n[DEFINITION INPUT]"
             );
         }
         let snapshot = engine.snapshot();
@@ -2059,7 +2059,7 @@ impl WorkspaceView {
         );
         let semantic_us = semantic_started.elapsed().as_micros();
         if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
-            tracing::info!(outcome = ?detailed.outcome, result = ?detailed.result, "[DEFINITION RESULT]");
+            tracing::info!(outcome = ?detailed.outcome, result = ?detailed.result, "\n\n\n[DEFINITION RESULT]");
         }
         let axiom_index::DefinitionResult::Resolved(candidate) = &detailed.result else {
             if debug_input_enabled() {

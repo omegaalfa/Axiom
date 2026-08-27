@@ -3002,7 +3002,7 @@ impl EditorView {
                 token_range = ?token.as_ref().map(|token| token.range.clone()),
                 ast_node_kind = ?ast_node.as_ref().map(|node| node.kind()),
                 ast_node_range = ?ast_node.as_ref().map(|node| node.byte_range()),
-                "[DEFINITION MOUSE INPUT]"
+                "\n\n\n[DEFINITION MOUSE INPUT]"
             );
         }
         if event.modifiers.control {
@@ -3014,7 +3014,7 @@ impl EditorView {
                     y = ?event.position.y,
                     line,
                     byte = offset,
-                    "[EDITOR CTRL CLICK]"
+                    "\n\n\n[EDITOR CTRL CLICK]"
                 );
                 if let Some(token) = self
                     .syntax
@@ -3028,7 +3028,7 @@ impl EditorView {
             if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
                 tracing::info!(
                     cursor_after_move = self.document.cursor_offset(),
-                    "[DEFINITION CURSOR]"
+                    "\n\n\n[DEFINITION CURSOR]"
                 );
             }
             self.selecting = false;
