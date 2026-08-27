@@ -139,6 +139,8 @@ pub struct Scope {
     /// Interfaces extended by an interface declaration. Classes keep using
     /// `parent_class` because PHP class inheritance is single-parent.
     pub interfaces_extended: Vec<String>,
+    /// Traits composed directly by this declaration.
+    pub traits_used: Vec<String>,
     pub is_static_method: bool,
     pub imports: ImportTable,
     pub bindings: Vec<VariableBinding>,
@@ -790,8 +792,9 @@ impl<'a> MemberResolver<'a> {
         // the wrong static/instance form.
         let mut candidates = Vec::new();
         let mut found_depth = None;
-        for (owner, depth) in owners {
-            if found_depth.is_some_and(|found| depth > found) {
+        let mut found_rank = None;
+        for (owner, depth, rank) in owners {
+            if found_depth.is_some_and(|found| (depth, rank) > (found, found_rank.unwrap_or(0))) {
                 break;
             }
             let mut declared = self
@@ -842,7 +845,12 @@ impl<'a> MemberResolver<'a> {
             }
             if !declared.is_empty() {
                 candidates.extend(declared);
-                found_depth.get_or_insert(depth);
+                if found_depth.is_none()
+                    || (depth, rank) < (found_depth.unwrap(), found_rank.unwrap_or(rank))
+                {
+                    found_depth = Some(depth);
+                    found_rank = Some(rank);
+                }
             }
         }
         candidates.sort_by_key(|id| id.0);
@@ -923,15 +931,15 @@ impl<'a> MemberResolver<'a> {
     fn inheritance_chain(&self, root: &str) -> Vec<String> {
         self.inheritance_chain_with_depth(root)
             .into_iter()
-            .map(|(name, _)| name)
+            .map(|(name, _, _)| name)
             .collect()
     }
 
-    fn inheritance_chain_with_depth(&self, root: &str) -> Vec<(String, usize)> {
+    fn inheritance_chain_with_depth(&self, root: &str) -> Vec<(String, usize, u8)> {
         let mut chain = Vec::new();
         let mut visited = HashSet::new();
-        let mut queue = vec![(root.to_owned(), 0usize)];
-        while let Some((current, depth)) = queue.first().cloned() {
+        let mut queue = vec![(root.to_owned(), 0usize, 0u8)];
+        while let Some((current, depth, rank)) = queue.first().cloned() {
             queue.remove(0);
             if !visited.insert(current.clone()) {
                 continue;
@@ -966,7 +974,11 @@ impl<'a> MemberResolver<'a> {
             if !has_owner {
                 break;
             }
-            chain.push((current.clone(), depth));
+            chain.push((current.clone(), depth, rank));
+            let traits = self.traits_of(&current);
+            for trait_name in traits {
+                queue.push((trait_name, depth + 1, 1));
+            }
             let parents = self.parents_of(&current);
             for parent in parents {
                 if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
@@ -974,7 +986,7 @@ impl<'a> MemberResolver<'a> {
                         "[INHERIT TRACE] receiver={root} owner={current} parent_fqn={parent}"
                     );
                 }
-                queue.push((parent, depth + 1));
+                queue.push((parent, depth + 1, 2));
             }
         }
         chain
@@ -994,6 +1006,51 @@ impl<'a> MemberResolver<'a> {
         } else {
             self.parent_class_of(class_name).into_iter().collect()
         }
+    }
+
+    fn traits_of(&self, class_name: &str) -> Vec<String> {
+        let mut names = self
+            .snapshot
+            .scopes
+            .records
+            .iter()
+            .find(|scope| {
+                matches!(scope.kind, ScopeKind::Class | ScopeKind::Trait)
+                    && scope.class_name.as_deref() == Some(class_name)
+            })
+            .map(|scope| scope.traits_used.clone())
+            .unwrap_or_default();
+        if names.is_empty() {
+            let class_scope = self
+                .snapshot
+                .scopes
+                .records
+                .iter()
+                .find(|scope| scope.class_name.as_deref() == Some(class_name));
+            if let Some(owner) = self
+                .snapshot
+                .symbols_for_fqn(class_name)
+                .iter()
+                .copied()
+                .find(|id| {
+                    self.snapshot.symbol(*id).is_some_and(|s| {
+                        s.kind == ProjectSymbolKind::Class || s.kind == ProjectSymbolKind::Trait
+                    })
+                })
+            {
+                for reference in &self.snapshot.references.records {
+                    if (reference.source_symbol == Some(owner)
+                        || class_scope.is_some_and(|scope| reference.source_scope == scope.id))
+                        && reference.role == ReferenceRole::TraitUse
+                        && let ReferenceTarget::Resolved(id) = reference.target
+                        && let Some(symbol) = self.snapshot.symbol(id)
+                    {
+                        names.push(symbol.fully_qualified_name.clone());
+                    }
+                }
+            }
+        }
+        names
     }
 
     fn parent_class_of(&self, class_name: &str) -> Option<String> {
@@ -2508,6 +2565,7 @@ impl SnapshotBuilder {
             class_name,
             parent_class,
             interfaces_extended: Vec::new(),
+            traits_used: Vec::new(),
             is_static_method,
             imports: ImportTable::default(),
             bindings: Vec::new(),
@@ -3186,6 +3244,26 @@ fn extract_scopes(
                         .collect();
                     builder.scopes.records[child.0 as usize].interfaces_extended = parents;
                 }
+            }
+            if matches!(kind, "class_declaration" | "trait_declaration") {
+                let traits = node
+                    .named_children(&mut node.walk())
+                    .filter(|child| child.kind() == "use_declaration")
+                    .flat_map(|use_node| {
+                        node_text(use_node, text)
+                            .trim()
+                            .strip_prefix("use")
+                            .unwrap_or_default()
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                            .map(|name| {
+                                resolve_builder_name(builder, scope, name, ImportKind::Class)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                builder.scopes.records[child.0 as usize].traits_used = traits;
             }
             mark_scope(builder, child, node);
             for child_node in node.named_children(&mut node.walk()) {
