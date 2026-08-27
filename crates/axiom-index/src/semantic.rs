@@ -6,14 +6,34 @@
 //! remains independent of this module during the initial migration.
 
 use super::{ProjectSymbolIndex, ProjectSymbolKind, Visibility};
-use axiom_syntax::PhpSyntax;
+use axiom_syntax::{PhpSyntax, SyntaxToken};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
+
+fn text_fingerprint(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+const SCOPE_COMPACTION_RATIO: usize = 8;
+const SCOPE_COMPACTION_MIN_TOTAL: usize = 256;
+
+fn should_compact_scopes(total_scopes: usize, active_scopes: usize) -> bool {
+    if total_scopes == active_scopes || total_scopes < SCOPE_COMPACTION_MIN_TOTAL {
+        return false;
+    }
+    if active_scopes == 0 {
+        return true;
+    }
+    total_scopes >= active_scopes.saturating_mul(SCOPE_COMPACTION_RATIO)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct ScopeId(pub u32);
@@ -116,6 +136,9 @@ pub struct Scope {
     pub namespace: String,
     pub class_name: Option<String>,
     pub parent_class: Option<String>,
+    /// Interfaces extended by an interface declaration. Classes keep using
+    /// `parent_class` because PHP class inheritance is single-parent.
+    pub interfaces_extended: Vec<String>,
     pub is_static_method: bool,
     pub imports: ImportTable,
     pub bindings: Vec<VariableBinding>,
@@ -268,10 +291,28 @@ pub struct PersistentFileKey {
 
 impl PersistentFileKey {
     pub fn workspace(path: impl AsRef<Path>) -> Self {
+        Self::workspace_physical(path)
+    }
+
+    /// Canonical identity for Workspace files; falls back lexically for unsaved paths.
+    pub fn workspace_physical(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+        let physical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         Self {
             origin: SourceOrigin::Workspace,
-            normalized_path: normalize_path(path.as_ref()),
+            normalized_path: normalize_path(&physical),
         }
+    }
+
+    /// Resolves relative paths against an explicit Workspace root.
+    pub fn workspace_physical_with_root(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.as_ref().join(path)
+        };
+        Self::workspace_physical(resolved)
     }
 
     pub fn new(origin: SourceOrigin, path: impl AsRef<Path>) -> Self {
@@ -342,6 +383,12 @@ pub enum MemberKind {
 pub enum MemberAccess {
     Instance,
     Static,
+    /// Class-scope syntax (`self::`, `static::`, `parent::`) may target either
+    /// a static or an instance method in PHP. The receiver still determines
+    /// the lookup owner; this variant only suppresses the static/instance
+    /// incompatibility check while preserving the access context for
+    /// visibility checks.
+    ClassScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,13 +449,36 @@ pub enum SemanticDefinitionOutcome {
     Unresolved,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InaccessibilityReason {
+    PrivateMember,
+    ProtectedMember,
+    IncompatibleAccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InaccessibilityInfo {
+    pub reason: InaccessibilityReason,
+    pub declaring_type: String,
+    pub member_name: String,
+    pub access_context: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticDefinitionResult {
     pub result: DefinitionResult,
     pub outcome: SemanticDefinitionOutcome,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+pub struct DefinitionSyntaxContext {
+    pub token: SyntaxToken,
+    pub is_keyword: bool,
+    pub tree: tree_sitter::Tree,
+    pub build_us: u128,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct DefinitionQueryContext {
     pub document_version: Option<u64>,
     pub semantic_revision: SemanticRevision,
@@ -708,43 +778,71 @@ impl<'a> MemberResolver<'a> {
             MemberKind::Property => ProjectSymbolKind::Property,
             MemberKind::ClassConstant => ProjectSymbolKind::ClassConstant,
         };
-        let owners: Vec<SymbolId> = self
-            .snapshot
-            .symbols_for_fqn(resolved)
-            .iter()
-            .copied()
-            .filter(|id| {
-                self.snapshot.symbol(*id).is_some_and(|symbol| {
-                    matches!(
-                        symbol.kind,
-                        ProjectSymbolKind::Class
-                            | ProjectSymbolKind::Interface
-                            | ProjectSymbolKind::Trait
-                            | ProjectSymbolKind::Enum
-                    )
-                })
-            })
-            .collect();
+        let owners = self.inheritance_chain_with_depth(resolved);
         if owners.is_empty() {
             // The nominal type can be known before a lazy Composer/vendor file
             // has entered the semantic snapshot.
             return MemberResolution::Deferred(format!("members for {resolved} are not indexed"));
         }
+        // PHP member lookup observes the first declaration in the inheritance
+        // chain. A child declaration therefore shadows every parent member,
+        // even when the declaration is later rejected as inaccessible or has
+        // the wrong static/instance form.
         let mut candidates = Vec::new();
-        for owner in owners {
-            candidates.extend(
-                self.snapshot
-                    .members_named(owner, name, project_kind)
+        let mut found_depth = None;
+        for (owner, depth) in owners {
+            if found_depth.is_some_and(|found| depth > found) {
+                break;
+            }
+            let mut declared = self
+                .snapshot
+                .symbols_for_fqn(&owner)
+                .iter()
+                .filter(|id| {
+                    self.snapshot.symbol(**id).is_some_and(|symbol| {
+                        matches!(
+                            symbol.kind,
+                            ProjectSymbolKind::Class
+                                | ProjectSymbolKind::Interface
+                                | ProjectSymbolKind::Trait
+                                | ProjectSymbolKind::Enum
+                        )
+                    })
+                })
+                .flat_map(|id| {
+                    let mut matches = self
+                        .snapshot
+                        .members_named(*id, name, project_kind)
+                        .to_vec();
+                    if kind == MemberKind::ClassConstant {
+                        matches.extend(
+                            self.snapshot
+                                .members_named(*id, name, ProjectSymbolKind::Constant)
+                                .iter()
+                                .copied(),
+                        );
+                    }
+                    matches
+                })
+                .collect::<Vec<_>>();
+            declared.sort_by_key(|id| id.0);
+            declared.dedup();
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                let files = self
+                    .snapshot
+                    .symbols_for_fqn(&owner)
                     .iter()
-                    .copied(),
-            );
-            if kind == MemberKind::ClassConstant {
-                candidates.extend(
-                    self.snapshot
-                        .members_named(owner, name, ProjectSymbolKind::Constant)
-                        .iter()
-                        .copied(),
+                    .filter_map(|id| self.snapshot.symbol(*id))
+                    .map(|symbol| symbol.file.0.to_string())
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "[INHERIT TRACE] receiver={} lookup={} owner={} members={:?} files={:?}",
+                    resolved, name, owner, declared, files
                 );
+            }
+            if !declared.is_empty() {
+                candidates.extend(declared);
+                found_depth.get_or_insert(depth);
             }
         }
         candidates.sort_by_key(|id| id.0);
@@ -761,7 +859,9 @@ impl<'a> MemberResolver<'a> {
             };
             if kind == MemberKind::Method {
                 let is_static = symbol.modifiers.iter().any(|modifier| modifier == "static");
-                if is_static != matches!(access, MemberAccess::Static) {
+                if !matches!(access, MemberAccess::ClassScope)
+                    && is_static != matches!(access, MemberAccess::Static)
+                {
                     incompatible.push(id);
                     continue;
                 }
@@ -786,10 +886,6 @@ impl<'a> MemberResolver<'a> {
     }
 
     fn is_accessible(&self, scope: ScopeId, symbol: &SemanticSymbol) -> bool {
-        // LIMITATION: protected members inherited through parent_class are not
-        // yet recognized here; access currently requires the declaring class
-        // itself. Private members intentionally remain restricted to that
-        // declaring class. Track this for the future inheritance graph.
         let visibility = symbol.visibility;
         if visibility == Visibility::Public {
             return true;
@@ -800,17 +896,124 @@ impl<'a> MemberResolver<'a> {
         let Some(owner_symbol) = self.snapshot.symbol(owner) else {
             return false;
         };
+        let owner_name = owner_symbol
+            .fully_qualified_name
+            .split_once("::")
+            .map(|(owner, _)| owner)
+            .unwrap_or(owner_symbol.fully_qualified_name.as_str());
         let mut current = Some(scope);
         while let Some(id) = current {
             let Some(scope) = self.snapshot.scope(id) else {
                 break;
             };
-            if scope.class_name.as_deref() == Some(owner_symbol.fully_qualified_name.as_str()) {
-                return true;
+            if let Some(class_name) = scope.class_name.as_deref() {
+                if visibility == Visibility::Private {
+                    if class_name == owner_name {
+                        return true;
+                    }
+                } else if self.is_same_or_subclass(class_name, owner_name) {
+                    return true;
+                }
             }
             current = scope.parent;
         }
         false
+    }
+
+    fn inheritance_chain(&self, root: &str) -> Vec<String> {
+        self.inheritance_chain_with_depth(root)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    fn inheritance_chain_with_depth(&self, root: &str) -> Vec<(String, usize)> {
+        let mut chain = Vec::new();
+        let mut visited = HashSet::new();
+        let mut queue = vec![(root.to_owned(), 0usize)];
+        while let Some((current, depth)) = queue.first().cloned() {
+            queue.remove(0);
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            let owner_ids: Vec<_> = self
+                .snapshot
+                .symbols_for_fqn(&current)
+                .iter()
+                .copied()
+                .collect();
+            let has_owner = owner_ids.iter().any(|id| {
+                self.snapshot.symbol(*id).is_some_and(|symbol| {
+                    matches!(
+                        symbol.kind,
+                        ProjectSymbolKind::Class
+                            | ProjectSymbolKind::Interface
+                            | ProjectSymbolKind::Trait
+                            | ProjectSymbolKind::Enum
+                    )
+                })
+            });
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                for id in &owner_ids {
+                    if let Some(symbol) = self.snapshot.symbol(*id) {
+                        eprintln!(
+                            "[INHERIT TRACE] receiver={root} owner={current} symbol_id={:?} file={} kind={:?}",
+                            id, symbol.file.0, symbol.kind
+                        );
+                    }
+                }
+            }
+            if !has_owner {
+                break;
+            }
+            chain.push((current.clone(), depth));
+            let parents = self.parents_of(&current);
+            for parent in parents {
+                if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                    eprintln!(
+                        "[INHERIT TRACE] receiver={root} owner={current} parent_fqn={parent}"
+                    );
+                }
+                queue.push((parent, depth + 1));
+            }
+        }
+        chain
+    }
+
+    fn parents_of(&self, class_name: &str) -> Vec<String> {
+        let Some(scope) = self.snapshot.scopes.records.iter().find(|scope| {
+            matches!(
+                scope.kind,
+                ScopeKind::Class | ScopeKind::Interface | ScopeKind::Enum
+            ) && scope.class_name.as_deref() == Some(class_name)
+        }) else {
+            return Vec::new();
+        };
+        if scope.kind == ScopeKind::Interface {
+            scope.interfaces_extended.clone()
+        } else {
+            self.parent_class_of(class_name).into_iter().collect()
+        }
+    }
+
+    fn parent_class_of(&self, class_name: &str) -> Option<String> {
+        self.snapshot
+            .scopes
+            .records
+            .iter()
+            .find(|scope| {
+                matches!(
+                    scope.kind,
+                    ScopeKind::Class | ScopeKind::Interface | ScopeKind::Enum
+                ) && scope.class_name.as_deref() == Some(class_name)
+            })
+            .and_then(|scope| scope.parent_class.clone())
+    }
+
+    fn is_same_or_subclass(&self, candidate: &str, ancestor: &str) -> bool {
+        self.inheritance_chain(candidate)
+            .iter()
+            .any(|name| name == ancestor)
     }
 }
 
@@ -821,6 +1024,16 @@ pub struct DeclarationIndexes {
     pub members_by_owner_name: HashMap<(SymbolId, String, ProjectSymbolKind), Vec<SymbolId>>,
 }
 
+/// Derived semantic relationships between interfaces and classes. These are
+/// rebuilt from the immutable symbol/reference graph whenever a snapshot is
+/// published, including incremental file replacements.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InterfaceRelationIndexes {
+    direct_implementers_by_interface: HashMap<SymbolId, Vec<SymbolId>>,
+    implementers_by_interface: HashMap<SymbolId, Vec<SymbolId>>,
+    method_implementations_by_interface_method: HashMap<SymbolId, Vec<SymbolId>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticSnapshot {
     pub revision: SemanticRevision,
@@ -829,6 +1042,8 @@ pub struct SemanticSnapshot {
     declarations: DeclarationIndexes,
     references: ReferenceStore,
     pub scopes: ScopeStore,
+    pub file_fingerprints: HashMap<FileId, u64>,
+    pub interface_relations: InterfaceRelationIndexes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -840,6 +1055,8 @@ struct PersistedSnapshot {
     references: ReferenceStore,
     #[serde(default)]
     scopes: ScopeStore,
+    #[serde(default)]
+    file_fingerprints: HashMap<FileId, u64>,
 }
 
 impl Default for SemanticSnapshot {
@@ -857,6 +1074,8 @@ impl SemanticSnapshot {
             declarations: DeclarationIndexes::default(),
             references: ReferenceStore::default(),
             scopes: ScopeStore::default(),
+            file_fingerprints: HashMap::new(),
+            interface_relations: InterfaceRelationIndexes::default(),
         }
     }
 
@@ -962,6 +1181,219 @@ impl SemanticSnapshot {
             .unwrap_or(&[])
     }
 
+    /// Classes that explicitly name `interface` in an implements clause.
+    pub fn direct_implementers_of(&self, interface: SymbolId) -> &[SymbolId] {
+        self.interface_relations
+            .direct_implementers_by_interface
+            .get(&interface)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// All classes implementing an interface, including implementations
+    /// inherited through parent interfaces and parent classes.
+    pub fn implementers_of(&self, interface: SymbolId) -> &[SymbolId] {
+        self.interface_relations
+            .implementers_by_interface
+            .get(&interface)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Methods satisfying an interface method contract. The returned symbols
+    /// retain their concrete declaring owner (including an inherited method).
+    pub fn implementations_of(&self, interface_method: SymbolId) -> &[SymbolId] {
+        self.interface_relations
+            .method_implementations_by_interface_method
+            .get(&interface_method)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn rebuild_interface_relations(&mut self) {
+        let active: HashSet<SymbolId> = self
+            .files
+            .records
+            .iter()
+            .flat_map(|file| file.symbols.iter().copied())
+            .collect();
+        let mut extends: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
+        let mut implements: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
+        for reference in &self.references.records {
+            let target = match reference.target {
+                ReferenceTarget::Resolved(id) if active.contains(&id) => id,
+                _ => continue,
+            };
+            let Some(source) = self.owner_for_scope(reference.source_scope, &active) else {
+                continue;
+            };
+            match reference.role {
+                ReferenceRole::Extends => extends.entry(source).or_default().push(target),
+                ReferenceRole::Implements => implements.entry(source).or_default().push(target),
+                _ => {}
+            }
+        }
+        for values in extends.values_mut().chain(implements.values_mut()) {
+            values.sort_by_key(|id| id.0);
+            values.dedup();
+        }
+
+        let mut relations = InterfaceRelationIndexes::default();
+        for (&class, interfaces) in &implements {
+            if self
+                .symbol(class)
+                .is_none_or(|symbol| symbol.kind != ProjectSymbolKind::Class)
+            {
+                continue;
+            }
+            for &interface in interfaces {
+                if self
+                    .symbol(interface)
+                    .is_some_and(|symbol| symbol.kind == ProjectSymbolKind::Interface)
+                {
+                    relations
+                        .direct_implementers_by_interface
+                        .entry(interface)
+                        .or_default()
+                        .push(class);
+                }
+            }
+        }
+
+        // A class inherits contracts from its parent classes. An interface
+        // also inherits all contracts from parent interfaces.
+        let classes: Vec<_> = active
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.symbol(*id)
+                    .is_some_and(|s| s.kind == ProjectSymbolKind::Class)
+            })
+            .collect();
+        for class in classes {
+            let mut contracts = HashSet::new();
+            let mut pending = vec![class];
+            let mut visited = HashSet::new();
+            while let Some(owner) = pending.pop() {
+                if !visited.insert(owner) {
+                    continue;
+                }
+                if let Some(names) = implements.get(&owner) {
+                    for &interface in names {
+                        collect_interface_ancestors(self, &extends, interface, &mut contracts);
+                    }
+                }
+                if let Some(parents) = extends.get(&owner) {
+                    pending.extend(parents.iter().copied().filter(|id| {
+                        self.symbol(*id)
+                            .is_some_and(|s| s.kind == ProjectSymbolKind::Class)
+                    }));
+                }
+            }
+            for interface in contracts {
+                relations
+                    .implementers_by_interface
+                    .entry(interface)
+                    .or_default()
+                    .push(class);
+            }
+        }
+
+        for values in relations
+            .direct_implementers_by_interface
+            .values_mut()
+            .chain(relations.implementers_by_interface.values_mut())
+        {
+            values.sort_by(|left, right| {
+                self.symbol(*left)
+                    .map(|s| s.fully_qualified_name.as_str())
+                    .cmp(&self.symbol(*right).map(|s| s.fully_qualified_name.as_str()))
+                    .then(left.0.cmp(&right.0))
+            });
+            values.dedup();
+        }
+
+        // Match each interface method against the effective method on every
+        // implementing class, following the same first-owner/override order
+        // as MemberResolver.
+        let interfaces: Vec<_> = active
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.symbol(*id)
+                    .is_some_and(|s| s.kind == ProjectSymbolKind::Interface)
+            })
+            .collect();
+        for interface in interfaces {
+            let implementers = relations
+                .implementers_by_interface
+                .get(&interface)
+                .cloned()
+                .unwrap_or_default();
+            for method in self.members_of(interface).iter().copied().filter(|id| {
+                self.symbol(*id)
+                    .is_some_and(|symbol| symbol.kind == ProjectSymbolKind::Method)
+            }) {
+                let Some(method_name) = self.symbol(method).map(|symbol| symbol.name.clone())
+                else {
+                    continue;
+                };
+                let mut matches = Vec::new();
+                for class in &implementers {
+                    let mut owners = vec![*class];
+                    let mut visited = HashSet::new();
+                    let mut found = Vec::new();
+                    while let Some(owner) = owners.pop() {
+                        if !visited.insert(owner) {
+                            continue;
+                        }
+                        let declared = self
+                            .members_named(owner, &method_name, ProjectSymbolKind::Method)
+                            .to_vec();
+                        if !declared.is_empty() {
+                            found = declared;
+                            break;
+                        }
+                        if let Some(parents) = extends.get(&owner) {
+                            owners.extend(parents.iter().copied().filter(|id| {
+                                self.symbol(*id)
+                                    .is_some_and(|s| s.kind == ProjectSymbolKind::Class)
+                            }));
+                        }
+                    }
+                    matches.extend(found);
+                }
+                matches.sort_by(|left, right| {
+                    self.symbol(*left)
+                        .map(|s| s.fully_qualified_name.as_str())
+                        .cmp(&self.symbol(*right).map(|s| s.fully_qualified_name.as_str()))
+                        .then(left.0.cmp(&right.0))
+                });
+                matches.dedup();
+                if !matches.is_empty() {
+                    relations
+                        .method_implementations_by_interface_method
+                        .insert(method, matches);
+                }
+            }
+        }
+        self.interface_relations = relations;
+    }
+
+    fn owner_for_scope(&self, scope_id: ScopeId, active: &HashSet<SymbolId>) -> Option<SymbolId> {
+        let scope = self.scope(scope_id)?;
+        let name = scope.class_name.as_deref()?;
+        self.symbols_for_fqn(name).iter().copied().find(|id| {
+            active.contains(id)
+                && self.symbol(*id).is_some_and(|s| {
+                    matches!(
+                        s.kind,
+                        ProjectSymbolKind::Class | ProjectSymbolKind::Interface
+                    )
+                })
+        })
+    }
+
     pub fn member_resolver(&self) -> MemberResolver<'_> {
         MemberResolver::new(self)
     }
@@ -984,12 +1416,34 @@ impl SemanticSnapshot {
         offset: usize,
         context: DefinitionQueryContext,
     ) -> SemanticDefinitionResult {
+        self.definition_at_detailed_with_syntax(file, text, offset, None, context)
+    }
+
+    pub fn definition_at_detailed_with_syntax(
+        &self,
+        file: impl AsRef<Path>,
+        text: &str,
+        offset: usize,
+        syntax_context: Option<DefinitionSyntaxContext>,
+        context: DefinitionQueryContext,
+    ) -> SemanticDefinitionResult {
+        let profile = std::env::var_os("AXIOM_DEBUG_DEFINITION_PROFILE").is_some();
+        let profile_started = std::time::Instant::now();
+        let revision_check_us;
+        let fingerprint_us;
+        let scope_lookup_us;
+        let text_clone_us;
+        let parse_us;
+        let mut token_lookup_us;
+        let resolution_us;
+        let phase = std::time::Instant::now();
         if context.semantic_revision != self.revision {
             return SemanticDefinitionResult {
                 result: DefinitionResult::Unresolved,
                 outcome: SemanticDefinitionOutcome::StaleSnapshot,
             };
         }
+        revision_check_us = phase.elapsed().as_micros();
         let key = PersistentFileKey::workspace(file.as_ref());
         let Some(file_id) = self.file_id(&key) else {
             return SemanticDefinitionResult {
@@ -1000,15 +1454,19 @@ impl SemanticSnapshot {
         // The immutable snapshot may lag behind an editor buffer. Never use
         // declarations from a stale disk snapshot for a dirty document; the
         // caller can then continue with the legacy/LSP providers.
-        if let Some(record) = self.file(file_id)
-            && let Ok(disk_text) = fs::read_to_string(&record.path)
-            && disk_text != text
+        let fingerprint_phase = std::time::Instant::now();
+        if self
+            .file_fingerprints
+            .get(&file_id)
+            .is_some_and(|fingerprint| *fingerprint != text_fingerprint(text))
         {
             return SemanticDefinitionResult {
                 result: DefinitionResult::Unresolved,
                 outcome: SemanticDefinitionOutcome::StaleSnapshot,
             };
         }
+        fingerprint_us = fingerprint_phase.elapsed().as_micros();
+        let scope_phase = std::time::Instant::now();
         let Some(mut scope) = self
             .scopes
             .records
@@ -1038,21 +1496,49 @@ impl SemanticSnapshot {
                 scope = namespace;
             }
         }
-        let Ok(syntax) = PhpSyntax::parse(text.to_owned()) else {
-            return SemanticDefinitionResult {
-                result: DefinitionResult::Unresolved,
-                outcome: SemanticDefinitionOutcome::IncompleteAst,
+        scope_lookup_us = scope_phase.elapsed().as_micros();
+        token_lookup_us = 0;
+        let syntax_context_build_us = syntax_context.as_ref().map(|s| s.build_us).unwrap_or(0);
+        let syntax_source_resident = syntax_context.is_some();
+        let (root, token, is_keyword) = if let Some(syntax) = syntax_context {
+            if syntax.token.range.end > text.len()
+                || syntax.token.range.start > syntax.token.range.end
+                || syntax.token.range.start > offset
+                || !text.is_char_boundary(syntax.token.range.start)
+            {
+                return SemanticDefinitionResult {
+                    result: DefinitionResult::Unresolved,
+                    outcome: SemanticDefinitionOutcome::IncompleteAst,
+                };
+            }
+            text_clone_us = 0;
+            parse_us = 0;
+            (syntax.tree, syntax.token, syntax.is_keyword)
+        } else {
+            let clone_phase = std::time::Instant::now();
+            let owned_text = text.to_owned();
+            text_clone_us = clone_phase.elapsed().as_micros();
+            let parse_phase = std::time::Instant::now();
+            let Ok(syntax) = PhpSyntax::parse(owned_text) else {
+                return SemanticDefinitionResult {
+                    result: DefinitionResult::Unresolved,
+                    outcome: SemanticDefinitionOutcome::IncompleteAst,
+                };
             };
-        };
-        let Some(token) = syntax.token_at_byte(offset) else {
-            return SemanticDefinitionResult {
-                result: DefinitionResult::Unresolved,
-                outcome: SemanticDefinitionOutcome::IncompleteAst,
+            parse_us = parse_phase.elapsed().as_micros();
+            let token_phase = std::time::Instant::now();
+            let Some(token) = syntax.token_at_byte(offset) else {
+                return SemanticDefinitionResult {
+                    result: DefinitionResult::Unresolved,
+                    outcome: SemanticDefinitionOutcome::IncompleteAst,
+                };
             };
+            token_lookup_us = token_phase.elapsed().as_micros();
+            let is_keyword = syntax.is_keyword_at_byte(offset);
+            (syntax.tree().clone(), token, is_keyword)
         };
         if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
-            let node = syntax
-                .tree()
+            let node = root
                 .root_node()
                 .descendant_for_byte_range(token.range.start, token.range.end);
             eprintln!(
@@ -1076,20 +1562,21 @@ impl SemanticSnapshot {
         // Keywords are syntax nodes, not nominal PHP symbols. In particular,
         // never let a statement keyword such as `return` fall through to
         // `resolve_class_name`, where it can become Namespace\\return.
-        if syntax.is_keyword_at_byte(offset) {
+        if is_keyword {
             return SemanticDefinitionResult {
                 result: DefinitionResult::Unresolved,
                 outcome: SemanticDefinitionOutcome::Unresolved,
             };
         }
-        let Some(target) =
-            self.definition_for_token(scope.id, syntax.tree().root_node(), token.range, text)
+        let resolution_phase = std::time::Instant::now();
+        let Some(target) = self.definition_for_token(scope.id, root.root_node(), token.range, text)
         else {
             return SemanticDefinitionResult {
                 result: DefinitionResult::Unresolved,
                 outcome: SemanticDefinitionOutcome::Unresolved,
             };
         };
+        resolution_us = resolution_phase.elapsed().as_micros();
         let outcome = match &target {
             DefinitionResult::Resolved(candidate) => match candidate.confidence {
                 DefinitionConfidence::Partial => SemanticDefinitionOutcome::Inaccessible,
@@ -1099,10 +1586,33 @@ impl SemanticSnapshot {
             DefinitionResult::Deferred(_) => SemanticDefinitionOutcome::DeferredVendor,
             DefinitionResult::Unresolved => SemanticDefinitionOutcome::MissingSymbol,
         };
-        SemanticDefinitionResult {
+        let result = SemanticDefinitionResult {
             result: target,
             outcome,
+        };
+        if profile {
+            eprintln!(
+                "[DEFINITION PROFILE] file={:?} bytes={} scopes_total={} syntax_source={} syntax_context_build_us={} revision_check_us={} fingerprint_us={} scope_lookup_us={} text_clone_us={} parse_us={} token_lookup_us={} receiver_name_member_us={} total_semantic_us={}",
+                file.as_ref(),
+                text.len(),
+                self.scopes.records.len(),
+                if syntax_source_resident {
+                    "resident"
+                } else {
+                    "fallback_parse"
+                },
+                syntax_context_build_us,
+                revision_check_us,
+                fingerprint_us,
+                scope_lookup_us,
+                text_clone_us,
+                parse_us,
+                token_lookup_us,
+                resolution_us,
+                profile_started.elapsed().as_micros()
+            );
         }
+        result
     }
 
     fn definition_for_token(
@@ -1142,7 +1652,13 @@ impl SemanticSnapshot {
                 candidate.kind(),
                 "member_call_expression" | "nullsafe_member_call_expression"
             ) {
-                let name = candidate.child_by_field_name("name")?;
+                let name = candidate
+                    .child_by_field_name("name")
+                    .or_else(|| candidate.child_by_field_name("constant"))
+                    .or_else(|| {
+                        let mut cursor = candidate.walk();
+                        candidate.named_children(&mut cursor).nth(1)
+                    })?;
                 if name.byte_range().contains(&range.start) {
                     let object = candidate.child_by_field_name("object")?;
                     let expression = expression_from_ast(object, text)?;
@@ -1162,7 +1678,13 @@ impl SemanticSnapshot {
                 candidate.kind(),
                 "member_access_expression" | "nullsafe_member_access_expression"
             ) {
-                let name = candidate.child_by_field_name("name")?;
+                let name = candidate
+                    .child_by_field_name("name")
+                    .or_else(|| candidate.child_by_field_name("constant"))
+                    .or_else(|| {
+                        let mut cursor = candidate.walk();
+                        candidate.named_children(&mut cursor).nth(1)
+                    })?;
                 if name.byte_range().contains(&range.start) {
                     let object = candidate.child_by_field_name("object")?;
                     let expression = expression_from_ast(object, text)?;
@@ -1179,15 +1701,29 @@ impl SemanticSnapshot {
             }
             if matches!(
                 candidate.kind(),
-                "static_call_expression" | "class_constant_access_expression"
+                "static_call_expression"
+                    | "scoped_call_expression"
+                    | "class_constant_access_expression"
             ) {
-                let name = candidate.child_by_field_name("name")?;
+                let name = candidate
+                    .child_by_field_name("name")
+                    .or_else(|| candidate.child_by_field_name("constant"))
+                    .or_else(|| {
+                        let mut cursor = candidate.walk();
+                        candidate.named_children(&mut cursor).nth(1)
+                    })?;
                 if name.byte_range().contains(&range.start) {
                     let object = candidate
                         .child_by_field_name("class")
-                        .or_else(|| candidate.child_by_field_name("object"))?;
+                        .or_else(|| candidate.child_by_field_name("scope"))
+                        .or_else(|| candidate.child_by_field_name("object"))
+                        .or_else(|| {
+                            let mut cursor = candidate.walk();
+                            candidate.named_children(&mut cursor).next()
+                        })?;
                     let receiver_name = node_text(object, text).trim();
                     let class_name = self.resolve_class_name(scope, receiver_name)?;
+                    let resolved_name = class_name.clone();
                     let receiver = DeclaredType::Named {
                         written: receiver_name.to_owned(),
                         resolved: class_name,
@@ -1196,6 +1732,32 @@ impl SemanticSnapshot {
                         MemberKind::ClassConstant
                     } else {
                         MemberKind::Method
+                    };
+                    if kind == MemberKind::ClassConstant && node_text(name, text) == "class" {
+                        let ids = self.symbols_for_fqn(&resolved_name);
+                        return Some(
+                            self.symbol_ids_to_definition(ids, DefinitionConfidence::Exact),
+                        );
+                    }
+                    if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                        eprintln!(
+                            "[STATIC MEMBER TRACE] ast_kind={} receiver_written={} receiver_fqn={} member_name={} member_kind={:?} lookup_mode={}",
+                            candidate.kind(),
+                            receiver_name,
+                            resolved_name,
+                            node_text(name, text),
+                            kind,
+                            if kind == MemberKind::Method {
+                                "static"
+                            } else {
+                                "constant"
+                            }
+                        );
+                    }
+                    let access = if matches!(receiver_name, "self" | "static" | "parent") {
+                        MemberAccess::ClassScope
+                    } else {
+                        MemberAccess::Static
                     };
                     let resolution =
                         match kind {
@@ -1206,7 +1768,7 @@ impl SemanticSnapshot {
                                 scope,
                                 &receiver,
                                 node_text(name, text),
-                                MemberAccess::Static,
+                                access,
                             ),
                         };
                     return Some(self.member_result_to_definition(resolution));
@@ -1297,6 +1859,47 @@ impl SemanticSnapshot {
 
     pub fn scope(&self, id: ScopeId) -> Option<&Scope> {
         self.scopes.records.get(id.0 as usize)
+    }
+
+    /// Returns structured visibility information for a partial definition.
+    /// Presentation layers can use this without reimplementing PHP visibility
+    /// heuristics.
+    pub fn explain_inaccessibility(
+        &self,
+        path: &Path,
+        offset: usize,
+        result: &DefinitionResult,
+    ) -> Option<InaccessibilityInfo> {
+        let DefinitionResult::Resolved(candidate) = result else {
+            return None;
+        };
+        if candidate.confidence != DefinitionConfidence::Partial {
+            return None;
+        }
+        let symbol = self.symbols.records.iter().find(|symbol| {
+            self.file(symbol.file).is_some_and(|file| file.path == path)
+                && symbol.range == candidate.location.span
+        })?;
+        let owner = symbol.owner.and_then(|id| self.symbol(id))?;
+        let declaring_type = owner.fully_qualified_name.clone();
+        let access_context = self
+            .files
+            .records
+            .iter()
+            .find(|file| file.path == path)
+            .and_then(|file| self.scope_at(file.id, offset))
+            .and_then(|scope| scope.class_name.clone());
+        let reason = match symbol.visibility {
+            Visibility::Private => InaccessibilityReason::PrivateMember,
+            Visibility::Protected => InaccessibilityReason::ProtectedMember,
+            _ => InaccessibilityReason::IncompatibleAccess,
+        };
+        Some(InaccessibilityInfo {
+            reason,
+            declaring_type,
+            member_name: symbol.name.clone(),
+            access_context,
+        })
     }
 
     pub fn lookup_binding(&self, mut scope: ScopeId, name: &str) -> Option<&VariableBinding> {
@@ -1518,6 +2121,7 @@ impl SemanticSnapshot {
             symbols: self.symbols.records.clone(),
             references: self.references.clone(),
             scopes: self.scopes.clone(),
+            file_fingerprints: self.file_fingerprints.clone(),
         };
         let bytes = serde_json::to_vec(&persisted)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
@@ -1577,13 +2181,52 @@ impl SemanticSnapshot {
                     .push(symbol.id);
             }
         }
-        Self {
+        let mut snapshot = Self {
             revision: persisted.revision,
             files,
             symbols,
             declarations,
             references: persisted.references,
             scopes: persisted.scopes,
+            file_fingerprints: persisted.file_fingerprints,
+            interface_relations: InterfaceRelationIndexes::default(),
+        };
+        snapshot.rebuild_interface_relations();
+        let active_symbols: HashSet<SymbolId> = snapshot
+            .files
+            .records
+            .iter()
+            .flat_map(|file| file.symbols.iter().copied())
+            .collect();
+        for reference in &snapshot.references.records {
+            if let ReferenceTarget::Resolved(symbol) = reference.target {
+                debug_assert!(
+                    active_symbols.contains(&symbol),
+                    "resolved reference points to inactive symbol {symbol:?}"
+                );
+            }
+        }
+        snapshot
+    }
+}
+
+fn collect_interface_ancestors(
+    snapshot: &SemanticSnapshot,
+    extends: &HashMap<SymbolId, Vec<SymbolId>>,
+    interface: SymbolId,
+    output: &mut HashSet<SymbolId>,
+) {
+    let mut pending = vec![interface];
+    while let Some(current) = pending.pop() {
+        if !output.insert(current) {
+            continue;
+        }
+        if let Some(parents) = extends.get(&current) {
+            pending.extend(parents.iter().copied().filter(|id| {
+                snapshot
+                    .symbol(*id)
+                    .is_some_and(|symbol| symbol.kind == ProjectSymbolKind::Interface)
+            }));
         }
     }
 }
@@ -1598,6 +2241,7 @@ pub struct SnapshotBuilder {
     declarations: DeclarationIndexes,
     references: ReferenceStore,
     scopes: ScopeStore,
+    file_fingerprints: HashMap<FileId, u64>,
     pending_files: HashMap<PersistentFileKey, Option<(PathBuf, String)>>,
 }
 
@@ -1625,6 +2269,19 @@ impl SnapshotBuilder {
                 path,
                 symbols: Vec::new(),
             });
+        }
+        let fingerprints = builder
+            .files
+            .records
+            .iter()
+            .filter_map(|record| {
+                fs::read_to_string(&record.path)
+                    .ok()
+                    .map(|text| (record.id, text_fingerprint(&text)))
+            })
+            .collect::<Vec<_>>();
+        for (id, fingerprint) in fingerprints {
+            builder.file_fingerprints.insert(id, fingerprint);
         }
 
         let mut source_symbols = index.symbols().to_vec();
@@ -1738,6 +2395,21 @@ impl SnapshotBuilder {
             let owner = candidates[0];
             symbol.owner = Some(owner);
             symbol.owner_key = owner_keys.get(&owner).cloned();
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
+                eprintln!(
+                    "[MEMBER INDEX TRACE] method_name={} method_fqn={} method_symbol_id={:?} method_file={} derived_owner_fqn={} derived_owner_symbol_id={:?} symbol_kind={:?} inserted_member_key=({:?},{},{:?})",
+                    symbol.name,
+                    symbol.fully_qualified_name,
+                    symbol.id,
+                    symbol.file.0,
+                    owner_name,
+                    owner,
+                    symbol.kind,
+                    owner,
+                    symbol.name.trim_start_matches('$'),
+                    symbol.kind
+                );
+            }
             builder
                 .declarations
                 .members_by_owner
@@ -1769,18 +2441,16 @@ impl SnapshotBuilder {
             declarations: base.declarations.clone(),
             references: base.references.clone(),
             scopes: base.scopes.clone(),
+            file_fingerprints: base.file_fingerprints.clone(),
             pending_files: HashMap::new(),
         }
     }
 
-    /// Queues a workspace file replacement. Multiple calls are committed as
-    /// one snapshot, avoiding intermediate revisions for a single batch.
-    pub fn replace_file(&mut self, path: impl AsRef<Path>, text: impl Into<String>) {
+    /// Queues an explicitly Workspace-owned file replacement. Multiple calls
+    /// are committed as one snapshot, avoiding intermediate revisions.
+    pub fn replace_workspace_file(&mut self, path: impl AsRef<Path>, text: impl Into<String>) {
         let path = path.as_ref().to_path_buf();
         let text = text.into();
-        if fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
-            return;
-        }
         self.pending_files
             .insert(PersistentFileKey::workspace(&path), Some((path, text)));
     }
@@ -1807,6 +2477,9 @@ impl SnapshotBuilder {
             path,
             symbols: Vec::new(),
         });
+        builder
+            .file_fingerprints
+            .insert(file, text_fingerprint(text));
         let file_scope = builder.new_scope(None, ScopeKind::File, String::new(), None, None, false);
         builder.set_scope_file_span(file_scope, file, 0..text.len());
         if let Ok(syntax) = PhpSyntax::parse(text.to_owned()) {
@@ -1834,6 +2507,7 @@ impl SnapshotBuilder {
             namespace,
             class_name,
             parent_class,
+            interfaces_extended: Vec::new(),
             is_static_method,
             imports: ImportTable::default(),
             bindings: Vec::new(),
@@ -1897,23 +2571,109 @@ impl SnapshotBuilder {
             declarations: self.declarations.clone(),
             references: ReferenceStore::default(),
             scopes: self.scopes.clone(),
+            file_fingerprints: self.file_fingerprints.clone(),
+            interface_relations: InterfaceRelationIndexes::default(),
         }
     }
 
     pub fn build(mut self) -> SemanticSnapshot {
         self.apply_pending_files();
-        SemanticSnapshot {
+        let total_scopes = self.scopes.records.len();
+        let active_scopes = self
+            .scopes
+            .records
+            .iter()
+            .filter(|scope| scope.file.is_some())
+            .count();
+        if should_compact_scopes(total_scopes, active_scopes) {
+            let started = std::time::Instant::now();
+            self.compact_scopes();
+            if std::env::var_os("AXIOM_DEBUG_SEMANTIC").is_some() {
+                eprintln!(
+                    "[SCOPE COMPACTION] revision={} total_before={} active_before={} total_after={} ratio={} elapsed_us={}",
+                    self.revision.0,
+                    total_scopes,
+                    active_scopes,
+                    self.scopes.records.len(),
+                    SCOPE_COMPACTION_RATIO,
+                    started.elapsed().as_micros()
+                );
+            }
+        }
+        let mut snapshot = SemanticSnapshot {
             revision: self.revision,
             files: self.files,
             symbols: self.symbols,
             declarations: self.declarations,
             references: self.references,
             scopes: self.scopes,
-        }
+            file_fingerprints: self.file_fingerprints,
+            interface_relations: InterfaceRelationIndexes::default(),
+        };
+        snapshot.rebuild_interface_relations();
+        snapshot
     }
 
     pub fn finish(self) -> SemanticSnapshot {
         self.build()
+    }
+
+    /// Compacts detached scope tombstones into a dense arena. Scope IDs are
+    /// local to a snapshot and may therefore change; symbol and file IDs are
+    /// deliberately left untouched. This operation is explicit for now and
+    /// is not invoked automatically by `finish`.
+    pub fn compact_scopes(&mut self) {
+        let active = self
+            .scopes
+            .records
+            .iter()
+            .map(|scope| scope.file.is_some())
+            .collect::<Vec<_>>();
+        if active.iter().all(|is_active| *is_active) {
+            return;
+        }
+
+        let mut old_to_new = vec![None; self.scopes.records.len()];
+        let mut compacted = Vec::with_capacity(active.iter().filter(|active| **active).count());
+        for (old_index, scope) in self.scopes.records.iter().enumerate() {
+            if !active[old_index] {
+                continue;
+            }
+            let new_id = ScopeId(compacted.len() as u32);
+            old_to_new[old_index] = Some(new_id);
+            let mut copy = scope.clone();
+            copy.id = new_id;
+            compacted.push(copy);
+        }
+
+        for scope in &mut compacted {
+            if let Some(parent) = scope.parent {
+                let mapped = old_to_new.get(parent.0 as usize).copied().flatten();
+                assert!(
+                    mapped.is_some(),
+                    "active scope {:?} points to inactive/invalid parent {:?}",
+                    scope.id,
+                    parent
+                );
+                scope.parent = mapped;
+            }
+        }
+
+        for reference in &mut self.references.records {
+            let mapped = old_to_new
+                .get(reference.source_scope.0 as usize)
+                .copied()
+                .flatten();
+            assert!(
+                mapped.is_some(),
+                "reference {:?} points to inactive/invalid scope {:?}",
+                reference.id,
+                reference.source_scope
+            );
+            reference.source_scope = mapped.expect("checked above");
+        }
+
+        self.scopes.records = compacted;
     }
 
     fn apply_pending_files(&mut self) {
@@ -1926,6 +2686,45 @@ impl SnapshotBuilder {
             .filter_map(|key| self.files.by_key.get(key).copied())
             .collect();
 
+        // Collect every symbol whose identity will no longer be active. This
+        // includes replacements (renames/removals), not only remove_file.
+        // References in unrelated files must not retain a Resolved target
+        // pointing at one of these IDs.
+        let mut removed_symbols = HashSet::new();
+        for (key, change) in &changes {
+            let Some(file) = self.files.by_key.get(key).copied() else {
+                continue;
+            };
+            let old_ids = self
+                .files
+                .records
+                .get(file.0 as usize)
+                .map(|record| record.symbols.clone())
+                .unwrap_or_default();
+            match change {
+                None => removed_symbols.extend(old_ids),
+                Some((path, text)) => {
+                    let mut replacement_keys = HashSet::new();
+                    let mut source_index = ProjectSymbolIndex::new();
+                    let _ = source_index.index_file_text(path, text);
+                    for symbol in source_index.symbols() {
+                        replacement_keys.insert((symbol.kind, symbol.fully_qualified_name.clone()));
+                    }
+                    for id in old_ids {
+                        let Some(symbol) = self.symbols.records.get(id.0 as usize) else {
+                            removed_symbols.insert(id);
+                            continue;
+                        };
+                        if !replacement_keys
+                            .contains(&(symbol.kind, symbol.fully_qualified_name.clone()))
+                        {
+                            removed_symbols.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+
         // Rebuild the dense reference arena while retaining every unrelated
         // file's records. This removes stale reverse-index entries and keeps
         // ReferenceId deliberately local to the new snapshot.
@@ -1935,6 +2734,23 @@ impl SnapshotBuilder {
             if changed_ids.contains(&reference.file) {
                 continue;
             }
+            let target = match reference.target {
+                ReferenceTarget::Resolved(id) if removed_symbols.contains(&id) => {
+                    ReferenceTarget::Unresolved
+                }
+                ReferenceTarget::Candidates(ids) => {
+                    let ids: Vec<_> = ids
+                        .into_iter()
+                        .filter(|id| !removed_symbols.contains(id))
+                        .collect();
+                    match ids.len() {
+                        0 => ReferenceTarget::Unresolved,
+                        1 => ReferenceTarget::Resolved(ids[0]),
+                        _ => ReferenceTarget::Candidates(ids),
+                    }
+                }
+                target => target,
+            };
             add_reference(
                 self,
                 reference.file,
@@ -1942,7 +2758,7 @@ impl SnapshotBuilder {
                 reference.source_scope,
                 reference.source_symbol,
                 reference.role,
-                reference.target,
+                target,
             );
         }
 
@@ -1975,6 +2791,8 @@ impl SnapshotBuilder {
                     let file_scope =
                         self.new_scope(None, ScopeKind::File, String::new(), None, None, false);
                     self.set_scope_file_span(file_scope, file, 0..text.len());
+                    self.file_fingerprints.insert(file, text_fingerprint(&text));
+                    self.replace_symbols_for_file(file, &path, &text);
                     if let Ok(syntax) = PhpSyntax::parse(text.clone()) {
                         extract_scopes(self, syntax.tree().root_node(), file_scope, &text);
                         extract_assignments(self, syntax.tree().root_node(), &text);
@@ -1982,10 +2800,43 @@ impl SnapshotBuilder {
                     }
                     Some(file)
                 }
-                None => self.files.by_key.get(&key).copied(),
+                None => {
+                    let file = self.files.by_key.remove(&key);
+                    if let Some(file) = file {
+                        let symbol_ids = self
+                            .files
+                            .records
+                            .get(file.0 as usize)
+                            .map(|record| record.symbols.clone())
+                            .unwrap_or_default();
+                        for id in &symbol_ids {
+                            if let Some((key, fqn)) =
+                                self.symbols.records.get(id.0 as usize).map(|symbol| {
+                                    (symbol.key.clone(), symbol.fully_qualified_name.clone())
+                                })
+                            {
+                                self.symbols.by_key.remove(&key);
+                                if let Some(ids) = self.symbols.by_fqn.get_mut(&fqn) {
+                                    ids.retain(|candidate| candidate != id);
+                                    if ids.is_empty() {
+                                        self.symbols.by_fqn.remove(&fqn);
+                                    }
+                                }
+                            }
+                        }
+                        self.declarations.symbols_by_file.remove(&file);
+                        if let Some(record) = self.files.records.get_mut(file.0 as usize) {
+                            // Keep the arena slot for stable IDs, but make it
+                            // semantically inactive and invisible to indexes.
+                            record.symbols.clear();
+                        }
+                    }
+                    file
+                }
             };
             if let Some(file) = file {
                 if removed {
+                    self.file_fingerprints.remove(&file);
                     for scope in &mut self.scopes.records {
                         if scope.file == Some(file) {
                             scope.file = None;
@@ -1997,6 +2848,161 @@ impl SnapshotBuilder {
         let semantic = self.snapshot_view();
         for (file, _path, text, syntax) in extracted {
             extract_references(&semantic, self, file, syntax.tree().root_node(), &text);
+        }
+        self.rebuild_member_indexes();
+    }
+
+    fn replace_symbols_for_file(&mut self, file: FileId, path: &Path, text: &str) {
+        let old_ids = self.files.records[file.0 as usize].symbols.clone();
+        let mut reusable = HashMap::new();
+        for old in &old_ids {
+            if let Some(symbol) = self.symbols.records.get(old.0 as usize) {
+                reusable.insert((symbol.kind, symbol.fully_qualified_name.clone()), *old);
+                self.symbols.by_key.remove(&symbol.key);
+                if let Some(ids) = self.symbols.by_fqn.get_mut(&symbol.fully_qualified_name) {
+                    ids.retain(|id| id != old);
+                }
+            }
+            if let Some(ids) = self.declarations.symbols_by_file.get_mut(&file) {
+                ids.retain(|id| id != old);
+            }
+        }
+        self.declarations.members_by_owner.retain(|owner, members| {
+            if old_ids.contains(owner) {
+                return false;
+            }
+            members.retain(|id| !old_ids.contains(id));
+            !members.is_empty()
+        });
+        self.declarations
+            .members_by_owner_name
+            .retain(|(owner, _, _), members| {
+                if old_ids.contains(owner) {
+                    return false;
+                }
+                members.retain(|id| !old_ids.contains(id));
+                !members.is_empty()
+            });
+        self.files.records[file.0 as usize].symbols.clear();
+
+        let mut source_index = ProjectSymbolIndex::new();
+        let _ = source_index.index_file_text(path, text);
+        for source in source_index.symbols().iter().cloned() {
+            let id = reusable
+                .remove(&(source.kind, source.fully_qualified_name.clone()))
+                .unwrap_or(SymbolId(self.symbols.records.len() as u32));
+            let key = self
+                .symbols
+                .records
+                .get(id.0 as usize)
+                .map(|symbol| symbol.key.clone())
+                .unwrap_or(PersistentSymbolKey {
+                    file: PersistentFileKey::workspace(path),
+                    kind: source.kind,
+                    qualified_name: source.fully_qualified_name.clone(),
+                    discriminator: Some(id.0),
+                });
+            self.symbols.by_key.insert(key.clone(), id);
+            self.symbols
+                .by_fqn
+                .entry(source.fully_qualified_name.clone())
+                .or_default()
+                .push(id);
+            self.declarations
+                .symbols_by_file
+                .entry(file)
+                .or_default()
+                .push(id);
+            self.files.records[file.0 as usize].symbols.push(id);
+            let replacement = SemanticSymbol {
+                id,
+                key,
+                name: source.name,
+                fully_qualified_name: source.fully_qualified_name,
+                kind: source.kind,
+                file,
+                range: source.range,
+                namespace: source.namespace,
+                visibility: source.visibility,
+                modifiers: source.modifiers,
+                parameters: source.parameters,
+                return_type: source.return_type,
+                owner: None,
+                owner_key: None,
+            };
+            if let Some(slot) = self.symbols.records.get_mut(id.0 as usize) {
+                *slot = replacement;
+            } else {
+                self.symbols.records.push(replacement);
+            }
+        }
+        self.rebuild_member_indexes();
+    }
+
+    fn rebuild_member_indexes(&mut self) {
+        self.declarations.members_by_owner.clear();
+        self.declarations.members_by_owner_name.clear();
+        let active: HashSet<SymbolId> = self
+            .files
+            .records
+            .iter()
+            .flat_map(|record| record.symbols.iter().copied())
+            .collect();
+        for symbol in &mut self.symbols.records {
+            if active.contains(&symbol.id) {
+                symbol.owner = None;
+                symbol.owner_key = None;
+            }
+        }
+        let owners: HashMap<(FileId, String), SymbolId> = self
+            .symbols
+            .records
+            .iter()
+            .filter(|s| {
+                active.contains(&s.id)
+                    && matches!(
+                        s.kind,
+                        ProjectSymbolKind::Class
+                            | ProjectSymbolKind::Interface
+                            | ProjectSymbolKind::Trait
+                            | ProjectSymbolKind::Enum
+                    )
+            })
+            .map(|s| ((s.file, s.fully_qualified_name.clone()), s.id))
+            .collect();
+        let owner_keys: HashMap<SymbolId, PersistentSymbolKey> = self
+            .symbols
+            .records
+            .iter()
+            .filter(|s| active.contains(&s.id))
+            .map(|s| (s.id, s.key.clone()))
+            .collect();
+        for symbol in &mut self.symbols.records {
+            if !active.contains(&symbol.id) {
+                continue;
+            }
+            let Some((owner_name, _)) = symbol.fully_qualified_name.rsplit_once("::") else {
+                continue;
+            };
+            let Some(&owner) = owners.get(&(symbol.file, owner_name.to_owned())) else {
+                continue;
+            };
+            symbol.owner = Some(owner);
+            symbol.owner_key = owner_keys.get(&owner).cloned();
+            self.declarations
+                .members_by_owner
+                .entry(owner)
+                .or_default()
+                .push(symbol.id);
+            self.declarations
+                .members_by_owner_name
+                .entry((
+                    owner,
+                    symbol.name.trim_start_matches('$').to_owned(),
+                    symbol.kind,
+                ))
+                .or_default()
+                .push(symbol.id);
         }
     }
 }
@@ -2088,10 +3094,13 @@ fn extract_scopes(
     text: &str,
 ) {
     if node.kind() == "program" {
-        let mut active = scope;
+        // Unbracketed PHP namespaces are sibling lexical regions. Do not use
+        // the previously active namespace as the parent of the next one.
+        let namespace_parent = scope;
+        let mut active = namespace_parent;
         for child in node.named_children(&mut node.walk()) {
             if child.kind() == "namespace_definition" {
-                active = create_namespace_scope(builder, child, active, text);
+                active = create_namespace_scope(builder, child, namespace_parent, text);
             } else {
                 extract_scopes(builder, child, active, text);
             }
@@ -2161,6 +3170,23 @@ fn extract_scopes(
                 parent_class,
                 false,
             );
+            if kind == "interface_declaration" {
+                if let Some(base) = node.child_by_field_name("base_clause").or_else(|| {
+                    node.named_children(&mut node.walk())
+                        .find(|child| matches!(child.kind(), "base_clause" | "extends_clause"))
+                }) {
+                    let parents = node_text(base, text)
+                        .trim()
+                        .strip_prefix("extends")
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(|name| resolve_builder_name(builder, scope, name, ImportKind::Class))
+                        .collect();
+                    builder.scopes.records[child.0 as usize].interfaces_extended = parents;
+                }
+            }
             mark_scope(builder, child, node);
             for child_node in node.named_children(&mut node.walk()) {
                 extract_scopes(builder, child_node, child, text);
@@ -3139,7 +4165,9 @@ fn resolve_builder_name(
     // `declared_type` and `declared_type_from_snapshot` share one parser. This
     // keeps build-time and post-build resolution behavior identical without a
     // broad semantic-index rewrite in this milestone.
-    let written = written.trim().trim_start_matches('\\');
+    let written = written.trim();
+    let absolute = written.starts_with('\\');
+    let written = written.trim_start_matches('\\');
     let first = written.split('\\').next().unwrap_or(written);
     let mut namespace = String::new();
     loop {
@@ -3161,7 +4189,7 @@ fn resolve_builder_name(
             None => break,
         };
     }
-    if namespace.is_empty() {
+    if absolute || namespace.is_empty() {
         written.to_owned()
     } else {
         format!("{namespace}\\{written}")
@@ -3239,16 +4267,49 @@ fn normalize_path(path: &Path) -> String {
     // file currently exists. Buffers are often indexed before their first
     // save, and that transition must not change the persistent identity.
     let normalized = lexical.to_string_lossy().replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    // Windows extended UNC (`\\?\\UNC\\host\\...`) and ordinary UNC
+    // (`\\host\\...`) identify the same file.  Collapse both spellings to
+    // the stable ordinary UNC form before using the path as a persistent key.
+    if lower.starts_with("//?/unc/") {
+        return format!("//{}", &normalized[8..]);
+    }
+    if lower.starts_with("//?/") {
+        return normalized[4..].to_owned();
+    }
     normalized
-        .strip_prefix("//?/")
-        .unwrap_or(&normalized)
-        .to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
+
+    #[test]
+    fn workspace_physical_identity_uses_canonical_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("src/A.php");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "<?php").unwrap();
+        let dotted = dir.path().join("src/../src/A.php");
+        assert_eq!(
+            PersistentFileKey::workspace_physical(&real),
+            PersistentFileKey::workspace_physical(&dotted)
+        );
+        assert_eq!(
+            PersistentFileKey::workspace_physical_with_root("src/A.php", dir.path()),
+            PersistentFileKey::workspace_physical(&real)
+        );
+    }
+    #[test]
+    fn persistent_file_key_collapses_extended_unc_spelling() {
+        let ordinary =
+            PersistentFileKey::workspace(Path::new("//wsl.localhost/Ubuntu/home/foo/bar.php"));
+        let extended = PersistentFileKey::workspace(Path::new(
+            "//?/UNC/wsl.localhost/Ubuntu/home/foo/bar.php",
+        ));
+        assert_eq!(ordinary, extended);
+    }
 
     fn fixture_index() -> (tempfile::TempDir, ProjectSymbolIndex) {
         let dir = tempfile::tempdir().unwrap();
@@ -3269,6 +4330,324 @@ mod tests {
         assert_eq!(snapshot.revision, SemanticRevision(7));
         assert!(snapshot.files.records.is_empty());
         assert!(snapshot.symbols.records.is_empty());
+    }
+
+    #[test]
+    fn scope_compaction_trigger_obeys_ratio_minimum_and_empty_edges() {
+        assert!(!should_compact_scopes(20, 5));
+        assert!(!should_compact_scopes(255, 1));
+        assert!(should_compact_scopes(256, 32));
+        assert!(!should_compact_scopes(256, 33));
+        assert!(!should_compact_scopes(20, 20));
+        assert!(should_compact_scopes(256, 0));
+        assert!(!should_compact_scopes(0, 0));
+    }
+
+    #[test]
+    fn replacing_target_file_invalidates_cross_file_reference_to_removed_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("A.php");
+        let b = dir.path().join("B.php");
+        fs::write(
+            &a,
+            "<?php namespace App; class Service { public function run(): void {} }",
+        )
+        .unwrap();
+        fs::write(
+            &b,
+            "<?php namespace App; function test(Service $service): void { $service->run(); }",
+        )
+        .unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let base = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let old_run = base.symbols_for_fqn("App\\Service::run")[0];
+        assert!(
+            !base
+                .find_usages(old_run, FindUsagesOptions::default())
+                .usages
+                .is_empty()
+        );
+
+        let mut builder = SnapshotBuilder::from_snapshot(&base);
+        builder.replace_workspace_file(
+            &a,
+            "<?php namespace App; class Service { public function execute(): void {} }",
+        );
+        let next = builder.finish();
+        assert!(next.symbols_for_fqn("App\\Service::run").is_empty());
+        assert!(next.symbols_for_fqn("App\\Service::execute").len() == 1);
+        assert!(
+            next.find_usages(old_run, FindUsagesOptions::default())
+                .usages
+                .is_empty()
+        );
+        let b_file = next.file_id(&PersistentFileKey::workspace(&b)).unwrap();
+        assert!(
+            next.references_for_file(b_file)
+                .iter()
+                .filter_map(|id| next.reference(*id))
+                .all(|reference| {
+                    !matches!(reference.target, ReferenceTarget::Resolved(id) if id == old_run)
+                })
+        );
+    }
+
+    #[test]
+    #[ignore = "long-running scope growth audit; run with --ignored"]
+    fn audit_repeated_replacements_append_detached_scopes_but_reuse_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("A.php");
+        let initial = "<?php class A { public function run(): void {} }";
+        fs::write(&path, initial).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let mut current = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let initial_symbols = current.symbols.records.len();
+        let initial_scopes = current.scopes.records.len();
+        for iteration in 0..100 {
+            let mut builder = SnapshotBuilder::from_snapshot(&current);
+            builder.replace_workspace_file(
+                &path,
+                format!("<?php // {iteration}\nclass A {{ public function run(): void {{}} }}"),
+            );
+            current = builder.finish();
+        }
+        assert_eq!(current.symbols.records.len(), initial_symbols);
+        assert!(current.scopes.records.len() > initial_scopes);
+        assert_eq!(current.references.records.len(), 0);
+    }
+
+    #[test]
+    #[ignore = "long-running scope growth audit; run with --ignored"]
+    fn audit_scope_growth_over_long_incremental_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Long.php");
+        let base_text = "<?php namespace App; class Long { public function m01() {} public function m02() {} public function m03() {} public function m04() {} public function m05() {} public function m06() {} public function m07() {} public function m08() {} public function m09() {} public function m10() {} }";
+        fs::write(&path, base_text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let mut current = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let file = current
+            .file_id(&PersistentFileKey::workspace(&path))
+            .unwrap();
+        let json_path = dir.path().join("snapshot.json");
+        current.save_json(&json_path).unwrap();
+        println!(
+            "[SCOPE AUDIT] iteration=0 scopes={} active_scopes={} symbols={} references={} snapshot_size_json_bytes={}",
+            current.scopes.records.len(),
+            current
+                .scopes
+                .records
+                .iter()
+                .filter(|scope| scope.file.is_some())
+                .count(),
+            current.symbols.records.len(),
+            current.references.records.len(),
+            fs::metadata(&json_path).unwrap().len(),
+        );
+        // 100 iterations is the lower bound of the requested audit and keeps
+        // this diagnostic test practical in the normal test suite.
+        for iteration in 1..=100 {
+            let text = format!(
+                "<?php namespace App; // iteration {iteration}\nclass Long {{ public function m01() {{ /* {iteration} */ }} public function m02() {{}} public function m03() {{}} public function m04() {{}} public function m05() {{}} public function m06() {{}} public function m07() {{}} public function m08() {{}} public function m09() {{}} public function m10() {{}} }}"
+            );
+            let offset = text.find("m01").unwrap();
+            let mut builder = SnapshotBuilder::from_snapshot(&current);
+            builder.replace_workspace_file(&path, text.clone());
+            let t_finish = Instant::now();
+            let next = builder.finish();
+            let finish_us = t_finish.elapsed().as_micros();
+            let t_scope = Instant::now();
+            let _ = next.scope_at(file, offset);
+            let scope_us = t_scope.elapsed().as_micros();
+            let t_definition = Instant::now();
+            let _ = next.definition_at_detailed(
+                &path,
+                &text,
+                offset,
+                DefinitionQueryContext {
+                    document_version: None,
+                    semantic_revision: next.revision,
+                },
+            );
+            let definition_us = t_definition.elapsed().as_micros();
+            let t_parent = Instant::now();
+            let _ = next.member_resolver().parent_class_of("App\\Long");
+            let parent_us = t_parent.elapsed().as_micros();
+            let active_scopes = next
+                .scopes
+                .records
+                .iter()
+                .filter(|scope| scope.file.is_some())
+                .count();
+            if iteration % 100 == 0 {
+                next.save_json(&json_path).unwrap();
+                let json_bytes = fs::metadata(&json_path).unwrap().len();
+                println!(
+                    "[SCOPE AUDIT] iteration={iteration} scopes={} active_scopes={active_scopes} symbols={} references={} snapshot_size_json_bytes={json_bytes} scope_at_us={scope_us} definition_at_detailed_us={definition_us} parent_class_of_us={parent_us} finish_us={finish_us}",
+                    next.scopes.records.len(),
+                    next.symbols.records.len(),
+                    next.references.records.len(),
+                );
+            }
+            current = next;
+        }
+        let before_scopes = current.scopes.records.len();
+        let active_scopes = current
+            .scopes
+            .records
+            .iter()
+            .filter(|scope| scope.file.is_some())
+            .count();
+        let symbols_before = current.symbols.records.clone();
+        let json_before = fs::metadata(&json_path).unwrap().len();
+        let mut compact_builder = SnapshotBuilder::from_snapshot(&current);
+        compact_builder.compact_scopes();
+        let compacted = compact_builder.finish();
+        let json_compacted = dir.path().join("snapshot-compacted.json");
+        compacted.save_json(&json_compacted).unwrap();
+        assert_eq!(compacted.scopes.records.len(), active_scopes);
+        assert!(
+            compacted
+                .scopes
+                .records
+                .iter()
+                .enumerate()
+                .all(|(index, scope)| scope.id == ScopeId(index as u32))
+        );
+        assert_eq!(compacted.symbols.records, symbols_before);
+        assert_eq!(compacted.files.records.len(), current.files.records.len());
+        assert!(
+            compacted
+                .files
+                .records
+                .iter()
+                .zip(&current.files.records)
+                .all(|(after, before)| after.id == before.id
+                    && after.key == before.key
+                    && after.path == before.path)
+        );
+        println!(
+            "[SCOPE AUDIT] compacted total_scopes={} active_scopes={} snapshot_size_json_bytes={} before_scopes={} before_json_bytes={json_before}",
+            compacted.scopes.records.len(),
+            active_scopes,
+            fs::metadata(&json_compacted).unwrap().len(),
+            before_scopes,
+        );
+    }
+
+    #[test]
+    fn compact_scopes_preserves_parent_bindings_definition_and_usages() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = dir.path().join("Service.php");
+        let test = dir.path().join("test.php");
+        let test_text = "<?php namespace App\\Test; use App\\Service; function test(Service $service): void { $closure = function() use ($service) {}; $service->run(); }";
+        fs::write(
+            &service,
+            "<?php namespace App; class Service { public function run(): void {} }",
+        )
+        .unwrap();
+        fs::write(&test, test_text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let base = SemanticSnapshot::from_project_index(&index, SemanticRevision(9));
+        let offset = test_text.rfind("run").unwrap();
+        let context = DefinitionQueryContext {
+            document_version: None,
+            semantic_revision: base.revision,
+        };
+        let definition_before = base.definition_at(&test, test_text, offset, context);
+        let usages_before = base.find_usages_at(&test, offset, FindUsagesOptions::default());
+        let function_scope = base
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::Function && scope.file.is_some())
+            .unwrap();
+        assert_eq!(
+            base.resolve_class_name(function_scope.id, "Service")
+                .as_deref(),
+            Some("App\\Service")
+        );
+        assert!(base.lookup_binding(function_scope.id, "$service").is_some());
+
+        let changed_text = format!("// edit\n{test_text}");
+        let changed_offset = changed_text.rfind("run").unwrap();
+        let mut changed = SnapshotBuilder::from_snapshot(&base);
+        changed.replace_workspace_file(&test, changed_text.clone());
+        let changed = changed.finish();
+        assert!(
+            changed.scopes.records.len()
+                > changed
+                    .scopes
+                    .records
+                    .iter()
+                    .filter(|scope| scope.file.is_some())
+                    .count()
+        );
+        let active_kinds_before: Vec<_> = changed
+            .scopes
+            .records
+            .iter()
+            .filter(|scope| scope.file.is_some())
+            .map(|scope| scope.kind)
+            .collect();
+        let mut compact_builder = SnapshotBuilder::from_snapshot(&changed);
+        compact_builder.compact_scopes();
+        let compacted = compact_builder.finish();
+        let active_kinds_after: Vec<_> = compacted
+            .scopes
+            .records
+            .iter()
+            .map(|scope| scope.kind)
+            .collect();
+        assert_eq!(active_kinds_after, active_kinds_before);
+        let changed_context = DefinitionQueryContext {
+            document_version: None,
+            semantic_revision: compacted.revision,
+        };
+        assert_eq!(
+            compacted.definition_at(&test, &changed_text, changed_offset, changed_context),
+            definition_before
+        );
+        let usages_after =
+            compacted.find_usages_at(&test, changed_offset, FindUsagesOptions::default());
+        assert_eq!(usages_after.status, usages_before.status);
+        assert_eq!(usages_after.usages.len(), usages_before.usages.len());
+        assert!(
+            usages_after
+                .usages
+                .iter()
+                .zip(&usages_before.usages)
+                .all(|(after, before)| after.file == before.file && after.role == before.role)
+        );
+        let compact_function = compacted
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::Function)
+            .unwrap();
+        assert_eq!(
+            compacted
+                .resolve_class_name(compact_function.id, "Service")
+                .as_deref(),
+            Some("App\\Service")
+        );
+        assert!(
+            compacted
+                .lookup_binding(compact_function.id, "$service")
+                .is_some()
+        );
+        for reference in &compacted.references.records {
+            assert!((reference.source_scope.0 as usize) < compacted.scopes.records.len());
+        }
+        assert!(
+            base.scopes
+                .records
+                .iter()
+                .all(|scope| (scope.id.0 as usize) < base.scopes.records.len())
+        );
     }
 
     #[test]
@@ -3758,6 +5137,86 @@ function b(One $x) {}
     }
 
     #[test]
+    fn same_file_multiple_namespaces_preserve_workspace_members_and_inheritance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.php");
+        let text = r#"<?php
+namespace App\Base;
+class A { public function run(): void {} protected function guarded(): void {} private function secret(): void {} }
+namespace App\Middle;
+use App\Base\A;
+class B extends A { public function test(): void { parent::run(); $this->guarded(); $this->secret(); } }
+namespace App\Final;
+use App\Middle\B;
+class C extends B {}
+namespace App\Test;
+use App\Final\C;
+function test(C $c): void { $c->run(); }
+"#;
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(60));
+        let a = snapshot.symbols_for_fqn("App\\Base\\A")[0];
+        assert_eq!(
+            snapshot
+                .members_named(a, "run", ProjectSymbolKind::Method)
+                .len(),
+            1
+        );
+        assert_eq!(snapshot.symbols_for_fqn("App\\Middle\\B").len(), 1);
+        assert_eq!(snapshot.symbols_for_fqn("App\\Final\\C").len(), 1);
+        let offset = text.rfind("$c->run").unwrap() + "$c->".len();
+        let detailed = snapshot.definition_at_detailed(
+            &path,
+            text,
+            offset,
+            DefinitionQueryContext {
+                document_version: None,
+                semantic_revision: SemanticRevision(60),
+            },
+        );
+        assert!(matches!(detailed.result, DefinitionResult::Resolved(_)));
+        assert_eq!(detailed.outcome, SemanticDefinitionOutcome::Resolved);
+    }
+
+    #[test]
+    fn multi_namespace_alias_does_not_leak_into_local_class_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alias.php");
+        let text = r#"<?php
+namespace App\Base;
+class A { public function run(): void {} }
+namespace App\Alias;
+use App\Base\A as ParentA;
+class AliasChild extends ParentA {}
+function testAlias(AliasChild $child): void { $child->run(); }
+"#;
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        assert!(
+            index
+                .symbols()
+                .iter()
+                .any(|s| s.fully_qualified_name == "App\\Alias\\AliasChild")
+        );
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(61));
+        let offset = text.rfind("run").unwrap();
+        let detailed = snapshot.definition_at_detailed(
+            &path,
+            text,
+            offset,
+            DefinitionQueryContext {
+                document_version: None,
+                semantic_revision: SemanticRevision(61),
+            },
+        );
+        assert!(matches!(detailed.result, DefinitionResult::Resolved(_)));
+        assert_eq!(detailed.outcome, SemanticDefinitionOutcome::Resolved);
+    }
+
+    #[test]
     fn declared_types_cover_nullable_union_intersection_and_builtins() {
         let text = "<?php namespace App; function f(?Foo $a, Bar|Baz $b, A&B $c, int $d) {}";
         let snapshot =
@@ -4010,6 +5469,728 @@ function b(One $x) {}
                 MemberAccess::Static
             ),
             MemberResolution::Incompatible(_)
+        ));
+    }
+
+    #[test]
+    fn parameter_type_alias_resolves_member_without_short_name_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("one.php"),
+            "<?php namespace App\\One; class StripeService { public function pay(): void {} }",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("two.php"),
+            "<?php namespace App\\Two; class StripeService { public function pay(): void {} }",
+        )
+        .unwrap();
+        let test = "<?php namespace App\\Test; use App\\Two\\StripeService; function test(StripeService $service): void { $service->pay(); }";
+        fs::write(dir.path().join("test.php"), test).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let offset = test.find("$service->pay").unwrap() + "$service->".len();
+        let result = snapshot.definition_at_detailed(
+            dir.path().join("test.php"),
+            test,
+            offset,
+            DefinitionQueryContext {
+                document_version: None,
+                semantic_revision: SemanticRevision(1),
+            },
+        );
+        assert_eq!(
+            result.outcome,
+            SemanticDefinitionOutcome::Resolved,
+            "{result:?}"
+        );
+        let DefinitionResult::Resolved(candidate) = result.result else {
+            panic!("{result:?}")
+        };
+        assert!(candidate.location.file.ends_with("two.php"));
+    }
+
+    #[test]
+    fn parameter_type_import_alias_resolves_member() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("service.php"),
+            "<?php namespace App\\Services; class StripeService { public function pay(): void {} }",
+        )
+        .unwrap();
+        let test = "<?php namespace App\\Test; use App\\Services\\StripeService as PaymentProcessor; function test(PaymentProcessor $service): void { $service->pay(); }";
+        fs::write(dir.path().join("test.php"), test).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let offset = test.find("$service->pay").unwrap() + "$service->".len();
+        let result = snapshot.definition_at_detailed(
+            dir.path().join("test.php"),
+            test,
+            offset,
+            DefinitionQueryContext {
+                document_version: None,
+                semantic_revision: SemanticRevision(1),
+            },
+        );
+        let DefinitionResult::Resolved(candidate) = result.result else {
+            panic!("{result:?}")
+        };
+        assert!(candidate.location.file.ends_with("service.php"));
+    }
+
+    #[test]
+    fn namespaced_typed_parameter_resolves_concrete_member() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("contract.php"), "<?php namespace App\\Contracts; interface PaymentService { public function pay(): void; }").unwrap();
+        fs::write(dir.path().join("service.php"), "<?php namespace App\\Services; use App\\Contracts\\PaymentService as Contract; class StripeService implements Contract { public function pay(): void {} }").unwrap();
+        let test = "<?php namespace App\\Test; use App\\Services\\StripeService; function testStripe(StripeService $service): void { $service->pay(); }";
+        fs::write(dir.path().join("test.php"), test).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let offset = test.find("$service->pay").unwrap() + "$service->".len();
+        let result = snapshot.definition_at_detailed(
+            dir.path().join("test.php"),
+            test,
+            offset,
+            DefinitionQueryContext {
+                document_version: None,
+                semantic_revision: SemanticRevision(1),
+            },
+        );
+        let DefinitionResult::Resolved(candidate) = result.result else {
+            panic!("{result:?}")
+        };
+        assert!(candidate.location.file.ends_with("service.php"));
+    }
+
+    #[test]
+    fn same_file_namespaced_typed_parameter_uses_imported_receiver() {
+        let dir = tempfile::tempdir().unwrap();
+        let test = r#"<?php
+namespace App\One;
+class StripeService { public function pay(): void {} }
+namespace App\Two;
+class StripeService { public function pay(): void {} }
+namespace App\Test;
+use App\Two\StripeService;
+function test(StripeService $service): void { $service->pay(); }
+"#;
+        let path = dir.path().join("test.php");
+        fs::write(&path, test).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let offset = test.rfind("$service->pay").unwrap() + "$service->".len();
+        let result = snapshot.definition_at_detailed(
+            &path,
+            test,
+            offset,
+            DefinitionQueryContext {
+                document_version: None,
+                semantic_revision: SemanticRevision(1),
+            },
+        );
+        let DefinitionResult::Resolved(candidate) = result.result else {
+            panic!("{result:?}")
+        };
+        assert!(candidate.location.file.ends_with("test.php"));
+        assert!(candidate.location.span.start > test.find("App\\Two").unwrap());
+    }
+
+    #[test]
+    fn member_resolver_walks_extends_chain_and_applies_overrides_visibility_and_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inheritance.php");
+        let text = r#"<?php
+namespace App;
+class A {
+    public function inherited() {}
+    public function overridden() {}
+    protected function guarded() {}
+    private function hidden() {}
+    public static function make() {}
+    public string $value;
+    public const KIND = 'a';
+}
+class B extends A {
+    public function overridden() {}
+    public function check(): void { $this->guarded(); $this->hidden(); }
+}
+class C extends B {}
+function use_c(C $c): void { $c->inherited(); $c->overridden(); $c->make(); $c->value; C::KIND; }
+class CycleA extends CycleB {}
+class CycleB extends CycleA {}
+"#;
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(30));
+        let use_scope = snapshot
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::Function && scope.class_name.is_none())
+            .unwrap();
+        let c = DeclaredType::Named {
+            written: "C".into(),
+            resolved: "App\\C".into(),
+        };
+        let resolver = snapshot.member_resolver();
+        let inherited =
+            resolver.resolve_method(use_scope.id, &c, "inherited", MemberAccess::Instance);
+        let inherited_id = match inherited {
+            MemberResolution::Resolved(id) => id,
+            other => panic!("inherited method did not resolve: {other:?}"),
+        };
+        assert_eq!(
+            snapshot.symbol(inherited_id).unwrap().fully_qualified_name,
+            "App\\A::inherited"
+        );
+        let overridden =
+            resolver.resolve_method(use_scope.id, &c, "overridden", MemberAccess::Instance);
+        let overridden_id = match overridden {
+            MemberResolution::Resolved(id) => id,
+            other => panic!("override did not resolve: {other:?}"),
+        };
+        assert_eq!(
+            snapshot.symbol(overridden_id).unwrap().fully_qualified_name,
+            "App\\B::overridden"
+        );
+        assert!(matches!(
+            resolver.resolve_method(use_scope.id, &c, "make", MemberAccess::Static),
+            MemberResolution::Resolved(_)
+        ));
+        assert!(matches!(
+            resolver.resolve_property(use_scope.id, &c, "value"),
+            MemberResolution::Resolved(_)
+        ));
+        assert!(matches!(
+            resolver.resolve_class_constant(use_scope.id, &c, "KIND"),
+            MemberResolution::Resolved(_)
+        ));
+
+        let usage_offset = text.find("$c->inherited").unwrap() + "$c->".len();
+        let semantic_definition = snapshot.definition_at(
+            &path,
+            text,
+            usage_offset,
+            DefinitionQueryContext {
+                document_version: None,
+                semantic_revision: SemanticRevision(30),
+            },
+        );
+        let definition = match semantic_definition {
+            DefinitionResult::Resolved(candidate) => candidate,
+            other => panic!("semantic inherited definition did not resolve: {other:?}"),
+        };
+        assert_eq!(
+            &fs::read_to_string(&path).unwrap()[definition.location.span],
+            "inherited"
+        );
+
+        let check_scope = snapshot
+            .scopes
+            .records
+            .iter()
+            .find(|scope| {
+                scope.kind == ScopeKind::Method && scope.class_name.as_deref() == Some("App\\B")
+            })
+            .unwrap();
+        assert!(matches!(
+            resolver.resolve_binding_method(check_scope.id, "$this", "guarded"),
+            MemberResolution::Resolved(_)
+        ));
+        assert!(matches!(
+            resolver.resolve_binding_method(check_scope.id, "$this", "hidden"),
+            MemberResolution::ResolvedButInaccessible(_)
+        ));
+        let parent_method = resolver.resolve_special_method(
+            check_scope.id,
+            "parent",
+            "inherited",
+            MemberAccess::Instance,
+        );
+        assert!(matches!(parent_method, MemberResolution::Resolved(_)));
+        let self_override = resolver.resolve_special_method(
+            check_scope.id,
+            "self",
+            "overridden",
+            MemberAccess::Instance,
+        );
+        assert!(matches!(self_override, MemberResolution::Resolved(_)));
+        let static_inherited =
+            resolver.resolve_special_method(check_scope.id, "static", "make", MemberAccess::Static);
+        assert!(matches!(static_inherited, MemberResolution::Resolved(_)));
+
+        let cycle = DeclaredType::Named {
+            written: "CycleA".into(),
+            resolved: "App\\CycleA".into(),
+        };
+        assert!(matches!(
+            resolver.resolve_method(use_scope.id, &cycle, "missing", MemberAccess::Instance),
+            MemberResolution::Unresolved
+        ));
+    }
+
+    #[test]
+    fn definition_at_parent_class_scope_preserves_visibility_context() {
+        let text = r#"<?php
+class ParentBase {
+    public function save(): void {}
+    protected function guarded(): void {}
+    private function secret(): void {}
+}
+class ParentChild extends ParentBase {
+    public function execute(): void {
+        parent::save();
+        parent::guarded();
+        parent::secret();
+        $this->save();
+        $this->guarded();
+        $this->secret();
+    }
+}
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parent.php");
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(31));
+        let context = |offset| {
+            snapshot.definition_at_detailed(
+                &path,
+                text,
+                offset,
+                DefinitionQueryContext {
+                    document_version: None,
+                    semantic_revision: SemanticRevision(31),
+                },
+            )
+        };
+        for needle in [
+            "parent::save",
+            "parent::guarded",
+            "$this->save",
+            "$this->guarded",
+        ] {
+            let result = context(
+                text.find(needle).unwrap()
+                    + needle
+                        .rfind("save")
+                        .or_else(|| needle.rfind("guarded"))
+                        .unwrap(),
+            );
+            assert!(
+                matches!(result.result, DefinitionResult::Resolved(candidate) if candidate.confidence == DefinitionConfidence::Exact)
+            );
+            assert_eq!(result.outcome, SemanticDefinitionOutcome::Resolved);
+        }
+        for needle in ["parent::secret", "$this->secret"] {
+            let result = context(text.find(needle).unwrap() + needle.len() - "secret".len());
+            assert!(
+                matches!(result.result, DefinitionResult::Resolved(candidate) if candidate.confidence == DefinitionConfidence::Partial)
+            );
+            assert_eq!(result.outcome, SemanticDefinitionOutcome::Inaccessible);
+        }
+    }
+
+    #[test]
+    fn member_resolver_inheritance_cross_file_and_namespace_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("Base.php");
+        let child_path = dir.path().join("Child.php");
+        fs::write(
+            &base_path,
+            "<?php namespace App\\Core; class Base { public function save(): void {} }",
+        )
+        .unwrap();
+        let child_text = "<?php namespace App\\Service; use App\\Core\\Base; class Child extends Base {} function test(Child $child): void { $child->save(); }";
+        fs::write(&child_path, child_text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(31));
+        let offset = child_text.rfind("save()").unwrap();
+        let result = snapshot.definition_at(
+            &child_path,
+            child_text,
+            offset,
+            DefinitionQueryContext {
+                document_version: None,
+                semantic_revision: SemanticRevision(31),
+            },
+        );
+        let candidate = match result {
+            DefinitionResult::Resolved(candidate) => candidate,
+            other => panic!("cross-file inherited definition did not resolve: {other:?}"),
+        };
+        assert_eq!(
+            candidate.location.file,
+            fs::canonicalize(&base_path).unwrap()
+        );
+        assert_eq!(
+            &fs::read_to_string(&base_path).unwrap()[candidate.location.span],
+            "save"
+        );
+
+        let global_dir = tempfile::tempdir().unwrap();
+        let global_base = global_dir.path().join("Base.php");
+        let global_child = global_dir.path().join("Child.php");
+        fs::write(
+            &global_base,
+            "<?php class Base { public function save(): void {} }",
+        )
+        .unwrap();
+        let global_text = "<?php class Child extends Base {} function test(Child $child): void { $child->save(); }";
+        fs::write(&global_child, global_text).unwrap();
+        let mut global_index = ProjectSymbolIndex::new();
+        global_index.index_project(global_dir.path()).unwrap();
+        let global_snapshot =
+            SemanticSnapshot::from_project_index(&global_index, SemanticRevision(32));
+        let global_result = global_snapshot.definition_at(
+            &global_child,
+            global_text,
+            global_text.rfind("save()").unwrap(),
+            DefinitionQueryContext {
+                document_version: None,
+                semantic_revision: SemanticRevision(32),
+            },
+        );
+        let global_candidate = match global_result {
+            DefinitionResult::Resolved(candidate) => candidate,
+            other => panic!("global cross-file inherited definition did not resolve: {other:?}"),
+        };
+        assert_eq!(
+            global_candidate.location.file,
+            fs::canonicalize(&global_base).unwrap()
+        );
+    }
+
+    #[test]
+    fn member_resolver_inheritance_three_levels_cross_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("A.php");
+        let b = dir.path().join("B.php");
+        let c = dir.path().join("C.php");
+        let test = dir.path().join("test.php");
+        fs::write(&a, "<?php class A { public function run(): void {} }").unwrap();
+        fs::write(&b, "<?php class B extends A {}").unwrap();
+        fs::write(&c, "<?php class C extends B {}").unwrap();
+        let test_text = "<?php function test(C $c): void { $c->run(); }";
+        fs::write(&test, test_text).unwrap();
+
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(33));
+        let a_id = snapshot
+            .symbols_for_fqn("A")
+            .iter()
+            .copied()
+            .find(|id| {
+                snapshot
+                    .symbol(*id)
+                    .is_some_and(|s| s.kind == ProjectSymbolKind::Class)
+            })
+            .expect("A class must be indexed");
+        let run = snapshot.members_named(a_id, "run", ProjectSymbolKind::Method);
+        assert_eq!(run.len(), 1, "A::run must be in the owner member index");
+        assert_eq!(
+            snapshot.symbol(run[0]).unwrap().fully_qualified_name,
+            "A::run"
+        );
+
+        let offset = test_text.rfind("run").unwrap();
+        let result = snapshot.definition_at(
+            &test,
+            test_text,
+            offset,
+            DefinitionQueryContext {
+                document_version: None,
+                semantic_revision: SemanticRevision(33),
+            },
+        );
+        let candidate = match result {
+            DefinitionResult::Resolved(candidate) => candidate,
+            other => panic!("three-level cross-file definition did not resolve: {other:?}"),
+        };
+        assert_eq!(candidate.location.file, fs::canonicalize(a).unwrap());
+    }
+
+    #[test]
+    fn member_resolver_inheritance_three_levels_namespace_cross_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("A.php"),
+            "<?php namespace App\\Base; class A { public function run(): void {} }",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("B.php"),
+            "<?php namespace App\\Middle; use App\\Base\\A as ParentA; class B extends ParentA {}",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("C.php"),
+            "<?php namespace App\\Final; class C extends \\App\\Middle\\B {}",
+        )
+        .unwrap();
+        let test_path = dir.path().join("test.php");
+        let test_text = "<?php namespace App\\Test; use App\\Final\\C; function test(C $c): void { $c->run(); }";
+        fs::write(&test_path, test_text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(34));
+        assert_eq!(snapshot.symbols_for_fqn("App\\Base\\A").len(), 1);
+        let result = snapshot.definition_at(
+            &test_path,
+            test_text,
+            test_text.rfind("run").unwrap(),
+            DefinitionQueryContext {
+                document_version: None,
+                semantic_revision: SemanticRevision(34),
+            },
+        );
+        let candidate = match result {
+            DefinitionResult::Resolved(candidate) => candidate,
+            other => panic!("namespace inheritance did not resolve: {other:?}"),
+        };
+        assert_eq!(
+            candidate.location.file,
+            fs::canonicalize(dir.path().join("A.php")).unwrap()
+        );
+    }
+
+    #[test]
+    fn interface_relations_cover_implementations_and_incremental_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = dir.path().join("Service.php");
+        let base = dir.path().join("Base.php");
+        let impl_a = dir.path().join("A.php");
+        let impl_b = dir.path().join("B.php");
+        let child = dir.path().join("Child.php");
+        fs::write(
+            &service,
+            "<?php interface Service { public function run(): void; }",
+        )
+        .unwrap();
+        fs::write(&base, "<?php class Base { public function run(): void {} }").unwrap();
+        fs::write(&impl_a, "<?php class A extends Base implements Service {} class Leaf extends A {} class Override extends Base implements Service { public function run(): void {} }").unwrap();
+        fs::write(
+            &impl_b,
+            "<?php class B implements Service { public function run(): void {} }",
+        )
+        .unwrap();
+        fs::write(&child, "<?php interface ChildService extends Service {} class Child implements ChildService { public function run(): void {} }").unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(100));
+        let service_id = snapshot.symbols_for_fqn("Service")[0];
+        let method_id = snapshot.members_named(service_id, "run", ProjectSymbolKind::Method)[0];
+        let direct_names: Vec<_> = snapshot
+            .direct_implementers_of(service_id)
+            .iter()
+            .filter_map(|id| {
+                snapshot
+                    .symbol(*id)
+                    .map(|s| s.fully_qualified_name.as_str())
+            })
+            .collect();
+        assert_eq!(direct_names, vec!["A", "B", "Override"]);
+        let implementer_names: Vec<_> = snapshot
+            .implementers_of(service_id)
+            .iter()
+            .filter_map(|id| {
+                snapshot
+                    .symbol(*id)
+                    .map(|s| s.fully_qualified_name.as_str())
+            })
+            .collect();
+        assert_eq!(
+            implementer_names,
+            vec!["A", "B", "Child", "Leaf", "Override"]
+        );
+        let implementation_names: Vec<_> = snapshot
+            .implementations_of(method_id)
+            .iter()
+            .filter_map(|id| {
+                snapshot
+                    .symbol(*id)
+                    .map(|s| s.fully_qualified_name.as_str())
+            })
+            .collect();
+        assert_eq!(
+            implementation_names,
+            vec!["B::run", "Base::run", "Child::run", "Override::run"]
+        );
+
+        let mut builder = SnapshotBuilder::from_snapshot(&snapshot);
+        builder.replace_workspace_file(&impl_b, "<?php class B {}".to_owned());
+        let changed = builder.finish();
+        assert!(
+            !changed
+                .implementers_of(service_id)
+                .iter()
+                .filter_map(|id| changed.symbol(*id))
+                .any(|symbol| symbol.fully_qualified_name == "B")
+        );
+        assert!(changed.implementations_of(method_id).iter().all(|id| {
+            changed
+                .symbol(*id)
+                .is_some_and(|s| s.fully_qualified_name != "B::run")
+        }));
+    }
+
+    #[test]
+    fn interface_relations_resolve_namespace_alias_and_multiple_interfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Contracts.php"), "<?php namespace App\\Contracts; interface Service { public function run(): void; } interface Extra {} ").unwrap();
+        fs::write(dir.path().join("Impl.php"), "<?php namespace App\\Impl; use App\\Contracts\\Service as Contract; use App\\Contracts\\Extra; class Impl implements Contract, Extra { public function run(): void {} } ").unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(101));
+        let service = snapshot.symbols_for_fqn("App\\Contracts\\Service")[0];
+        let extra = snapshot.symbols_for_fqn("App\\Contracts\\Extra")[0];
+        let impl_id = snapshot.symbols_for_fqn("App\\Impl\\Impl")[0];
+        let method = snapshot.members_named(service, "run", ProjectSymbolKind::Method)[0];
+        assert_eq!(snapshot.direct_implementers_of(service), &[impl_id]);
+        assert_eq!(snapshot.implementers_of(service), &[impl_id]);
+        assert_eq!(
+            snapshot.implementations_of(method),
+            &[snapshot.symbols_for_fqn("App\\Impl\\Impl::run")[0]]
+        );
+        assert_eq!(snapshot.implementers_of(extra), &[impl_id]);
+    }
+
+    #[test]
+    fn definition_at_resolves_inherited_constants_and_static_calls_semantically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.php");
+        let text = "<?php class A { public const TYPE = 1; public static function create() {} } class B extends A {} class C extends B {} $x = C::TYPE; C::create(); C::class;";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(35));
+        let context = |_: usize| DefinitionQueryContext {
+            document_version: None,
+            semantic_revision: SemanticRevision(35),
+        };
+        let constant = snapshot.definition_at(&path, text, text.rfind("TYPE").unwrap(), context(0));
+        let method =
+            snapshot.definition_at(&path, text, text.find("create();").unwrap(), context(0));
+        assert!(
+            matches!(constant, DefinitionResult::Resolved(candidate) if candidate.location.span == index.symbols().iter().find(|s| s.fully_qualified_name == "A::TYPE").unwrap().range)
+        );
+        assert!(
+            matches!(method, DefinitionResult::Resolved(candidate) if candidate.location.span == index.symbols().iter().find(|s| s.fully_qualified_name == "A::create").unwrap().range)
+        );
+        assert!(matches!(
+            snapshot.definition_at(&path, text, text.rfind("class").unwrap(), context(0)),
+            DefinitionResult::Resolved(_)
+        ));
+    }
+
+    #[test]
+    fn incremental_inherited_member_add_remove_and_signature_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("A.php");
+        let b = dir.path().join("B.php");
+        let c = dir.path().join("C.php");
+        let test = dir.path().join("test.php");
+        let a_v1 = "<?php class A { public function run(): void {} }";
+        let a_v2 = "<?php class A { public function run(): void {} public function run2(): void {} public string $name; public const TYPE = 'x'; }";
+        let a_v3 = "<?php class A { public function run(): void {} public function run2(int $value): int { return $value; } }";
+        fs::write(&a, a_v1).unwrap();
+        fs::write(&b, "<?php class B extends A {}").unwrap();
+        fs::write(&c, "<?php class C extends B {}").unwrap();
+        let test_v1 = "<?php function test(C $c): void { $c->run(); }";
+        fs::write(&test, test_v1).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let base = SemanticSnapshot::from_project_index(&index, SemanticRevision(40));
+        let c_scope = base
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.class_name.as_deref() == Some("C"))
+            .unwrap();
+        let receiver = DeclaredType::Named {
+            written: "C".into(),
+            resolved: "C".into(),
+        };
+        assert!(matches!(
+            base.member_resolver().resolve_method(
+                c_scope.id,
+                &receiver,
+                "run2",
+                MemberAccess::Instance
+            ),
+            MemberResolution::Unresolved
+        ));
+
+        let mut builder = SnapshotBuilder::from_snapshot(&base);
+        builder.replace_workspace_file(&a, a_v2);
+        builder.replace_workspace_file(
+            &test,
+            "<?php function test(C $c): void { $c->run2(); $c->name; C::TYPE; }",
+        );
+        let next = builder.finish();
+        let c_scope = next
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.class_name.as_deref() == Some("C"))
+            .unwrap();
+        assert!(matches!(
+            next.member_resolver().resolve_method(
+                c_scope.id,
+                &receiver,
+                "run2",
+                MemberAccess::Instance
+            ),
+            MemberResolution::Resolved(_)
+        ));
+        assert!(matches!(
+            next.member_resolver()
+                .resolve_property(c_scope.id, &receiver, "name"),
+            MemberResolution::Resolved(_)
+        ));
+        assert!(matches!(
+            next.member_resolver()
+                .resolve_class_constant(c_scope.id, &receiver, "TYPE"),
+            MemberResolution::Resolved(_)
+        ));
+
+        let mut changed = SnapshotBuilder::from_snapshot(&next);
+        changed.replace_workspace_file(&a, a_v3);
+        let changed = changed.finish();
+        let run2 = changed
+            .symbols_for_fqn("A::run2")
+            .first()
+            .and_then(|id| changed.symbol(*id))
+            .unwrap();
+        assert_eq!(run2.parameters.as_deref(), Some("(int $value)"));
+        assert_eq!(run2.return_type.as_deref(), Some("int"));
+
+        let mut removed = SnapshotBuilder::from_snapshot(&changed);
+        removed.replace_workspace_file(&a, a_v1);
+        let removed = removed.finish();
+        let c_scope = removed
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.class_name.as_deref() == Some("C"))
+            .unwrap();
+        assert!(matches!(
+            removed.member_resolver().resolve_method(
+                c_scope.id,
+                &receiver,
+                "run2",
+                MemberAccess::Instance
+            ),
+            MemberResolution::Unresolved
         ));
     }
 
@@ -4639,7 +6820,7 @@ function run(User $user): void { foo(); echo $user->name; $user->name = 'A'; ech
             .unwrap();
         assert_eq!(base.references_for_target(method).len(), 2);
         let mut next = SnapshotBuilder::from_snapshot(&base);
-        next.replace_file(
+        next.replace_workspace_file(
             &path,
             "<?php namespace App; class Future { public function await() {} } function first(Future $future) { return $future->await(); }",
         );
@@ -4736,6 +6917,115 @@ function run(User $user): void { foo(); echo $user->name; $user->name = 'A'; ech
         let next = builder.finish();
         assert!(next.references_for_target(method).is_empty());
         assert_eq!(base.references_for_target(method).len(), 1);
+        assert!(next.symbols_for_fqn("App\\Future").is_empty());
+        assert!(next.symbols_for_fqn("App\\Future::await").is_empty());
+        assert!(next.file_id(&PersistentFileKey::workspace(&path)).is_none());
+    }
+
+    #[test]
+    fn removing_a_file_clears_members_relations_and_external_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.php");
+        let impl_path = dir.path().join("impl.php");
+        let usage_path = dir.path().join("usage.php");
+        fs::write(
+            &base_path,
+            "<?php\nnamespace App;\ninterface Service { public function run(): void; }\nclass User {\n    public function save(): void {}\n    public string $name;\n    public const TYPE = 'x';\n}",
+        )
+        .unwrap();
+        fs::write(
+            &impl_path,
+            "<?php namespace App; class Impl implements Service { public function run(): void {} }",
+        )
+        .unwrap();
+        fs::write(
+            &usage_path,
+            "<?php namespace App; function test(User $user): void { $user->save(); }",
+        )
+        .unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let base = SemanticSnapshot::from_project_index(&index, SemanticRevision(10));
+        let user = base.symbols_for_fqn("App\\User")[0];
+        let service = base.symbols_for_fqn("App\\Service")[0];
+        let service_run = base.symbols_for_fqn("App\\Service::run")[0];
+        assert_eq!(
+            base.members_named(user, "save", ProjectSymbolKind::Method)
+                .len(),
+            1
+        );
+        assert_eq!(
+            base.members_named(user, "name", ProjectSymbolKind::Property)
+                .len(),
+            1
+        );
+        assert_eq!(
+            base.members_named(user, "TYPE", ProjectSymbolKind::Constant)
+                .len(),
+            1
+        );
+        assert_eq!(base.implementers_of(service).len(), 1);
+        assert_eq!(base.implementations_of(service_run).len(), 1);
+
+        let mut builder = SnapshotBuilder::from_snapshot(&base);
+        builder.remove_file(&impl_path);
+        builder.remove_file(&base_path);
+        let next = builder.finish();
+        assert!(next.symbols_for_fqn("App\\User").is_empty());
+        assert!(next.symbols_for_fqn("App\\Service").is_empty());
+        assert!(
+            next.members_named(user, "save", ProjectSymbolKind::Method)
+                .is_empty()
+        );
+        assert!(
+            next.members_named(user, "name", ProjectSymbolKind::Property)
+                .is_empty()
+        );
+        assert!(
+            next.members_named(user, "TYPE", ProjectSymbolKind::Constant)
+                .is_empty()
+        );
+        assert!(next.implementers_of(service).is_empty());
+        assert!(next.implementations_of(service_run).is_empty());
+        let usage_file = next
+            .file_id(&PersistentFileKey::workspace(&usage_path))
+            .unwrap();
+        for reference_id in next.references_for_file(usage_file) {
+            let reference = next.reference(*reference_id).unwrap();
+            assert!(!matches!(reference.target, ReferenceTarget::Resolved(id) if id == user));
+        }
+        assert!(!base.symbols_for_fqn("App\\User").is_empty());
+        assert_eq!(base.implementers_of(service).len(), 1);
+    }
+
+    #[test]
+    fn rename_batch_removes_old_path_and_replaces_new_path_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("A.php");
+        let new_path = dir.path().join("B.php");
+        let text = "<?php namespace App; class User { public function save(): void {} }";
+        fs::write(&old_path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let base = SemanticSnapshot::from_project_index(&index, SemanticRevision(20));
+        let mut builder = SnapshotBuilder::from_snapshot(&base);
+        builder.remove_file(&old_path);
+        builder.replace_workspace_file(&new_path, text);
+        let next = builder.finish();
+        assert!(
+            next.file_id(&PersistentFileKey::workspace(&old_path))
+                .is_none()
+        );
+        let new_file = next
+            .file_id(&PersistentFileKey::workspace(&new_path))
+            .expect("renamed file should be active");
+        assert_eq!(next.symbols_for_fqn("App\\User").len(), 1);
+        let user = next.symbols_for_fqn("App\\User")[0];
+        assert_eq!(next.symbol(user).unwrap().file, new_file);
+        assert!(
+            base.file_id(&PersistentFileKey::workspace(&old_path))
+                .is_some()
+        );
     }
 
     #[test]
@@ -4754,7 +7044,7 @@ function run(User $user): void { foo(); echo $user->name; $user->name = 'A'; ech
         let other_method = base.symbols_for_fqn("App\\OtherFuture::await")[0];
         assert_eq!(base.references_for_target(future_method).len(), 1);
         let mut builder = SnapshotBuilder::from_snapshot(&base);
-        builder.replace_file(
+        builder.replace_workspace_file(
             &path,
             "<?php namespace App; class Future { public function await() {} } class OtherFuture { public function await() {} } function use_it(OtherFuture $future) { return $future->await(); }",
         );
@@ -4792,7 +7082,7 @@ function run(User $user): void { foo(); echo $user->name; $user->name = 'A'; ech
             .map(|reference| (reference.span.clone(), reference.role))
             .collect::<Vec<_>>();
         let mut builder = SnapshotBuilder::from_snapshot(&base);
-        builder.replace_file(
+        builder.replace_workspace_file(
             &changed,
             "<?php namespace App; class Future { public function await() {} } function first(Future $future) { return $future->await(); } function extra() {}",
         );

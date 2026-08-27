@@ -18,8 +18,8 @@ use axiom_app::shell_state::{
 };
 use axiom_editor::Document;
 use axiom_index::{
-    DefinitionConfidence, FindUsagesOptions, ProjectSymbolIndex, ReferenceRole, SemanticEngine,
-    SemanticRevision, VendorSymbolIndex,
+    FindUsagesOptions, ProjectSymbolIndex, ReferenceRole, SemanticEngine, SemanticRevision,
+    SemanticSnapshot, SnapshotBuilder, VendorSymbolIndex,
 };
 use axiom_lsp::{PositionCodec, ServerStatus, uri_to_path};
 use axiom_php::{RuntimeSymbolIndex, StubProvider};
@@ -111,6 +111,12 @@ struct DefinitionTarget {
     position: lsp_types::Position,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetTextSource {
+    Memory,
+    Disk,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FindUsageTarget {
     file: PathBuf,
@@ -126,6 +132,23 @@ enum DefinitionSource {
     LegacyRuntime,
     Lsp,
     Unresolved,
+}
+
+#[derive(Clone, Copy)]
+enum SemanticDefinitionRoute {
+    Unavailable,
+    Resolved,
+    Outcome(axiom_index::SemanticDefinitionOutcome),
+}
+
+fn vendor_allowed_for_route(route: SemanticDefinitionRoute) -> bool {
+    matches!(
+        route,
+        SemanticDefinitionRoute::Unavailable
+            | SemanticDefinitionRoute::Outcome(
+                axiom_index::SemanticDefinitionOutcome::DeferredVendor
+            )
+    )
 }
 
 fn definition_cache_lookup(
@@ -209,6 +232,13 @@ type RuntimeLoadResult = (
     Result<(RuntimeStubStatus, Arc<RuntimeSymbolIndex>), String>,
 );
 
+fn semantic_update_matches(
+    current_project_generation: u64,
+    update_project_generation: u64,
+) -> bool {
+    current_project_generation == update_project_generation
+}
+
 impl RuntimeStubStatus {
     fn label(&self) -> String {
         match self {
@@ -287,6 +317,12 @@ pub struct WorkspaceView {
     index_generation: u64,
     index_results: Option<Receiver<(u64, Result<SemanticIndexPayload, String>)>>,
     semantic_engine: Option<Arc<SemanticEngine>>,
+    semantic_update_sender: mpsc::Sender<(u64, PathBuf, String)>,
+    semantic_update_receiver: Receiver<(u64, PathBuf, String)>,
+    semantic_update_generation: u64,
+    project_semantic_generation: u64,
+    semantic_update_results: Option<Receiver<(u64, u64, Result<Arc<SemanticSnapshot>, String>)>>,
+    pending_semantic_fs_changes: Vec<(PathBuf, Option<(PathBuf, String)>)>,
     vendor_index: Option<Arc<RwLock<VendorSymbolIndex>>>,
     vendor_index_generation: u64,
     vendor_index_results: Option<Receiver<(u64, Result<VendorSymbolIndex, String>)>>,
@@ -317,6 +353,22 @@ pub struct WorkspaceView {
 }
 
 impl WorkspaceView {
+    fn current_text_for_path(&self, path: &Path, cx: &App) -> Option<(String, TargetTextSource)> {
+        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Some(tab) = self.tabs.iter().find(|tab| {
+            let tab_path = fs::canonicalize(&tab.path).unwrap_or_else(|_| tab.path.clone());
+            tab_path == canonical
+        }) {
+            return Some((
+                tab.editor.read(cx).document_content(),
+                TargetTextSource::Memory,
+            ));
+        }
+        fs::read_to_string(path)
+            .ok()
+            .map(|text| (text, TargetTextSource::Disk))
+    }
+
     fn render_command_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
@@ -738,6 +790,7 @@ impl WorkspaceView {
             .map(RecentProjects::load)
             .unwrap_or_default();
         let keymap = Keymap::load_user();
+        let (semantic_update_sender, semantic_update_receiver) = mpsc::channel();
         if debug_input_enabled() {
             tracing::info!(
                 command = "project.rename",
@@ -813,6 +866,12 @@ impl WorkspaceView {
             index_generation: 0,
             index_results: None,
             semantic_engine: None,
+            semantic_update_sender,
+            semantic_update_receiver,
+            semantic_update_generation: 0,
+            project_semantic_generation: 0,
+            semantic_update_results: None,
+            pending_semantic_fs_changes: Vec::new(),
             vendor_index: None,
             vendor_index_generation: 0,
             vendor_index_results: None,
@@ -867,6 +926,7 @@ impl WorkspaceView {
                         this.poll_project_load(cx);
                         this.poll_runtime_stub_load(cx);
                         this.poll_runtime_watcher(cx);
+                        this.poll_semantic_updates(cx);
                     })
                     .is_err()
                 {
@@ -1116,6 +1176,13 @@ impl WorkspaceView {
     ) {
         self.navigation_back.clear();
         self.navigation_forward.clear();
+        self.project_semantic_generation = self.project_semantic_generation.wrapping_add(1);
+        self.semantic_update_generation = 0;
+        self.semantic_update_results = None;
+        self.pending_semantic_fs_changes.clear();
+        let (semantic_update_sender, semantic_update_receiver) = mpsc::channel();
+        self.semantic_update_sender = semantic_update_sender;
+        self.semantic_update_receiver = semantic_update_receiver;
         let root = project.root_path().to_path_buf();
         self.index_generation = self.index_generation.wrapping_add(1);
         let generation = self.index_generation;
@@ -1232,18 +1299,186 @@ impl WorkspaceView {
                 self.semantic_engine = Some(semantic_engine);
                 if let Some(engine) = &self.semantic_engine {
                     for tab in &self.tabs {
-                        tab.editor
-                            .update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
+                        tab.editor.update(cx, |editor, _| {
+                            editor.set_workspace_root(
+                                self.project.as_ref().unwrap().root_path().to_path_buf(),
+                            );
+                            editor.set_semantic_engine(engine.clone());
+                        });
                     }
                 }
                 for tab in &self.tabs {
-                    tab.editor
-                        .update(cx, |editor, _| editor.set_project_symbols(shared.clone()));
+                    let updates = self.semantic_update_sender.clone();
+                    tab.editor.update(cx, |editor, _| {
+                        editor.set_workspace_root(
+                            self.project.as_ref().unwrap().root_path().to_path_buf(),
+                        );
+                        editor.set_project_symbols(shared.clone());
+                        editor
+                            .set_semantic_update_sender(updates, self.project_semantic_generation);
+                    });
                 }
                 self.status = format!("PHP • {} symbols", report.symbols).into();
             }
             Err(error) => self.status = format!("PHP Index Failed: {error}").into(),
         }
+        cx.notify();
+    }
+
+    fn poll_semantic_updates(&mut self, cx: &mut Context<Self>) {
+        if self.semantic_update_results.is_none() && !self.pending_semantic_fs_changes.is_empty() {
+            let changes = std::mem::take(&mut self.pending_semantic_fs_changes);
+            self.schedule_semantic_fs_batch(changes, cx);
+        }
+        if self.semantic_update_results.is_none() {
+            let mut updates = HashMap::new();
+            while let Ok((project_generation, path, text)) =
+                self.semantic_update_receiver.try_recv()
+            {
+                let is_workspace = self.project.as_ref().is_some_and(|project| {
+                    axiom_index::is_workspace_source(&path, project.root_path())
+                });
+                if semantic_update_matches(self.project_semantic_generation, project_generation)
+                    && is_workspace
+                {
+                    updates.insert(path, text);
+                } else if debug_input_enabled() {
+                    tracing::debug!(path = %path.display(), reason = if is_workspace { "generation_mismatch" } else { "non_workspace_source" }, "[SEMANTIC UPDATE REJECTED]");
+                }
+            }
+            if !updates.is_empty()
+                && let Some(engine) = self.semantic_engine.clone()
+            {
+                self.semantic_update_generation = self.semantic_update_generation.wrapping_add(1);
+                let generation = self.semantic_update_generation;
+                let project_generation = self.project_semantic_generation;
+                let base = engine.snapshot();
+                let (sender, receiver) = mpsc::channel();
+                self.semantic_update_results = Some(receiver);
+                let changed_files = updates.keys().cloned().collect::<Vec<_>>();
+                thread::spawn(move || {
+                    let base_revision = base.revision;
+                    let mut builder = SnapshotBuilder::from_snapshot(&base);
+                    for (path, text) in updates {
+                        builder.replace_workspace_file(path, text);
+                    }
+                    let snapshot = Arc::new(builder.finish());
+                    let _ = sender.send((project_generation, generation, Ok(snapshot)));
+                    if debug_input_enabled() {
+                        tracing::info!(files = ?changed_files, document_version = generation, ?base_revision, new_revision = base_revision.0 + 1, publish = true, "[SEMANTIC UPDATE]");
+                    }
+                });
+            }
+        }
+        let Some(receiver) = self.semantic_update_results.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.semantic_update_results = None;
+                return;
+            }
+        };
+        self.semantic_update_results = None;
+        let (project_generation, generation, result) = result;
+        if !semantic_update_matches(self.project_semantic_generation, project_generation)
+            || generation != self.semantic_update_generation
+        {
+            if debug_input_enabled() {
+                tracing::info!(
+                    project_generation,
+                    current = self.project_semantic_generation,
+                    generation,
+                    "[SEMANTIC PROJECT] discard=project_generation_mismatch"
+                );
+            }
+            return;
+        }
+        if let Ok(snapshot) = result {
+            if let Some(engine) = &self.semantic_engine {
+                let published = engine.publish(snapshot);
+                let revision = engine.snapshot().revision.0;
+                if published {
+                    for tab in &self.tabs {
+                        tab.editor.update(cx, |editor, _| {
+                            editor.set_semantic_engine(engine.clone());
+                        });
+                    }
+                    self.status = format!("PHP • semantic revision {revision}").into();
+                }
+                if debug_input_enabled() {
+                    tracing::info!(
+                        new_revision = revision,
+                        publish = published,
+                        "[SEMANTIC UPDATE]"
+                    );
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    /// Applies Explorer filesystem changes to both mutable project indexes and
+    /// the published semantic snapshot as one batch. Each tuple is
+    /// `(old_path, replacement)`; `None` represents deletion.
+    fn schedule_semantic_fs_batch(
+        &mut self,
+        changes: Vec<(PathBuf, Option<(PathBuf, String)>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if changes.is_empty() || self.semantic_engine.is_none() {
+            return;
+        }
+        if self.semantic_update_results.is_some() {
+            self.pending_semantic_fs_changes.extend(changes);
+            return;
+        }
+        let Some(project_index) = self.project_index.clone() else {
+            return;
+        };
+        self.semantic_update_generation = self.semantic_update_generation.wrapping_add(1);
+        let generation = self.semantic_update_generation;
+        let project_generation = self.project_semantic_generation;
+        let base = self.semantic_engine.as_ref().unwrap().snapshot();
+        let (sender, receiver) = mpsc::channel();
+        self.semantic_update_results = Some(receiver);
+        if debug_input_enabled() {
+            tracing::info!(
+                generation,
+                project_generation,
+                files_affected = changes.len(),
+                "[FS SEMANTIC] batch_start"
+            );
+        }
+        thread::spawn(move || {
+            let mut index = project_index.write().expect("project index lock poisoned");
+            let mut builder = SnapshotBuilder::from_snapshot(&base);
+            for (old_path, replacement) in &changes {
+                index.remove_file(old_path);
+                builder.remove_file(old_path);
+                if let Some((new_path, text)) = replacement {
+                    let _ = index.index_file_text_with_source(
+                        new_path,
+                        text.clone(),
+                        "ExplorerFilesystemUpdate",
+                    );
+                    builder.replace_workspace_file(new_path, text.clone());
+                }
+            }
+            let snapshot = Arc::new(builder.finish());
+            let _ = sender.send((project_generation, generation, Ok(snapshot)));
+            if debug_input_enabled() {
+                tracing::info!(
+                    generation,
+                    project_generation,
+                    files_affected = changes.len(),
+                    publish = true,
+                    "[FS SEMANTIC] batch_ready"
+                );
+            }
+        });
         cx.notify();
     }
 
@@ -1278,6 +1513,13 @@ impl WorkspaceView {
     fn clear_project(&mut self, cx: &mut Context<Self>) {
         self.project_load_generation = self.project_load_generation.wrapping_add(1);
         self.project_load_results = None;
+        self.project_semantic_generation = self.project_semantic_generation.wrapping_add(1);
+        self.semantic_update_generation = 0;
+        self.semantic_update_results = None;
+        self.pending_semantic_fs_changes.clear();
+        let (semantic_update_sender, semantic_update_receiver) = mpsc::channel();
+        self.semantic_update_sender = semantic_update_sender;
+        self.semantic_update_receiver = semantic_update_receiver;
         self.navigation_back.clear();
         self.navigation_forward.clear();
         for tab in &self.tabs {
@@ -1287,6 +1529,17 @@ impl WorkspaceView {
         self.active = None;
         self.explorer.clear();
         self.expanded.clear();
+        self.explorer_context = None;
+        self.explorer_new_menu_open = false;
+        self.explorer_operation = None;
+        self.explorer_input.clear();
+        self.explorer_namespace.clear();
+        self.explorer_extends.clear();
+        self.explorer_implements.clear();
+        self.pending_delete = None;
+        self.selected_path = None;
+        self.context_menu_selected = 0;
+        self.context_submenu_selected = 0;
         self.project = None;
         self.project_index = None;
         self.semantic_engine = None;
@@ -1762,20 +2015,23 @@ impl WorkspaceView {
         false
     }
 
-    fn navigate_semantic_definition(&mut self, cx: &mut Context<Self>) -> bool {
+    fn navigate_semantic_definition(&mut self, cx: &mut Context<Self>) -> SemanticDefinitionRoute {
+        let profile = std::env::var_os("AXIOM_DEBUG_DEFINITION_PROFILE").is_some();
+        let navigation_started = Instant::now();
         let Some(engine) = self.semantic_engine.clone() else {
-            return false;
+            return SemanticDefinitionRoute::Unavailable;
         };
         let Some(tab_index) = self.active else {
-            return false;
+            return SemanticDefinitionRoute::Unavailable;
         };
         let Some(tab) = self.tabs.get(tab_index) else {
-            return false;
+            return SemanticDefinitionRoute::Unavailable;
         };
         let editor = tab.editor.read(cx);
         let path = tab.path.clone();
         let offset = editor.current_cursor_offset();
         let text = editor.document_content();
+        let syntax_context = editor.definition_syntax_context(offset);
         if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
             let token = axiom_syntax::PhpSyntax::parse(text.clone())
                 .ok()
@@ -1793,7 +2049,15 @@ impl WorkspaceView {
             document_version: None,
             semantic_revision: snapshot.revision,
         };
-        let detailed = snapshot.definition_at_detailed(&path, &text, offset, context);
+        let semantic_started = Instant::now();
+        let detailed = snapshot.definition_at_detailed_with_syntax(
+            &path,
+            &text,
+            offset,
+            syntax_context,
+            context,
+        );
+        let semantic_us = semantic_started.elapsed().as_micros();
         if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
             tracing::info!(outcome = ?detailed.outcome, result = ?detailed.result, "[DEFINITION RESULT]");
         }
@@ -1806,23 +2070,35 @@ impl WorkspaceView {
                     "[DEFINITION SEMANTIC]"
                 );
             }
-            return false;
+            return SemanticDefinitionRoute::Outcome(detailed.outcome);
         };
-        if !matches!(
-            candidate.confidence,
-            DefinitionConfidence::Exact | DefinitionConfidence::High
-        ) {
-            return false;
-        }
         let target_path = candidate.location.file.clone();
-        let Ok(target_text) = fs::read_to_string(&target_path) else {
-            return false;
+        let target_lookup_started = Instant::now();
+        let Some((target_text, text_source)) = self.current_text_for_path(&target_path, cx) else {
+            return SemanticDefinitionRoute::Outcome(detailed.outcome);
         };
+        let target_text_lookup_us = target_lookup_started.elapsed().as_micros();
+        if debug_input_enabled() {
+            let span = &candidate.location.span;
+            let text_at_span = target_text.get(span.clone()).unwrap_or("");
+            tracing::info!(
+                file = %target_path.display(),
+                span = ?span,
+                text_source = ?text_source,
+                text_len = target_text.len(),
+                text_at_span,
+                "[NAVIGATION TARGET]"
+            );
+        }
+        let position_started = Instant::now();
         let position = PositionCodec::offset_to_position(
             &target_text,
             candidate.location.span.start,
             Default::default(),
         );
+        if profile {
+            tracing::debug!(semantic_us, target_text_lookup_us, position_codec_us = position_started.elapsed().as_micros(), total_navigation_us = navigation_started.elapsed().as_micros(), target_text_source = ?text_source, "[NAVIGATION PROFILE]");
+        }
         if debug_input_enabled() {
             tracing::info!(
                 source = ?DefinitionSource::Semantic,
@@ -1839,7 +2115,7 @@ impl WorkspaceView {
             },
             cx,
         );
-        true
+        SemanticDefinitionRoute::Resolved
     }
 
     fn native_definition_action(
@@ -1851,18 +2127,32 @@ impl WorkspaceView {
         if debug_input_enabled() {
             tracing::info!(provider = "native", "[DEFINITION REQUEST]");
         }
-        let semantic_result = self.navigate_semantic_definition(cx);
+        let semantic_route = self.navigate_semantic_definition(cx);
+        let semantic_result = matches!(semantic_route, SemanticDefinitionRoute::Resolved);
+        let vendor_allowed = vendor_allowed_for_route(semantic_route);
         if debug_input_enabled() {
             tracing::info!(
                 called = true,
                 result = semantic_result,
                 "[DEFINITION SEMANTIC PATH]"
             );
+            tracing::info!(
+                semantic_outcome = ?match semantic_route {
+                    SemanticDefinitionRoute::Outcome(outcome) => Some(outcome),
+                    SemanticDefinitionRoute::Resolved => Some(axiom_index::SemanticDefinitionOutcome::Resolved),
+                    SemanticDefinitionRoute::Unavailable => None,
+                },
+                vendor_allowed,
+                legacy_allowed = true,
+                lsp_allowed = true,
+                reason = if vendor_allowed { "deferred-vendor-or-no-semantic-engine" } else { "semantic-outcome-disallows-vendor" },
+                "[DEFINITION ROUTING]"
+            );
         }
         if semantic_result {
             return;
         }
-        let vendor_result = self.start_vendor_definition(cx);
+        let vendor_result = vendor_allowed && self.start_vendor_definition(cx);
         if debug_input_enabled() {
             tracing::info!(
                 called = true,
@@ -1933,31 +2223,9 @@ impl WorkspaceView {
             self.navigate_to_definition(target, cx);
             return true;
         }
-        if debug_input_enabled() {
-            tracing::info!(kind = "definition", symbol = ?query_key, source = "Project|Vendor", hit = false, "[DEFINITION CACHE]");
-        }
-        if let Some((path, position)) = tab.editor.read(cx).project_definition_location() {
-            if debug_input_enabled() {
-                tracing::info!(found = true, path = %path.display(), "[DEFINITION PROJECT]");
-                tracing::info!(attempted = false, found = false, "[DEFINITION VENDOR]");
-                tracing::info!(source = "Project", path = %path.display(), "[DEFINITION TARGET]");
-                tracing::info!(source = ?DefinitionSource::LegacyProject, "[DEFINITION SOURCE]");
-            }
-            if let Some(key) = query_key.as_ref() {
-                self.definition_cache.insert(
-                    key.clone(),
-                    DefinitionTarget {
-                        path: path.clone(),
-                        position,
-                    },
-                );
-            }
-            self.navigate_to_definition(DefinitionTarget { path, position }, cx);
-            return true;
-        }
-        if debug_input_enabled() {
-            tracing::info!(found = false, "[DEFINITION PROJECT]");
-        }
+        // Workspace project definitions are resolved exclusively by the
+        // SemanticEngine. This path is retained only for deferred Vendor
+        // symbols, whose files are loaded asynchronously below.
         self.definition_loading = true;
         self.definition_loading_tick = 0;
         self.status = "Resolving definition…".into();
@@ -2099,10 +2367,26 @@ impl WorkspaceView {
                 editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
             }
             if let Some(index) = &self.project_index {
+                editor.update(cx, |editor, _| {
+                    editor.set_workspace_root(
+                        self.project
+                            .as_ref()
+                            .map(|p| p.root_path().to_path_buf())
+                            .unwrap_or_default(),
+                    )
+                });
                 editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+                editor.update(cx, |editor, _| {
+                    editor.set_semantic_update_sender(
+                        self.semantic_update_sender.clone(),
+                        self.project_semantic_generation,
+                    )
+                });
             }
             if let Some(engine) = &self.semantic_engine {
-                editor.update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
+                editor.update(cx, |editor, _| {
+                    editor.set_semantic_engine(engine.clone());
+                });
             }
             if let Some(vendor) = &self.vendor_index {
                 editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
@@ -2183,9 +2467,19 @@ impl WorkspaceView {
 
     fn open_find_usage(&mut self, target: FindUsageTarget, cx: &mut Context<Self>) {
         let path = target.file.clone();
-        let Ok(text) = fs::read_to_string(&path) else {
+        let Some((text, text_source)) = self.current_text_for_path(&path, cx) else {
             return;
         };
+        if debug_input_enabled() {
+            tracing::info!(
+                file = %path.display(),
+                span = ?target.span,
+                text_source = ?text_source,
+                text_len = text.len(),
+                text_at_span = text.get(target.span.clone()).unwrap_or(""),
+                "[NAVIGATION TARGET]"
+            );
+        }
         let position =
             PositionCodec::offset_to_position(&text, target.span.start, Default::default());
         self.find_usages_visible = false;
@@ -3428,6 +3722,47 @@ impl WorkspaceView {
                         this.explorer_fs_busy = false;
                         match result {
                             Ok(ExplorerFsResult::Rename { old, new }) => {
+                                let dirty_contents: HashMap<PathBuf, String> = this
+                                    .tabs
+                                    .iter()
+                                    .filter(|tab| tab.path.starts_with(&old))
+                                    .filter_map(|tab| {
+                                        tab.editor.read(cx).is_dirty().then(|| {
+                                            (
+                                                tab.path.clone(),
+                                                tab.editor.read(cx).document_content(),
+                                            )
+                                        })
+                                    })
+                                    .collect();
+                                let semantic_changes = this
+                                    .project_index
+                                    .as_ref()
+                                    .map(|index| {
+                                        let paths = index
+                                            .read()
+                                            .map(|index| {
+                                                index
+                                                    .indexed_files()
+                                                    .map(Path::to_path_buf)
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default();
+                                        paths
+                                            .into_iter()
+                                            .filter(|path| path.starts_with(&old))
+                                            .filter_map(|path| {
+                                                let relative = path.strip_prefix(&old).ok()?;
+                                                let new_path = new.join(relative);
+                                                let text =
+                                                    dirty_contents.get(&path).cloned().or_else(
+                                                        || fs::read_to_string(&new_path).ok(),
+                                                    )?;
+                                                Some((path, Some((new_path, text))))
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
                                 for tab in &mut this.tabs {
                                     if let Ok(relative) = tab.path.strip_prefix(&old) {
                                         tab.path = new.join(relative);
@@ -3436,6 +3771,7 @@ impl WorkspaceView {
                                         });
                                     }
                                 }
+                                this.schedule_semantic_fs_batch(semantic_changes, cx);
                                 this.refresh_explorer(cx);
                                 this.status = "Renamed".into();
                             }
@@ -3545,6 +3881,27 @@ impl WorkspaceView {
                         for tab in this.tabs.iter().filter(|tab| tab.path.starts_with(&path)) {
                             tab.editor.read(cx).close_lsp_document();
                         }
+                        let semantic_changes = this
+                            .project_index
+                            .as_ref()
+                            .map(|index| {
+                                let paths = index
+                                    .read()
+                                    .map(|index| {
+                                        index
+                                            .indexed_files()
+                                            .map(Path::to_path_buf)
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                paths
+                                    .into_iter()
+                                    .filter(|candidate| candidate.starts_with(&path))
+                                    .map(|candidate| (candidate, None))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        this.schedule_semantic_fs_batch(semantic_changes, cx);
                         this.tabs.retain(|tab| !tab.path.starts_with(&path));
                         this.active = if this.tabs.is_empty() {
                             None
@@ -3605,13 +3962,29 @@ impl WorkspaceView {
             editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
         }
         if let Some(index) = &self.project_index {
+            editor.update(cx, |editor, _| {
+                editor.set_workspace_root(
+                    self.project
+                        .as_ref()
+                        .map(|p| p.root_path().to_path_buf())
+                        .unwrap_or_default(),
+                )
+            });
             editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+            editor.update(cx, |editor, _| {
+                editor.set_semantic_update_sender(
+                    self.semantic_update_sender.clone(),
+                    self.project_semantic_generation,
+                )
+            });
             if let Some(vendor) = &self.vendor_index {
                 editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
             }
         }
         if let Some(engine) = &self.semantic_engine {
-            editor.update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
+            editor.update(cx, |editor, _| {
+                editor.set_semantic_engine(engine.clone());
+            });
         }
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
         self.tabs.push(OpenTab { path, editor });
@@ -3660,13 +4033,29 @@ impl WorkspaceView {
             editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
         }
         if let Some(index) = &self.project_index {
+            editor.update(cx, |editor, _| {
+                editor.set_workspace_root(
+                    self.project
+                        .as_ref()
+                        .map(|p| p.root_path().to_path_buf())
+                        .unwrap_or_default(),
+                )
+            });
             editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+            editor.update(cx, |editor, _| {
+                editor.set_semantic_update_sender(
+                    self.semantic_update_sender.clone(),
+                    self.project_semantic_generation,
+                )
+            });
             if let Some(vendor) = &self.vendor_index {
                 editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
             }
         }
         if let Some(engine) = &self.semantic_engine {
-            editor.update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
+            editor.update(cx, |editor, _| {
+                editor.set_semantic_engine(engine.clone());
+            });
         }
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
         self.tabs.push(OpenTab { path, editor });
@@ -3739,14 +4128,16 @@ impl WorkspaceView {
         }
         for event in events {
             match event {
-                IdeLspEvent::Diagnostics(params) => {
+                IdeLspEvent::Diagnostics { params, session } => {
                     if let Some(tab) = self
                         .tabs
                         .iter()
                         .find(|tab| tab.editor.read(cx).lsp_uri() == Some(&params.uri))
                     {
                         tab.editor.update(cx, |editor, cx| {
-                            editor.set_diagnostics(params.version, params.diagnostics, cx)
+                            if editor.document_session() == session {
+                                editor.set_diagnostics(params.version, params.diagnostics, cx)
+                            }
                         });
                     }
                 }
@@ -3969,13 +4360,29 @@ impl WorkspaceView {
                 editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
             }
             if let Some(index) = &self.project_index {
+                editor.update(cx, |editor, _| {
+                    editor.set_workspace_root(
+                        self.project
+                            .as_ref()
+                            .map(|p| p.root_path().to_path_buf())
+                            .unwrap_or_default(),
+                    )
+                });
                 editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+                editor.update(cx, |editor, _| {
+                    editor.set_semantic_update_sender(
+                        self.semantic_update_sender.clone(),
+                        self.project_semantic_generation,
+                    )
+                });
                 if let Some(vendor) = &self.vendor_index {
                     editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
                 }
             }
             if let Some(engine) = &self.semantic_engine {
-                editor.update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
+                editor.update(cx, |editor, _| {
+                    editor.set_semantic_engine(engine.clone());
+                });
             }
             cx.observe(&editor, |_, _, cx| cx.notify()).detach();
             self.tabs.push(OpenTab {
@@ -4092,13 +4499,29 @@ impl WorkspaceView {
                 editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
             }
             if let Some(index) = &self.project_index {
+                editor.update(cx, |editor, _| {
+                    editor.set_workspace_root(
+                        self.project
+                            .as_ref()
+                            .map(|p| p.root_path().to_path_buf())
+                            .unwrap_or_default(),
+                    )
+                });
                 editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+                editor.update(cx, |editor, _| {
+                    editor.set_semantic_update_sender(
+                        self.semantic_update_sender.clone(),
+                        self.project_semantic_generation,
+                    )
+                });
                 if let Some(vendor) = &self.vendor_index {
                     editor.update(cx, |editor, _| editor.set_vendor_symbols(vendor.clone()));
                 }
             }
             if let Some(engine) = &self.semantic_engine {
-                editor.update(cx, |editor, _| editor.set_semantic_engine(engine.clone()));
+                editor.update(cx, |editor, _| {
+                    editor.set_semantic_engine(engine.clone());
+                });
             }
             cx.observe(&editor, |_, _, cx| cx.notify()).detach();
             self.tabs.push(OpenTab { path, editor });
@@ -4263,9 +4686,9 @@ impl WorkspaceView {
                     .enumerate()
                     .map(|(index, target)| {
                         let workspace = workspace.clone();
-                        let (line, character) = fs::read_to_string(&target.file)
-                            .ok()
-                            .map(|text| {
+                        let (line, character) = self
+                            .current_text_for_path(&target.file, cx)
+                            .map(|(text, _)| {
                                 let position = PositionCodec::offset_to_position(
                                     &text,
                                     target.span.start,
@@ -4680,16 +5103,13 @@ impl WorkspaceView {
         let t = theme();
         let m = metrics();
         let workspace = cx.entity();
-        let context = self
-            .explorer_context
-            .clone()
-            .expect("context menu is visible");
-        let root = self
-            .project
-            .as_ref()
-            .expect("project is open")
-            .root_path()
-            .to_path_buf();
+        let Some(context) = self.explorer_context.clone() else {
+            return div();
+        };
+        let Some(project) = self.project.as_ref() else {
+            return div();
+        };
+        let root = project.root_path().to_path_buf();
         let directory = Self::context_directory(&context.path, context.kind).to_path_buf();
         let is_root = context.path == root;
         let menu_width = px(300.);
@@ -6886,12 +7306,109 @@ fn tab_display_path(path: &Path, project_root: Option<&Path>, runtime_root: &Pat
 #[cfg(test)]
 mod modifier_tests {
     use super::{
-        byte_to_utf16_offset, normalize_modifiers, replace_utf16_range, utf16_slice,
-        utf16_to_byte_offset,
+        EditorView, EntryKind, ExplorerContext, OpenTab, SemanticDefinitionRoute, StartupTarget,
+        WorkspaceView, byte_to_utf16_offset, normalize_modifiers, replace_utf16_range,
+        semantic_update_matches, utf16_slice, utf16_to_byte_offset, vendor_allowed_for_route,
     };
-    use gpui::Modifiers;
+    use gpui::{AppContext, Modifiers};
     use std::collections::HashMap;
     use std::collections::HashSet;
+
+    #[gpui::test]
+    fn clear_project_discards_explorer_transient_state(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx) =
+            cx.add_window_view(move |_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.explorer_context = Some(ExplorerContext {
+                path: std::path::PathBuf::from("old.php"),
+                kind: EntryKind::File,
+            });
+            workspace.explorer_new_menu_open = true;
+            workspace.explorer_operation = Some(super::ExplorerOperation::Rename(
+                std::path::PathBuf::from("old.php"),
+            ));
+            workspace.clear_project(cx);
+            assert!(workspace.project.is_none());
+            assert!(workspace.explorer_context.is_none());
+            assert!(!workspace.explorer_new_menu_open);
+            assert!(workspace.explorer_operation.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn navigation_text_prefers_dirty_open_buffer_and_preserves_utf8_byte_spans(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Service.php");
+        std::fs::write(
+            &path,
+            "<?php\nclass Service { public function old(): void {} }\n",
+        )
+        .unwrap();
+        let dirty =
+            "<?php\n$label = \"ação ç ã 😀\";\nclass Service { public function run(): void {} }\n";
+        let path_for_editor = path.clone();
+        let dirty_for_editor = dirty.to_owned();
+        let (workspace, cx) =
+            cx.add_window_view(move |_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        let editor = cx.new(|cx| {
+            EditorView::from_document(
+                path_for_editor.clone(),
+                axiom_editor::Document::from_content(&dirty_for_editor),
+                None,
+                cx,
+            )
+        });
+        workspace.update(cx, |workspace, _| {
+            workspace.tabs.push(OpenTab {
+                path: path_for_editor,
+                editor,
+            });
+        });
+        let (text, source) = cx.read(|app| {
+            let workspace = workspace.read(app);
+            workspace.current_text_for_path(&path, app).unwrap()
+        });
+        assert_eq!(source, super::TargetTextSource::Memory);
+        let start = text.rfind("run").unwrap();
+        assert_eq!(&text[start..start + 3], "run");
+        let closed_path = dir.path().join("Closed.php");
+        std::fs::write(&closed_path, "<?php class Closed {}\n").unwrap();
+        let (closed_text, closed_source) = cx.read(|app| {
+            let workspace = workspace.read(app);
+            workspace.current_text_for_path(&closed_path, app).unwrap()
+        });
+        assert_eq!(closed_source, super::TargetTextSource::Disk);
+        assert!(closed_text.contains("class Closed"));
+    }
+
+    #[test]
+    fn stale_semantic_project_generations_are_rejected() {
+        assert!(!semantic_update_matches(3, 1));
+        assert!(!semantic_update_matches(3, 2));
+        assert!(semantic_update_matches(3, 3));
+        assert!(!semantic_update_matches(3, 4));
+    }
+
+    #[test]
+    fn definition_routing_never_sends_stale_or_ambiguous_results_to_vendor() {
+        use axiom_index::SemanticDefinitionOutcome;
+
+        assert!(!vendor_allowed_for_route(SemanticDefinitionRoute::Outcome(
+            SemanticDefinitionOutcome::StaleSnapshot,
+        )));
+        assert!(!vendor_allowed_for_route(SemanticDefinitionRoute::Outcome(
+            SemanticDefinitionOutcome::Ambiguous,
+        )));
+        assert!(!vendor_allowed_for_route(SemanticDefinitionRoute::Resolved));
+        assert!(vendor_allowed_for_route(SemanticDefinitionRoute::Outcome(
+            SemanticDefinitionOutcome::DeferredVendor,
+        )));
+        assert!(vendor_allowed_for_route(
+            SemanticDefinitionRoute::Unavailable
+        ));
+    }
 
     #[test]
     fn preserves_plain_control_shift_and_alt() {

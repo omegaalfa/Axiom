@@ -6,7 +6,7 @@
 use axiom_syntax::PhpSyntax;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -19,11 +19,12 @@ mod source;
 
 pub use semantic::{
     BuiltinType, DeclaredType, DefinitionCandidate, DefinitionConfidence, DefinitionLocation,
-    DefinitionQueryContext, DefinitionResult, Expression, ExpressionResolver, FileId, FileRecord,
-    FindUsagesOptions, FindUsagesResult, FindUsagesStatus, ImportBinding, ImportKind, ImportTable,
-    MemberAccess, MemberKind, MemberResolution, MemberResolver, PersistentFileKey,
-    PersistentSymbolKey, ReferenceConfidence, ReferenceId, ReferenceLocation, ReferenceProvider,
-    ReferenceRole, ReferenceTarget, Scope, ScopeId, ScopeKind, ScopeStore,
+    DefinitionQueryContext, DefinitionResult, DefinitionSyntaxContext, Expression,
+    ExpressionResolver, FileId, FileRecord, FindUsagesOptions, FindUsagesResult, FindUsagesStatus,
+    ImportBinding, ImportKind, ImportTable, InaccessibilityInfo, InaccessibilityReason,
+    InterfaceRelationIndexes, MemberAccess, MemberKind, MemberResolution, MemberResolver,
+    PersistentFileKey, PersistentSymbolKey, ReferenceConfidence, ReferenceId, ReferenceLocation,
+    ReferenceProvider, ReferenceRole, ReferenceTarget, Scope, ScopeId, ScopeKind, ScopeStore,
     SemanticDefinitionOutcome, SemanticDefinitionResult, SemanticEngine, SemanticReference,
     SemanticRevision, SemanticSnapshot, SemanticSymbol, SnapshotBuilder, SourceOrigin, SymbolId,
     UsageLocation, VariableBinding,
@@ -83,7 +84,9 @@ pub struct ProjectSymbolIndex {
     ready: bool,
 }
 
-const PROJECT_CACHE_SCHEMA: u32 = 1;
+// Bumped when symbol FQNs/owner indexing change so stale caches cannot keep
+// invalid member names (for example the old `\\Base::save` global FQN).
+const PROJECT_CACHE_SCHEMA: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ProjectCacheFile {
@@ -781,8 +784,12 @@ impl ProjectSymbolIndex {
         self.ready = false;
         let mut paths = Vec::new();
         collect_php_files(root.as_ref(), &mut paths)?;
+        let mut seen = HashSet::new();
         for path in paths {
-            let _ = self.index_file_with_source(&path, "InitialProjectScan");
+            let path = canonical_or(path);
+            if seen.insert(path.clone()) {
+                let _ = self.index_file_with_source(&path, "InitialProjectScan");
+            }
         }
         self.ready = true;
         Ok(self.report())
@@ -797,9 +804,11 @@ impl ProjectSymbolIndex {
         let root = root.as_ref();
         let mut discovered = Vec::new();
         collect_php_files(root, &mut discovered)?;
+        let mut seen = HashSet::new();
         let discovered: Vec<PathBuf> = discovered
             .into_iter()
             .filter_map(|path| fs::canonicalize(path).ok())
+            .filter(|path| seen.insert(path.clone()))
             .collect();
         let cached = fs::read_to_string(cache_path.as_ref())
             .ok()
@@ -923,12 +932,11 @@ impl ProjectSymbolIndex {
         let syntax = PhpSyntax::parse(text.clone())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         let mut output = Vec::new();
-        let namespace = namespace_of(&syntax);
         walk(
             syntax.tree().root_node(),
             &text,
             &path,
-            &namespace,
+            "",
             None,
             &mut output,
             source,
@@ -1027,21 +1035,25 @@ fn collect_php_files(root: &Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
-fn namespace_of(syntax: &PhpSyntax) -> String {
-    let text = syntax.text();
-    let mut found = String::new();
-    let mut stack = vec![syntax.tree().root_node()];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "namespace_definition" {
-            if let Some(name) = node.child_by_field_name("name") {
-                found = name.utf8_text(text.as_bytes()).unwrap_or("").to_owned();
-                break;
-            }
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.children(&mut cursor));
+/// Returns whether a path belongs to the editable Workspace source set.
+/// This is the same root/exclusion policy used by project discovery.
+pub fn is_workspace_source(path: impl AsRef<Path>, project_root: impl AsRef<Path>) -> bool {
+    let path = canonical_or(path.as_ref().to_path_buf());
+    let root = canonical_or(project_root.as_ref().to_path_buf());
+    if !path.starts_with(&root) {
+        return false;
     }
-    found.trim_matches('\\').to_owned()
+    path.strip_prefix(&root)
+        .ok()
+        .into_iter()
+        .flat_map(Path::components)
+        .all(|component| {
+            let name = component.as_os_str().to_string_lossy();
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                ".git" | "target" | "node_modules" | "vendor"
+            )
+        })
 }
 
 fn walk(
@@ -1053,6 +1065,39 @@ fn walk(
     out: &mut Vec<ProjectSymbol>,
     source: &str,
 ) {
+    if node.kind() == "program" {
+        let mut current_namespace = namespace.to_owned();
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "namespace_definition" {
+                current_namespace = child
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(text.as_bytes()).ok())
+                    .unwrap_or("")
+                    .trim_matches('\\')
+                    .to_owned();
+            } else {
+                walk(child, text, file, &current_namespace, class, out, source);
+            }
+        }
+        return;
+    }
+    // Namespace declarations are lexical scopes. Carry the namespace from
+    // each declaration's own byte range instead of selecting the first one in
+    // the file; PHP permits multiple namespaces in a single file.
+    if node.kind() == "namespace_definition" {
+        let namespace = node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(text.as_bytes()).ok())
+            .unwrap_or("")
+            .trim_matches('\\')
+            .to_owned();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(child, text, file, &namespace, None, out, source);
+        }
+        return;
+    }
     if let Some((kind, name_node)) = symbol_node(node) {
         if let Ok(name) = name_node.utf8_text(text.as_bytes()) {
             let name = name.to_owned();
@@ -1075,6 +1120,13 @@ fn walk(
                         .flatten()
                 });
             let fqn = match (class, kind) {
+                (
+                    Some(parent),
+                    ProjectSymbolKind::Method
+                    | ProjectSymbolKind::Property
+                    | ProjectSymbolKind::Constant
+                    | ProjectSymbolKind::ClassConstant,
+                ) if namespace.is_empty() => format!("{parent}::{name}"),
                 (
                     Some(parent),
                     ProjectSymbolKind::Method
@@ -1212,6 +1264,26 @@ fn symbol_node(node: Node<'_>) -> Option<(ProjectSymbolKind, Node<'_>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_source_uses_discovery_exclusions_and_root_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src/User.php");
+        let vendor = root.path().join("vendor/pkg/Foo.php");
+        let target = root.path().join("target/generated.php");
+        let external = root.path().join(r"..\external.php");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&src, "<?php").unwrap();
+        fs::write(&vendor, "<?php").unwrap();
+        fs::write(&target, "<?php").unwrap();
+        fs::write(&external, "<?php").unwrap();
+        assert!(is_workspace_source(&src, root.path()));
+        assert!(!is_workspace_source(&vendor, root.path()));
+        assert!(!is_workspace_source(&target, root.path()));
+        assert!(!is_workspace_source(external, root.path()));
+    }
     #[test]
     fn indexes_php_symbols_and_fqns() {
         let dir = tempfile::tempdir().unwrap();

@@ -14,7 +14,10 @@ use lsp_types::{CompletionResponse, GotoDefinitionResponse, Hover, Location, Pos
 
 #[derive(Debug)]
 pub enum IdeLspEvent {
-    Diagnostics(lsp_types::PublishDiagnosticsParams),
+    Diagnostics {
+        params: lsp_types::PublishDiagnosticsParams,
+        session: u64,
+    },
     Completion {
         uri: Uri,
         items: Vec<lsp_types::CompletionItem>,
@@ -64,6 +67,7 @@ pub struct LspBridge {
     status: Mutex<ServerStatus>,
     pending_events: Arc<Mutex<Vec<IdeLspEvent>>>,
     generations: Mutex<HashMap<(Uri, LspRequestKind), u64>>,
+    document_sessions: Mutex<HashMap<Uri, u64>>,
 }
 
 impl LspBridge {
@@ -75,6 +79,7 @@ impl LspBridge {
                     status: Mutex::new(ServerStatus::Ready),
                     pending_events: Arc::new(Mutex::new(Vec::new())),
                     generations: Mutex::new(HashMap::new()),
+                    document_sessions: Mutex::new(HashMap::new()),
                 }),
                 Err(error) => Arc::new(Self {
                     server: None,
@@ -83,6 +88,7 @@ impl LspBridge {
                         error.to_string(),
                     )])),
                     generations: Mutex::new(HashMap::new()),
+                    document_sessions: Mutex::new(HashMap::new()),
                 }),
             },
             Err(axiom_lsp::LspError::ServerNotFound) => Arc::new(Self {
@@ -90,12 +96,14 @@ impl LspBridge {
                 status: Mutex::new(ServerStatus::NotFound),
                 pending_events: Arc::new(Mutex::new(Vec::new())),
                 generations: Mutex::new(HashMap::new()),
+                document_sessions: Mutex::new(HashMap::new()),
             }),
             Err(error) => Arc::new(Self {
                 server: None,
                 status: Mutex::new(ServerStatus::Stopped),
                 pending_events: Arc::new(Mutex::new(vec![IdeLspEvent::Error(error.to_string())])),
                 generations: Mutex::new(HashMap::new()),
+                document_sessions: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -318,12 +326,37 @@ impl LspBridge {
             .detach();
     }
 
+    pub fn register_document_session(&self, uri: Uri, session: u64) {
+        if let Ok(mut sessions) = self.document_sessions.lock() {
+            sessions.insert(uri, session);
+        }
+    }
+
+    pub fn invalidate_document_session(&self, uri: &Uri, session: u64) {
+        if let Ok(mut sessions) = self.document_sessions.lock() {
+            if sessions.get(uri).copied() == Some(session) {
+                sessions.remove(uri);
+            }
+        }
+        if let Ok(mut events) = self.pending_events.lock() {
+            events.retain(|event| !matches!(event, IdeLspEvent::Diagnostics { params, session: old } if &params.uri == uri && *old == session));
+        }
+    }
+
     pub fn drain_events(&self) -> Vec<IdeLspEvent> {
         if let Some(server) = &self.server {
             let server = server.lock().expect("LSP lock poisoned");
             while let Some(event) = server.try_event() {
                 match event {
-                    ServerEvent::Diagnostics(params) => self.push(IdeLspEvent::Diagnostics(params)),
+                    ServerEvent::Diagnostics(params) => {
+                        let session = self
+                            .document_sessions
+                            .lock()
+                            .ok()
+                            .and_then(|sessions| sessions.get(&params.uri).copied())
+                            .unwrap_or(0);
+                        self.push(IdeLspEvent::Diagnostics { params, session });
+                    }
                     ServerEvent::Stopped => self.push(IdeLspEvent::Stopped),
                     ServerEvent::Log(_) => {}
                 }
@@ -358,6 +391,8 @@ fn signature_help_text(help: lsp_types::SignatureHelp) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::Arc;
     fn accept_generation(last: &mut u64, generation: u64) -> bool {
         if generation < *last {
             return false;
@@ -366,6 +401,46 @@ mod tests {
         true
     }
 
+    #[test]
+    fn document_session_invalidation_rejects_old_diagnostics() {
+        let uri: Uri = "file:///A.php".parse().unwrap();
+        let bridge = LspBridge {
+            server: None,
+            status: Mutex::new(ServerStatus::Stopped),
+            pending_events: Arc::new(Mutex::new(Vec::new())),
+            generations: Mutex::new(HashMap::new()),
+            document_sessions: Mutex::new(HashMap::new()),
+        };
+        bridge.register_document_session(uri.clone(), 10);
+        bridge
+            .pending_events
+            .lock()
+            .unwrap()
+            .push(IdeLspEvent::Diagnostics {
+                params: lsp_types::PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: Vec::new(),
+                    version: None,
+                },
+                session: 10,
+            });
+        bridge.invalidate_document_session(&uri, 10);
+        bridge.register_document_session(uri.clone(), 11);
+        assert!(bridge.drain_events().is_empty());
+        bridge
+            .pending_events
+            .lock()
+            .unwrap()
+            .push(IdeLspEvent::Diagnostics {
+                params: lsp_types::PublishDiagnosticsParams {
+                    uri,
+                    diagnostics: Vec::new(),
+                    version: None,
+                },
+                session: 11,
+            });
+        assert_eq!(bridge.drain_events().len(), 1);
+    }
     #[test]
     fn newer_lsp_response_wins_over_out_of_order_older_response() {
         let mut last = 0;

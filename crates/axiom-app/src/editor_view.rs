@@ -1,20 +1,7 @@
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    fs,
-    ops::Range,
-    path::{Path, PathBuf},
-    sync::mpsc::{self, Sender},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
-
 use axiom_editor::Document;
 use axiom_index::{
-    FindUsagesStatus, ProjectSymbolIndex, ProjectSymbolKind, SemanticEngine, VendorSymbolIndex,
+    DefinitionSyntaxContext, FindUsagesStatus, PersistentFileKey, ProjectSymbolIndex,
+    ProjectSymbolKind, SemanticEngine, VendorSymbolIndex,
 };
 use axiom_lsp::{PositionCodec, PositionEncoding, path_to_uri};
 use axiom_php::{RuntimeSymbolIndex, Symbol as RuntimeSymbol, SymbolKind as RuntimeKind};
@@ -31,6 +18,19 @@ use gpui::{
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
     InsertTextFormat, Uri,
+};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fs,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use crate::{
@@ -128,6 +128,10 @@ pub fn key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
+pub type DocumentSessionId = u64;
+
+static NEXT_DOCUMENT_SESSION: AtomicU64 = AtomicU64::new(1);
+
 pub struct EditorView {
     document: Document,
     syntax: Option<PhpSyntax>,
@@ -142,12 +146,13 @@ pub struct EditorView {
     lsp: Option<Arc<LspBridge>>,
     lsp_uri: Option<Uri>,
     lsp_version: i32,
+    document_session: DocumentSessionId,
     last_lsp_text: String,
     completions: Vec<CompletionItem>,
     completion_selected: usize,
     hover_popup: Option<String>,
     hover_anchor: Option<Point<Pixels>>,
-    diagnostics: Vec<ByteDiagnostic>,
+    diagnostics: DiagnosticStore,
     context_menu: Option<Point<Pixels>>,
     ctrl_hover_range: Option<Range<usize>>,
     line_layouts: RefCell<HashMap<usize, CachedLineLayout>>,
@@ -160,12 +165,22 @@ pub struct EditorView {
     semantic_engine: Option<Arc<SemanticEngine>>,
     project_index_revision: Option<Arc<AtomicU64>>,
     index_update_sender: Option<Sender<IndexUpdateRequest>>,
+    semantic_update_sender: Option<Sender<(u64, PathBuf, String)>>,
+    semantic_update_generation: u64,
+    workspace_root: Option<PathBuf>,
     last_completion_layout: Option<(u32, u32, u32, u32, bool)>,
     editor_scroll_hovered: bool,
     editor_scroll_drag_axis: Option<EditorScrollAxis>,
     editor_scroll_drag_start: Point<Pixels>,
     editor_scroll_drag_start_offset: Point<Pixels>,
     content_width: Pixels,
+    line_width_cache: HashMap<usize, Pixels>,
+    max_width_line: Option<usize>,
+    width_cache_line_count: usize,
+    width_cache_dirty: bool,
+    native_inspection_generation: u64,
+    native_inspection_sender: Sender<NativeInspectionResult>,
+    native_inspection_results: Receiver<NativeInspectionResult>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,12 +196,425 @@ struct ByteDiagnostic {
     message: String,
 }
 
+struct NativeInspectionResult {
+    document_session: DocumentSessionId,
+    generation: u64,
+    diagnostics: Vec<ByteDiagnostic>,
+}
+
+struct NativeInspectionWorkItem {
+    document_session: DocumentSessionId,
+    generation: u64,
+    unknown_class: UnknownClassInspectionInput,
+    unknown_constant: UnknownConstantInspectionInput,
+    duplicate_class: DuplicateClassInspectionInput,
+    arguments: ArgumentInspectionInput,
+}
+
+#[derive(Clone)]
+struct UnknownClassInspectionInput {
+    text: Arc<str>,
+    project_classes: std::collections::HashSet<String>,
+    runtime_symbols: Option<Arc<RuntimeSymbolIndex>>,
+    vendor_symbols: Option<Arc<VendorSymbolIndex>>,
+}
+
+fn compute_unknown_class_inspections(input: &UnknownClassInspectionInput) -> Vec<ByteDiagnostic> {
+    let Ok(syntax) = PhpSyntax::parse(input.text.as_ref()) else {
+        return Vec::new();
+    };
+    let mut diagnostics = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = input.text[offset..].find("new ") {
+        let start = offset + relative + 4;
+        let Some(node) = syntax
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(start, start + 1)
+        else {
+            break;
+        };
+        if node.kind() == "comment" || node.kind().contains("string") {
+            offset = start + 1;
+            continue;
+        }
+        let end = start
+            + input.text[start..]
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '\\')
+                .map(char::len_utf8)
+                .sum::<usize>();
+        if end > start {
+            let written = &input.text[start..end];
+            let name = written.trim_start_matches('\\');
+            let resolved = resolve_php_class_name(written, input.text.as_ref());
+            let known_project =
+                input.project_classes.contains(&resolved) || input.project_classes.contains(name);
+            let known_runtime = input.runtime_symbols.as_ref().is_some_and(|index| {
+                index.find_class(&resolved).is_some()
+                    || index.find_class_by_short_name(name).is_some()
+            });
+            let known_vendor = input
+                .vendor_symbols
+                .as_ref()
+                .is_some_and(|index| index.has_class_metadata(&resolved));
+            if !known_project
+                && !known_runtime
+                && !known_vendor
+                && !matches!(name, "self" | "static" | "parent")
+            {
+                diagnostics.push(ByteDiagnostic {
+                    range: start..end,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: format!("Unknown class '{name}'"),
+                });
+            }
+        }
+        offset = end.max(start + 1);
+        if offset >= input.text.len() {
+            break;
+        }
+    }
+    diagnostics
+}
+
+#[derive(Clone)]
+struct UnknownConstantInspectionInput {
+    text: Arc<str>,
+    known_constants: Vec<(String, String)>,
+    runtime_symbols: Option<Arc<RuntimeSymbolIndex>>,
+}
+
+#[derive(Clone)]
+struct DuplicateClassDeclaration {
+    fqn: String,
+    file: PersistentFileKey,
+    range: Range<usize>,
+}
+
+#[derive(Clone)]
+struct DuplicateClassInspectionInput {
+    path: PersistentFileKey,
+    declarations: Vec<DuplicateClassDeclaration>,
+}
+
+fn compute_duplicate_class_inspections(
+    input: &DuplicateClassInspectionInput,
+) -> Vec<ByteDiagnostic> {
+    let mut groups: HashMap<String, Vec<&DuplicateClassDeclaration>> = HashMap::new();
+    for declaration in &input.declarations {
+        groups
+            .entry(declaration.fqn.clone())
+            .or_default()
+            .push(declaration);
+    }
+    groups
+        .into_values()
+        .filter(|declarations| {
+            declarations
+                .iter()
+                .any(|declaration| declaration.file == input.path)
+                && declarations
+                    .iter()
+                    .filter(|declaration| declaration.file != input.path)
+                    .count()
+                    > 0
+        })
+        .flat_map(|declarations| {
+            declarations
+                .into_iter()
+                .filter(|declaration| declaration.file == input.path)
+        })
+        .map(|declaration| ByteDiagnostic {
+            range: declaration.range.clone(),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: format!("Duplicate class {}", declaration.fqn),
+        })
+        .collect()
+}
+
+fn compute_unknown_constant_inspections(
+    input: &UnknownConstantInspectionInput,
+) -> Vec<ByteDiagnostic> {
+    const BUILT_INS: &[&str] = &[
+        "PHP_VERSION",
+        "PHP_VERSION_ID",
+        "PHP_INT_MAX",
+        "PHP_INT_MIN",
+        "PHP_INT_SIZE",
+        "PHP_OS",
+        "PHP_OS_FAMILY",
+        "DIRECTORY_SEPARATOR",
+        "PATH_SEPARATOR",
+        "E_ERROR",
+        "E_WARNING",
+        "E_PARSE",
+        "E_NOTICE",
+    ];
+    let Ok(syntax) = PhpSyntax::parse(input.text.as_ref()) else {
+        return Vec::new();
+    };
+    let mut diagnostics = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = input.text[offset..].find("echo ") {
+        let start = offset + relative + 5;
+        let Some(node) = syntax
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(start, start + 1)
+        else {
+            break;
+        };
+        if node.kind() == "comment" || node.kind().contains("string") {
+            offset = start + 1;
+            continue;
+        }
+        let end = start
+            + input.text[start..]
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .map(char::len_utf8)
+                .sum::<usize>();
+        let name = &input.text[start..end];
+        if !name.is_empty()
+            && name
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+            && !BUILT_INS.contains(&name)
+        {
+            let declared = input.known_constants.iter().any(|(symbol_name, fqn)| {
+                symbol_name == name || fqn.ends_with(&format!("\\{name}"))
+            });
+            let runtime = input
+                .runtime_symbols
+                .as_ref()
+                .is_some_and(|symbols| symbols.find_constant(name).is_some());
+            if !declared && !runtime {
+                diagnostics.push(ByteDiagnostic {
+                    range: start..end,
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    message: format!("Undefined constant '{name}'"),
+                });
+            }
+        }
+        offset = end.max(start + 1);
+        if offset >= input.text.len() {
+            break;
+        }
+    }
+    diagnostics
+}
+
+#[derive(Clone)]
+struct ArgumentInspectionInput {
+    text: Arc<str>,
+    project_symbols: Vec<axiom_index::ProjectSymbol>,
+    runtime_symbols: Option<Arc<RuntimeSymbolIndex>>,
+}
+
+fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiagnostic> {
+    let mut out = Vec::new();
+    let mut search = 0;
+    while let Some(relative) = input.text[search..].find('(') {
+        let open = search + relative;
+        let code = PhpSyntax::parse(input.text.as_ref())
+            .ok()
+            .is_some_and(|syntax| {
+                syntax
+                    .tree()
+                    .root_node()
+                    .descendant_for_byte_range(open, open + 1)
+                    .is_some_and(|node| {
+                        !matches!(
+                            node.kind(),
+                            "comment" | "string" | "encapsed_string" | "heredoc" | "nowdoc"
+                        )
+                    })
+            });
+        if !code {
+            search = open.saturating_add(1);
+            continue;
+        }
+        let Some(close) = matching_paren(&input.text, open) else {
+            break;
+        };
+        let callable_start = input.text[..open]
+            .char_indices()
+            .rev()
+            .take_while(|(_, ch)| {
+                ch.is_alphanumeric() || matches!(ch, '_' | '$' | '\\' | ':' | '-' | '>')
+            })
+            .last()
+            .map_or(open, |(i, _)| i);
+        let callable = input.text[callable_start..open].trim();
+        let name = callable
+            .rsplit_once("::")
+            .or_else(|| callable.rsplit_once("->"))
+            .map(|(_, n)| n)
+            .unwrap_or(callable)
+            .trim_start_matches('$');
+        if !name.is_empty() {
+            let owner = callable
+                .rsplit_once("::")
+                .or_else(|| callable.rsplit_once("->"))
+                .map(|(o, _)| {
+                    let owner = o.trim();
+                    if owner.starts_with('$') {
+                        let pattern = format!("{} ", owner);
+                        input.text[..open]
+                            .rfind(&pattern)
+                            .and_then(|pos| {
+                                let before = &input.text[..pos];
+                                before
+                                    .rsplit(|ch: char| {
+                                        !(ch.is_alphanumeric()
+                                            || matches!(ch, '_' | '\\' | '?' | '|'))
+                                    })
+                                    .find(|part| !part.is_empty())
+                                    .map(|ty| {
+                                        resolve_php_class_name(
+                                            ty.trim_start_matches('?'),
+                                            &input.text,
+                                        )
+                                    })
+                            })
+                            .unwrap_or_else(|| resolve_php_class_name(owner, &input.text))
+                    } else {
+                        resolve_php_class_name(owner, &input.text)
+                    }
+                });
+            let symbol = owner
+                .as_deref()
+                .and_then(|o| {
+                    input.project_symbols.iter().find(|s| {
+                        s.kind == ProjectSymbolKind::Method
+                            && s.fully_qualified_name.starts_with(&format!("{o}::"))
+                            && s.name == name
+                    })
+                })
+                .or_else(|| {
+                    owner
+                        .is_none()
+                        .then(|| {
+                            input
+                                .project_symbols
+                                .iter()
+                                .find(|s| s.kind == ProjectSymbolKind::Function && s.name == name)
+                        })
+                        .flatten()
+                });
+            let detail = symbol
+                .and_then(|s| s.parameters.as_deref())
+                .map(signature_counts_from_detail);
+            let runtime_detail = input.runtime_symbols.as_ref().and_then(|r| {
+                owner
+                    .as_deref()
+                    .and_then(|o| r.methods_of(o).find(|s| s.name == name))
+                    .and_then(|s| s.signature.as_ref())
+                    .map(|s| {
+                        (
+                            s.parameters
+                                .iter()
+                                .filter(|p| !p.optional && !p.variadic)
+                                .count(),
+                            s.parameters.len(),
+                            s.parameters.iter().any(|p| p.variadic),
+                        )
+                    })
+            });
+            if let Some((required, maximum, variadic)) = runtime_detail.or(detail) {
+                let arguments = count_call_arguments(&input.text[open + 1..close]);
+                if arguments < required || (!variadic && arguments > maximum) {
+                    out.push(ByteDiagnostic {
+                        range: callable_start..close + 1,
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: if arguments > maximum && !variadic {
+                            format!("Expected at most {maximum} arguments, found {arguments}")
+                        } else {
+                            format!(
+                                "Expected {required} argument{}, found {arguments}",
+                                if required == 1 { "" } else { "s" }
+                            )
+                        },
+                    });
+                }
+            }
+        }
+        search = close.saturating_add(1);
+    }
+    out
+}
+
+#[derive(Default)]
+struct DiagnosticStore {
+    native_syntax: Vec<ByteDiagnostic>,
+    native_inspections: Vec<ByteDiagnostic>,
+    lsp: Vec<ByteDiagnostic>,
+    combined_cache: Arc<Vec<ByteDiagnostic>>,
+}
+
+impl DiagnosticStore {
+    fn rebuild(&mut self) {
+        let mut diagnostics = self
+            .native_syntax
+            .iter()
+            .chain(self.native_inspections.iter())
+            .chain(self.lsp.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        diagnostics.sort_by(|a, b| {
+            a.range
+                .start
+                .cmp(&b.range.start)
+                .then_with(|| a.range.end.cmp(&b.range.end))
+                .then_with(|| {
+                    diagnostic_severity_rank(a.severity).cmp(&diagnostic_severity_rank(b.severity))
+                })
+                .then_with(|| a.message.cmp(&b.message))
+        });
+        self.combined_cache = Arc::new(diagnostics);
+    }
+
+    fn set_native_syntax(&mut self, diagnostics: Vec<ByteDiagnostic>) {
+        self.native_syntax = diagnostics;
+        self.rebuild();
+    }
+
+    fn set_native_inspections(&mut self, diagnostics: Vec<ByteDiagnostic>) {
+        self.native_inspections = diagnostics;
+        self.rebuild();
+    }
+
+    fn set_lsp(&mut self, diagnostics: Vec<ByteDiagnostic>) {
+        self.lsp = diagnostics;
+        self.rebuild();
+    }
+
+    fn combined(&self) -> Arc<Vec<ByteDiagnostic>> {
+        self.combined_cache.clone()
+    }
+}
+
+fn diagnostic_severity_rank(severity: Option<DiagnosticSeverity>) -> u8 {
+    match severity {
+        Some(DiagnosticSeverity::ERROR) => 0,
+        Some(DiagnosticSeverity::WARNING) => 1,
+        Some(DiagnosticSeverity::INFORMATION) => 2,
+        Some(DiagnosticSeverity::HINT) => 3,
+        Some(_) => 4,
+        None => 4,
+    }
+}
+
 struct IndexUpdateRequest {
     generation: u64,
+    semantic_generation: u64,
     path: PathBuf,
     text: String,
     index: Arc<std::sync::RwLock<ProjectSymbolIndex>>,
     revision: Arc<AtomicU64>,
+    semantic_updates: Option<Sender<(u64, PathBuf, String)>>,
 }
 
 #[derive(Clone)]
@@ -201,16 +629,13 @@ pub struct VendorDefinitionRequest {
 pub enum DefinitionQuery {
     Name {
         fqn: String,
-        written: String,
     },
     Method {
         owner_fqn: String,
         name: String,
         is_static: bool,
     },
-    Function {
-        name: String,
-    },
+    Function,
 }
 
 fn run_index_update_worker(receiver: mpsc::Receiver<IndexUpdateRequest>) {
@@ -227,8 +652,15 @@ fn run_index_update_worker(receiver: mpsc::Receiver<IndexUpdateRequest>) {
         if let Ok(mut index) = request.index.write()
             && request.revision.load(Ordering::SeqCst) == request.generation
         {
-            let _ =
+            let path = request.path.clone();
+            let text = request.text.clone();
+            let result =
                 index.index_file_text_with_source(request.path, request.text, "EditorDirtyUpdate");
+            if result.is_ok() {
+                if let Some(sender) = request.semantic_updates {
+                    let _ = sender.send((request.semantic_generation, path, text));
+                }
+            }
         }
     }
 }
@@ -281,6 +713,12 @@ impl EditorView {
                 }
             });
         }
+        let initial_line_count = document.line_count();
+        let document_session = NEXT_DOCUMENT_SESSION.fetch_add(1, Ordering::Relaxed);
+        let (native_inspection_sender, native_inspection_results) = mpsc::channel();
+        if let (Some(lsp), Some(uri)) = (&lsp, &lsp_uri) {
+            lsp.register_document_session(uri.clone(), document_session);
+        }
         let lsp_setup_us = lsp_started.elapsed().as_micros();
         let mut view = Self {
             document,
@@ -296,12 +734,13 @@ impl EditorView {
             lsp,
             lsp_uri,
             lsp_version: 1,
+            document_session,
             last_lsp_text,
             completions: Vec::new(),
             completion_selected: 0,
             hover_popup: None,
             hover_anchor: None,
-            diagnostics: Vec::new(),
+            diagnostics: DiagnosticStore::default(),
             context_menu: None,
             ctrl_hover_range: None,
             line_layouts: RefCell::new(HashMap::new()),
@@ -311,12 +750,22 @@ impl EditorView {
             semantic_engine: None,
             project_index_revision: None,
             index_update_sender: Some(index_update_sender),
+            semantic_update_sender: None,
+            semantic_update_generation: 0,
+            workspace_root: None,
             last_completion_layout: None,
             editor_scroll_hovered: false,
             editor_scroll_drag_axis: None,
             editor_scroll_drag_start: Point::default(),
             editor_scroll_drag_start_offset: Point::default(),
             content_width: px(0.),
+            line_width_cache: HashMap::new(),
+            max_width_line: None,
+            width_cache_line_count: initial_line_count,
+            width_cache_dirty: true,
+            native_inspection_generation: 0,
+            native_inspection_sender,
+            native_inspection_results,
         };
         let inspections_started = std::time::Instant::now();
         view.sync_syntax();
@@ -363,12 +812,29 @@ impl EditorView {
         self.document.content()
     }
 
+    pub fn definition_syntax_context(&self, offset: usize) -> Option<DefinitionSyntaxContext> {
+        let started = std::time::Instant::now();
+        let syntax = self.syntax.as_ref()?;
+        let token = syntax.token_at_byte(offset)?;
+        let context = DefinitionSyntaxContext {
+            token,
+            is_keyword: syntax.is_keyword_at_byte(offset),
+            tree: syntax.tree().clone(),
+            build_us: started.elapsed().as_micros(),
+        };
+        Some(context)
+    }
+
     pub fn current_cursor_offset(&self) -> usize {
         self.document.cursor_offset()
     }
 
     pub fn is_dirty(&self) -> bool {
         self.document.is_dirty()
+    }
+
+    pub fn document_session(&self) -> DocumentSessionId {
+        self.document_session
     }
 
     pub fn lsp_uri(&self) -> Option<&Uri> {
@@ -581,7 +1047,7 @@ impl EditorView {
             if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
                 tracing::info!(branch = "Function", "[DEFINITION QUERY BRANCH]");
             }
-            return Some(DefinitionQuery::Function { name });
+            return Some(DefinitionQuery::Function);
         }
         let fqn = resolve_php_class_name(&name, &text);
         if debug_completion_enabled() {
@@ -600,7 +1066,7 @@ impl EditorView {
         if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
             tracing::info!(branch = "Name", "[DEFINITION QUERY BRANCH]");
         }
-        Some(DefinitionQuery::Name { fqn, written: name })
+        Some(DefinitionQuery::Name { fqn })
     }
 
     pub fn vendor_definition_request(&self) -> Option<VendorDefinitionRequest> {
@@ -612,8 +1078,8 @@ impl EditorView {
                 is_static,
                 ..
             } => (owner_fqn, Some(name), is_static),
-            DefinitionQuery::Name { fqn, .. } => (fqn, None, false),
-            DefinitionQuery::Function { .. } => return None,
+            DefinitionQuery::Name { fqn } => (fqn, None, false),
+            DefinitionQuery::Function => return None,
         };
         let index = self.vendor_symbols.clone()?;
         // Vendor metadata and dependency files are resolved by the background
@@ -624,32 +1090,6 @@ impl EditorView {
             member,
             is_static,
         })
-    }
-
-    /// Project-only lookup. Composer is deliberately not consulted here so
-    /// workspace symbols always take precedence over Vendor metadata.
-    pub fn project_definition_location(&self) -> Option<(PathBuf, lsp_types::Position)> {
-        let text = self.document.content();
-        let query = self.definition_query()?;
-        let index = self.project_symbols.as_ref()?.try_read().ok()?;
-        let symbol = match query {
-            DefinitionQuery::Method {
-                owner_fqn,
-                name,
-                is_static,
-                ..
-            } => index.find_methods(&owner_fqn).into_iter().find(|symbol| {
-                symbol.name == name && symbol.modifiers.iter().any(|m| m == "static") == is_static
-            }),
-            DefinitionQuery::Name { fqn, written } => index
-                .find_class(&fqn)
-                .or_else(|| index.find_class(&written)),
-            DefinitionQuery::Function { name } => index
-                .symbols()
-                .iter()
-                .find(|symbol| symbol.kind == ProjectSymbolKind::Function && symbol.name == name),
-        }?;
-        self.resolve_location(&symbol.file, symbol.range.start, &text)
     }
 
     fn lsp_encoding(&self) -> PositionEncoding {
@@ -670,6 +1110,27 @@ impl EditorView {
         self.sync_syntax();
     }
 
+    pub fn set_semantic_update_sender(
+        &mut self,
+        sender: Sender<(u64, PathBuf, String)>,
+        generation: u64,
+    ) {
+        if self
+            .workspace_root
+            .as_ref()
+            .is_some_and(|root| axiom_index::is_workspace_source(&self.file_path, root))
+        {
+            self.semantic_update_sender = Some(sender);
+            self.semantic_update_generation = generation;
+        } else {
+            self.semantic_update_sender = None;
+        }
+    }
+
+    pub fn set_workspace_root(&mut self, root: PathBuf) {
+        self.workspace_root = Some(root);
+    }
+
     pub fn set_vendor_symbols(&mut self, symbols: Arc<std::sync::RwLock<VendorSymbolIndex>>) {
         self.vendor_symbols = Some(symbols);
         self.sync_syntax();
@@ -680,6 +1141,9 @@ impl EditorView {
     }
 
     pub fn close_lsp_document(&self) {
+        if let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) {
+            lsp.invalidate_document_session(uri, self.document_session);
+        }
         if let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) {
             lsp.with_server(|server| {
                 if let Err(error) = server.did_close(uri.clone()) {
@@ -1105,6 +1569,10 @@ impl EditorView {
         match Document::from_file(&self.file_path) {
             Ok(document) => {
                 self.document = document;
+                self.line_width_cache.clear();
+                self.max_width_line = None;
+                self.width_cache_line_count = self.document.line_count();
+                self.width_cache_dirty = true;
                 match is_php_file(&self.file_path)
                     .then(|| PhpSyntax::parse(self.document.content()))
                     .transpose()
@@ -1155,8 +1623,23 @@ impl EditorView {
     }
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
+        let edited_line = self.document.line_of_offset(self.document.cursor_offset());
+        self.line_width_cache.remove(&edited_line);
+        if self.max_width_line == Some(edited_line) {
+            self.width_cache_dirty = true;
+        }
         let text = self.document.content();
+        let started = std::time::Instant::now();
         self.sync_syntax_text(&text);
+        if debug_input_enabled() {
+            tracing::debug!(
+                syntax_us = started.elapsed().as_micros(),
+                inspection_sync_us = 0,
+                total_sync_us = started.elapsed().as_micros(),
+                "[EDITOR EDIT PROFILE]"
+            );
+        }
+        self.schedule_native_inspections(&text, cx);
         self.sync_lsp_text(&text);
         self.schedule_incremental_index_update(&text);
         self.maybe_trigger_completion();
@@ -1205,6 +1688,15 @@ impl EditorView {
     }
 
     fn schedule_incremental_index_update(&self, text: &str) {
+        let Some(root) = &self.workspace_root else {
+            return;
+        };
+        if !axiom_index::is_workspace_source(&self.file_path, root) {
+            if debug_input_enabled() {
+                tracing::debug!(path = %self.file_path.display(), "[SEMANTIC UPDATE REJECTED] reason=non_workspace_source");
+            }
+            return;
+        }
         let (Some(index), Some(revision)) = (
             self.project_symbols.clone(),
             self.project_index_revision.clone(),
@@ -1222,38 +1714,150 @@ impl EditorView {
                 text,
                 index,
                 revision,
+                semantic_generation: self.semantic_update_generation,
+                semantic_updates: self.semantic_update_sender.clone(),
             });
         }
     }
 
-    /// Returns false for offsets contained in PHP comments or string-like
-    /// literals. Native inspections still use byte ranges for precise edits,
-    /// but this AST guard prevents text scans from interpreting prose as code.
-    fn is_code_offset(&self, offset: usize) -> bool {
-        let Some(syntax) = &self.syntax else {
-            return true;
+    fn schedule_native_inspections(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.native_inspection_generation = self.native_inspection_generation.wrapping_add(1);
+        let generation = self.native_inspection_generation;
+        let session = self.document_session;
+        let text: Arc<str> = Arc::from(text);
+        let Some(work) = self.capture_native_inspection_work(text, session, generation) else {
+            return;
         };
-        if offset >= syntax.text().len() {
-            return false;
-        }
-        let Some(mut node) = syntax
-            .tree()
-            .root_node()
-            .descendant_for_byte_range(offset, offset + 1)
-        else {
-            return true;
-        };
-        loop {
-            if matches!(
-                node.kind(),
-                "comment" | "string" | "encapsed_string" | "heredoc" | "nowdoc"
-            ) {
-                return false;
+        let sender = self.native_inspection_sender.clone();
+        cx.spawn(async move |this, cx| {
+            gpui::Timer::after(Duration::from_millis(200)).await;
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let mut diagnostics = compute_unknown_class_inspections(&work.unknown_class);
+                diagnostics.extend(compute_unknown_constant_inspections(&work.unknown_constant));
+                diagnostics.extend(compute_duplicate_class_inspections(&work.duplicate_class));
+                diagnostics.extend(compute_argument_inspections(&work.arguments));
+                let _ = sender.send(NativeInspectionResult {
+                    document_session: work.document_session,
+                    generation: work.generation,
+                    diagnostics,
+                });
+                if debug_input_enabled() {
+                    tracing::debug!(
+                        generation,
+                        compute_us = started.elapsed().as_micros(),
+                        "[NATIVE INSPECTION WORKER]"
+                    );
+                }
+            });
+            for _ in 0..600 {
+                gpui::Timer::after(Duration::from_millis(16)).await;
+                if this
+                    .update(cx, |editor, cx| editor.poll_native_inspection_results(cx))
+                    .is_err()
+                {
+                    break;
+                }
             }
-            let Some(parent) = node.parent() else { break };
-            node = parent;
+        })
+        .detach();
+    }
+
+    fn capture_native_inspection_work(
+        &self,
+        text: Arc<str>,
+        session: DocumentSessionId,
+        generation: u64,
+    ) -> Option<NativeInspectionWorkItem> {
+        let index = self.project_symbols.as_ref()?.try_read().ok()?;
+        if !index.is_ready() {
+            return None;
         }
-        true
+        let symbols = index.symbols().to_vec();
+        let project_classes = symbols
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    ProjectSymbolKind::Class
+                        | ProjectSymbolKind::Interface
+                        | ProjectSymbolKind::Trait
+                        | ProjectSymbolKind::Enum
+                )
+            })
+            .map(|s| s.fully_qualified_name.clone())
+            .collect();
+        let known_constants = symbols
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    ProjectSymbolKind::Constant | ProjectSymbolKind::ClassConstant
+                )
+            })
+            .map(|s| (s.name.clone(), s.fully_qualified_name.clone()))
+            .collect();
+        let declarations = symbols
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    ProjectSymbolKind::Class
+                        | ProjectSymbolKind::Interface
+                        | ProjectSymbolKind::Trait
+                        | ProjectSymbolKind::Enum
+                )
+            })
+            .map(|s| DuplicateClassDeclaration {
+                fqn: s.fully_qualified_name.clone(),
+                file: PersistentFileKey::workspace_physical(&s.file),
+                range: s.range.clone(),
+            })
+            .collect();
+        let vendor_symbols = self
+            .vendor_symbols
+            .as_ref()
+            .and_then(|v| v.try_read().ok())
+            .map(|v| Arc::new(v.clone()));
+        Some(NativeInspectionWorkItem {
+            document_session: session,
+            generation,
+            unknown_class: UnknownClassInspectionInput {
+                text: text.clone(),
+                project_classes,
+                runtime_symbols: self.runtime_symbols.clone(),
+                vendor_symbols,
+            },
+            unknown_constant: UnknownConstantInspectionInput {
+                text: text.clone(),
+                known_constants,
+                runtime_symbols: self.runtime_symbols.clone(),
+            },
+            duplicate_class: DuplicateClassInspectionInput {
+                path: PersistentFileKey::workspace_physical(&self.file_path),
+                declarations,
+            },
+            arguments: ArgumentInspectionInput {
+                text,
+                project_symbols: symbols,
+                runtime_symbols: self.runtime_symbols.clone(),
+            },
+        })
+    }
+
+    fn poll_native_inspection_results(&mut self, cx: &mut Context<Self>) {
+        let mut latest = None;
+        while let Ok(result) = self.native_inspection_results.try_recv() {
+            latest = Some(result);
+        }
+        if let Some(result) = latest {
+            if result.document_session == self.document_session
+                && result.generation == self.native_inspection_generation
+            {
+                self.diagnostics.set_native_inspections(result.diagnostics);
+                cx.notify();
+            }
+        }
     }
 
     fn maybe_trigger_completion(&self) {
@@ -1268,13 +1872,13 @@ impl EditorView {
         };
         let text = self.document.content();
         let tail = &text[..self.document.cursor_offset().min(text.len())];
-        let relevant = tail.ends_with("->")
+        if tail.ends_with("->")
             || tail.ends_with("::")
             || tail.ends_with("new ")
             || tail.ends_with("extends ")
             || tail.ends_with("implements ")
-            || tail.ends_with("use ");
-        if relevant {
+            || tail.ends_with("use ")
+        {
             lsp.request_completion(uri.clone(), position);
         }
     }
@@ -1290,7 +1894,7 @@ impl EditorView {
         {
             self.status = Some(format!("Falha ao atualizar sintaxe PHP: {error}").into());
         }
-        self.diagnostics = self
+        let diagnostics = self
             .syntax
             .as_ref()
             .map(|syntax| {
@@ -1305,381 +1909,7 @@ impl EditorView {
                     .collect()
             })
             .unwrap_or_default();
-        self.add_native_inspections(text);
-        self.add_native_argument_inspections(text);
-    }
-
-    fn add_native_argument_inspections(&mut self, text: &str) {
-        let runtime = self.runtime_symbols.clone();
-        let project = self.project_symbols.clone();
-        let mut search = 0;
-        while let Some(relative_open) = text[search..].find('(') {
-            let open = search + relative_open;
-            if !self.is_code_offset(open) {
-                search = open.saturating_add(1);
-                continue;
-            }
-            let Some(close) = matching_paren(text, open) else {
-                break;
-            };
-            let callable_start = text[..open]
-                .char_indices()
-                .rev()
-                .take_while(|(_, ch)| {
-                    ch.is_alphanumeric() || matches!(ch, '_' | '$' | '\\' | ':' | '-' | '>')
-                })
-                .last()
-                .map_or(open, |(index, _)| index);
-            let callable = text[callable_start..open].trim();
-            let name = callable
-                .rsplit_once("::")
-                .or_else(|| callable.rsplit_once("->"))
-                .map(|(_, name)| name)
-                .unwrap_or(callable)
-                .trim_start_matches('$');
-            let has_receiver = callable.contains("->") || callable.contains("::");
-            if name.is_empty() {
-                search = close.saturating_add(1);
-                continue;
-            }
-            let runtime_signature = runtime.as_ref().and_then(|runtime| {
-                callable
-                    .rsplit_once("::")
-                    .or_else(|| callable.rsplit_once("->"))
-                    .and_then(|(owner, _)| {
-                        let owner = self.resolve_native_type(owner.trim(), &text[..open])?;
-                        runtime
-                            .methods_of(&owner)
-                            .find(|symbol| symbol.name == name)
-                    })
-                    .or_else(|| {
-                        (!has_receiver)
-                            .then(|| runtime.find_function(name))
-                            .flatten()
-                    })
-                    .and_then(|symbol| {
-                        symbol.signature.as_ref().map(|signature| {
-                            (
-                                signature
-                                    .parameters
-                                    .iter()
-                                    .filter(|parameter| !parameter.optional && !parameter.variadic)
-                                    .count(),
-                                signature.parameters.len(),
-                                signature
-                                    .parameters
-                                    .iter()
-                                    .any(|parameter| parameter.variadic),
-                            )
-                        })
-                    })
-            });
-            let signature_info = runtime_signature.or_else(|| {
-                let resolved_owner = callable
-                    .rsplit_once("::")
-                    .or_else(|| callable.rsplit_once("->"))
-                    .and_then(|(owner, _)| self.resolve_receiver_type(owner.trim(), &text[..open]));
-                let project = project.as_ref()?.try_read().ok()?;
-                let symbol = resolved_owner
-                    .as_deref()
-                    .and_then(|owner| {
-                        project
-                            .find_methods(owner)
-                            .into_iter()
-                            .find(|symbol| symbol.name == name)
-                    })
-                    .or_else(|| {
-                        (!has_receiver)
-                            .then(|| {
-                                project.symbols().iter().find(|symbol| {
-                                    symbol.kind == ProjectSymbolKind::Function
-                                        && symbol.name == name
-                                })
-                            })
-                            .flatten()
-                    });
-                let detail = project_callable_detail(symbol?)?;
-                let (required, maximum, variadic) = signature_counts_from_detail(&detail);
-                Some((required, maximum, variadic))
-            });
-            if let Some((required, maximum, variadic)) = signature_info {
-                let arguments = count_call_arguments(&text[open + 1..close]);
-                let too_few = arguments < required;
-                let too_many = !variadic && arguments > maximum;
-                if too_few || too_many {
-                    let expected = if too_many {
-                        format!("Expected at most {maximum} arguments, found {arguments}")
-                    } else {
-                        format!(
-                            "Expected {} argument{}, found {arguments}",
-                            required,
-                            if required == 1 { "" } else { "s" }
-                        )
-                    };
-                    self.diagnostics.push(ByteDiagnostic {
-                        range: callable_start..close + 1,
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: expected,
-                    });
-                }
-            }
-            search = close.saturating_add(1);
-        }
-    }
-
-    fn add_native_inspections(&mut self, text: &str) {
-        // Do not publish definitive Unknown class diagnostics while either
-        // project or Composer metadata is still loading.
-        if self.project_symbols.is_none() || self.vendor_symbols.is_none() {
-            return;
-        }
-        if self
-            .project_symbols
-            .as_ref()
-            .and_then(|index| index.try_read().ok())
-            .is_some_and(|index| !index.is_ready())
-        {
-            return;
-        }
-        let mut offset = 0;
-        while let Some(relative) = text[offset..].find("new ") {
-            let start = offset + relative + 4;
-            if !self.is_code_offset(start) {
-                offset = start.max(offset + 1);
-                continue;
-            }
-            let end = start
-                + text[start..]
-                    .chars()
-                    .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '\\')
-                    .map(char::len_utf8)
-                    .sum::<usize>();
-            if end > start {
-                let written = &text[start..end];
-                let name = written.trim_start_matches('\\');
-                let resolved = self.resolve_class_name(written, text);
-                let project_symbol = self
-                    .project_symbols
-                    .as_ref()
-                    .and_then(|index| index.try_read().ok())
-                    .and_then(|index| index.find_class(&resolved).cloned());
-                let known_project = project_symbol.is_some();
-                let known_vendor = self
-                    .vendor_symbols
-                    .as_ref()
-                    .and_then(|index| index.try_read().ok())
-                    .is_some_and(|index| index.has_class_metadata(&resolved));
-                // Composer resolution performs filesystem probes. Completion
-                // must not perform those probes synchronously on the UI thread.
-                let composer_found = false;
-                let known_runtime = self.runtime_symbols.as_ref().is_some_and(|runtime| {
-                    runtime.find_class(&resolved).is_some()
-                        || runtime.find_class_by_short_name(name).is_some()
-                });
-                let lsp_found = self
-                    .lsp
-                    .as_ref()
-                    .is_some_and(|lsp| lsp.status() == axiom_lsp::ServerStatus::Ready);
-                let special = matches!(name, "self" | "static" | "parent");
-                // LSP readiness is reported for diagnostics, but it does not
-                // prove that this class exists. Native/project/runtime indexes
-                // remain the source of truth for this local inspection.
-                let diagnostic = !known_project
-                    && !known_vendor
-                    && !composer_found
-                    && !known_runtime
-                    && !special;
-                if debug_completion_enabled() {
-                    let via = if resolved == name {
-                        if text[..start].contains("namespace ") {
-                            "namespace-or-global"
-                        } else {
-                            "fqn-or-global"
-                        }
-                    } else if text[..start]
-                        .lines()
-                        .any(|line| line.trim_start().starts_with("use ") && line.contains(name))
-                    {
-                        "import"
-                    } else {
-                        "namespace"
-                    };
-                    tracing::info!(
-                        written,
-                        resolved = %resolved,
-                        via,
-                        project_found = known_project,
-                        vendor_found = known_vendor,
-                        composer_found,
-                        runtime_found = known_runtime,
-                        lsp_found,
-                        diagnostic,
-                        "[CLASS RESOLUTION]"
-                    );
-                }
-                if diagnostic {
-                    self.diagnostics.push(ByteDiagnostic {
-                        range: start..end,
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!("Unknown class '{name}'"),
-                    });
-                }
-            }
-            offset = end.max(start + 1);
-            if offset >= text.len() {
-                break;
-            }
-        }
-        let mut symbol_files: std::collections::HashMap<
-            (&str, ProjectSymbolKind),
-            std::collections::HashSet<&Path>,
-        > = std::collections::HashMap::new();
-        let Some(project_guard) = self
-            .project_symbols
-            .as_ref()
-            .and_then(|index| index.try_read().ok())
-        else {
-            return;
-        };
-        let index = &project_guard;
-        for symbol in index.symbols() {
-            symbol_files
-                .entry((symbol.fully_qualified_name.as_str(), symbol.kind))
-                .or_default()
-                .insert(symbol.file.as_path());
-        }
-        for symbol in index
-            .symbols()
-            .iter()
-            .filter(|symbol| symbol.file == self.file_path)
-        {
-            if symbol_files
-                .get(&(symbol.fully_qualified_name.as_str(), symbol.kind))
-                .is_some_and(|files| files.len() > 1)
-            {
-                if debug_completion_enabled() {
-                    let paths = symbol_files
-                        .get(&(symbol.fully_qualified_name.as_str(), symbol.kind))
-                        .into_iter()
-                        .flat_map(|files| files.iter())
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>();
-                    let candidates = symbol_files
-                        .get(&(symbol.fully_qualified_name.as_str(), symbol.kind))
-                        .into_iter()
-                        .flat_map(|files| files.iter())
-                        .enumerate()
-                        .map(|(index, path)| {
-                            let canonical = std::fs::canonicalize(path);
-                            let source = if *path == self.file_path {
-                                "EditorDirtyUpdate/Document"
-                            } else {
-                                "InitialProjectScan/Other"
-                            };
-                            format!(
-                                "candidate_{}_source={source} path={:?} exists={} canonical={:?} canonicalize_error={:?}",
-                                index + 1,
-                                path,
-                                path.exists(),
-                                canonical.as_ref().ok(),
-                                canonical.as_ref().err().map(ToString::to_string),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    tracing::warn!(
-                        symbol = %symbol.fully_qualified_name,
-                        kind = ?symbol.kind,
-                        current = %symbol.file.display(),
-                        candidates = ?paths,
-                        candidate_details = ?candidates,
-                        "[DUPLICATE CLASS PATHS]"
-                    );
-                }
-                self.diagnostics.push(ByteDiagnostic {
-                    range: symbol.range.clone(),
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    message: format!("Duplicate class {}", symbol.fully_qualified_name),
-                });
-            }
-        }
-        let constant_names: Vec<(String, String)> = index
-            .symbols()
-            .iter()
-            .filter(|symbol| {
-                matches!(
-                    symbol.kind,
-                    axiom_index::ProjectSymbolKind::Constant
-                        | axiom_index::ProjectSymbolKind::ClassConstant
-                )
-            })
-            .map(|symbol| (symbol.name.clone(), symbol.fully_qualified_name.clone()))
-            .collect();
-        let _ = index;
-        let runtime_symbols = self.runtime_symbols.clone();
-        drop(project_guard);
-        self.add_unknown_constant_inspections(text, &constant_names, runtime_symbols.as_ref());
-    }
-
-    fn add_unknown_constant_inspections(
-        &mut self,
-        text: &str,
-        constants: &[(String, String)],
-        runtime_symbols: Option<&Arc<RuntimeSymbolIndex>>,
-    ) {
-        const BUILT_INS: &[&str] = &[
-            "PHP_VERSION",
-            "PHP_VERSION_ID",
-            "PHP_INT_MAX",
-            "PHP_INT_MIN",
-            "PHP_INT_SIZE",
-            "PHP_OS",
-            "PHP_OS_FAMILY",
-            "DIRECTORY_SEPARATOR",
-            "PATH_SEPARATOR",
-            "E_ERROR",
-            "E_WARNING",
-            "E_PARSE",
-            "E_NOTICE",
-        ];
-        let mut offset = 0;
-        while let Some(relative) = text[offset..].find("echo ") {
-            let start = offset + relative + 5;
-            if !self.is_code_offset(start) {
-                offset = start.max(offset + 1);
-                continue;
-            }
-            let name_end = start
-                + text[start..]
-                    .chars()
-                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                    .map(char::len_utf8)
-                    .sum::<usize>();
-            let name = &text[start..name_end];
-            if !name.is_empty()
-                && name
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-                && !BUILT_INS.iter().any(|builtin| builtin == &name)
-            {
-                let declared = constants.iter().any(|(symbol_name, fqn)| {
-                    symbol_name == name || fqn.ends_with(&format!("\\{name}"))
-                });
-                let runtime =
-                    runtime_symbols.is_some_and(|symbols| symbols.find_constant(name).is_some());
-                if !declared && !runtime {
-                    self.diagnostics.push(ByteDiagnostic {
-                        range: start..name_end,
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        message: format!("Undefined constant '{name}'"),
-                    });
-                }
-            }
-            offset = name_end.max(start + 1);
-            if offset >= text.len() {
-                break;
-            }
-        }
+        self.diagnostics.set_native_syntax(diagnostics);
     }
 
     fn sync_lsp(&mut self) {
@@ -2660,14 +2890,16 @@ impl EditorView {
         if version.is_some_and(|version| version < self.lsp_version) {
             return;
         }
-        self.diagnostics = diagnostics
-            .into_iter()
-            .map(|diagnostic| ByteDiagnostic {
-                range: self.lsp_range_to_bytes(diagnostic.range),
-                severity: diagnostic.severity,
-                message: diagnostic.message,
-            })
-            .collect();
+        self.diagnostics.set_lsp(
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| ByteDiagnostic {
+                    range: self.lsp_range_to_bytes(diagnostic.range),
+                    severity: diagnostic.severity,
+                    message: diagnostic.message,
+                })
+                .collect(),
+        );
         cx.notify();
     }
 
@@ -2843,8 +3075,8 @@ impl EditorView {
             if self.is_in_text_area(event.position) {
                 let line = self.mouse_line(event.position);
                 let offset = self.mouse_offset(line, event.position.x, window);
-                let next = self
-                    .diagnostics
+                let combined_diagnostics = self.diagnostics.combined();
+                let next = combined_diagnostics
                     .iter()
                     .find(|diagnostic| diagnostic.range.contains(&offset))
                     .map(|diagnostic| format!("{}\nAxiom PHP Parser", diagnostic.message));
@@ -3025,7 +3257,12 @@ impl EditorView {
         cx.notify();
     }
 
-    fn render_line(&self, line: usize, window: &mut Window) -> gpui::AnyElement {
+    fn render_line(
+        &self,
+        line: usize,
+        window: &mut Window,
+        diagnostics: &[ByteDiagnostic],
+    ) -> gpui::AnyElement {
         let t = theme();
         let raw = self.document.line_content(line);
         let text = trim_eol(raw.as_ref()).to_owned();
@@ -3053,8 +3290,7 @@ impl EditorView {
             .flat_map(|syntax| syntax.highlights_in(start..end))
             .cloned()
             .collect();
-        let diagnostic = self
-            .diagnostics
+        let diagnostic = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.range.end > start && diagnostic.range.start < end);
         let diagnostic_underline = diagnostic.map(|diagnostic| {
@@ -3673,10 +3909,12 @@ fn debug_completion_enabled() -> bool {
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.poll_native_inspection_results(cx);
         let t = theme();
         let m = metrics();
+        let combined_diagnostics = self.diagnostics.combined();
         let status = self.status.clone().or_else(|| {
-            self.diagnostics
+            combined_diagnostics
                 .first()
                 .map(|diagnostic| diagnostic.message.clone().into())
         });
@@ -3705,17 +3943,75 @@ impl Render for EditorView {
         let offset = scroll_handle.offset();
         let offset_x: f32 = (-offset.x).into();
         let offset_y: f32 = (-offset.y).into();
-        let mut content_width = viewport.size.width;
-        for line in 0..self.document.line_count() {
-            let raw = self.document.line_content(line);
+        let line_count = self.document.line_count();
+        if line_count != self.width_cache_line_count {
+            self.line_width_cache.clear();
+            self.max_width_line = None;
+            self.width_cache_line_count = line_count;
+            self.width_cache_dirty = true;
+        }
+        let profile_started = std::time::Instant::now();
+        let mut lines_laid_out = 0usize;
+        let mut cache_hits = 0usize;
+        let mut cache_misses = 0usize;
+        if self.width_cache_dirty {
+            self.line_width_cache.clear();
+            self.max_width_line = None;
+            for line in 0..line_count {
+                let raw = self.document.line_content(line);
+                let text = trim_eol(raw.as_ref());
+                let width =
+                    px(GUTTER_WIDTH + TEXT_PADDING) + self.line_layout(line, text, window).width;
+                self.line_width_cache.insert(line, width);
+                if self
+                    .max_width_line
+                    .is_none_or(|max| width > self.line_width_cache[&max])
+                {
+                    self.max_width_line = Some(line);
+                }
+                lines_laid_out += 1;
+                cache_misses += 1;
+            }
+            self.width_cache_dirty = false;
+        }
+        let cursor_line = self.document.line_of_offset(self.document.cursor_offset());
+        if !self.line_width_cache.contains_key(&cursor_line) {
+            let raw = self.document.line_content(cursor_line);
             let text = trim_eol(raw.as_ref());
             let width =
-                px(GUTTER_WIDTH + TEXT_PADDING) + self.line_layout(line, text, window).width;
-            if width > content_width {
-                content_width = width;
+                px(GUTTER_WIDTH + TEXT_PADDING) + self.line_layout(cursor_line, text, window).width;
+            self.line_width_cache.insert(cursor_line, width);
+            self.max_width_line = self.max_width_line.filter(|line| {
+                self.line_width_cache
+                    .get(line)
+                    .is_some_and(|old| *old >= width)
+            });
+            if self
+                .max_width_line
+                .is_none_or(|line| width > self.line_width_cache[&line])
+            {
+                self.max_width_line = Some(cursor_line);
             }
+            lines_laid_out += 1;
+            cache_misses += 1;
+        } else {
+            cache_hits += 1;
         }
-        self.content_width = content_width;
+        self.content_width = self
+            .max_width_line
+            .and_then(|line| self.line_width_cache.get(&line).copied())
+            .unwrap_or(viewport.size.width);
+        if debug_input_enabled() {
+            tracing::debug!(
+                lines_total = line_count,
+                lines_laid_out_this_frame = lines_laid_out,
+                width_cache_hits = cache_hits,
+                width_cache_misses = cache_misses,
+                width_scan_all = cache_misses == line_count && line_count > 0,
+                render_us = profile_started.elapsed().as_micros(),
+                "[EDITOR RENDER PROFILE]"
+            );
+        }
         let vertical_top = if max_y > 0.0 {
             offset_y / max_y * (viewport_h - vertical_thumb).max(0.0)
         } else {
@@ -3875,11 +4171,15 @@ impl Render for EditorView {
                         uniform_list(
                             "editor-lines",
                             self.document.line_count(),
-                            cx.processor(|this, range: Range<usize>, window, _| {
+                            cx.processor(move |this, range: Range<usize>, window, _| {
                                 this.line_layouts
                                     .borrow_mut()
                                     .retain(|line, _| range.contains(line));
-                                range.map(|line| this.render_line(line, window)).collect()
+                                range
+                                    .map(|line| {
+                                        this.render_line(line, window, &combined_diagnostics)
+                                    })
+                                    .collect()
                             }),
                         )
                         .with_horizontal_sizing_behavior(
@@ -4391,9 +4691,12 @@ impl Element for EditorInputElement {
 }
 
 fn trim_eol(text: &str) -> &str {
-    text.strip_suffix("\r\n")
-        .or_else(|| text.strip_suffix('\n'))
-        .unwrap_or(text)
+    text.strip_suffix(
+        "
+",
+    )
+    .or_else(|| text.strip_suffix('\n'))
+    .unwrap_or(text)
 }
 
 fn matching_paren(text: &str, open: usize) -> Option<usize> {
@@ -4411,19 +4714,6 @@ fn matching_paren(text: &str, open: usize) -> Option<usize> {
         }
     }
     None
-}
-
-fn project_callable_detail(symbol: &axiom_index::ProjectSymbol) -> Option<String> {
-    Some(format!(
-        "{}{}{}",
-        symbol.name,
-        symbol.parameters.as_deref().unwrap_or("()"),
-        symbol
-            .return_type
-            .as_deref()
-            .map(|value| format!(": {value}"))
-            .unwrap_or_default()
-    ))
 }
 
 fn signature_counts_from_detail(detail: &str) -> (usize, usize, bool) {
@@ -4628,8 +4918,8 @@ mod formatter_tests {
         assert!(
             matches!(
                 &query,
-                Some(DefinitionQuery::Name { fqn, written })
-                    if fqn == "Omegaalfa\\FiberEventLoop\\Future" && written == "Future"
+                Some(DefinitionQuery::Name { fqn })
+                    if fqn == "Omegaalfa\\FiberEventLoop\\Future"
             ),
             "unexpected imported type query: {query:?}"
         );
@@ -4657,9 +4947,8 @@ mod formatter_tests {
         assert!(
             matches!(
                 &query,
-                Some(DefinitionQuery::Name { fqn, written })
+                Some(DefinitionQuery::Name { fqn })
                     if fqn == "Omegaalfa\\FiberEventLoop\\FiberEventLoop"
-                        && written == "FiberEventLoop"
             ),
             "unexpected new-expression query: {query:?}"
         );
@@ -4862,7 +5151,7 @@ mod formatter_tests {
 
     #[test]
     fn receiver_chain_and_typed_property_resolve() {
-        let text = "namespace App;\nuse Vendor\\FiberEventLoop\\FiberEventLoop;\nclass Client {\n private FiberEventLoop $loop;\n function f() { $this->loop->run(); }\n}";
+        let text = "namespace App;\nuse Vendor\\FiberEventLoop\\FiberEventLoop;\nclass Client {\n private FiberEventLoop $loop;\n function f() { $this->loop->run(); }\\n}";
         let operator = text.find("$this->loop->run").unwrap() + "$this->loop".len();
         let (_, owner) = extract_owner_expression(text, operator);
         assert_eq!(owner, "$this->loop");
@@ -4908,5 +5197,153 @@ mod formatter_tests {
     fn project_hit_short_circuits_vendor_lookup() {
         assert!(!vendor_lookup_needed(true));
         assert!(vendor_lookup_needed(false));
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_store_tests {
+    use super::{
+        ArgumentInspectionInput, ByteDiagnostic, DiagnosticStore, DuplicateClassDeclaration,
+        DuplicateClassInspectionInput, UnknownConstantInspectionInput,
+        compute_argument_inspections, compute_duplicate_class_inspections,
+        compute_unknown_constant_inspections,
+    };
+    use std::sync::Arc;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn argument_inspection_is_pure_and_send_sync() {
+        assert_send_sync::<ArgumentInspectionInput>();
+        let input = ArgumentInspectionInput {
+            text: Arc::from("<?php function run(int $value) {} run();"),
+            project_symbols: vec![axiom_index::ProjectSymbol {
+                name: "run".into(),
+                fully_qualified_name: "run".into(),
+                kind: axiom_index::ProjectSymbolKind::Function,
+                file: "test.php".into(),
+                range: 0..3,
+                namespace: String::new(),
+                visibility: axiom_index::Visibility::Public,
+                modifiers: Vec::new(),
+                parameters: Some("(int $value)".into()),
+                return_type: None,
+            }],
+            runtime_symbols: None,
+        };
+        assert_eq!(compute_argument_inspections(&input).len(), 1);
+    }
+
+    #[test]
+    fn duplicate_class_inspection_is_pure_and_send_sync() {
+        assert_send_sync::<DuplicateClassInspectionInput>();
+        let a = axiom_index::PersistentFileKey::workspace("A.php");
+        let b = axiom_index::PersistentFileKey::workspace("B.php");
+        let input = DuplicateClassInspectionInput {
+            path: a.clone(),
+            declarations: vec![
+                DuplicateClassDeclaration {
+                    fqn: "App\\User".into(),
+                    file: a,
+                    range: 1..5,
+                },
+                DuplicateClassDeclaration {
+                    fqn: "App\\User".into(),
+                    file: b,
+                    range: 2..6,
+                },
+            ],
+        };
+        assert_eq!(compute_duplicate_class_inspections(&input).len(), 1);
+    }
+
+    #[test]
+    fn duplicate_class_inspection_distinguishes_fqn_and_self() {
+        assert_send_sync::<DuplicateClassInspectionInput>();
+        let file = axiom_index::PersistentFileKey::workspace("same.php");
+        let other = axiom_index::PersistentFileKey::workspace("other.php");
+        let input = DuplicateClassInspectionInput {
+            path: file.clone(),
+            declarations: vec![
+                DuplicateClassDeclaration {
+                    fqn: "App\\One\\User".into(),
+                    file: file.clone(),
+                    range: 1..2,
+                },
+                DuplicateClassDeclaration {
+                    fqn: "App\\Two\\User".into(),
+                    file: file.clone(),
+                    range: 3..4,
+                },
+                DuplicateClassDeclaration {
+                    fqn: "App\\One\\User".into(),
+                    file: other,
+                    range: 5..6,
+                },
+            ],
+        };
+        let diagnostics = compute_duplicate_class_inspections(&input);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range, 1..2);
+    }
+
+    #[test]
+    fn unknown_constant_inspection_is_pure_and_send_sync() {
+        assert_send_sync::<UnknownConstantInspectionInput>();
+        let input = UnknownConstantInspectionInput {
+            text: Arc::from("<?php echo UNKNOWN_VALUE;"),
+            known_constants: Vec::new(),
+            runtime_symbols: None,
+        };
+        let diagnostics = compute_unknown_constant_inspections(&input);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "Undefined constant 'UNKNOWN_VALUE'");
+    }
+
+    #[test]
+    fn unknown_constant_inspection_preserves_known_namespaces_and_literals() {
+        let input = UnknownConstantInspectionInput {
+            text: Arc::from(
+                "<?php namespace App; const VALUE = 1; echo VALUE; echo \\App\\VALUE; echo \"FAKE\"; // FAKE\n",
+            ),
+            known_constants: vec![("VALUE".into(), "App\\VALUE".into())],
+            runtime_symbols: None,
+        };
+        assert!(compute_unknown_constant_inspections(&input).is_empty());
+    }
+
+    #[test]
+    fn native_and_lsp_updates_are_independent_and_combined() {
+        let mut store = DiagnosticStore::default();
+        store.set_native_syntax(vec![ByteDiagnostic {
+            range: 0..3,
+            severity: None,
+            message: "native".into(),
+        }]);
+        store.set_lsp(vec![ByteDiagnostic {
+            range: 4..7,
+            severity: None,
+            message: "lsp".into(),
+        }]);
+        let first_cache = store.combined();
+        let second_cache = store.combined();
+        assert!(Arc::ptr_eq(&first_cache, &second_cache));
+        assert_eq!(store.combined().len(), 2);
+        store.set_lsp(Vec::new());
+        assert_eq!(
+            store
+                .combined()
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["native"]
+        );
+        store.set_native_syntax(Vec::new());
+        store.set_lsp(vec![ByteDiagnostic {
+            range: 1..2,
+            severity: None,
+            message: "lsp-again".into(),
+        }]);
+        assert_eq!(store.combined()[0].message, "lsp-again");
     }
 }

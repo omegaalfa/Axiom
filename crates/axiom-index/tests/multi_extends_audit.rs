@@ -1,0 +1,55 @@
+use axiom_index::{
+    DefinitionQueryContext, ProjectSymbolIndex, SemanticDefinitionOutcome, SemanticRevision,
+    SemanticSnapshot,
+};
+use std::fs;
+
+fn context(snapshot: &SemanticSnapshot) -> DefinitionQueryContext {
+    DefinitionQueryContext {
+        document_version: None,
+        semantic_revision: snapshot.revision,
+    }
+}
+
+#[test]
+fn multi_extends_definition_audit() {
+    let text = "<?php interface A { public function a(): void; } interface B { public function b(): void; } interface C extends A, B {} function test(C $c): void { $c->a(); $c->b(); }";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multi-extends-audit.php");
+    fs::write(&path, text).unwrap();
+    let mut index = ProjectSymbolIndex::new();
+    index.index_project(dir.path()).unwrap();
+    let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+    let a = snapshot.definition_at_detailed(
+        &path,
+        text,
+        text.find("$c->a").unwrap() + 4,
+        context(&snapshot),
+    );
+    let b = snapshot.definition_at_detailed(
+        &path,
+        text,
+        text.find("$c->b").unwrap() + 4,
+        context(&snapshot),
+    );
+    assert_eq!(a.outcome, SemanticDefinitionOutcome::Resolved);
+    assert_eq!(b.outcome, SemanticDefinitionOutcome::Resolved);
+}
+
+#[test]
+fn interface_diamond_deduplicates_root() {
+    let text = "<?php interface Root { public function run(): void; } interface Left extends Root {} interface Right extends Root {} interface FinalContract extends Left, Right {} function test(FinalContract $x): void { $x->run(); }";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("diamond.php");
+    fs::write(&path, text).unwrap();
+    let mut index = ProjectSymbolIndex::new();
+    index.index_project(dir.path()).unwrap();
+    let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(2));
+    let result = snapshot.definition_at_detailed(
+        &path,
+        text,
+        text.find("$x->run").unwrap() + 4,
+        context(&snapshot),
+    );
+    assert_eq!(result.outcome, SemanticDefinitionOutcome::Resolved);
+}
