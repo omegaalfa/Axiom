@@ -75,3 +75,32 @@ fn trait_method_definition_uses_original_trait_symbol() {
         format!("{:?}", result.result).contains(&format!("span: {trait_span}..{}", trait_span + 3))
     );
 }
+
+#[test]
+fn inherited_class_trait_supplies_method_property_and_constant() {
+    let text = "<?php trait T { public string $name; public const VERSION = '1'; public function run(): void {} } class Base { use T; } class Child extends Base {} function test(Child $c): void { $c->name; $c->run(); } $value = Child::VERSION;";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("inherited-trait.php");
+    fs::write(&path, text).unwrap();
+    let mut index = ProjectSymbolIndex::new();
+    index.index_project(dir.path()).unwrap();
+    let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(4));
+    let ctx = context(&snapshot);
+    let property =
+        snapshot.definition_at_detailed(&path, text, text.find("$c->name").unwrap() + 4, ctx);
+    let method = snapshot.definition_at_detailed(
+        &path,
+        text,
+        text.find("$c->run").unwrap() + 4,
+        context(&snapshot),
+    );
+    let constant = snapshot.definition_at_detailed(
+        &path,
+        text,
+        text.rfind("VERSION").unwrap(),
+        context(&snapshot),
+    );
+    assert_eq!(property.outcome, SemanticDefinitionOutcome::Resolved);
+    assert_eq!(method.outcome, SemanticDefinitionOutcome::Resolved);
+    assert_eq!(constant.outcome, SemanticDefinitionOutcome::Resolved);
+}
