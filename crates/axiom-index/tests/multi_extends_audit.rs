@@ -174,3 +174,131 @@ fn incremental_replace_preserves_direct_trait_relation() {
     );
     assert_eq!(result.outcome, SemanticDefinitionOutcome::MissingSymbol);
 }
+
+#[test]
+fn enum_case_definition_is_owner_scoped() {
+    let text = "<?php namespace N; enum Status { case Active; case Disabled; public const VERSION = '1'; } enum Feature { case Active; } $a = Status::Active; $b = Feature::Active; $v = Status::VERSION;";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("enum.php");
+    fs::write(&path, text).unwrap();
+    let mut index = ProjectSymbolIndex::new();
+    index.index_project(dir.path()).unwrap();
+    let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(7));
+    let status = snapshot.symbols_for_fqn("N\\Status");
+    assert_eq!(status.len(), 1);
+    let active = snapshot.members_named(
+        status[0],
+        "Active",
+        axiom_index::ProjectSymbolKind::EnumCase,
+    );
+    assert_eq!(active.len(), 1);
+    let first = snapshot.definition_at_detailed(
+        &path,
+        text,
+        text.find("Status::Active").unwrap() + "Status::".len(),
+        context(&snapshot),
+    );
+    let second = snapshot.definition_at_detailed(
+        &path,
+        text,
+        text.find("Feature::Active").unwrap() + "Feature::".len(),
+        context(&snapshot),
+    );
+    assert_eq!(first.outcome, SemanticDefinitionOutcome::Resolved);
+    assert_eq!(second.outcome, SemanticDefinitionOutcome::Resolved);
+}
+
+#[test]
+fn enum_case_incremental_add_remove_and_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.php");
+    let use_text = "<?php enum Status { case Pending; } $x = Status::Active;";
+    fs::write(&path, use_text).unwrap();
+    let mut index = ProjectSymbolIndex::new();
+    index.index_project(dir.path()).unwrap();
+    let base = SemanticSnapshot::from_project_index(&index, SemanticRevision(8));
+    let add_text = "<?php enum Status { case Pending; case Active; } $x = Status::Active;";
+    let mut add = axiom_index::SnapshotBuilder::from_snapshot(&base);
+    add.replace_workspace_file(&path, add_text);
+    let added = add.finish();
+    assert_eq!(
+        added
+            .definition_at_detailed(
+                &path,
+                add_text,
+                add_text.rfind("Active").unwrap(),
+                context(&added)
+            )
+            .outcome,
+        SemanticDefinitionOutcome::Resolved
+    );
+    let rename_text = "<?php enum Status { case Pending; case Enabled; } $x = Status::Active;";
+    let mut rename = axiom_index::SnapshotBuilder::from_snapshot(&added);
+    rename.replace_workspace_file(&path, rename_text);
+    let renamed = rename.finish();
+    assert_eq!(
+        renamed
+            .definition_at_detailed(
+                &path,
+                rename_text,
+                rename_text.rfind("Active").unwrap(),
+                context(&renamed)
+            )
+            .outcome,
+        SemanticDefinitionOutcome::MissingSymbol
+    );
+}
+
+#[test]
+fn enum_implements_interface_relations_and_incremental_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let contracts = dir.path().join("contracts.php");
+    let domain = dir.path().join("status.php");
+    let child = dir.path().join("child.php");
+    fs::write(
+        &contracts,
+        "<?php namespace App\\Contracts; interface Runnable { public function run(): void; } interface ParentContract extends Runnable {} interface Other { public function other(): void; }",
+    )
+    .unwrap();
+    fs::write(
+        &domain,
+        "<?php namespace App\\Domain; use App\\Contracts\\Runnable as Contract; use App\\Contracts\\Other; enum Status implements Contract, Other { case Active; public function run(): void {} public function other(): void {} }",
+    )
+    .unwrap();
+    fs::write(
+        &child,
+        "<?php namespace App\\Domain; class Base implements \\App\\Contracts\\ParentContract { public function run(): void {} } class Child extends Base {}",
+    )
+    .unwrap();
+
+    let mut index = ProjectSymbolIndex::new();
+    index.index_project(dir.path()).unwrap();
+    let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(9));
+    let runnable = snapshot.symbols_for_fqn("App\\Contracts\\Runnable")[0];
+    let parent = snapshot.symbols_for_fqn("App\\Contracts\\ParentContract")[0];
+    let other = snapshot.symbols_for_fqn("App\\Contracts\\Other")[0];
+    let status = snapshot.symbols_for_fqn("App\\Domain\\Status")[0];
+
+    assert_eq!(snapshot.direct_implementers_of(runnable), &[status]);
+    let runnable_implementers = snapshot.implementers_of(runnable);
+    assert!(runnable_implementers.contains(&status));
+    assert_eq!(runnable_implementers.len(), 3);
+    assert_eq!(snapshot.direct_implementers_of(other), &[status]);
+    assert_eq!(snapshot.implementers_of(parent).len(), 2);
+    let run = snapshot.members_named(runnable, "run", axiom_index::ProjectSymbolKind::Method)[0];
+    let implementations = snapshot.implementations_of(run);
+    assert!(implementations.iter().any(|id| *id
+        == snapshot.members_named(status, "run", axiom_index::ProjectSymbolKind::Method)[0]));
+    assert!(!implementations.iter().any(|id| {
+        snapshot
+            .symbol(*id)
+            .is_some_and(|s| s.kind == axiom_index::ProjectSymbolKind::EnumCase)
+    }));
+
+    let changed_text = "<?php namespace App\\Domain; use App\\Contracts\\Runnable as Contract; enum Status implements Contract { case Active; public function run(): void {} }";
+    let mut builder = axiom_index::SnapshotBuilder::from_snapshot(&snapshot);
+    builder.replace_workspace_file(&domain, changed_text);
+    let changed = builder.finish();
+    assert!(changed.direct_implementers_of(other).is_empty());
+    assert!(changed.implementers_of(runnable).contains(&status));
+}

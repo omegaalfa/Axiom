@@ -824,6 +824,12 @@ impl<'a> MemberResolver<'a> {
                                 .iter()
                                 .copied(),
                         );
+                        matches.extend(
+                            self.snapshot
+                                .members_named(*id, name, ProjectSymbolKind::EnumCase)
+                                .iter()
+                                .copied(),
+                        );
                     }
                     matches
                 })
@@ -894,6 +900,9 @@ impl<'a> MemberResolver<'a> {
     }
 
     fn is_accessible(&self, scope: ScopeId, symbol: &SemanticSymbol) -> bool {
+        if symbol.kind == ProjectSymbolKind::EnumCase {
+            return true;
+        }
         let visibility = symbol.visibility;
         if visibility == Visibility::Public {
             return true;
@@ -1298,10 +1307,12 @@ impl SemanticSnapshot {
 
         let mut relations = InterfaceRelationIndexes::default();
         for (&class, interfaces) in &implements {
-            if self
-                .symbol(class)
-                .is_none_or(|symbol| symbol.kind != ProjectSymbolKind::Class)
-            {
+            if self.symbol(class).is_none_or(|symbol| {
+                !matches!(
+                    symbol.kind,
+                    ProjectSymbolKind::Class | ProjectSymbolKind::Enum
+                )
+            }) {
                 continue;
             }
             for &interface in interfaces {
@@ -1324,8 +1335,9 @@ impl SemanticSnapshot {
             .iter()
             .copied()
             .filter(|id| {
-                self.symbol(*id)
-                    .is_some_and(|s| s.kind == ProjectSymbolKind::Class)
+                self.symbol(*id).is_some_and(|s| {
+                    matches!(s.kind, ProjectSymbolKind::Class | ProjectSymbolKind::Enum)
+                })
             })
             .collect();
         for class in classes {
@@ -1446,7 +1458,9 @@ impl SemanticSnapshot {
                 && self.symbol(*id).is_some_and(|s| {
                     matches!(
                         s.kind,
-                        ProjectSymbolKind::Class | ProjectSymbolKind::Interface
+                        ProjectSymbolKind::Class
+                            | ProjectSymbolKind::Interface
+                            | ProjectSymbolKind::Enum
                     )
                 })
         })

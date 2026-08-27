@@ -46,6 +46,7 @@ pub enum ProjectSymbolKind {
     Property,
     Constant,
     ClassConstant,
+    EnumCase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1125,14 +1126,16 @@ fn walk(
                     ProjectSymbolKind::Method
                     | ProjectSymbolKind::Property
                     | ProjectSymbolKind::Constant
-                    | ProjectSymbolKind::ClassConstant,
+                    | ProjectSymbolKind::ClassConstant
+                    | ProjectSymbolKind::EnumCase,
                 ) if namespace.is_empty() => format!("{parent}::{name}"),
                 (
                     Some(parent),
                     ProjectSymbolKind::Method
                     | ProjectSymbolKind::Property
                     | ProjectSymbolKind::Constant
-                    | ProjectSymbolKind::ClassConstant,
+                    | ProjectSymbolKind::ClassConstant
+                    | ProjectSymbolKind::EnumCase,
                 ) => format!("{namespace}\\{parent}::{name}"),
                 _ if namespace.is_empty() => name.clone(),
                 _ => format!("{namespace}\\{name}"),
@@ -1231,6 +1234,7 @@ fn symbol_node(node: Node<'_>) -> Option<(ProjectSymbolKind, Node<'_>)> {
         "property_declaration" => ProjectSymbolKind::Property,
         "const_declaration" => ProjectSymbolKind::Constant,
         "class_constant_declaration" => ProjectSymbolKind::ClassConstant,
+        "enum_case" => ProjectSymbolKind::EnumCase,
         _ => return None,
     };
     let field = node.child_by_field_name("name").or_else(|| {
