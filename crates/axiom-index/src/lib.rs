@@ -385,6 +385,28 @@ impl VendorSymbolIndex {
     }
 
     pub fn symbols_of(&mut self, fqn: &str) -> Vec<ProjectSymbol> {
+        let mut in_progress = HashSet::new();
+        self.symbols_of_inner(fqn, &mut in_progress)
+    }
+
+    fn symbols_of_inner(
+        &mut self,
+        fqn: &str,
+        in_progress: &mut HashSet<String>,
+    ) -> Vec<ProjectSymbol> {
+        if !in_progress.insert(fqn.to_owned()) {
+            return Vec::new();
+        }
+        let result = self.symbols_of_inner_impl(fqn, in_progress);
+        in_progress.remove(fqn);
+        result
+    }
+
+    fn symbols_of_inner_impl(
+        &mut self,
+        fqn: &str,
+        in_progress: &mut HashSet<String>,
+    ) -> Vec<ProjectSymbol> {
         let started = Instant::now();
         let Some(path) = self.resolve_class(fqn) else {
             return Vec::new();
@@ -424,6 +446,7 @@ impl VendorSymbolIndex {
                     .map(|v| v.trim_end_matches(';').trim().to_owned())
             })
             .unwrap_or_default();
+        let (_, imports) = vendor_trait_info(&text);
         for (offset, line) in text.split_inclusive('\n').scan(0usize, |offset, line| {
             let start = *offset;
             *offset += line.len();
@@ -461,11 +484,18 @@ impl VendorSymbolIndex {
             }
             if let Some(pos) = trimmed.find("function ") {
                 let start = offset + line.len() - trimmed.len() + pos + 9;
-                let name = trimmed[pos + 9..]
+                let function_tail = &trimmed[pos + 9..];
+                let name = function_tail
                     .split(|c: char| !c.is_alphanumeric() && c != '_')
                     .next()
                     .unwrap_or_default();
                 if !name.is_empty() {
+                    // Keep the declaration's return type in the vendor
+                    // symbol metadata.  This is intentionally syntax-only:
+                    // resolving imports, self/static/parent and unions is
+                    // done by the semantic resolver with the file context.
+                    let return_type = vendor_method_return_type(function_tail, name.len())
+                        .map(|raw| normalize_vendor_type(&raw, &namespace, &imports));
                     symbols.push(ProjectSymbol {
                         name: name.to_owned(),
                         fully_qualified_name: format!("{fqn}::{name}"),
@@ -488,7 +518,7 @@ impl VendorSymbolIndex {
                                         .to_owned()
                                 })
                         }),
-                        return_type: None,
+                        return_type,
                     });
                 }
             }
@@ -530,29 +560,18 @@ impl VendorSymbolIndex {
         // Methods supplied by traits are callable on the consuming class.
         // Load only explicitly used traits, on the background worker, and
         // retain their symbols in the same class result for member lookup.
-        let trait_names: Vec<String> = text
-            .lines()
-            .filter_map(|line| {
-                let value = line
-                    .trim()
-                    .strip_prefix("use ")?
-                    .trim_end_matches(';')
-                    .trim();
-                (value
-                    .chars()
-                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '\\')))
-                .then(|| value.to_owned())
-            })
-            .collect();
+        let (trait_names, _) = vendor_trait_info(&text);
         for trait_name in trait_names {
             let trait_fqn = if trait_name.starts_with('\\') || trait_name.contains('\\') {
                 trait_name.trim_start_matches('\\').to_owned()
+            } else if let Some(imported) = imports.get(&trait_name) {
+                imported.clone()
             } else if namespace.is_empty() {
                 trait_name
             } else {
                 format!("{namespace}\\{trait_name}")
             };
-            let trait_symbols = self.symbols_of(&trait_fqn);
+            let trait_symbols = self.symbols_of_inner(&trait_fqn, in_progress);
             symbols.extend(
                 trait_symbols
                     .into_iter()
@@ -614,6 +633,158 @@ impl VendorSymbolIndex {
 
 fn canonical_or(path: PathBuf) -> PathBuf {
     fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// Extracts only trait-use declarations from class-like bodies. Namespace
+/// imports are represented by a different syntax node and must not trigger
+/// recursive Vendor parsing.
+/// Extracts a method return type without resolving it. Vendor parsing is kept
+/// deliberately lightweight, but dropping this piece of declaration metadata
+/// prevents semantic member chains from discovering the next receiver.
+fn vendor_method_return_type(signature: &str, name_len: usize) -> Option<String> {
+    let open = signature.get(name_len..)?.find('(')? + name_len;
+    let bytes = signature.as_bytes();
+    let mut depth = 0usize;
+    let mut close = None;
+    for (index, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let suffix = signature.get(close + 1..)?.trim_start();
+    let suffix = suffix.strip_prefix(':')?.trim_start();
+    let end = suffix.find(['{', ';']).unwrap_or(suffix.len());
+    let return_type = suffix[..end].trim();
+    (!return_type.is_empty()).then(|| return_type.to_owned())
+}
+
+fn normalize_vendor_type(raw: &str, namespace: &str, imports: &BTreeMap<String, String>) -> String {
+    let raw = raw.trim();
+    if let Some(inner) = raw.strip_prefix('?') {
+        return format!("?{}", normalize_vendor_type(inner, namespace, imports));
+    }
+    for separator in ['|', '&'] {
+        if raw.contains(separator) {
+            return raw
+                .split(separator)
+                .map(|part| normalize_vendor_type(part, namespace, imports))
+                .collect::<Vec<_>>()
+                .join(&separator.to_string());
+        }
+    }
+    if raw.starts_with('\\')
+        || raw.contains('\\')
+        || matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "int"
+                | "string"
+                | "bool"
+                | "float"
+                | "array"
+                | "object"
+                | "callable"
+                | "iterable"
+                | "mixed"
+                | "void"
+                | "never"
+                | "null"
+                | "false"
+                | "true"
+                | "self"
+                | "static"
+                | "parent"
+        )
+    {
+        return raw.to_owned();
+    }
+    if let Some(imported) = imports.get(raw) {
+        return imported.clone();
+    }
+    if namespace.is_empty() {
+        raw.to_owned()
+    } else {
+        format!("{namespace}\\{raw}")
+    }
+}
+
+fn vendor_trait_info(text: &str) -> (Vec<String>, BTreeMap<String, String>) {
+    fn walk(node: Node<'_>, text: &str, in_class_like: bool, output: &mut Vec<String>) {
+        let class_like = in_class_like
+            || matches!(
+                node.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "trait_declaration"
+                    | "enum_declaration"
+            );
+        if class_like && node.kind() == "use_declaration" {
+            let value = text[node.start_byte()..node.end_byte()]
+                .trim()
+                .trim_start_matches("use")
+                .trim_end_matches(';')
+                .trim();
+            for name in value.split(',').map(str::trim) {
+                let name = name
+                    .split_once(" as ")
+                    .map(|(name, _)| name.trim())
+                    .unwrap_or(name);
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '\\'))
+                {
+                    output.push(name.to_owned());
+                }
+            }
+            return;
+        }
+        for child in node.named_children(&mut node.walk()) {
+            walk(child, text, class_like, output);
+        }
+    }
+
+    let Ok(syntax) = PhpSyntax::parse(text.to_owned()) else {
+        return (Vec::new(), BTreeMap::new());
+    };
+    let mut output = Vec::new();
+    walk(syntax.tree().root_node(), text, false, &mut output);
+    let mut imports = BTreeMap::new();
+    fn collect_imports(node: Node<'_>, text: &str, imports: &mut BTreeMap<String, String>) {
+        if node.kind() == "namespace_use_declaration" {
+            let value = text[node.start_byte()..node.end_byte()]
+                .trim()
+                .trim_start_matches("use")
+                .trim_end_matches(';')
+                .trim();
+            for item in value.split(',').map(str::trim) {
+                let (name, alias) = item
+                    .split_once(" as ")
+                    .map(|(name, alias)| (name.trim(), alias.trim().to_owned()))
+                    .unwrap_or_else(|| {
+                        let name = item.trim();
+                        let alias = name.rsplit('\\').next().unwrap_or(name).to_owned();
+                        (name, alias)
+                    });
+                if !name.is_empty() {
+                    imports.insert(alias, name.trim_start_matches('\\').to_owned());
+                }
+            }
+        }
+        for child in node.named_children(&mut node.walk()) {
+            collect_imports(child, text, imports);
+        }
+    }
+    collect_imports(syntax.tree().root_node(), text, &mut imports);
+    (output, imports)
 }
 
 fn metadata_fingerprint(root: &Path) -> Vec<(PathBuf, u64, u128)> {
@@ -1057,6 +1228,27 @@ pub fn is_workspace_source(path: impl AsRef<Path>, project_root: impl AsRef<Path
         })
 }
 
+/// Purely lexical variant for UI classification when the path and project
+/// root have already been obtained from resident workspace state. Unlike
+/// [`is_workspace_source`], this never canonicalizes or otherwise touches the
+/// filesystem.
+pub fn is_workspace_source_lexical(path: impl AsRef<Path>, project_root: impl AsRef<Path>) -> bool {
+    let path = PersistentFileKey::workspace_lexical(path).normalized_path;
+    let root = PersistentFileKey::workspace_lexical(project_root).normalized_path;
+    let Some(relative) = path
+        .strip_prefix(&root)
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return false;
+    };
+    relative.split('/').all(|component| {
+        !matches!(
+            component.to_ascii_lowercase().as_str(),
+            ".git" | "target" | "node_modules" | "vendor"
+        )
+    })
+}
+
 fn walk(
     node: Node<'_>,
     text: &str,
@@ -1287,6 +1479,19 @@ mod tests {
         assert!(!is_workspace_source(&vendor, root.path()));
         assert!(!is_workspace_source(&target, root.path()));
         assert!(!is_workspace_source(external, root.path()));
+        let lexical_root = root.path().to_string_lossy().replace('\\', "/");
+        assert!(is_workspace_source_lexical(
+            format!("{lexical_root}/src/User.php"),
+            &lexical_root
+        ));
+        assert!(!is_workspace_source_lexical(
+            format!("{lexical_root}/vendor/pkg/Foo.php"),
+            &lexical_root
+        ));
+        assert!(!is_workspace_source_lexical(
+            "C:/other/External.php",
+            &lexical_root
+        ));
     }
     #[test]
     fn indexes_php_symbols_and_fqns() {
@@ -1362,6 +1567,14 @@ mod tests {
                 .symbols_of("Acme\\Widget")
                 .iter()
                 .any(|s| s.name == "run" && s.parameters.as_deref() == Some("(string $x)"))
+        );
+        assert_eq!(
+            index
+                .symbols_of("Acme\\Widget")
+                .iter()
+                .find(|s| s.name == "run")
+                .and_then(|s| s.return_type.as_deref()),
+            Some("bool")
         );
     }
 
@@ -1470,5 +1683,146 @@ mod tests {
                 symbol.kind == ProjectSymbolKind::Property && symbol.name == "loop"
             })
         );
+    }
+
+    #[test]
+    fn vendor_method_return_types_are_preserved_verbatim() {
+        for (signature, expected) in [
+            ("getUri(): UriInterface {}", "UriInterface"),
+            (
+                "getUri(): \\Psr\\Http\\Message\\UriInterface;",
+                "\\Psr\\Http\\Message\\UriInterface",
+            ),
+            ("getUri(): ?UriInterface {}", "?UriInterface"),
+            ("getUri(): A|B {}", "A|B"),
+            ("getUri(): A&B {}", "A&B"),
+            ("getUri(): self {}", "self"),
+            ("getUri(): static {}", "static"),
+            ("getUri(): parent {}", "parent"),
+        ] {
+            assert_eq!(
+                vendor_method_return_type(signature, 6).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_method_return_types_resolve_namespace_and_aliases() {
+        let mut imports = BTreeMap::new();
+        imports.insert(
+            "UriInterface".to_owned(),
+            "Psr\\Http\\Message\\UriInterface".to_owned(),
+        );
+        assert_eq!(
+            normalize_vendor_type("UriInterface", "Laminas\\Diactoros", &imports),
+            "Psr\\Http\\Message\\UriInterface"
+        );
+        assert_eq!(
+            normalize_vendor_type("?UriInterface|self", "Laminas\\Diactoros", &imports),
+            "?Psr\\Http\\Message\\UriInterface|self"
+        );
+        assert_eq!(
+            normalize_vendor_type("\\Psr\\Http\\Message\\UriInterface", "Laminas", &imports),
+            "\\Psr\\Http\\Message\\UriInterface"
+        );
+    }
+
+    #[test]
+    fn vendor_parser_distinguishes_imports_from_trait_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("A.php");
+        let b = dir.path().join("B.php");
+        fs::write(
+            &a,
+            "<?php namespace Pkg; use Pkg\\B; class A { public function own() {} }",
+        )
+        .unwrap();
+        fs::write(
+            &b,
+            "<?php namespace Pkg; class B { public function imported() {} }",
+        )
+        .unwrap();
+        let mut index = VendorSymbolIndex::default();
+        index.classmap.insert("Pkg\\A".into(), a.clone());
+        index.classmap.insert("Pkg\\B".into(), b.clone());
+        let symbols = index.symbols_of("Pkg\\A");
+        assert!(symbols.iter().any(|symbol| symbol.name == "own"));
+        assert!(!index.parsed.contains_key("Pkg\\B"));
+    }
+
+    #[test]
+    fn vendor_trait_cycle_terminates_and_keeps_own_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("A.php");
+        let b = dir.path().join("B.php");
+        fs::write(
+            &a,
+            "<?php\nnamespace Pkg;\ntrait A {\n    use B;\n    public function a() {}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &b,
+            "<?php\nnamespace Pkg;\ntrait B {\n    use A;\n    public function b() {}\n}\n",
+        )
+        .unwrap();
+        let mut index = VendorSymbolIndex::default();
+        index.classmap.insert("Pkg\\A".into(), a);
+        index.classmap.insert("Pkg\\B".into(), b);
+        let symbols = index.symbols_of("Pkg\\A");
+        assert!(symbols.iter().any(|symbol| symbol.name == "a"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "b"));
+    }
+
+    #[test]
+    fn vendor_trait_indirect_and_self_cycles_terminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ["A", "B", "C"]
+            .into_iter()
+            .map(|name| dir.path().join(format!("{name}.php")))
+            .collect::<Vec<_>>();
+        fs::write(
+            &paths[0],
+            "<?php\nnamespace Pkg;\ntrait A { use B; public function a() {} }\n",
+        )
+        .unwrap();
+        fs::write(
+            &paths[1],
+            "<?php\nnamespace Pkg;\ntrait B { use C; public function b() {} }\n",
+        )
+        .unwrap();
+        fs::write(
+            &paths[2],
+            "<?php\nnamespace Pkg;\ntrait C { use A; public function c() {} }\n",
+        )
+        .unwrap();
+        let mut index = VendorSymbolIndex::default();
+        for (name, path) in ["A", "B", "C"].into_iter().zip(paths) {
+            index.classmap.insert(format!("Pkg\\{name}"), path);
+        }
+        let symbols = index.symbols_of("Pkg\\A");
+        assert!(symbols.iter().any(|symbol| symbol.name == "a"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "b"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "c"));
+
+        let self_cycle = dir.path().join("Self.php");
+        fs::write(
+            &self_cycle,
+            "<?php\nnamespace Pkg;\ntrait SelfTrait { use SelfTrait; public function own() {} }\n",
+        )
+        .unwrap();
+        index.classmap.insert("Pkg\\SelfTrait".into(), self_cycle);
+        assert!(
+            index
+                .symbols_of("Pkg\\SelfTrait")
+                .iter()
+                .any(|symbol| symbol.name == "own")
+        );
+    }
+
+    #[test]
+    fn vendor_trait_use_helper_ignores_namespace_imports_and_aliases() {
+        let text = "<?php namespace Pkg; use Pkg\\Imported; use Pkg\\Aliased as Alias; class A { use TraitB; }";
+        assert_eq!(vendor_trait_info(text).0, vec!["TraitB"]);
     }
 }

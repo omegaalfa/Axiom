@@ -20,6 +20,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Incremental document edit. All ranges are UTF-8 byte offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentEdit {
+    pub revision: u64,
+    pub old_range_bytes: std::ops::Range<usize>,
+    pub inserted_text: String,
+    pub old_start_line: usize,
+    pub old_start_column_bytes: usize,
+    pub old_start_line_text: String,
+    pub old_end_line: usize,
+    pub old_end_column_bytes: usize,
+    pub old_end_line_text: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineEnding {
     Lf,
@@ -66,6 +80,9 @@ pub struct Document {
     cursor: Cursor,
     file_path: Option<PathBuf>,
     line_ending: LineEnding,
+    revision: u64,
+    last_edit: Option<DocumentEdit>,
+    edit_batch_invalid: bool,
 }
 
 impl Document {
@@ -82,6 +99,9 @@ impl Document {
             cursor: Cursor::new(CursorMode::Normal(0), None, None),
             file_path: None,
             line_ending,
+            revision: 0,
+            last_edit: None,
+            edit_batch_invalid: false,
         }
     }
 
@@ -131,6 +151,11 @@ impl Document {
     }
     pub fn content(&self) -> String {
         self.buffer.text().to_string()
+    }
+
+    pub fn take_last_edit(&mut self) -> Option<DocumentEdit> {
+        self.edit_batch_invalid = false;
+        self.last_edit.take()
     }
     pub fn line_count(&self) -> usize {
         self.buffer.num_lines()
@@ -273,8 +298,37 @@ impl Document {
     }
 
     fn apply_edit(&mut self, selection: Selection, text: &str, kind: EditType, offset: usize) {
+        let old_start = selection.min_offset();
+        let old_end = selection.max_offset();
+        let old_start_line = self.line_of_offset(old_start);
+        let old_end_line = self.line_of_offset(old_end);
+        let old_start_line_offset = self.offset_of_line(old_start_line);
+        let old_end_line_offset = self.offset_of_line(old_end_line);
+        let old_start_line_text = self.line_content(old_start_line).into_owned();
+        let old_end_line_text = self.line_content(old_end_line).into_owned();
         let before = self.cursor.mode.clone();
         self.buffer.edit([(selection, text)], kind);
+        self.revision = self.revision.saturating_add(1);
+        self.last_edit = if self.last_edit.is_some() || self.edit_batch_invalid {
+            // Multiple low-level mutations are grouped into one UI edit (for
+            // example newline plus automatic indentation). Without a merged
+            // range, sending only the final mutation would corrupt the LSP
+            // document, so use the documented full-text fallback.
+            self.edit_batch_invalid = true;
+            None
+        } else {
+            Some(DocumentEdit {
+                revision: self.revision,
+                old_range_bytes: old_start..old_end,
+                inserted_text: text.to_owned(),
+                old_start_line,
+                old_start_column_bytes: old_start.saturating_sub(old_start_line_offset),
+                old_start_line_text,
+                old_end_line,
+                old_end_column_bytes: old_end.saturating_sub(old_end_line_offset),
+                old_end_line_text,
+            })
+        };
         let after = CursorMode::Normal(offset);
         self.buffer.set_cursor_before(before);
         self.buffer.set_cursor_after(after.clone());
@@ -657,6 +711,37 @@ mod tests {
         assert_eq!(document.content(), "João ");
         document.paste_text("你好");
         assert_eq!(document.content(), "João 你好");
+    }
+
+    #[test]
+    fn document_edit_reports_utf8_byte_range_and_revision() {
+        let mut document = Document::from_content("ação\nvalue");
+        document.move_cursor(5);
+        document.insert_text("X");
+        let edit = document.take_last_edit().expect("edit metadata");
+        assert_eq!(edit.revision, 1);
+        assert_eq!(edit.old_range_bytes, 5..5);
+        assert_eq!(edit.inserted_text, "X");
+        assert_eq!(edit.old_start_line, 0);
+        assert_eq!(edit.old_start_column_bytes, 5);
+    }
+
+    #[test]
+    fn document_edit_reports_delete_and_replacement_ranges() {
+        let mut document = Document::from_content("one\ntwo");
+        document.set_selection(0, 3);
+        document.insert_text("x");
+        let replacement = document.take_last_edit().unwrap();
+        assert_eq!(replacement.old_range_bytes, 0..3);
+        assert_eq!(replacement.inserted_text, "x");
+        document.move_cursor(document.len());
+        document.delete_backward();
+        let deletion = document.take_last_edit().unwrap();
+        assert_eq!(deletion.inserted_text, "");
+        assert_eq!(
+            deletion.old_range_bytes.end - deletion.old_range_bytes.start,
+            1
+        );
     }
 
     #[test]

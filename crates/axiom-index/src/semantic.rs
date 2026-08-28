@@ -296,6 +296,16 @@ impl PersistentFileKey {
         Self::workspace_physical(path)
     }
 
+    /// Lexical Workspace identity for hot paths where filesystem access is not
+    /// permitted. Callers must provide a path whose physical identity has
+    /// already been stabilized (for example by ProjectSymbolIndex discovery).
+    pub fn workspace_lexical(path: impl AsRef<Path>) -> Self {
+        Self {
+            origin: SourceOrigin::Workspace,
+            normalized_path: normalize_path(path.as_ref()),
+        }
+    }
+
     /// Canonical identity for Workspace files; falls back lexically for unsaved paths.
     pub fn workspace_physical(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
@@ -1734,8 +1744,20 @@ impl SemanticSnapshot {
                 if name.byte_range().contains(&range.start) {
                     let object = candidate.child_by_field_name("object")?;
                     let expression = expression_from_ast(object, text)?;
-                    let receiver =
-                        ExpressionResolver::new(self, scope).infer_expression_type(&expression)?;
+                    let Some(receiver) =
+                        ExpressionResolver::new(self, scope).infer_expression_type(&expression)
+                    else {
+                        // An intermediate method may live in a lazy Vendor
+                        // source. Preserve that state so the app can route
+                        // the complete chain to the Vendor resolver instead
+                        // of turning it into an unconditional Unresolved.
+                        if expression_contains_method_call(&expression) {
+                            return Some(DefinitionResult::Deferred(
+                                "receiver method is deferred to Vendor".into(),
+                            ));
+                        }
+                        return None;
+                    };
                     return Some(self.member_result_to_definition(
                         self.member_resolver().resolve_method(
                             scope,
@@ -2279,6 +2301,14 @@ impl SemanticSnapshot {
             }
         }
         snapshot
+    }
+}
+
+fn expression_contains_method_call(expression: &Expression) -> bool {
+    match expression {
+        Expression::MethodCall { .. } => true,
+        Expression::Parenthesized(inner) => expression_contains_method_call(inner),
+        _ => false,
     }
 }
 
@@ -4422,6 +4452,30 @@ mod tests {
             PersistentFileKey::workspace_physical(&real)
         );
     }
+
+    #[test]
+    fn workspace_lexical_is_stable_without_filesystem_access() {
+        let path = Path::new("missing/../src/Unsaved.php");
+        let first = PersistentFileKey::workspace_lexical(path);
+        let second = PersistentFileKey::workspace_lexical(path);
+        assert_eq!(first, second);
+        assert_eq!(first.origin, SourceOrigin::Workspace);
+        assert_eq!(first.normalized_path, "src/Unsaved.php");
+    }
+
+    #[test]
+    fn workspace_lexical_matches_physical_index_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src/User.php");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "<?php").unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        assert_eq!(
+            PersistentFileKey::workspace_lexical(&canonical),
+            PersistentFileKey::workspace_physical(&path)
+        );
+    }
+
     #[test]
     fn persistent_file_key_collapses_extended_unc_spelling() {
         let ordinary =

@@ -350,6 +350,17 @@ pub struct WorkspaceView {
     find_usages: Vec<FindUsageTarget>,
     find_usages_visible: bool,
     find_usages_source: crate::editor_view::FindUsagesSource,
+    heartbeat_last_tick: Option<Instant>,
+    heartbeat_summary_at: Instant,
+    heartbeat_ticks: u64,
+    heartbeat_over_10ms: u64,
+    heartbeat_over_16ms: u64,
+    heartbeat_over_50ms: u64,
+    heartbeat_over_100ms: u64,
+    heartbeat_over_1s: u64,
+    heartbeat_worst_us: u128,
+    key_event_id: u64,
+    last_key_event_at: Option<Instant>,
 }
 
 impl WorkspaceView {
@@ -899,6 +910,17 @@ impl WorkspaceView {
             find_usages: Vec::new(),
             find_usages_visible: false,
             find_usages_source: crate::editor_view::FindUsagesSource::LegacyOrLsp,
+            heartbeat_last_tick: None,
+            heartbeat_summary_at: Instant::now(),
+            heartbeat_ticks: 0,
+            heartbeat_over_10ms: 0,
+            heartbeat_over_16ms: 0,
+            heartbeat_over_50ms: 0,
+            heartbeat_over_100ms: 0,
+            heartbeat_over_1s: 0,
+            heartbeat_worst_us: 0,
+            key_event_id: 0,
+            last_key_event_at: None,
         };
         workspace.begin_runtime_stub_load(cx, false);
         workspace.start_runtime_watcher(cx);
@@ -911,7 +933,13 @@ impl WorkspaceView {
                 Timer::after(std::time::Duration::from_millis(100)).await;
                 if this
                     .update(cx, |this, cx| {
+                        let _stage = crate::editor_view::UiStageGuard::new(
+                            crate::editor_view::UI_STAGE_POLL_CYCLE,
+                        );
+                        let cycle_started = Instant::now();
+                        let poll_started = Instant::now();
                         this.poll_lsp(cx);
+                        let lsp_us = poll_started.elapsed().as_micros();
                         if this.index_results.is_some() {
                             this.indexing_phase = this.indexing_phase.wrapping_add(6) % 100;
                             cx.notify();
@@ -921,12 +949,51 @@ impl WorkspaceView {
                                 this.definition_loading_tick.wrapping_add(1) % 4;
                             cx.notify();
                         }
+                        let poll_started = Instant::now();
                         this.poll_index(cx);
+                        let index_us = poll_started.elapsed().as_micros();
+                        let poll_started = Instant::now();
                         this.poll_vendor_index(cx);
+                        let vendor_us = poll_started.elapsed().as_micros();
+                        let poll_started = Instant::now();
                         this.poll_project_load(cx);
+                        let project_load_us = poll_started.elapsed().as_micros();
+                        let poll_started = Instant::now();
                         this.poll_runtime_stub_load(cx);
+                        let runtime_stub_us = poll_started.elapsed().as_micros();
+                        let poll_started = Instant::now();
                         this.poll_runtime_watcher(cx);
+                        let watcher_us = poll_started.elapsed().as_micros();
+                        let poll_started = Instant::now();
                         this.poll_semantic_updates(cx);
+                        let semantic_us = poll_started.elapsed().as_micros();
+                        let total_us = cycle_started.elapsed().as_micros();
+                        if debug_ui_stall_enabled()
+                            && (total_us >= 5_000
+                                || [
+                                    lsp_us,
+                                    index_us,
+                                    vendor_us,
+                                    project_load_us,
+                                    runtime_stub_us,
+                                    watcher_us,
+                                    semantic_us,
+                                ]
+                                .into_iter()
+                                .any(|us| us >= 3_000))
+                        {
+                            tracing::info!(target: "axiom.ui_stall",
+                                total_us,
+                                lsp_us,
+                                index_us,
+                                vendor_us,
+                                project_load_us,
+                                runtime_stub_us,
+                                watcher_us,
+                                semantic_us,
+                                "[UI POLL CYCLE]"
+                            );
+                        }
                     })
                     .is_err()
                 {
@@ -935,6 +1002,129 @@ impl WorkspaceView {
             }
         })
         .detach();
+        cx.spawn(async move |this, cx| {
+            let expected_interval = std::time::Duration::from_millis(50);
+            loop {
+                Timer::after(expected_interval).await;
+                if this
+                    .update(cx, |this, _| {
+                        let now = Instant::now();
+                        crate::editor_view::LAST_UI_HEARTBEAT_NS
+                            .store(crate::editor_view::ui_clock_ns(), Ordering::Relaxed);
+                        let lateness_us = this
+                            .heartbeat_last_tick
+                            .map(|last| {
+                                now.duration_since(last)
+                                    .saturating_sub(expected_interval)
+                                    .as_micros()
+                            })
+                            .unwrap_or_default();
+                        this.heartbeat_last_tick = Some(now);
+                        this.heartbeat_ticks = this.heartbeat_ticks.saturating_add(1);
+                        this.heartbeat_worst_us = this.heartbeat_worst_us.max(lateness_us);
+                        if lateness_us >= 10_000 {
+                            this.heartbeat_over_10ms += 1;
+                            if lateness_us >= 16_000 {
+                                this.heartbeat_over_16ms += 1;
+                            }
+                            if lateness_us >= 50_000 {
+                                this.heartbeat_over_50ms += 1;
+                            }
+                            if lateness_us >= 100_000 {
+                                this.heartbeat_over_100ms += 1;
+                            }
+                            if lateness_us >= 1_000_000 {
+                                this.heartbeat_over_1s += 1;
+                            }
+                            if debug_ui_stall_enabled() {
+                                let ms_since_last_key_event = this
+                                    .last_key_event_at
+                                    .map(|at| now.duration_since(at).as_millis())
+                                    .unwrap_or_default();
+                                tracing::info!(target: "axiom.ui_stall",
+                                    lateness_us,
+                                    actual_interval_us = lateness_us + expected_interval.as_micros(),
+                                    severity = if lateness_us >= 1_000_000 { "freeze" } else if lateness_us >= 100_000 { "major" } else { "stall" },
+                                    last_key_event_id = this.key_event_id,
+                                    ms_since_last_key_event,
+                                    edit_generation = crate::editor_view::LAST_UI_EDIT_GENERATION.load(Ordering::Relaxed),
+                                    "[UI EVENT LOOP STALL]"
+                                );
+                            }
+                        }
+                        if debug_ui_stall_enabled()
+                            && now.duration_since(this.heartbeat_summary_at)
+                                >= std::time::Duration::from_secs(10)
+                        {
+                            tracing::info!(target: "axiom.ui_stall",
+                                ticks = this.heartbeat_ticks,
+                                over_10ms = this.heartbeat_over_10ms,
+                                over_16ms = this.heartbeat_over_16ms,
+                                over_50ms = this.heartbeat_over_50ms,
+                                over_100ms = this.heartbeat_over_100ms,
+                                over_1s = this.heartbeat_over_1s,
+                                worst_us = this.heartbeat_worst_us,
+                                caret_tasks_alive = crate::editor_view::CARET_TASKS_ACTIVE.load(Ordering::Relaxed),
+                                caret_tasks_started = crate::editor_view::CARET_TASKS_STARTED.load(Ordering::Relaxed),
+                                "[UI EVENT LOOP SUMMARY]"
+                            );
+                            this.heartbeat_summary_at = now;
+                            this.heartbeat_ticks = 0;
+                            this.heartbeat_over_10ms = 0;
+                            this.heartbeat_over_16ms = 0;
+                            this.heartbeat_over_50ms = 0;
+                            this.heartbeat_over_100ms = 0;
+                            this.heartbeat_over_1s = 0;
+                            this.heartbeat_worst_us = 0;
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        if debug_ui_stall_enabled() {
+            std::thread::spawn(|| {
+                let mut last_report_ns = 0u64;
+                let mut last_severity = 0u8;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let now = crate::editor_view::ui_clock_ns();
+                    let heartbeat =
+                        crate::editor_view::LAST_UI_HEARTBEAT_NS.load(Ordering::Relaxed);
+                    if heartbeat == 0 {
+                        continue;
+                    }
+                    let blocked_for_us = now.saturating_sub(heartbeat) / 1_000;
+                    let severity = if blocked_for_us >= 1_000_000 { 3 } else { 0 };
+                    if severity == 0 {
+                        last_severity = 0;
+                        continue;
+                    }
+                    if severity != last_severity
+                        || now.saturating_sub(last_report_ns) >= 1_000_000_000
+                    {
+                        let stage = crate::editor_view::UI_STAGE.load(Ordering::Relaxed);
+                        let entered =
+                            crate::editor_view::UI_STAGE_ENTERED_AT_NS.load(Ordering::Relaxed);
+                        tracing::info!(target: "axiom.ui_stall",
+                            blocked_for_us,
+                            severity = if severity >= 3 { "freeze" } else { "major" },
+                            ui_stage = crate::editor_view::ui_stage_name(stage),
+                            stage_elapsed_us = now.saturating_sub(entered) / 1_000,
+                            last_key_event_id = crate::editor_view::LAST_UI_KEY_EVENT_ID.load(Ordering::Relaxed),
+                            edit_generation = crate::editor_view::LAST_UI_EDIT_GENERATION.load(Ordering::Relaxed),
+                            last_rendered_generation = crate::editor_view::LAST_UI_RENDERED_GENERATION.load(Ordering::Relaxed),
+                            "[UI WATCHDOG STALL]"
+                        );
+                        last_report_ns = now;
+                        last_severity = severity;
+                    }
+                }
+            });
+        }
         workspace
     }
 
@@ -1025,6 +1215,8 @@ impl WorkspaceView {
     }
 
     fn poll_runtime_stub_load(&mut self, cx: &mut Context<Self>) {
+        let _stage =
+            crate::editor_view::UiStageGuard::new(crate::editor_view::UI_STAGE_POLL_RUNTIME_STUB);
         let Some(receiver) = self.runtime_load_results.as_ref() else {
             return;
         };
@@ -1083,6 +1275,9 @@ impl WorkspaceView {
     }
 
     fn poll_runtime_watcher(&mut self, cx: &mut Context<Self>) {
+        let _stage = crate::editor_view::UiStageGuard::new(
+            crate::editor_view::UI_STAGE_POLL_RUNTIME_WATCHER,
+        );
         let Some(receiver) = self.runtime_watch_events.as_ref() else {
             return;
         };
@@ -1125,6 +1320,8 @@ impl WorkspaceView {
     }
 
     fn poll_project_load(&mut self, cx: &mut Context<Self>) {
+        let _stage =
+            crate::editor_view::UiStageGuard::new(crate::editor_view::UI_STAGE_POLL_PROJECT);
         let Some(receiver) = self.project_load_results.as_ref() else {
             return;
         };
@@ -1243,6 +1440,8 @@ impl WorkspaceView {
     }
 
     fn poll_vendor_index(&mut self, cx: &mut Context<Self>) {
+        let _stage =
+            crate::editor_view::UiStageGuard::new(crate::editor_view::UI_STAGE_POLL_VENDOR);
         let Some(receiver) = self.vendor_index_results.as_ref() else {
             return;
         };
@@ -1274,6 +1473,7 @@ impl WorkspaceView {
     }
 
     fn poll_index(&mut self, cx: &mut Context<Self>) {
+        let _stage = crate::editor_view::UiStageGuard::new(crate::editor_view::UI_STAGE_POLL_INDEX);
         let Some(receiver) = self.index_results.as_ref() else {
             return;
         };
@@ -1300,9 +1500,10 @@ impl WorkspaceView {
                 if let Some(engine) = &self.semantic_engine {
                     for tab in &self.tabs {
                         tab.editor.update(cx, |editor, _| {
-                            editor.set_workspace_root(
-                                self.project.as_ref().unwrap().root_path().to_path_buf(),
-                            );
+                            let root = self.project.as_ref().unwrap().root_path().to_path_buf();
+                            let workspace_source =
+                                axiom_index::is_workspace_source_lexical(&tab.path, &root);
+                            editor.set_workspace_root(root, workspace_source);
                             editor.set_semantic_engine(engine.clone());
                         });
                     }
@@ -1310,9 +1511,10 @@ impl WorkspaceView {
                 for tab in &self.tabs {
                     let updates = self.semantic_update_sender.clone();
                     tab.editor.update(cx, |editor, _| {
-                        editor.set_workspace_root(
-                            self.project.as_ref().unwrap().root_path().to_path_buf(),
-                        );
+                        let root = self.project.as_ref().unwrap().root_path().to_path_buf();
+                        let workspace_source =
+                            axiom_index::is_workspace_source_lexical(&tab.path, &root);
+                        editor.set_workspace_root(root, workspace_source);
                         editor.set_project_symbols(shared.clone());
                         editor
                             .set_semantic_update_sender(updates, self.project_semantic_generation);
@@ -1326,25 +1528,51 @@ impl WorkspaceView {
     }
 
     fn poll_semantic_updates(&mut self, cx: &mut Context<Self>) {
+        let _stage =
+            crate::editor_view::UiStageGuard::new(crate::editor_view::UI_STAGE_POLL_SEMANTIC);
+        let ui_started = Instant::now();
+        let mut receive_us = 0u128;
+        let mut publish_us = 0u128;
+        let mut tabs_update_us = 0u128;
+        let mut tabs_count = 0usize;
         if self.semantic_update_results.is_none() && !self.pending_semantic_fs_changes.is_empty() {
             let changes = std::mem::take(&mut self.pending_semantic_fs_changes);
             self.schedule_semantic_fs_batch(changes, cx);
         }
         if self.semantic_update_results.is_none() {
             let mut updates = HashMap::new();
+            let semantic_poll_started = Instant::now();
+            let mut items_drained = 0usize;
+            let workspace_checks = 0usize;
+            let workspace_check_us = 0u128;
+            let max_workspace_check_us = 0u128;
+            let receive_started = Instant::now();
             while let Ok((project_generation, path, text)) =
                 self.semantic_update_receiver.try_recv()
             {
-                let is_workspace = self.project.as_ref().is_some_and(|project| {
-                    axiom_index::is_workspace_source(&path, project.root_path())
-                });
-                if semantic_update_matches(self.project_semantic_generation, project_generation)
-                    && is_workspace
-                {
+                items_drained += 1;
+                if semantic_update_matches(self.project_semantic_generation, project_generation) {
                     updates.insert(path, text);
                 } else if debug_input_enabled() {
-                    tracing::debug!(path = %path.display(), reason = if is_workspace { "generation_mismatch" } else { "non_workspace_source" }, "[SEMANTIC UPDATE REJECTED]");
+                    tracing::debug!(path = %path.display(), reason = "generation_mismatch", "[SEMANTIC UPDATE REJECTED]");
                 }
+            }
+            receive_us = receive_started.elapsed().as_micros();
+            let semantic_poll_total_us = semantic_poll_started.elapsed().as_micros();
+            if debug_ui_stall_enabled()
+                && (semantic_poll_total_us >= 3_000
+                    || workspace_check_us >= 3_000
+                    || items_drained > 1)
+            {
+                tracing::info!(target: "axiom.ui_stall",
+                    items_drained,
+                    workspace_checks,
+                    workspace_check_us,
+                    max_workspace_check_us,
+                    remainder_us = semantic_poll_total_us.saturating_sub(workspace_check_us),
+                    total_us = semantic_poll_total_us,
+                    "[UI SEMANTIC POLL]"
+                );
             }
             if !updates.is_empty()
                 && let Some(engine) = self.semantic_engine.clone()
@@ -1398,14 +1626,25 @@ impl WorkspaceView {
         }
         if let Ok(snapshot) = result {
             if let Some(engine) = &self.semantic_engine {
+                let _stage = crate::editor_view::UiStageGuard::new(
+                    crate::editor_view::UI_STAGE_SEMANTIC_PUBLISH,
+                );
+                let publish_started = Instant::now();
                 let published = engine.publish(snapshot);
+                publish_us = publish_started.elapsed().as_micros();
                 let revision = engine.snapshot().revision.0;
                 if published {
+                    let _stage = crate::editor_view::UiStageGuard::new(
+                        crate::editor_view::UI_STAGE_TAB_UPDATE,
+                    );
+                    let tabs_started = Instant::now();
+                    tabs_count = self.tabs.len();
                     for tab in &self.tabs {
                         tab.editor.update(cx, |editor, _| {
                             editor.set_semantic_engine(engine.clone());
                         });
                     }
+                    tabs_update_us = tabs_started.elapsed().as_micros();
                     self.status = format!("PHP • semantic revision {revision}").into();
                 }
                 if debug_input_enabled() {
@@ -1416,7 +1655,21 @@ impl WorkspaceView {
                     );
                 }
             }
+            let notify_started = Instant::now();
             cx.notify();
+            let notify_us = notify_started.elapsed().as_micros();
+            let total_us = ui_started.elapsed().as_micros();
+            if debug_ui_stall_enabled() && total_us >= 3_000 {
+                tracing::info!(target: "axiom.ui_stall",
+                    receive_us,
+                    publish_us,
+                    tabs_update_us,
+                    notify_us,
+                    total_us,
+                    tabs_count,
+                    "[UI SEMANTIC APPLY]"
+                );
+            }
         }
     }
 
@@ -2267,7 +2520,32 @@ impl WorkspaceView {
                         .read()
                         .map_err(|_| "vendor index lock poisoned")?
                         .clone();
-                    let symbols = parser.symbols_of(&request.fqn);
+                    let mut owner_fqn = request.fqn.clone();
+                    for member in &request.chain {
+                        let Some(method) =
+                            parser.symbols_of(&owner_fqn).into_iter().find(|symbol| {
+                                symbol.name == *member
+                                    && symbol.kind == axiom_index::ProjectSymbolKind::Method
+                            })
+                        else {
+                            return Err("vendor chain member not found");
+                        };
+                        let Some(next) = method.return_type else {
+                            return Err("vendor chain return type unavailable");
+                        };
+                        let next = next
+                            .trim_start_matches('?')
+                            .split(['|', '&'])
+                            .next()
+                            .unwrap_or(&next)
+                            .trim();
+                        owner_fqn = if matches!(next, "self" | "static") {
+                            owner_fqn
+                        } else {
+                            next.to_owned()
+                        };
+                    }
+                    let symbols = parser.symbols_of(&owner_fqn);
                     let symbol = symbols.into_iter().find(|symbol| match &request.member {
                         Some(member) => {
                             symbol.name == *member
@@ -2368,12 +2646,13 @@ impl WorkspaceView {
             }
             if let Some(index) = &self.project_index {
                 editor.update(cx, |editor, _| {
-                    editor.set_workspace_root(
-                        self.project
-                            .as_ref()
-                            .map(|p| p.root_path().to_path_buf())
-                            .unwrap_or_default(),
-                    )
+                    let root = self
+                        .project
+                        .as_ref()
+                        .map(|p| p.root_path().to_path_buf())
+                        .unwrap_or_default();
+                    let workspace_source = axiom_index::is_workspace_source_lexical(&path, &root);
+                    editor.set_workspace_root(root, workspace_source)
                 });
                 editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
                 editor.update(cx, |editor, _| {
@@ -2770,6 +3049,12 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let _stage =
+            crate::editor_view::UiStageGuard::new(crate::editor_view::UI_STAGE_KEY_CALLBACK);
+        self.key_event_id = self.key_event_id.wrapping_add(1);
+        self.last_key_event_at = Some(Instant::now());
+        crate::editor_view::LAST_UI_KEY_EVENT_ID.store(self.key_event_id, Ordering::Relaxed);
+        let _probe = UiKeyProbe::new(event.keystroke.key.clone());
         if self.explorer_operation.is_none()
             && self.pending_delete.is_none()
             && (debug_keys_enabled() || debug_input_enabled())
@@ -3963,12 +4248,13 @@ impl WorkspaceView {
         }
         if let Some(index) = &self.project_index {
             editor.update(cx, |editor, _| {
-                editor.set_workspace_root(
-                    self.project
-                        .as_ref()
-                        .map(|p| p.root_path().to_path_buf())
-                        .unwrap_or_default(),
-                )
+                let root = self
+                    .project
+                    .as_ref()
+                    .map(|p| p.root_path().to_path_buf())
+                    .unwrap_or_default();
+                let workspace_source = axiom_index::is_workspace_source_lexical(&path, &root);
+                editor.set_workspace_root(root, workspace_source)
             });
             editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
             editor.update(cx, |editor, _| {
@@ -4034,12 +4320,13 @@ impl WorkspaceView {
         }
         if let Some(index) = &self.project_index {
             editor.update(cx, |editor, _| {
-                editor.set_workspace_root(
-                    self.project
-                        .as_ref()
-                        .map(|p| p.root_path().to_path_buf())
-                        .unwrap_or_default(),
-                )
+                let root = self
+                    .project
+                    .as_ref()
+                    .map(|p| p.root_path().to_path_buf())
+                    .unwrap_or_default();
+                let workspace_source = axiom_index::is_workspace_source_lexical(&path, &root);
+                editor.set_workspace_root(root, workspace_source)
             });
             editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
             editor.update(cx, |editor, _| {
@@ -4121,6 +4408,7 @@ impl WorkspaceView {
     }
 
     fn poll_lsp(&mut self, cx: &mut Context<Self>) {
+        let _stage = crate::editor_view::UiStageGuard::new(crate::editor_view::UI_STAGE_POLL_LSP);
         let Some(lsp) = self.lsp.clone() else { return };
         let events = lsp.drain_events();
         if events.is_empty() {
@@ -4361,12 +4649,13 @@ impl WorkspaceView {
             }
             if let Some(index) = &self.project_index {
                 editor.update(cx, |editor, _| {
-                    editor.set_workspace_root(
-                        self.project
-                            .as_ref()
-                            .map(|p| p.root_path().to_path_buf())
-                            .unwrap_or_default(),
-                    )
+                    let root = self
+                        .project
+                        .as_ref()
+                        .map(|p| p.root_path().to_path_buf())
+                        .unwrap_or_default();
+                    let workspace_source = axiom_index::is_workspace_source_lexical(&path, &root);
+                    editor.set_workspace_root(root, workspace_source)
                 });
                 editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
                 editor.update(cx, |editor, _| {
@@ -4500,12 +4789,13 @@ impl WorkspaceView {
             }
             if let Some(index) = &self.project_index {
                 editor.update(cx, |editor, _| {
-                    editor.set_workspace_root(
-                        self.project
-                            .as_ref()
-                            .map(|p| p.root_path().to_path_buf())
-                            .unwrap_or_default(),
-                    )
+                    let root = self
+                        .project
+                        .as_ref()
+                        .map(|p| p.root_path().to_path_buf())
+                        .unwrap_or_default();
+                    let workspace_source = axiom_index::is_workspace_source_lexical(&path, &root);
+                    editor.set_workspace_root(root, workspace_source)
                 });
                 editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
                 editor.update(cx, |editor, _| {
@@ -7165,6 +7455,50 @@ fn debug_input_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
+}
+
+#[cfg(debug_assertions)]
+fn debug_ui_stall_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_UI_STALL").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_ui_stall_enabled() -> bool {
+    false
+}
+
+struct UiKeyProbe {
+    key: String,
+    started: Instant,
+}
+
+impl UiKeyProbe {
+    fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for UiKeyProbe {
+    fn drop(&mut self) {
+        if !debug_ui_stall_enabled() {
+            return;
+        }
+        let total_us = self.started.elapsed().as_micros();
+        if total_us >= 10_000 {
+            tracing::info!(target: "axiom.ui_stall",
+                key = %self.key,
+                total_us,
+                dispatch_us = 0_u128,
+                other_us = total_us,
+                "[UI KEY CALLBACK]"
+            );
+        }
+    }
 }
 
 #[cfg(not(debug_assertions))]

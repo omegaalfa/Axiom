@@ -1,4 +1,4 @@
-use axiom_editor::Document;
+use axiom_editor::{Document, DocumentEdit};
 use axiom_index::{
     DefinitionSyntaxContext, FindUsagesStatus, PersistentFileKey, ProjectSymbolIndex,
     ProjectSymbolKind, SemanticEngine, VendorSymbolIndex,
@@ -30,7 +30,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -131,6 +131,83 @@ pub fn key_bindings() -> Vec<KeyBinding> {
 pub type DocumentSessionId = u64;
 
 static NEXT_DOCUMENT_SESSION: AtomicU64 = AtomicU64::new(1);
+static NATIVE_INSPECTIONS_SCHEDULED: AtomicU64 = AtomicU64::new(0);
+static NATIVE_INSPECTIONS_STARTED: AtomicU64 = AtomicU64::new(0);
+static NATIVE_INSPECTIONS_FINISHED: AtomicU64 = AtomicU64::new(0);
+static NATIVE_INSPECTIONS_DISCARDED: AtomicU64 = AtomicU64::new(0);
+static NATIVE_INSPECTIONS_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static NATIVE_INSPECTIONS_ACTIVE_PEAK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LAST_UI_EDIT_GENERATION: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LAST_UI_HEARTBEAT_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static UI_STAGE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static UI_STAGE_ENTERED_AT_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LAST_UI_KEY_EVENT_ID: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LAST_UI_RENDERED_GENERATION: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CARET_TASKS_STARTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CARET_TASKS_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) const UI_STAGE_KEY_CALLBACK: u64 = 1;
+pub(crate) const UI_STAGE_AFTER_EDIT: u64 = 2;
+pub(crate) const UI_STAGE_COMPLETION: u64 = 3;
+pub(crate) const UI_STAGE_RENDER: u64 = 4;
+pub(crate) const UI_STAGE_WIDTH_CACHE_REBUILD: u64 = 5;
+pub(crate) const UI_STAGE_POLL_CYCLE: u64 = 6;
+pub(crate) const UI_STAGE_POLL_LSP: u64 = 7;
+pub(crate) const UI_STAGE_POLL_INDEX: u64 = 8;
+pub(crate) const UI_STAGE_POLL_VENDOR: u64 = 9;
+pub(crate) const UI_STAGE_POLL_PROJECT: u64 = 10;
+pub(crate) const UI_STAGE_POLL_RUNTIME_STUB: u64 = 11;
+pub(crate) const UI_STAGE_POLL_RUNTIME_WATCHER: u64 = 12;
+pub(crate) const UI_STAGE_POLL_SEMANTIC: u64 = 13;
+pub(crate) const UI_STAGE_SEMANTIC_PUBLISH: u64 = 14;
+pub(crate) const UI_STAGE_TAB_UPDATE: u64 = 15;
+
+pub(crate) fn ui_stage_name(stage: u64) -> &'static str {
+    match stage {
+        UI_STAGE_KEY_CALLBACK => "key_callback",
+        UI_STAGE_AFTER_EDIT => "after_edit",
+        UI_STAGE_COMPLETION => "completion",
+        UI_STAGE_RENDER => "render",
+        UI_STAGE_WIDTH_CACHE_REBUILD => "width_cache_rebuild",
+        UI_STAGE_POLL_CYCLE => "poll_cycle",
+        UI_STAGE_POLL_LSP => "poll_lsp",
+        UI_STAGE_POLL_INDEX => "poll_index",
+        UI_STAGE_POLL_VENDOR => "poll_vendor",
+        UI_STAGE_POLL_PROJECT => "poll_project",
+        UI_STAGE_POLL_RUNTIME_STUB => "poll_runtime_stub",
+        UI_STAGE_POLL_RUNTIME_WATCHER => "poll_runtime_watcher",
+        UI_STAGE_POLL_SEMANTIC => "poll_semantic",
+        UI_STAGE_SEMANTIC_PUBLISH => "semantic_publish",
+        UI_STAGE_TAB_UPDATE => "tab_update",
+        _ => "idle",
+    }
+}
+
+pub(crate) fn ui_clock_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or_default()
+}
+
+pub(crate) struct UiStageGuard {
+    previous: u64,
+}
+
+impl UiStageGuard {
+    pub(crate) fn new(stage: u64) -> Self {
+        let previous = UI_STAGE.swap(stage, Ordering::Relaxed);
+        UI_STAGE_ENTERED_AT_NS.store(ui_clock_ns(), Ordering::Relaxed);
+        Self { previous }
+    }
+}
+
+impl Drop for UiStageGuard {
+    fn drop(&mut self) {
+        UI_STAGE.store(self.previous, Ordering::Relaxed);
+        UI_STAGE_ENTERED_AT_NS.store(ui_clock_ns(), Ordering::Relaxed);
+    }
+}
 
 pub struct EditorView {
     document: Document,
@@ -168,11 +245,28 @@ pub struct EditorView {
     semantic_update_sender: Option<Sender<(u64, PathBuf, String)>>,
     semantic_update_generation: u64,
     workspace_root: Option<PathBuf>,
+    workspace_source: bool,
     last_completion_layout: Option<(u32, u32, u32, u32, bool)>,
     editor_scroll_hovered: bool,
     editor_scroll_drag_axis: Option<EditorScrollAxis>,
     editor_scroll_drag_start: Point<Pixels>,
     editor_scroll_drag_start_offset: Point<Pixels>,
+    editor_scroll_drag_id: u64,
+    editor_scroll_drag_started_at: Option<Instant>,
+    editor_scroll_drag_last_move_at: Option<Instant>,
+    editor_scroll_drag_last_move_to_frame_us: Option<u128>,
+    editor_scroll_drag_interval_sum_us: u128,
+    editor_scroll_drag_move_to_frame_sum_us: u128,
+    editor_scroll_drag_move_to_frame_worst_us: u128,
+    editor_scroll_drag_moves: u64,
+    editor_scroll_drag_viewport_moves: u64,
+    editor_scroll_drag_scrollbar_moves: u64,
+    editor_scroll_drag_duplicate_moves: u64,
+    editor_scroll_drag_frames: u64,
+    editor_scroll_drag_offset_repeats: u64,
+    editor_scroll_drag_large_jumps: u64,
+    editor_scroll_drag_last_offset: Option<Point<Pixels>>,
+    editor_scroll_drag_last_source: Option<EditorScrollEventSource>,
     content_width: Pixels,
     line_width_cache: HashMap<usize, Pixels>,
     max_width_line: Option<usize>,
@@ -181,12 +275,28 @@ pub struct EditorView {
     native_inspection_generation: u64,
     native_inspection_sender: Sender<NativeInspectionResult>,
     native_inspection_results: Receiver<NativeInspectionResult>,
+    caret_visible: bool,
+    caret_blink_generation: u64,
+    caret_last_activity: Instant,
+    caret_last_toggle: Instant,
+    caret_blink_task_active: bool,
+    edit_generation: u64,
+    last_mutation_at: Option<Instant>,
+    last_rendered_edit_generation: u64,
+    last_render_at: Option<Instant>,
+    last_notify_at: Option<(u64, Instant)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditorScrollAxis {
     Vertical,
     Horizontal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorScrollEventSource {
+    Viewport,
+    Scrollbar,
 }
 
 #[derive(Clone)]
@@ -623,6 +733,7 @@ pub struct VendorDefinitionRequest {
     pub fqn: String,
     pub member: Option<String>,
     pub is_static: bool,
+    pub chain: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -634,6 +745,7 @@ pub enum DefinitionQuery {
         owner_fqn: String,
         name: String,
         is_static: bool,
+        chain: Vec<String>,
     },
     Function,
 }
@@ -753,11 +865,28 @@ impl EditorView {
             semantic_update_sender: None,
             semantic_update_generation: 0,
             workspace_root: None,
+            workspace_source: false,
             last_completion_layout: None,
             editor_scroll_hovered: false,
             editor_scroll_drag_axis: None,
             editor_scroll_drag_start: Point::default(),
             editor_scroll_drag_start_offset: Point::default(),
+            editor_scroll_drag_id: 0,
+            editor_scroll_drag_started_at: None,
+            editor_scroll_drag_last_move_at: None,
+            editor_scroll_drag_last_move_to_frame_us: None,
+            editor_scroll_drag_interval_sum_us: 0,
+            editor_scroll_drag_move_to_frame_sum_us: 0,
+            editor_scroll_drag_move_to_frame_worst_us: 0,
+            editor_scroll_drag_moves: 0,
+            editor_scroll_drag_viewport_moves: 0,
+            editor_scroll_drag_scrollbar_moves: 0,
+            editor_scroll_drag_duplicate_moves: 0,
+            editor_scroll_drag_frames: 0,
+            editor_scroll_drag_offset_repeats: 0,
+            editor_scroll_drag_large_jumps: 0,
+            editor_scroll_drag_last_offset: None,
+            editor_scroll_drag_last_source: None,
             content_width: px(0.),
             line_width_cache: HashMap::new(),
             max_width_line: None,
@@ -766,6 +895,16 @@ impl EditorView {
             native_inspection_generation: 0,
             native_inspection_sender,
             native_inspection_results,
+            caret_visible: true,
+            caret_blink_generation: 0,
+            caret_last_activity: Instant::now(),
+            caret_last_toggle: Instant::now(),
+            caret_blink_task_active: false,
+            edit_generation: 0,
+            last_mutation_at: None,
+            last_rendered_edit_generation: 0,
+            last_render_at: None,
+            last_notify_at: None,
         };
         let inspections_started = std::time::Instant::now();
         view.sync_syntax();
@@ -1024,8 +1163,15 @@ impl EditorView {
             let operator = before.trim_end().len() - operator_text.len();
             let owner_end = operator;
             let (_, written_owner) = extract_owner_expression(before, owner_end);
+            let mut chain = Vec::new();
             let owner_fqn = if written_owner.starts_with('$') {
-                self.resolve_receiver_type(&written_owner, before)?
+                if let Some((base, methods)) = split_method_chain(&written_owner) {
+                    let base_fqn = self.resolve_native_type(base, before)?;
+                    chain = methods;
+                    base_fqn
+                } else {
+                    self.resolve_receiver_type(&written_owner, before)?
+                }
             } else {
                 resolve_php_class_name(&written_owner, &text)
             };
@@ -1039,6 +1185,7 @@ impl EditorView {
                 owner_fqn,
                 name: token.text.trim_start_matches('$').to_owned(),
                 is_static,
+                chain,
             });
         }
         let name = token.text.trim_start_matches('$').to_owned();
@@ -1071,14 +1218,15 @@ impl EditorView {
 
     pub fn vendor_definition_request(&self) -> Option<VendorDefinitionRequest> {
         let query = self.definition_query()?;
-        let (fqn, member, is_static) = match query {
+        let (fqn, member, is_static, chain) = match query {
             DefinitionQuery::Method {
                 owner_fqn,
                 name,
                 is_static,
+                chain,
                 ..
-            } => (owner_fqn, Some(name), is_static),
-            DefinitionQuery::Name { fqn } => (fqn, None, false),
+            } => (owner_fqn, Some(name), is_static, chain),
+            DefinitionQuery::Name { fqn } => (fqn, None, false, Vec::new()),
             DefinitionQuery::Function => return None,
         };
         let index = self.vendor_symbols.clone()?;
@@ -1089,6 +1237,7 @@ impl EditorView {
             fqn,
             member,
             is_static,
+            chain,
         })
     }
 
@@ -1115,11 +1264,7 @@ impl EditorView {
         sender: Sender<(u64, PathBuf, String)>,
         generation: u64,
     ) {
-        if self
-            .workspace_root
-            .as_ref()
-            .is_some_and(|root| axiom_index::is_workspace_source(&self.file_path, root))
-        {
+        if self.workspace_source {
             self.semantic_update_sender = Some(sender);
             self.semantic_update_generation = generation;
         } else {
@@ -1127,7 +1272,8 @@ impl EditorView {
         }
     }
 
-    pub fn set_workspace_root(&mut self, root: PathBuf) {
+    pub fn set_workspace_root(&mut self, root: PathBuf, workspace_source: bool) {
+        self.workspace_source = workspace_source;
         self.workspace_root = Some(root);
     }
 
@@ -1226,6 +1372,7 @@ impl EditorView {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.reset_caret_blink(cx);
         self.document.move_cursor(offset);
         self.selection_anchor = None;
         self.preferred_x = None;
@@ -1233,7 +1380,49 @@ impl EditorView {
         cx.notify();
     }
 
+    fn reset_caret_blink(&mut self, cx: &mut Context<Self>) {
+        self.caret_visible = true;
+        self.caret_blink_generation = self.caret_blink_generation.wrapping_add(1);
+        self.caret_last_activity = Instant::now();
+        self.caret_last_toggle = Instant::now();
+        if self.caret_blink_task_active {
+            cx.notify();
+            return;
+        }
+        self.caret_blink_task_active = true;
+        CARET_TASKS_STARTED.fetch_add(1, Ordering::Relaxed);
+        CARET_TASKS_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        cx.spawn(async move |this, cx| {
+            for _ in 0..240 {
+                gpui::Timer::after(Duration::from_millis(100)).await;
+                let alive = this
+                    .update(cx, |editor, cx| {
+                        let now = Instant::now();
+                        if now.duration_since(editor.caret_last_activity)
+                            >= Duration::from_millis(500)
+                            && now.duration_since(editor.caret_last_toggle)
+                                >= Duration::from_millis(500)
+                        {
+                            editor.caret_visible = !editor.caret_visible;
+                            editor.caret_last_toggle = now;
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |editor, _| editor.caret_blink_task_active = false);
+            CARET_TASKS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.reset_caret_blink(cx);
         let anchor = *self
             .selection_anchor
             .get_or_insert(self.document.cursor_offset());
@@ -1623,44 +1812,127 @@ impl EditorView {
     }
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
+        let _stage = UiStageGuard::new(UI_STAGE_AFTER_EDIT);
+        let edit_started = Instant::now();
+        self.edit_generation = self.edit_generation.wrapping_add(1);
+        LAST_UI_EDIT_GENERATION.store(self.edit_generation, Ordering::Relaxed);
+        self.last_mutation_at = Some(edit_started);
+        self.reset_caret_blink(cx);
         let edited_line = self.document.line_of_offset(self.document.cursor_offset());
         self.line_width_cache.remove(&edited_line);
         if self.max_width_line == Some(edited_line) {
             self.width_cache_dirty = true;
         }
         let text = self.document.content();
+        let edit = self.document.take_last_edit();
         let started = std::time::Instant::now();
         self.sync_syntax_text(&text);
+        let syntax_us = started.elapsed().as_micros();
         if debug_input_enabled() {
             tracing::debug!(
-                syntax_us = started.elapsed().as_micros(),
+                syntax_us,
                 inspection_sync_us = 0,
                 total_sync_us = started.elapsed().as_micros(),
                 "[EDITOR EDIT PROFILE]"
             );
         }
+        let inspection_started = Instant::now();
         self.schedule_native_inspections(&text, cx);
-        self.sync_lsp_text(&text);
+        let inspection_schedule_us = inspection_started.elapsed().as_micros();
+        let lsp_started = Instant::now();
+        self.sync_lsp_text(&text, edit.as_ref());
+        let lsp_queue_us = lsp_started.elapsed().as_micros();
+        let semantic_started = Instant::now();
         self.schedule_incremental_index_update(&text);
+        let semantic_schedule_us = semantic_started.elapsed().as_micros();
+        let completion_started = Instant::now();
+        let trigger_started = Instant::now();
         self.maybe_trigger_completion();
+        let trigger_us = trigger_started.elapsed().as_micros();
         let cursor = self.document.cursor_offset();
         let content = self.document.content();
         if cursor > 0 && matches!(content[..cursor].chars().next_back(), Some('(' | ',')) {
             self.hover_popup = self.native_signature_help();
             self.hover_anchor = None;
         }
+        let native_started = Instant::now();
         let native = self.native_completions();
-        if native.is_empty() {
+        let native_total_us = native_started.elapsed().as_micros();
+        let native_empty = native.is_empty();
+        let clear_started = Instant::now();
+        if native_empty {
             self.completions.clear();
         } else {
+            let set_started = Instant::now();
             self.set_completions(native, cx);
+            let set_completions_us = set_started.elapsed().as_micros();
+            let completion_total_us = completion_started.elapsed().as_micros();
+            if debug_ui_stall_enabled() && completion_total_us >= 3_000 {
+                tracing::info!(target: "axiom.ui_stall",
+                    trigger_us,
+                    native_total_us,
+                    project_search_us = 0_u128,
+                    vendor_search_us = 0_u128,
+                    runtime_search_us = 0_u128,
+                    member_resolution_us = 0_u128,
+                    import_edits_us = 0_u128,
+                    set_completions_us,
+                    clear_completions_us = clear_started.elapsed().as_micros(),
+                    other_us = completion_total_us.saturating_sub(
+                        trigger_us + native_total_us + set_completions_us,
+                    ),
+                    total_us = completion_total_us,
+                    "[UI COMPLETION DETAIL]"
+                );
+            }
+        }
+        let completion_us = completion_started.elapsed().as_micros();
+        if native_empty {
+            if debug_ui_stall_enabled() && completion_us >= 3_000 {
+                tracing::info!(target: "axiom.ui_stall",
+                    trigger_us,
+                    native_total_us,
+                    project_search_us = 0_u128,
+                    vendor_search_us = 0_u128,
+                    runtime_search_us = 0_u128,
+                    member_resolution_us = 0_u128,
+                    import_edits_us = 0_u128,
+                    set_completions_us = 0_u128,
+                    clear_completions_us = clear_started.elapsed().as_micros(),
+                    other_us = completion_us.saturating_sub(trigger_us + native_total_us),
+                    total_us = completion_us,
+                    "[UI COMPLETION DETAIL]"
+                );
+            }
         }
         self.selection_anchor = None;
         self.preferred_x = None;
         self.marked_range = None;
         self.ctrl_hover_range = None;
         self.ensure_cursor_visible();
+        let notify_started = Instant::now();
         cx.notify();
+        self.last_notify_at = Some((self.edit_generation, Instant::now()));
+        if debug_ui_stall_enabled() && edit_started.elapsed().as_micros() >= 5_000 {
+            let total_us = edit_started.elapsed().as_micros();
+            let accounted = syntax_us
+                + inspection_schedule_us
+                + lsp_queue_us
+                + semantic_schedule_us
+                + completion_us
+                + notify_started.elapsed().as_micros();
+            tracing::info!(target: "axiom.ui_stall",
+                total_us,
+                syntax_us,
+                inspection_schedule_us,
+                lsp_queue_us,
+                semantic_schedule_us,
+                completion_us,
+                notify_us = notify_started.elapsed().as_micros(),
+                other_us = total_us.saturating_sub(accounted),
+                "[UI AFTER EDIT]"
+            );
+        }
     }
 
     fn should_expand_member_dash(&self) -> bool {
@@ -1688,10 +1960,10 @@ impl EditorView {
     }
 
     fn schedule_incremental_index_update(&self, text: &str) {
-        let Some(root) = &self.workspace_root else {
+        let Some(_root) = &self.workspace_root else {
             return;
         };
-        if !axiom_index::is_workspace_source(&self.file_path, root) {
+        if !self.workspace_source {
             if debug_input_enabled() {
                 tracing::debug!(path = %self.file_path.display(), "[SEMANTIC UPDATE REJECTED] reason=non_workspace_source");
             }
@@ -1720,18 +1992,76 @@ impl EditorView {
         }
     }
 
-    fn schedule_native_inspections(&mut self, text: &str, cx: &mut Context<Self>) {
+    fn schedule_native_inspections(&mut self, _: &str, cx: &mut Context<Self>) {
         self.native_inspection_generation = self.native_inspection_generation.wrapping_add(1);
         let generation = self.native_inspection_generation;
         let session = self.document_session;
-        let text: Arc<str> = Arc::from(text);
-        let Some(work) = self.capture_native_inspection_work(text, session, generation) else {
-            return;
-        };
         let sender = self.native_inspection_sender.clone();
+        if debug_native_inspection_enabled() {
+            tracing::info!(
+                generation,
+                session,
+                "event=schedule [NATIVE INSPECTION DEBOUNCE]"
+            );
+        }
         cx.spawn(async move |this, cx| {
             gpui::Timer::after(Duration::from_millis(200)).await;
+            let capture_started = Instant::now();
+            let work = match this.update(cx, |editor, _| {
+                if editor.document_session != session
+                    || editor.native_inspection_generation != generation
+                {
+                    return None;
+                }
+                let text_snapshot_started = Instant::now();
+                let text: Arc<str> = Arc::from(editor.document.content());
+                let text_snapshot_us = text_snapshot_started.elapsed().as_micros();
+                let file_bytes = text.len();
+                let work = editor.capture_native_inspection_work(text, session, generation);
+                Some((work, file_bytes, text_snapshot_us))
+            }) {
+                Ok(Some((Some(work), file_bytes, text_snapshot_us))) => {
+                    if debug_native_inspection_enabled() {
+                        tracing::debug!(
+                            generation,
+                            file_bytes,
+                            text_snapshot_us,
+                            total_ui_us = capture_started.elapsed().as_micros(),
+                            project_snapshot_skipped = false,
+                            "[NATIVE INSPECTION CAPTURE]"
+                        );
+                    }
+                    work
+                }
+                Ok(Some((None, file_bytes, text_snapshot_us))) => {
+                    if debug_native_inspection_enabled() {
+                        tracing::debug!(
+                            generation,
+                            file_bytes,
+                            text_snapshot_us,
+                            total_ui_us = capture_started.elapsed().as_micros(),
+                            project_snapshot_skipped = true,
+                            "[NATIVE INSPECTION CAPTURE]"
+                        );
+                    }
+                    return;
+                }
+                Ok(None) | Err(_) => {
+                    if debug_native_inspection_enabled() {
+                        tracing::debug!(
+                            generation,
+                            session,
+                            "event=discard_before_capture [NATIVE INSPECTION DEBOUNCE]"
+                        );
+                    }
+                    return;
+                }
+            };
+            NATIVE_INSPECTIONS_SCHEDULED.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
+                NATIVE_INSPECTIONS_STARTED.fetch_add(1, Ordering::Relaxed);
+                let active = NATIVE_INSPECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed) + 1;
+                NATIVE_INSPECTIONS_ACTIVE_PEAK.fetch_max(active, Ordering::Relaxed);
                 let started = std::time::Instant::now();
                 let mut diagnostics = compute_unknown_class_inspections(&work.unknown_class);
                 diagnostics.extend(compute_unknown_constant_inspections(&work.unknown_constant));
@@ -1742,10 +2072,13 @@ impl EditorView {
                     generation: work.generation,
                     diagnostics,
                 });
-                if debug_input_enabled() {
-                    tracing::debug!(
+                NATIVE_INSPECTIONS_FINISHED.fetch_add(1, Ordering::Relaxed);
+                NATIVE_INSPECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+                if debug_native_inspection_enabled() {
+                    tracing::info!(
                         generation,
                         compute_us = started.elapsed().as_micros(),
+                        active,
                         "[NATIVE INSPECTION WORKER]"
                     );
                 }
@@ -1761,6 +2094,16 @@ impl EditorView {
             }
         })
         .detach();
+        if debug_native_inspection_enabled() {
+            tracing::debug!(
+                scheduled = NATIVE_INSPECTIONS_SCHEDULED.load(Ordering::Relaxed),
+                started = NATIVE_INSPECTIONS_STARTED.load(Ordering::Relaxed),
+                finished = NATIVE_INSPECTIONS_FINISHED.load(Ordering::Relaxed),
+                discarded_generation = NATIVE_INSPECTIONS_DISCARDED.load(Ordering::Relaxed),
+                active_peak = NATIVE_INSPECTIONS_ACTIVE_PEAK.load(Ordering::Relaxed),
+                "[NATIVE INSPECTION WORKERS]"
+            );
+        }
     }
 
     fn capture_native_inspection_work(
@@ -1769,11 +2112,17 @@ impl EditorView {
         session: DocumentSessionId,
         generation: u64,
     ) -> Option<NativeInspectionWorkItem> {
+        let started = Instant::now();
+        let text_snapshot_us = 0_u128;
+        let project_lock_started = Instant::now();
         let index = self.project_symbols.as_ref()?.try_read().ok()?;
+        let project_lock_wait_us = project_lock_started.elapsed().as_micros();
         if !index.is_ready() {
             return None;
         }
+        let project_symbols_started = Instant::now();
         let symbols = index.symbols().to_vec();
+        let project_symbols_copy_us = project_symbols_started.elapsed().as_micros();
         let project_classes = symbols
             .iter()
             .filter(|s| {
@@ -1810,15 +2159,35 @@ impl EditorView {
             })
             .map(|s| DuplicateClassDeclaration {
                 fqn: s.fully_qualified_name.clone(),
-                file: PersistentFileKey::workspace_physical(&s.file),
+                // ProjectSymbolIndex stores discovered files in canonical form.
+                // The lexical key is therefore sufficient here and avoids a
+                // filesystem call in the debounced UI capture callback.
+                file: PersistentFileKey::workspace_lexical(&s.file),
                 range: s.range.clone(),
             })
             .collect();
+        let vendor_lock_started = Instant::now();
         let vendor_symbols = self
             .vendor_symbols
             .as_ref()
             .and_then(|v| v.try_read().ok())
             .map(|v| Arc::new(v.clone()));
+        let vendor_lock_wait_us = vendor_lock_started.elapsed().as_micros();
+        if debug_native_inspection_enabled() {
+            tracing::debug!(
+                file_bytes = text.len(),
+                project_lock_wait_us,
+                project_symbols_copy_us,
+                project_symbols_count = symbols.len(),
+                runtime_snapshot_us = 0_u128,
+                vendor_lock_wait_us,
+                vendor_snapshot_us = vendor_lock_wait_us,
+                text_snapshot_us,
+                input_build_us = started.elapsed().as_micros(),
+                project_snapshot_skipped = false,
+                "[NATIVE INSPECTION CAPTURE DETAIL]"
+            );
+        }
         Some(NativeInspectionWorkItem {
             document_session: session,
             generation,
@@ -1834,7 +2203,9 @@ impl EditorView {
                 runtime_symbols: self.runtime_symbols.clone(),
             },
             duplicate_class: DuplicateClassInspectionInput {
-                path: PersistentFileKey::workspace_physical(&self.file_path),
+                // The editor only schedules this work for a workspace source;
+                // avoid canonicalization/filesystem access on the UI callback.
+                path: PersistentFileKey::workspace_lexical(&self.file_path),
                 declarations,
             },
             arguments: ArgumentInspectionInput {
@@ -1856,6 +2227,8 @@ impl EditorView {
             {
                 self.diagnostics.set_native_inspections(result.diagnostics);
                 cx.notify();
+            } else {
+                NATIVE_INSPECTIONS_DISCARDED.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -1914,23 +2287,45 @@ impl EditorView {
 
     fn sync_lsp(&mut self) {
         let text = self.document.content();
-        self.sync_lsp_text(&text);
+        self.sync_lsp_text(&text, None);
     }
 
-    fn sync_lsp_text(&mut self, text: &str) {
+    fn sync_lsp_text(&mut self, text: &str, edit: Option<&DocumentEdit>) {
         if text == self.last_lsp_text {
             return;
         }
         self.last_lsp_text = text.to_owned();
         self.lsp_version = self.lsp_version.saturating_add(1);
         if let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) {
-            lsp.with_server(|server| {
-                if let Err(error) =
-                    server.did_change(uri.clone(), self.lsp_version, text.to_owned())
-                {
-                    tracing::warn!("didChange failed: {error}");
-                }
+            let encoding = lsp.encoding();
+            let encode = |line: &str, column: usize| match encoding {
+                PositionEncoding::Utf8 => column,
+                PositionEncoding::Utf16 => utf8_column_to_utf16(line, column),
+                PositionEncoding::Utf32 => line
+                    .get(..column.min(line.len()))
+                    .map(|prefix| prefix.chars().count())
+                    .unwrap_or_else(|| line.chars().count()),
+            };
+            let range = edit.and_then(|edit| {
+                Some(lsp_types::Range::new(
+                    lsp_types::Position::new(
+                        edit.old_start_line as u32,
+                        encode(&edit.old_start_line_text, edit.old_start_column_bytes) as u32,
+                    ),
+                    lsp_types::Position::new(
+                        edit.old_end_line as u32,
+                        encode(&edit.old_end_line_text, edit.old_end_column_bytes) as u32,
+                    ),
+                ))
             });
+            lsp.queue_did_change_range(
+                self.document_session,
+                uri.clone(),
+                self.lsp_version,
+                range,
+                edit.map(|edit| edit.inserted_text.clone())
+                    .unwrap_or_else(|| text.to_owned()),
+            );
         }
     }
 
@@ -1967,6 +2362,20 @@ impl EditorView {
     }
 
     fn native_completions(&self) -> Vec<CompletionItem> {
+        let _stage = UiStageGuard::new(UI_STAGE_COMPLETION);
+        let started = Instant::now();
+        let result = self.native_completions_impl();
+        if debug_ui_stall_enabled() && started.elapsed().as_micros() >= 3_000 {
+            tracing::info!(target: "axiom.ui_stall",
+                candidates = result.len(),
+                total_us = started.elapsed().as_micros(),
+                "[UI COMPLETION]"
+            );
+        }
+        result
+    }
+
+    fn native_completions_impl(&self) -> Vec<CompletionItem> {
         let text = self.document.content();
         let cursor = self.document.cursor_offset().min(text.len());
         let before = &text[..cursor];
@@ -2251,35 +2660,64 @@ impl EditorView {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if let Some(index) = &self.project_symbols
-            && let Ok(index) = index.try_read()
-        {
-            items.extend(index.search_prefix(prefix).into_iter().map(|symbol| {
-                let import = matches!(
-                    symbol.kind,
-                    ProjectSymbolKind::Class
-                        | ProjectSymbolKind::Interface
-                        | ProjectSymbolKind::Trait
-                        | ProjectSymbolKind::Enum
-                )
-                .then(|| self.composer_import_edit(&symbol.fully_qualified_name))
-                .flatten();
-                CompletionItem {
-                    label: symbol.name.clone(),
-                    detail: Some(format!("{} • Project", symbol.fully_qualified_name)),
-                    kind: Some(match symbol.kind {
-                        ProjectSymbolKind::Function => CompletionItemKind::FUNCTION,
-                        ProjectSymbolKind::Method => CompletionItemKind::METHOD,
+        let completion_search_started = Instant::now();
+        let mut completion_search_us = 0u128;
+        let mut completion_import_us = 0u128;
+        let mut completion_symbols_total = 0usize;
+        let mut completion_matches = 0usize;
+        let mut completion_index_unavailable = false;
+        if let Some(index) = &self.project_symbols {
+            if let Ok(index) = index.try_read() {
+                completion_symbols_total = index.symbols().len();
+                let search_started = Instant::now();
+                let project_matches = index.search_prefix(prefix);
+                completion_search_us = search_started.elapsed().as_micros();
+                completion_matches = project_matches.len();
+                items.extend(project_matches.into_iter().map(|symbol| {
+                    let import_started = Instant::now();
+                    let import = matches!(
+                        symbol.kind,
                         ProjectSymbolKind::Class
-                        | ProjectSymbolKind::Interface
-                        | ProjectSymbolKind::Trait
-                        | ProjectSymbolKind::Enum => CompletionItemKind::CLASS,
-                        _ => CompletionItemKind::VALUE,
-                    }),
-                    additional_text_edits: import.map(|edit| vec![edit]),
-                    ..Default::default()
-                }
-            }));
+                            | ProjectSymbolKind::Interface
+                            | ProjectSymbolKind::Trait
+                            | ProjectSymbolKind::Enum
+                    )
+                    .then(|| self.composer_import_edit(&symbol.fully_qualified_name))
+                    .flatten();
+                    completion_import_us += import_started.elapsed().as_micros();
+                    CompletionItem {
+                        label: symbol.name.clone(),
+                        detail: Some(format!("{} • Project", symbol.fully_qualified_name)),
+                        kind: Some(match symbol.kind {
+                            ProjectSymbolKind::Function => CompletionItemKind::FUNCTION,
+                            ProjectSymbolKind::Method => CompletionItemKind::METHOD,
+                            ProjectSymbolKind::Class
+                            | ProjectSymbolKind::Interface
+                            | ProjectSymbolKind::Trait
+                            | ProjectSymbolKind::Enum => CompletionItemKind::CLASS,
+                            _ => CompletionItemKind::VALUE,
+                        }),
+                        additional_text_edits: import.map(|edit| vec![edit]),
+                        ..Default::default()
+                    }
+                }));
+            } else {
+                completion_index_unavailable = true;
+            }
+        }
+        let completion_inner_us = completion_search_started.elapsed().as_micros();
+        if debug_ui_stall_enabled() && completion_index_unavailable {
+            tracing::info!(target: "axiom.ui_stall", index_unavailable = true, "[UI COMPLETION SEARCH]");
+        } else if debug_ui_stall_enabled() && completion_inner_us >= 3_000 {
+            tracing::info!(target: "axiom.ui_stall",
+                prefix_len = prefix.len(),
+                symbols_total = completion_symbols_total,
+                matches = completion_matches,
+                search_prefix_us = completion_search_us,
+                import_edits_us = completion_import_us,
+                total_inner_us = completion_inner_us,
+                "[UI COMPLETION SEARCH]"
+            );
         }
         if let Some(index) = &self.vendor_symbols
             && let Ok(index) = index.try_read()
@@ -2955,8 +3393,25 @@ impl EditorView {
     }
 
     fn is_in_text_area(&self, position: Point<Pixels>) -> bool {
-        let bounds = self.scroll.0.borrow().base_handle.bounds();
-        position.x >= bounds.left() + px(GUTTER_WIDTH)
+        let scroll = self.scroll.0.borrow();
+        let bounds = scroll.base_handle.bounds();
+        let max = scroll.base_handle.max_offset();
+        let vertical = max.height > px(0.);
+        let horizontal = max.width > px(0.);
+        let in_vertical = vertical
+            && position.x >= bounds.right() - px(10.)
+            && position.y <= bounds.bottom() - if horizontal { px(10.) } else { px(0.) };
+        let in_horizontal = horizontal
+            && position.y >= bounds.bottom() - px(10.)
+            && position.x <= bounds.right() - if vertical { px(10.) } else { px(0.) };
+        let in_corner = vertical
+            && horizontal
+            && position.x > bounds.right() - px(10.)
+            && position.y > bounds.bottom() - px(10.);
+        !in_vertical
+            && !in_horizontal
+            && !in_corner
+            && position.x >= bounds.left() + px(GUTTER_WIDTH)
             && position.y >= bounds.top()
             && position.y <= bounds.bottom()
     }
@@ -3060,6 +3515,9 @@ impl EditorView {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor_scroll_drag_axis.is_some() {
+            return;
+        }
         if self.selecting {
             self.ctrl_hover_range = None;
             self.autoscroll_drag(event.position);
@@ -3151,6 +3609,24 @@ impl EditorView {
         cx.notify();
     }
 
+    fn trace_raw_scroll_event(
+        &self,
+        source: &'static str,
+        event: &'static str,
+        position: Point<Pixels>,
+    ) {
+        if debug_scroll_enabled() {
+            tracing::debug!(
+                source,
+                event,
+                x = ?position.x,
+                y = ?position.y,
+                drag_axis = ?self.editor_scroll_drag_axis,
+                "[SCROLL EVENT RAW]"
+            );
+        }
+    }
+
     fn editor_scroll_drag_start(
         &mut self,
         axis: EditorScrollAxis,
@@ -3160,20 +3636,51 @@ impl EditorView {
     ) {
         let offset = self.scroll.0.borrow().base_handle.offset();
         self.editor_scroll_drag_axis = Some(axis);
+        self.editor_scroll_drag_id = self.editor_scroll_drag_id.wrapping_add(1);
+        self.editor_scroll_drag_started_at = Some(Instant::now());
+        self.editor_scroll_drag_last_move_at = None;
+        self.editor_scroll_drag_last_move_to_frame_us = None;
+        self.editor_scroll_drag_interval_sum_us = 0;
+        self.editor_scroll_drag_move_to_frame_sum_us = 0;
+        self.editor_scroll_drag_move_to_frame_worst_us = 0;
+        self.editor_scroll_drag_moves = 0;
+        self.editor_scroll_drag_viewport_moves = 0;
+        self.editor_scroll_drag_scrollbar_moves = 0;
+        self.editor_scroll_drag_duplicate_moves = 0;
+        self.editor_scroll_drag_frames = 0;
+        self.editor_scroll_drag_offset_repeats = 0;
+        self.editor_scroll_drag_large_jumps = 0;
+        self.editor_scroll_drag_last_offset = Some(offset);
+        self.editor_scroll_drag_last_source = None;
         self.editor_scroll_drag_start = event.position;
         self.editor_scroll_drag_start_offset = offset;
+        if debug_scroll_enabled() {
+            tracing::debug!(
+                drag_id = self.editor_scroll_drag_id,
+                axis = ?axis,
+                mouse = ?event.position,
+                scroll_start = ?offset,
+                "[SCROLLBAR DRAG START]"
+            );
+        }
         cx.notify();
     }
 
     fn editor_scroll_drag_move(
         &mut self,
+        source: EditorScrollEventSource,
         event: &MouseMoveEvent,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         let Some(axis) = self.editor_scroll_drag_axis else {
             return;
         };
+        // The viewport is the single logical owner. The scrollbar callback
+        // still emits the raw trace, but must not apply the same movement.
+        if source == EditorScrollEventSource::Scrollbar {
+            return;
+        }
         let handle = self.scroll.0.borrow().base_handle.clone();
         let bounds = handle.bounds();
         let max = handle.max_offset();
@@ -3210,11 +3717,100 @@ impl EditorView {
             EditorScrollAxis::Vertical => next.y = px(-position),
             EditorScrollAxis::Horizontal => next.x = px(-position),
         }
-        handle.set_offset(next);
+        let now = Instant::now();
+        let interval_us = self
+            .editor_scroll_drag_last_move_at
+            .map(|last| now.duration_since(last).as_micros());
+        let offset_before = handle.offset();
+        let offset_repeated = self.editor_scroll_drag_last_offset == Some(next);
+        let jump_x: f32 = (next.x - offset_before.x).into();
+        let jump_y: f32 = (next.y - offset_before.y).into();
+        let jump = jump_x.abs() > 100.0 || jump_y.abs() > 100.0;
+        self.editor_scroll_drag_moves += 1;
+        match source {
+            EditorScrollEventSource::Viewport => self.editor_scroll_drag_viewport_moves += 1,
+            EditorScrollEventSource::Scrollbar => self.editor_scroll_drag_scrollbar_moves += 1,
+        }
+        if self
+            .editor_scroll_drag_last_source
+            .is_some_and(|last| last != source)
+            && interval_us.is_some_and(|interval| interval < 1_000)
+        {
+            self.editor_scroll_drag_duplicate_moves += 1;
+        }
+        if offset_repeated {
+            self.editor_scroll_drag_offset_repeats += 1;
+        }
+        if jump {
+            self.editor_scroll_drag_large_jumps += 1;
+        }
+        self.editor_scroll_drag_last_move_at = Some(now);
+        if let Some(interval) = interval_us {
+            self.editor_scroll_drag_interval_sum_us += interval;
+        }
+        self.editor_scroll_drag_last_offset = Some(next);
+        self.editor_scroll_drag_last_source = Some(source);
+        let changed = next != offset_before;
+        if changed {
+            handle.set_offset(next);
+            cx.notify();
+        }
+        if debug_scroll_enabled() {
+            tracing::debug!(
+                drag_id = self.editor_scroll_drag_id,
+                axis = ?axis,
+                handler_source = ?source,
+                timestamp_us = self
+                    .editor_scroll_drag_started_at
+                    .map(|start| start.elapsed().as_micros())
+                    .unwrap_or_default(),
+                interval_us = ?interval_us,
+                mouse_x = ?event.position.x,
+                mouse_y = ?event.position.y,
+                delta_mouse = ?delta,
+                offset_before = ?offset_before,
+                offset_raw = ?next,
+                offset_after = ?handle.offset(),
+                handler_us = 0_u128,
+                notify_called = changed,
+                "[SCROLLBAR DRAG MOVE]"
+            );
+        }
     }
 
     fn editor_scroll_drag_end(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(axis) = self.editor_scroll_drag_axis else {
+            return;
+        };
+        if debug_scroll_enabled() {
+            let duration_ms = self
+                .editor_scroll_drag_started_at
+                .map(|start| start.elapsed().as_millis())
+                .unwrap_or_default();
+            let avg_interval_us = self.editor_scroll_drag_moves.saturating_sub(1).max(1);
+            let avg_interval_us =
+                self.editor_scroll_drag_interval_sum_us / u128::from(avg_interval_us);
+            let avg_move_to_frame_us = self.editor_scroll_drag_move_to_frame_sum_us
+                / u128::from(self.editor_scroll_drag_frames.max(1));
+            tracing::debug!(
+                drag_id = self.editor_scroll_drag_id,
+                axis = ?axis,
+                duration_ms,
+                mouse_moves_total = self.editor_scroll_drag_moves,
+                viewport_moves = self.editor_scroll_drag_viewport_moves,
+                scrollbar_moves = self.editor_scroll_drag_scrollbar_moves,
+                duplicate_moves_suspected = self.editor_scroll_drag_duplicate_moves,
+                frames_during_drag = self.editor_scroll_drag_frames,
+                avg_move_interval_us = avg_interval_us,
+                avg_move_to_frame_us,
+                worst_move_to_frame_us = self.editor_scroll_drag_move_to_frame_worst_us,
+                offset_repeated_count = self.editor_scroll_drag_offset_repeats,
+                large_jump_count = self.editor_scroll_drag_large_jumps,
+                "[SCROLLBAR DRAG END]"
+            );
+        }
         self.editor_scroll_drag_axis = None;
+        self.editor_scroll_drag_started_at = None;
         cx.notify();
     }
 
@@ -3322,7 +3918,7 @@ impl EditorView {
                     start + selected_end,
                     &highlights,
                 ))
-        } else if cursor_here {
+        } else if cursor_here && self.caret_visible && self.focus.is_focused(window) {
             let layout = self.line_layout(line, &text, window);
             let caret_x = layout.x_for_index(cursor_column);
             let metrics = shape(window, "M");
@@ -3521,6 +4117,17 @@ fn resolve_php_class_name(written: &str, context: &str) -> String {
         })
         .map(|namespace| format!("{namespace}\\{written}"))
         .unwrap_or_else(|| written.to_owned())
+}
+
+fn split_method_chain(owner: &str) -> Option<(&str, Vec<String>)> {
+    let mut parts = owner.split("->");
+    let base = parts.next()?.trim();
+    let methods: Vec<String> = parts
+        .map(|part| part.trim().trim_end_matches("()"))
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!methods.is_empty()).then_some((base, methods))
 }
 
 /// Returns `(fully-qualified import, local binding)` pairs for PHP `use`
@@ -3886,8 +4493,46 @@ fn completion_icon(kind: Option<CompletionItemKind>) -> &'static str {
 }
 
 #[cfg(debug_assertions)]
+fn debug_scroll_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_INPUT_SCROLL").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_scroll_enabled() -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
 fn debug_input_enabled() -> bool {
-    std::env::var_os("AXIOM_DEBUG_INPUT").is_some()
+    std::env::var_os("AXIOM_DEBUG_INPUT").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
+}
+
+#[cfg(debug_assertions)]
+fn debug_native_inspection_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_INPUT_INSPECT").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_native_inspection_enabled() -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
+fn debug_ui_stall_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_UI_STALL").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_ui_stall_enabled() -> bool {
+    false
 }
 
 #[cfg(not(debug_assertions))]
@@ -3902,6 +4547,12 @@ fn debug_completion_enabled() -> bool {
     })
 }
 
+fn utf8_column_to_utf16(line: &str, byte_column: usize) -> usize {
+    line.get(..byte_column.min(line.len()))
+        .map(|prefix| prefix.encode_utf16().count())
+        .unwrap_or_else(|| line.encode_utf16().count())
+}
+
 #[cfg(not(debug_assertions))]
 fn debug_completion_enabled() -> bool {
     false
@@ -3909,6 +4560,23 @@ fn debug_completion_enabled() -> bool {
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _stage = UiStageGuard::new(UI_STAGE_RENDER);
+        let frame_started = Instant::now();
+        let previous_render = self.last_render_at.replace(frame_started);
+        if debug_ui_stall_enabled()
+            && let Some(previous) = previous_render
+        {
+            let gap_us = frame_started.duration_since(previous).as_micros();
+            if gap_us >= 30_000 && self.edit_generation > self.last_rendered_edit_generation {
+                tracing::info!(target: "axiom.ui_stall",
+                    gap_us,
+                    dirty_document = true,
+                    pending_edit_generation = self.edit_generation,
+                    last_rendered_generation = self.last_rendered_edit_generation,
+                    "[UI FRAME GAP]"
+                );
+            }
+        }
         self.poll_native_inspection_results(cx);
         let t = theme();
         let m = metrics();
@@ -3944,6 +4612,31 @@ impl Render for EditorView {
         let offset_x: f32 = (-offset.x).into();
         let offset_y: f32 = (-offset.y).into();
         let line_count = self.document.line_count();
+        if debug_ui_stall_enabled() && self.edit_generation != self.last_rendered_edit_generation {
+            let generation = self.edit_generation;
+            self.last_rendered_edit_generation = generation;
+            LAST_UI_RENDERED_GENERATION.store(generation, Ordering::Relaxed);
+            if let Some(mutation) = self.last_mutation_at {
+                let latency_us = frame_started.duration_since(mutation).as_micros();
+                if latency_us >= 10_000 {
+                    tracing::info!(target: "axiom.ui_stall",
+                        generation,
+                        latency_us,
+                        file = %self.file_path.display(),
+                        lines = line_count,
+                        "[UI EDIT TO RENDER]"
+                    );
+                }
+            }
+            if let Some((notify_generation, notified_at)) = self.last_notify_at
+                && notify_generation == generation
+            {
+                let latency_us = frame_started.duration_since(notified_at).as_micros();
+                if latency_us >= 10_000 {
+                    tracing::info!(target: "axiom.ui_stall", generation, latency_us, "[UI NOTIFY TO RENDER]");
+                }
+            }
+        }
         if line_count != self.width_cache_line_count {
             self.line_width_cache.clear();
             self.max_width_line = None;
@@ -3955,6 +4648,8 @@ impl Render for EditorView {
         let mut cache_hits = 0usize;
         let mut cache_misses = 0usize;
         if self.width_cache_dirty {
+            let _stage = UiStageGuard::new(UI_STAGE_WIDTH_CACHE_REBUILD);
+            let width_rebuild_started = Instant::now();
             self.line_width_cache.clear();
             self.max_width_line = None;
             for line in 0..line_count {
@@ -3973,6 +4668,16 @@ impl Render for EditorView {
                 cache_misses += 1;
             }
             self.width_cache_dirty = false;
+            let elapsed_us = width_rebuild_started.elapsed().as_micros();
+            if debug_ui_stall_enabled() && elapsed_us >= 3_000 {
+                tracing::info!(target: "axiom.ui_stall",
+                    elapsed_us,
+                    lines = line_count,
+                    layouts_reused = 0usize,
+                    layouts_reshaped = lines_laid_out,
+                    "[UI WIDTH CACHE REBUILD]"
+                );
+            }
         }
         let cursor_line = self.document.line_of_offset(self.document.cursor_offset());
         if !self.line_width_cache.contains_key(&cursor_line) {
@@ -4022,6 +4727,36 @@ impl Render for EditorView {
         } else {
             0.0
         };
+        if let Some(axis) = self.editor_scroll_drag_axis {
+            self.editor_scroll_drag_frames += 1;
+            let frame_since_last_move_us = self
+                .editor_scroll_drag_last_move_at
+                .map(|move_at| move_at.elapsed().as_micros());
+            self.editor_scroll_drag_last_move_to_frame_us = frame_since_last_move_us;
+            if let Some(latency) = frame_since_last_move_us {
+                self.editor_scroll_drag_move_to_frame_sum_us += latency;
+                self.editor_scroll_drag_move_to_frame_worst_us =
+                    self.editor_scroll_drag_move_to_frame_worst_us.max(latency);
+            }
+            if debug_scroll_enabled() {
+                tracing::debug!(
+                    drag_id = self.editor_scroll_drag_id,
+                    axis = ?axis,
+                    timestamp_us = self
+                        .editor_scroll_drag_started_at
+                        .map(|start| start.elapsed().as_micros())
+                        .unwrap_or_default(),
+                    offset = ?offset,
+                    thumb_position = if axis == EditorScrollAxis::Vertical {
+                        vertical_top
+                    } else {
+                        horizontal_left
+                    },
+                    frame_since_last_move_us = ?frame_since_last_move_us,
+                    "[SCROLLBAR DRAG FRAME]"
+                );
+            }
+        }
         let line = self.document.line_of_offset(self.document.cursor_offset());
         let line_start = self.document.offset_of_line(line);
         let line_content = self.document.line_content(line);
@@ -4149,12 +4884,32 @@ impl Render for EditorView {
                     .relative()
                     .flex_1()
                     .on_hover(cx.listener(Self::editor_scroll_hover))
-                    .on_mouse_move(cx.listener(Self::editor_scroll_drag_move))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::editor_scroll_drag_end))
-                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::editor_scroll_drag_end))
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                        this.editor_scroll_drag_move(
+                            EditorScrollEventSource::Viewport,
+                            event,
+                            window,
+                            cx,
+                        )
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            this.trace_raw_scroll_event("viewport", "up", event.position);
+                            this.editor_scroll_drag_end(event, window, cx);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            this.trace_raw_scroll_event("viewport", "up_out", event.position);
+                            this.editor_scroll_drag_end(event, window, cx);
+                        }),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, event, window, cx| {
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.trace_raw_scroll_event("viewport", "down", event.position);
                             this.mouse_down(event, window, cx);
                         }),
                     )
@@ -4197,15 +4952,57 @@ impl Render for EditorView {
                                 .bottom(px(8.))
                                 .w(px(8.))
                                 .bg(t.scrollbar)
+                                .on_mouse_move(cx.listener(
+                                    |this, event: &MouseMoveEvent, window, cx| {
+                                        this.trace_raw_scroll_event(
+                                            "vscroll",
+                                            "move",
+                                            event.position,
+                                        );
+                                        this.editor_scroll_drag_move(
+                                            EditorScrollEventSource::Scrollbar,
+                                            event,
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                ))
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, event, window, cx| {
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                        this.trace_raw_scroll_event(
+                                            "vscroll",
+                                            "down",
+                                            event.position,
+                                        );
                                         this.editor_scroll_drag_start(
                                             EditorScrollAxis::Vertical,
                                             event,
                                             window,
                                             cx,
                                         )
+                                    }),
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                                        this.trace_raw_scroll_event(
+                                            "vscroll",
+                                            "up",
+                                            event.position,
+                                        );
+                                        this.editor_scroll_drag_end(event, window, cx);
+                                    }),
+                                )
+                                .on_mouse_up_out(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                                        this.trace_raw_scroll_event(
+                                            "vscroll",
+                                            "up_out",
+                                            event.position,
+                                        );
+                                        this.editor_scroll_drag_end(event, window, cx);
                                     }),
                                 )
                                 .child(
@@ -4216,7 +5013,15 @@ impl Render for EditorView {
                                         .top(px(vertical_top))
                                         .h(px(vertical_thumb))
                                         .rounded(px(4.))
-                                        .bg(t.scrollbar_hover),
+                                        .bg(
+                                            if self.editor_scroll_drag_axis
+                                                == Some(EditorScrollAxis::Vertical)
+                                            {
+                                                t.accent
+                                            } else {
+                                                t.scrollbar_hover
+                                            },
+                                        ),
                                 ),
                         )
                     })
@@ -4229,15 +5034,57 @@ impl Render for EditorView {
                                 .bottom(px(2.))
                                 .h(px(8.))
                                 .bg(t.scrollbar)
+                                .on_mouse_move(cx.listener(
+                                    |this, event: &MouseMoveEvent, window, cx| {
+                                        this.trace_raw_scroll_event(
+                                            "hscroll",
+                                            "move",
+                                            event.position,
+                                        );
+                                        this.editor_scroll_drag_move(
+                                            EditorScrollEventSource::Scrollbar,
+                                            event,
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                ))
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, event, window, cx| {
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                        this.trace_raw_scroll_event(
+                                            "hscroll",
+                                            "down",
+                                            event.position,
+                                        );
                                         this.editor_scroll_drag_start(
                                             EditorScrollAxis::Horizontal,
                                             event,
                                             window,
                                             cx,
                                         )
+                                    }),
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                                        this.trace_raw_scroll_event(
+                                            "hscroll",
+                                            "up",
+                                            event.position,
+                                        );
+                                        this.editor_scroll_drag_end(event, window, cx);
+                                    }),
+                                )
+                                .on_mouse_up_out(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                                        this.trace_raw_scroll_event(
+                                            "hscroll",
+                                            "up_out",
+                                            event.position,
+                                        );
+                                        this.editor_scroll_drag_end(event, window, cx);
                                     }),
                                 )
                                 .child(
@@ -4248,7 +5095,15 @@ impl Render for EditorView {
                                         .bottom(px(1.))
                                         .w(px(horizontal_thumb))
                                         .rounded(px(4.))
-                                        .bg(t.scrollbar_hover),
+                                        .bg(
+                                            if self.editor_scroll_drag_axis
+                                                == Some(EditorScrollAxis::Horizontal)
+                                            {
+                                                t.accent
+                                            } else {
+                                                t.scrollbar_hover
+                                            },
+                                        ),
                                 ),
                         )
                     })
@@ -4526,6 +5381,7 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.reset_caret_blink(cx);
         let range = range
             .as_ref()
             .map(|range| self.range_from_utf16(range))
@@ -4843,6 +5699,7 @@ mod formatter_tests {
                     owner_fqn,
                     name,
                     is_static: false,
+                    ..
                 }) if owner_fqn == "Omegaalfa\\FiberEventLoop\\Future" && name == "await"
             ),
             "unexpected definition query: {query:?}"

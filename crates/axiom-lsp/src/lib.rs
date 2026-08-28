@@ -349,15 +349,28 @@ impl LanguageServer {
     }
 
     pub fn did_change(&self, uri: Uri, version: i32, text: String) -> Result<(), LspError> {
+        self.did_change_event(
+            uri,
+            version,
+            TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text,
+            },
+        )
+    }
+
+    pub fn did_change_event(
+        &self,
+        uri: Uri,
+        version: i32,
+        change: TextDocumentContentChangeEvent,
+    ) -> Result<(), LspError> {
         self.notify(
             "textDocument/didChange",
             DidChangeTextDocumentParams {
                 text_document: VersionedTextDocumentIdentifier { uri, version },
-                content_changes: vec![TextDocumentContentChangeEvent {
-                    range: None,
-                    range_length: None,
-                    text,
-                }],
+                content_changes: vec![change],
             },
         )
     }
