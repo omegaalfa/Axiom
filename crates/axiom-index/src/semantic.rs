@@ -757,6 +757,57 @@ impl<'a> MemberResolver<'a> {
         self.resolve_method(scope, declared_type, name, MemberAccess::Instance)
     }
 
+    /// Returns the instance methods visible on a typed binding, including
+    /// methods inherited through classes and composed through traits.
+    ///
+    /// The result is derived exclusively from the immutable snapshot. No
+    /// parsing, filesystem access, or project-wide index scan is performed;
+    /// traversal is limited to the owners reachable from the binding type.
+    pub fn completion_methods_for_binding(
+        &self,
+        scope: ScopeId,
+        binding_name: &str,
+        prefix: &str,
+    ) -> Vec<SymbolId> {
+        let Some(binding) = self.snapshot.lookup_binding(scope, binding_name) else {
+            return Vec::new();
+        };
+        let Some(DeclaredType::Named { resolved, .. }) = binding.declared_type.as_ref() else {
+            return Vec::new();
+        };
+
+        let prefix = prefix.trim();
+        let mut result = Vec::new();
+        let mut seen_names = HashSet::new();
+        for (owner, _, _) in self.inheritance_chain_with_depth(resolved) {
+            let mut owner_ids = self.snapshot.symbols_for_fqn(&owner).to_vec();
+            owner_ids.sort_by_key(|id| id.0);
+            for owner_id in owner_ids {
+                let mut methods = self
+                    .snapshot
+                    .members_of(owner_id)
+                    .iter()
+                    .filter_map(|id| self.snapshot.symbol(*id).map(|symbol| (*id, symbol)))
+                    .filter(|(_, symbol)| {
+                        symbol.kind == ProjectSymbolKind::Method
+                            && symbol.name.starts_with(prefix)
+                            && !symbol.modifiers.iter().any(|modifier| modifier == "static")
+                            && self.is_accessible(scope, symbol)
+                    })
+                    .collect::<Vec<_>>();
+                methods.sort_by_key(|(id, _)| id.0);
+                for (id, symbol) in methods {
+                    // The first declaration in the owner traversal wins, so
+                    // child overrides do not produce a second completion item.
+                    if seen_names.insert(symbol.name.clone()) {
+                        result.push(id);
+                    }
+                }
+            }
+        }
+        result
+    }
+
     pub fn resolve_special_method(
         &self,
         scope: ScopeId,
@@ -1162,6 +1213,19 @@ impl SemanticSnapshot {
 
     pub fn file_id(&self, key: &PersistentFileKey) -> Option<FileId> {
         self.files.by_key.get(key).copied()
+    }
+
+    /// Finds the lexical scope containing a byte offset in a snapshot file.
+    /// The file key must already be present in the snapshot; this method never
+    /// canonicalizes, parses, or touches the filesystem.
+    pub fn scope_id_at(&self, file: &PersistentFileKey, offset: usize) -> Option<ScopeId> {
+        let file_id = self.file_id(file)?;
+        self.scope_at(file_id, offset).map(|scope| scope.id)
+    }
+
+    /// Variant for callers that already hold the resident compact `FileId`.
+    pub fn scope_id_at_file(&self, file: FileId, offset: usize) -> Option<ScopeId> {
+        self.scope_at(file, offset).map(|scope| scope.id)
     }
 
     pub fn symbol_id(&self, key: &PersistentSymbolKey) -> Option<SymbolId> {
@@ -7273,5 +7337,78 @@ function run(User $user): void { foo(); echo $user->name; $user->name = 'A'; ech
             .collect::<Vec<_>>();
         assert_eq!(before, after);
         assert_eq!(next.references_for_target(method).len(), 2);
+    }
+
+    #[test]
+    fn completion_methods_for_binding_uses_resident_inheritance_and_traits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("completion.php");
+        let text = r#"<?php
+namespace App;
+trait Shared {
+    public function inheritedRun(): void {}
+}
+class OverrideBase {
+    use Shared;
+    public function baseOnly(): void {}
+}
+class OverrideChild extends OverrideBase {
+    public function childOnly(): void {}
+    public function inheritedRun(): void {}
+}
+function testOverride(OverrideChild $child): void {}
+class CycleA extends CycleB {}
+class CycleB extends CycleA { public function cycleMethod(): void {} }
+function testCycle(CycleA $cycle): void {}
+"#;
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let key = PersistentFileKey::workspace(&path);
+        let offset = text.find("$child):").unwrap();
+        let scope = snapshot.scope_id_at(&key, offset).expect("function scope");
+        let methods =
+            snapshot
+                .member_resolver()
+                .completion_methods_for_binding(scope, "$child", "inherited");
+        let names = methods
+            .iter()
+            .filter_map(|id| snapshot.symbol(*id))
+            .map(|symbol| symbol.fully_qualified_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["App\\OverrideChild::inheritedRun"]);
+
+        let all = snapshot
+            .member_resolver()
+            .completion_methods_for_binding(scope, "$child", "");
+        let all_names = all
+            .iter()
+            .filter_map(|id| snapshot.symbol(*id))
+            .map(|symbol| symbol.name.as_str())
+            .collect::<HashSet<_>>();
+        assert!(all_names.contains("childOnly"));
+        assert!(all_names.contains("baseOnly"));
+        assert!(all_names.contains("inheritedRun"));
+        assert_eq!(all_names.len(), all.len());
+
+        let file_id = snapshot.file_id(&key).unwrap();
+        assert_eq!(snapshot.scope_id_at_file(file_id, offset), Some(scope));
+
+        let cycle_scope = snapshot
+            .scopes
+            .records
+            .iter()
+            .find(|scope| {
+                scope.kind == ScopeKind::Function
+                    && scope.bindings.iter().any(|b| b.name == "$cycle")
+            })
+            .expect("cycle function");
+        let cycle_methods = snapshot.member_resolver().completion_methods_for_binding(
+            cycle_scope.id,
+            "$cycle",
+            "cycle",
+        );
+        assert_eq!(cycle_methods.len(), 1);
     }
 }

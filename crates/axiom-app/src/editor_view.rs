@@ -2367,6 +2367,15 @@ impl EditorView {
     }
 
     fn complete(&mut self, _: &Complete, _: &mut Window, cx: &mut Context<Self>) {
+        // Axiom currently has no resident embedded-language map. Until one
+        // exists, the already-detected PHP file kind is the authoritative
+        // O(1) completion gate; importantly, this runs before any document
+        // snapshot or provider lookup.
+        if !is_php_file(&self.file_path) {
+            self.completions.clear();
+            cx.notify();
+            return;
+        }
         self.completions.clear();
         let native = self.native_completions();
         if debug_completion_enabled() {
@@ -2544,6 +2553,48 @@ impl EditorView {
             if debug_completion_enabled() && owner_expression.contains("->") {
                 tracing::info!(owner = %owner_expression, "[DEFINITION RECEIVER CHAIN]");
             }
+
+            // For direct instance-member completion, prefer the resident
+            // semantic snapshot. It already knows the binding type and walks
+            // inherited/trait owners without touching the filesystem or
+            // scanning the project index. The legacy path below remains only
+            // for contexts that cannot be represented by a snapshot binding
+            // (for example an unresolved chained expression).
+            if !is_static && let Some(engine) = &self.semantic_engine {
+                let snapshot = engine.snapshot();
+                let file_key = PersistentFileKey::workspace_lexical(&self.file_path);
+                if let Some(scope) = snapshot.scope_id_at(&file_key, cursor)
+                    && snapshot.lookup_binding(scope, &owner_expression).is_some()
+                {
+                    let ids = snapshot.member_resolver().completion_methods_for_binding(
+                        scope,
+                        &owner_expression,
+                        prefix,
+                    );
+                    let members = ids
+                        .into_iter()
+                        .filter_map(|id| snapshot.symbol(id))
+                        .map(|symbol| CompletionItem {
+                            label: symbol.name.clone(),
+                            detail: Some(format!(
+                                "{}{}{} • Project",
+                                symbol.name,
+                                symbol.parameters.clone().unwrap_or_else(|| "()".to_owned()),
+                                symbol
+                                    .return_type
+                                    .as_deref()
+                                    .map(|value| format!(": {value}"))
+                                    .unwrap_or_default()
+                            )),
+                            kind: Some(CompletionItemKind::METHOD),
+                            ..Default::default()
+                        })
+                        .take(40)
+                        .collect::<Vec<_>>();
+                    return members;
+                }
+            }
+
             if let Some(class_fqn) =
                 self.resolve_receiver_type(&owner_expression, &text[..owner_end])
             {
@@ -4509,14 +4560,15 @@ fn compress_completion_parameter(parameter: &str) -> String {
 
 fn completion_icon(kind: Option<CompletionItemKind>) -> &'static str {
     match kind {
-        Some(CompletionItemKind::METHOD | CompletionItemKind::FUNCTION) => "ƒ",
+        Some(CompletionItemKind::METHOD) => "M",
+        Some(CompletionItemKind::FUNCTION) => "F",
         Some(CompletionItemKind::CLASS | CompletionItemKind::CONSTRUCTOR) => "C",
         Some(CompletionItemKind::INTERFACE) => "I",
         Some(CompletionItemKind::ENUM) => "E",
         Some(CompletionItemKind::STRUCT) => "S",
-        Some(CompletionItemKind::PROPERTY | CompletionItemKind::FIELD) => "·",
+        Some(CompletionItemKind::PROPERTY | CompletionItemKind::FIELD) => "P",
         Some(CompletionItemKind::CONSTANT | CompletionItemKind::ENUM_MEMBER) => "#",
-        _ => "•",
+        _ => ".",
     }
 }
 
@@ -5147,9 +5199,9 @@ impl Render for EditorView {
                                 .id("completion-popup-scroll")
                                 .overflow_y_scroll()
                                 .rounded(m.border_radius_medium)
-                                .bg(t.popup_background)
+                                .bg(t.elevated_surface)
                                 .border_1()
-                                .border_color(t.border)
+                                .border_color(t.border_subtle)
                                 .shadow_lg()
                                 .occlude()
                                 .children(
@@ -5159,6 +5211,7 @@ impl Render for EditorView {
                                         .zip(presentations.iter())
                                         .map(|((index, item), presentation)| {
                                             let editor = cx.entity();
+                                            let selected = index == self.completion_selected;
                                             div()
                                                 .id(("completion-item", index))
                                                 .h(row_height)
@@ -5173,16 +5226,24 @@ impl Render for EditorView {
                                                         this.accept_completion(cx);
                                                     });
                                                 })
-                                                .bg(if index == self.completion_selected {
-                                                    t.active_line
+                                                .bg(if selected {
+                                                    t.selection
                                                 } else {
-                                                    t.popup_background
+                                                    t.elevated_surface
+                                                })
+                                                .hover(move |style| {
+                                                    style.bg(if selected {
+                                                        t.selection
+                                                    } else {
+                                                        t.hover
+                                                    })
                                                 })
                                                 .text_color(t.text_primary)
                                                 .child(
                                                     div()
                                                         .w(px(16.0))
                                                         .flex_none()
+                                                        .mr_1()
                                                         .text_color(t.info)
                                                         .child(completion_icon(item.kind)),
                                                 )
