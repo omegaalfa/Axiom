@@ -4817,25 +4817,26 @@ impl Render for EditorView {
             .fold(280.0, f32::max);
         let viewport_width: f32 = viewport.size.width.into();
         let popup_width = px(estimated_width
-            .min(620.0)
+            .min(520.0)
             .min((viewport_width - 16.0).max(180.0)));
-        let mut popup_x = viewport.left() + px(GUTTER_WIDTH + TEXT_PADDING) + caret_x;
-        popup_x = popup_x.min((viewport.right() - popup_width).max(viewport.left()));
-        let mut below_y = viewport.top() + px((line as f32 + 1.0) * LINE_HEIGHT)
-            - self.scroll.0.borrow().base_handle.offset().y;
-        let row_height = px(28.);
-        let popup_height = px((presentations.len() as f32 * 28.0).min(224.0));
+        let mut popup_x = px(GUTTER_WIDTH + TEXT_PADDING) + caret_x;
+        popup_x = popup_x.min((px(viewport_w) - popup_width).max(px(0.)));
+        let scroll_y = self.scroll.0.borrow().base_handle.offset().y;
+        let mut below_y = px((line as f32 + 1.0) * LINE_HEIGHT) + scroll_y;
+        let row_height = px(26.0);
+        let popup_height = px((self.completions.len() as f32 * 26.0).min(224.0));
         if let Some(anchor) = self.hover_anchor {
-            popup_x = anchor.x.max(viewport.left());
-            popup_x = popup_x.min((viewport.right() - popup_width).max(viewport.left()));
-            below_y = (anchor.y + px(LINE_HEIGHT)).min(viewport.bottom());
+            popup_x = anchor.x.max(px(0.0));
+            popup_x = popup_x.min((px(viewport_w) - popup_width).max(px(0.0)));
+            below_y = (anchor.y + px(LINE_HEIGHT)).min(px(viewport_h));
         }
-        let opens_above = below_y + popup_height > viewport.bottom();
-        let popup_y = if opens_above {
-            (below_y - popup_height - px(4.)).max(viewport.top())
+        let opens_above = below_y + popup_height > px(viewport_h);
+        let mut popup_y = if opens_above {
+            (below_y - popup_height - px(4.0)).max(px(0.0))
         } else {
-            below_y.min((viewport.bottom() - popup_height).max(viewport.top()))
+            below_y.min((px(viewport_h) - popup_height).max(px(0.0)))
         };
+        popup_y = popup_y.min((px(viewport_h) - popup_height).max(px(0.0)));
         if self.completions.is_empty() {
             self.last_completion_layout = None;
         }
@@ -5162,7 +5163,7 @@ impl Render for EditorView {
                                                 .id(("completion-item", index))
                                                 .h(row_height)
                                                 .w_full()
-                                                .px_2()
+                                                .px_1()
                                                 .flex()
                                                 .items_center()
                                                 .overflow_hidden()
@@ -5173,14 +5174,14 @@ impl Render for EditorView {
                                                     });
                                                 })
                                                 .bg(if index == self.completion_selected {
-                                                    t.selection
+                                                    t.active_line
                                                 } else {
                                                     t.popup_background
                                                 })
                                                 .text_color(t.text_primary)
                                                 .child(
                                                     div()
-                                                        .w(px(18.))
+                                                        .w(px(16.0))
                                                         .flex_none()
                                                         .text_color(t.info)
                                                         .child(completion_icon(item.kind)),
@@ -5200,7 +5201,7 @@ impl Render for EditorView {
                                                                 .max_w(px(120.))
                                                                 .flex_none()
                                                                 .overflow_hidden()
-                                                                .ml_2()
+                                                                .ml_1()
                                                                 .text_color(t.text_muted)
                                                                 .child(return_type),
                                                         )
@@ -5214,7 +5215,7 @@ impl Render for EditorView {
                                                                 .max_w(px(64.))
                                                                 .flex_none()
                                                                 .overflow_hidden()
-                                                                .ml_2()
+                                                                .ml_1()
                                                                 .text_color(t.text_muted)
                                                                 .child(source),
                                                         )
