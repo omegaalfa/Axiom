@@ -1492,6 +1492,7 @@ impl WorkspaceView {
         }
         match result {
             Ok(index) => {
+                let publish_started = Instant::now();
                 let (index, semantic_engine) = index;
                 let report = index.report();
                 let shared = Arc::new(RwLock::new(index));
@@ -1521,6 +1522,14 @@ impl WorkspaceView {
                     });
                 }
                 self.status = format!("PHP • {} symbols", report.symbols).into();
+                if debug_input_enabled() {
+                    tracing::debug!(
+                        publish_ui_us = publish_started.elapsed().as_micros(),
+                        tabs = self.tabs.len(),
+                        symbols = report.symbols,
+                        "[PROJECT STARTUP UI PROFILE]"
+                    );
+                }
             }
             Err(error) => self.status = format!("PHP Index Failed: {error}").into(),
         }

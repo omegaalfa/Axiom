@@ -99,6 +99,16 @@ pub struct PhpSyntax {
     symbols: Vec<SyntaxSymbol>,
 }
 
+/// Timings for one syntax update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SyntaxUpdateProfile {
+    pub incremental: bool,
+    pub edit_span_bytes: usize,
+    pub parse_us: u128,
+    pub derived_us: u128,
+    pub total_us: u128,
+}
+
 impl PhpSyntax {
     pub fn parse(text: impl Into<String>) -> Result<Self, SyntaxError> {
         let text = text.into();
@@ -238,6 +248,19 @@ impl PhpSyntax {
         old_range: Range<usize>,
         replacement: &str,
     ) -> Result<(), SyntaxError> {
+        self.apply_edit_profiled(old_range, replacement).map(|_| ())
+    }
+
+    pub fn apply_edit_profiled(
+        &mut self,
+        old_range: Range<usize>,
+        replacement: &str,
+    ) -> Result<SyntaxUpdateProfile, SyntaxError> {
+        let total_started = std::time::Instant::now();
+        // `old_range` is deliberately expressed in UTF-8 bytes, matching
+        // DocumentEdit.  Keep this operation separate from `update_text`:
+        // callers that already have the edit must not make us rediscover it
+        // by comparing two complete documents.
         if old_range.start > old_range.end
             || old_range.end > self.text.len()
             || !self.text.is_char_boundary(old_range.start)
@@ -258,18 +281,36 @@ impl PhpSyntax {
             old_end_position,
             new_end_position,
         });
+        let edit_span_bytes = old_range.end.saturating_sub(old_range.start);
         self.text.replace_range(old_range, replacement);
+        let parse_started = std::time::Instant::now();
         self.tree = self
             .parser
             .parse(self.text.as_bytes(), Some(&self.tree))
             .ok_or(SyntaxError::ParseCancelled)?;
+        let parse_us = parse_started.elapsed().as_micros();
+        let derived_started = std::time::Instant::now();
         self.refresh_derived_data();
-        Ok(())
+        let derived_us = derived_started.elapsed().as_micros();
+        Ok(SyntaxUpdateProfile {
+            incremental: true,
+            edit_span_bytes,
+            parse_us,
+            derived_us,
+            total_us: total_started.elapsed().as_micros(),
+        })
     }
 
     pub fn update_text(&mut self, new_text: &str) -> Result<(), SyntaxError> {
+        self.update_text_profiled(new_text).map(|_| ())
+    }
+
+    pub fn update_text_profiled(
+        &mut self,
+        new_text: &str,
+    ) -> Result<SyntaxUpdateProfile, SyntaxError> {
         if self.text == new_text {
-            return Ok(());
+            return Ok(SyntaxUpdateProfile::default());
         }
         let prefix = self
             .text
@@ -289,7 +330,9 @@ impl PhpSyntax {
             .sum::<usize>();
         let old_end = self.text.len() - suffix;
         let new_end = new_text.len() - suffix;
-        self.apply_edit(prefix..old_end, &new_text[prefix..new_end])
+        let mut profile = self.apply_edit_profiled(prefix..old_end, &new_text[prefix..new_end])?;
+        profile.incremental = false;
+        Ok(profile)
     }
 
     fn refresh_derived_data(&mut self) {
@@ -591,6 +634,90 @@ mod tests {
             syntax.tree().root_node().to_sexp(),
             full.tree().root_node().to_sexp()
         );
+    }
+
+    #[test]
+    fn incremental_multiline_edit_uses_utf8_bytes_and_matches_full_parse() {
+        let initial = "<?php\n// ação 😀\nclass User {\n    public function run(): void {}\n}\n";
+        let mut syntax = PhpSyntax::parse(initial).unwrap();
+        let start = initial.find("public function").unwrap();
+        let replacement = "public function prepare(): void {}\n    public function run(): void {}";
+        syntax
+            .apply_edit(
+                start..start + "public function run(): void {}".len(),
+                replacement,
+            )
+            .unwrap();
+
+        let full = PhpSyntax::parse(syntax.text()).unwrap();
+        assert_eq!(
+            syntax.tree().root_node().to_sexp(),
+            full.tree().root_node().to_sexp()
+        );
+        assert_eq!(syntax.text().match_indices("function").count(), 2);
+    }
+
+    #[test]
+    fn incremental_delete_and_append_around_emoji_match_full_parse() {
+        let initial = "<?php\n$label = \"ação ç ã 😀\";\nclass User {}\n";
+        let mut syntax = PhpSyntax::parse(initial).unwrap();
+        let emoji = initial.find('😀').unwrap();
+        syntax
+            .apply_edit(emoji..emoji + '😀'.len_utf8(), "")
+            .unwrap();
+        let end = syntax.text().len();
+        syntax
+            .apply_edit(end..end, "final class Added {}\n")
+            .unwrap();
+
+        let full = PhpSyntax::parse(syntax.text()).unwrap();
+        assert_eq!(
+            syntax.tree().root_node().to_sexp(),
+            full.tree().root_node().to_sexp()
+        );
+        assert!(!syntax.text().contains('😀'));
+        assert!(syntax.text().contains("final class Added"));
+    }
+
+    #[test]
+    fn incremental_edit_rejects_ranges_inside_utf8_codepoints() {
+        let initial = "<?php $label = \"ação 😀\";";
+        let mut syntax = PhpSyntax::parse(initial).unwrap();
+        let start = initial.find('ç').unwrap();
+        let before = syntax.text().to_owned();
+        let error = syntax.apply_edit(start + 1..start + 1, "x").unwrap_err();
+        assert!(matches!(error, SyntaxError::InvalidEdit(_)));
+        assert_eq!(syntax.text(), before);
+    }
+
+    #[test]
+    fn incremental_multiline_edit_matches_full_parse() {
+        let initial = "<?php\nfunction run(): void {\n    return;\n}\n";
+        let mut syntax = PhpSyntax::parse(initial).unwrap();
+        let start = initial.find("return;").unwrap();
+        syntax
+            .apply_edit(
+                start..start + "return;".len(),
+                "// ação\n    return;\n    // 😀",
+            )
+            .unwrap();
+        let full = PhpSyntax::parse(syntax.text()).unwrap();
+        assert_eq!(
+            syntax.tree().root_node().to_sexp(),
+            full.tree().root_node().to_sexp()
+        );
+        assert!(syntax.text().contains("ação"));
+        assert!(syntax.text().contains("😀"));
+    }
+
+    #[test]
+    fn incremental_edit_rejects_non_boundary_byte_offsets() {
+        let mut syntax = PhpSyntax::parse("<?php $value = \"ç\";").unwrap();
+        let start = syntax.text().find('ç').unwrap();
+        assert!(matches!(
+            syntax.apply_edit(start + 1..start + 1, "x"),
+            Err(SyntaxError::InvalidEdit(_))
+        ));
     }
 
     #[test]

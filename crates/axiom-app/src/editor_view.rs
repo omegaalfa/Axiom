@@ -1826,7 +1826,7 @@ impl EditorView {
         let text = self.document.content();
         let edit = self.document.take_last_edit();
         let started = std::time::Instant::now();
-        self.sync_syntax_text(&text);
+        self.sync_syntax_text(&text, edit.as_ref());
         let syntax_us = started.elapsed().as_micros();
         if debug_input_enabled() {
             tracing::debug!(
@@ -2258,14 +2258,31 @@ impl EditorView {
 
     fn sync_syntax(&mut self) {
         let text = self.document.content();
-        self.sync_syntax_text(&text);
+        self.sync_syntax_text(&text, None);
     }
 
-    fn sync_syntax_text(&mut self, text: &str) {
-        if let Some(syntax) = &mut self.syntax
-            && let Err(error) = syntax.update_text(text)
-        {
-            self.status = Some(format!("Falha ao atualizar sintaxe PHP: {error}").into());
+    fn sync_syntax_text(&mut self, text: &str, edit: Option<&DocumentEdit>) {
+        let started = Instant::now();
+        let mut profile = axiom_syntax::SyntaxUpdateProfile::default();
+        if let Some(syntax) = &mut self.syntax {
+            let result = match edit {
+                Some(edit) => match syntax
+                    .apply_edit_profiled(edit.old_range_bytes.clone(), &edit.inserted_text)
+                {
+                    Ok(profile) if syntax.text() == text => Ok(profile),
+                    // A stale or non-representable delta must not leave the
+                    // resident tree out of sync; fall back to the complete
+                    // document update in that rare path.
+                    Ok(_) | Err(_) => syntax.update_text_profiled(text),
+                },
+                None => syntax.update_text_profiled(text),
+            };
+            match result {
+                Ok(value) => profile = value,
+                Err(error) => {
+                    self.status = Some(format!("Falha ao atualizar sintaxe PHP: {error}").into())
+                }
+            }
         }
         let diagnostics = self
             .syntax
@@ -2283,6 +2300,17 @@ impl EditorView {
             })
             .unwrap_or_default();
         self.diagnostics.set_native_syntax(diagnostics);
+        if debug_input_enabled() {
+            tracing::debug!(
+                bytes = text.len(),
+                incremental = profile.incremental,
+                edit_span_bytes = profile.edit_span_bytes,
+                parse_us = profile.parse_us,
+                derived_us = profile.derived_us,
+                total_us = started.elapsed().as_micros(),
+                "[UI SYNTAX DETAIL]"
+            );
+        }
     }
 
     fn sync_lsp(&mut self) {

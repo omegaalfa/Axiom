@@ -955,10 +955,10 @@ impl ProjectSymbolIndex {
         self.symbols.clear();
         self.ready = false;
         let mut paths = Vec::new();
-        collect_php_files(root.as_ref(), &mut paths)?;
+        collect_php_files(root.as_ref(), &mut paths, &mut DiscoveryStats::default())?;
         let mut seen = HashSet::new();
-        for path in paths {
-            let path = canonical_or(path);
+        for discovered in paths {
+            let path = canonical_or(discovered.path);
             if seen.insert(path.clone()) {
                 let _ = self.index_file_with_source(&path, "InitialProjectScan");
             }
@@ -973,65 +973,75 @@ impl ProjectSymbolIndex {
         cache_path: impl AsRef<Path>,
     ) -> io::Result<IndexReport> {
         let started = Instant::now();
-        let root = root.as_ref();
+        let root = canonical_or(root.as_ref().to_path_buf());
         let mut discovered = Vec::new();
-        collect_php_files(root, &mut discovered)?;
+        let mut discovery = DiscoveryStats::default();
+        let discovery_started = Instant::now();
+        collect_php_files(&root, &mut discovered, &mut discovery)?;
+        let discovery_us = discovery_started.elapsed().as_micros();
         let mut seen = HashSet::new();
-        let discovered: Vec<PathBuf> = discovered
+        let canonicalize_started = Instant::now();
+        let discovered: Vec<DiscoveredFile> = discovered
             .into_iter()
-            .filter_map(|path| fs::canonicalize(path).ok())
-            .filter(|path| seen.insert(path.clone()))
+            .filter(|file| seen.insert(file.path.clone()))
             .collect();
-        let cached = fs::read_to_string(cache_path.as_ref())
-            .ok()
+        let canonicalize_us = canonicalize_started.elapsed().as_micros();
+        let cache_read_started = Instant::now();
+        let cache_text = fs::read_to_string(cache_path.as_ref()).ok();
+        let cache_read_us = cache_read_started.elapsed().as_micros();
+        let cache_deserialize_started = Instant::now();
+        let cached = cache_text
             .and_then(|text| serde_json::from_str::<ProjectCacheFile>(&text).ok())
             .filter(|cache| cache.schema_version == PROJECT_CACHE_SCHEMA);
+        let cache_deserialize_us = cache_deserialize_started.elapsed().as_micros();
+        let cache_validation_started = Instant::now();
         let cached_files = cached
             .as_ref()
             .map(|cache| cache.files.len())
             .unwrap_or_default();
+        let cache_validation_us = cache_validation_started.elapsed().as_micros();
+        let snapshot_started = Instant::now();
         self.files.clear();
         self.symbols.clear();
         self.ready = false;
         let mut reparsed = 0usize;
-        for path in &discovered {
-            let metadata = fs::metadata(path)?;
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|v| v.as_nanos())
-                .unwrap_or_default();
+        let metadata_us = discovery.metadata_us;
+        let metadata_calls = discovery.metadata_calls;
+        let mut changed_detection_us = 0u128;
+        let mut files_read = 1usize;
+        for file in &discovered {
+            let path = &file.path;
+            let modified = file.modified;
+            let changed_started = Instant::now();
             let reused = cached
                 .as_ref()
                 .and_then(|cache| cache.files.get(path))
-                .filter(|(size, stamp, _)| *size == metadata.len() && *stamp == modified);
+                .filter(|(size, stamp, _)| *size == file.size && *stamp == modified);
+            changed_detection_us += changed_started.elapsed().as_micros();
             if let Some((_, _, symbols)) = reused {
                 self.files.insert(path.clone(), Arc::from(""));
                 self.symbols.extend(symbols.clone());
             } else {
-                self.index_file_with_source(path, "InitialProjectScan")?;
+                let text = fs::read_to_string(path)?;
+                files_read += 1;
+                self.index_file_text_at_path(path.clone(), text, "InitialProjectScan")?;
                 reparsed += 1;
             }
         }
+        let snapshot_restore_us = snapshot_started.elapsed().as_micros();
         let removed = cached_files.saturating_sub(discovered.len());
         self.ready = true;
         let mut files = BTreeMap::new();
-        for path in &discovered {
-            let metadata = fs::metadata(path)?;
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|v| v.as_nanos())
-                .unwrap_or_default();
+        for file in &discovered {
+            let path = &file.path;
+            let modified = file.modified;
             let symbols = self
                 .symbols
                 .iter()
                 .filter(|symbol| &symbol.file == path)
                 .cloned()
                 .collect();
-            files.insert(path.clone(), (metadata.len(), modified, symbols));
+            files.insert(path.clone(), (file.size, modified, symbols));
         }
         if let Some(parent) = cache_path.as_ref().parent() {
             let _ = fs::create_dir_all(parent);
@@ -1059,6 +1069,22 @@ impl ProjectSymbolIndex {
                 reparsed,
                 removed,
                 started.elapsed().as_millis()
+            );
+            eprintln!(
+                "[PROJECT STARTUP PROFILE] cache_read_us={} cache_deserialize_us={} discovery_us={} metadata_us={} cache_validation_us={} changed_file_detection_us={} snapshot_restore_us={} publish_ui_us=0 canonicalize_us={} directories_visited={} metadata_calls={} canonicalize_calls={} files_opened_read={} total_us={}",
+                cache_read_us,
+                cache_deserialize_us,
+                discovery_us,
+                metadata_us,
+                cache_validation_us,
+                changed_detection_us,
+                snapshot_restore_us,
+                canonicalize_us,
+                discovery.directories_visited,
+                metadata_calls,
+                discovery.canonicalize_calls,
+                files_read,
+                started.elapsed().as_micros(),
             );
         }
         Ok(self.report())
@@ -1099,8 +1125,17 @@ impl ProjectSymbolIndex {
         trace_path("index_file_text_input", source, path.as_ref());
         let path = fs::canonicalize(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
         trace_path("index_file_text_stored", source, &path);
-        let text = text.into();
-        self.remove_file(&path);
+        self.index_file_text_at_path(path, text.into(), source)
+    }
+
+    fn index_file_text_at_path(
+        &mut self,
+        path: PathBuf,
+        text: String,
+        source: &str,
+    ) -> io::Result<usize> {
+        self.files.remove(&path);
+        self.symbols.retain(|symbol| symbol.file != path);
         let syntax = PhpSyntax::parse(text.clone())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         let mut output = Vec::new();
@@ -1183,7 +1218,26 @@ impl ProjectSymbolIndex {
     }
 }
 
-fn collect_php_files(root: &Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
+#[derive(Default)]
+struct DiscoveryStats {
+    directories_visited: usize,
+    metadata_calls: usize,
+    canonicalize_calls: usize,
+    metadata_us: u128,
+}
+
+struct DiscoveredFile {
+    path: PathBuf,
+    size: u64,
+    modified: u128,
+}
+
+fn collect_php_files(
+    root: &Path,
+    output: &mut Vec<DiscoveredFile>,
+    stats: &mut DiscoveryStats,
+) -> io::Result<()> {
+    stats.directories_visited += 1;
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
@@ -1194,14 +1248,35 @@ fn collect_php_files(root: &Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
         {
             continue;
         }
-        if path.is_dir() {
-            collect_php_files(&path, output)?;
+        // Inspect the directory entry itself before following its target.
+        // This avoids following ordinary symlink directories without adding a
+        // second metadata call to the warm-cache traversal.
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let metadata_started = Instant::now();
+        let metadata = entry.metadata()?;
+        stats.metadata_calls += 1;
+        stats.metadata_us += metadata_started.elapsed().as_micros();
+        if metadata.is_dir() {
+            collect_php_files(&path, output, stats)?;
         } else if path
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("php"))
         {
-            output.push(path);
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos())
+                .unwrap_or_default();
+            output.push(DiscoveredFile {
+                path,
+                size: metadata.len(),
+                modified,
+            });
         }
     }
     Ok(())
