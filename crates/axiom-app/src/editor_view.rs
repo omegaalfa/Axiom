@@ -2554,6 +2554,58 @@ impl EditorView {
             if !is_static && let Some(engine) = &self.semantic_engine {
                 let snapshot = engine.snapshot();
                 let file_key = PersistentFileKey::workspace_lexical(&self.file_path);
+                let lexical_file_id = snapshot.file_id(&file_key);
+                if !is_static && debug_semantic_binding_flow_enabled() {
+                    let scope_id = lexical_file_id
+                        .and_then(|file_id| snapshot.scope_id_at_file(file_id, cursor));
+                    let scope_kind = scope_id
+                        .and_then(|scope| snapshot.scope(scope))
+                        .map(|scope| format!("{:?}", scope.kind))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let binding = scope_id
+                        .and_then(|scope| snapshot.lookup_binding(scope, &owner_expression));
+                    let binding_type = binding
+                        .and_then(|binding| binding.declared_type.as_ref())
+                        .map(|ty| format!("{ty:?}"))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    eprintln!(
+                        "[SEM COMP] semantic_revision={} file_id={lexical_file_id:?} scope_id={scope_id:?} scope_kind={} receiver={} binding_found={} binding_type={}",
+                        snapshot.revision.0,
+                        scope_kind,
+                        owner_expression,
+                        binding.is_some(),
+                        binding_type
+                    );
+                }
+                if debug_completion_flow_enabled() {
+                    let scope_id = lexical_file_id
+                        .and_then(|file_id| snapshot.scope_id_at_file(file_id, cursor));
+                    let binding = scope_id
+                        .and_then(|scope| snapshot.lookup_binding(scope, &owner_expression));
+                    let semantic_items = binding.map(|_| {
+                        snapshot
+                            .member_resolver()
+                            .completion_methods_for_binding(
+                                scope_id.expect("binding scope exists"),
+                                &owner_expression,
+                                prefix,
+                            )
+                            .len()
+                    });
+                    let binding_type = binding
+                        .and_then(|binding| binding.declared_type.as_ref())
+                        .map(|ty| format!("{ty:?}"))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    eprintln!(
+                        "[COMP FLOW] revision={} requested_lexical={:?} lexical_file_id={lexical_file_id:?} resident_identity_file_id=unavailable scope_id={scope_id:?} binding_found={} binding_type={} branch={} semantic_items={} fallback_items=pending",
+                        snapshot.revision.0,
+                        file_key.normalized_path,
+                        binding.is_some(),
+                        binding_type,
+                        if semantic_items.is_some() { "semantic" } else { "fallback" },
+                        semantic_items.map_or_else(|| "unavailable".to_owned(), |count| count.to_string())
+                    );
+                }
                 if let Some(scope) = snapshot.scope_id_at(&file_key, cursor)
                     && snapshot.lookup_binding(scope, &owner_expression).is_some()
                 {
@@ -2673,6 +2725,16 @@ impl EditorView {
                 }
                 let mut seen = std::collections::HashSet::new();
                 members.retain(|item| seen.insert(item.label.to_ascii_lowercase()));
+                if debug_completion_flow_enabled() {
+                    eprintln!(
+                        "[COMP FLOW] revision={} requested_lexical=fallback lexical_file_id=unknown resident_identity_file_id=unavailable scope_id=unknown binding_found=unknown binding_type=unknown branch=fallback semantic_items=0 fallback_items={}",
+                        self.semantic_engine
+                            .as_ref()
+                            .map(|engine| engine.snapshot().revision.0)
+                            .unwrap_or_default(),
+                        members.len()
+                    );
+                }
                 return NativeCompletionBatch {
                     items: members.into_iter().take(40).collect(),
                     new_prefix: None,
@@ -4513,6 +4575,30 @@ fn debug_ui_stall_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_UI_STALL").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
+}
+
+#[cfg(debug_assertions)]
+fn debug_completion_flow_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_COMPLETION_FLOW").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn debug_semantic_binding_flow_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_SEMANTIC_BINDING_FLOW").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_completion_flow_enabled() -> bool {
+    false
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn debug_semantic_binding_flow_enabled() -> bool {
+    false
 }
 
 #[cfg(not(debug_assertions))]

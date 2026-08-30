@@ -1282,7 +1282,18 @@ impl SemanticSnapshot {
             .records
             .iter()
             .filter(|scope| scope.file == Some(file) && scope.span.contains(&offset))
-            .max_by_key(|scope| scope.span.start)?;
+            .max_by_key(|scope| scope.span.start);
+        if scope.is_none() {
+            // An editor cursor may be ahead of a stale snapshot's last byte.
+            // Keep the lookup conservative: return only the resident File
+            // scope for this FileId, without extending spans or creating data.
+            scope = self.scopes.records.iter().find(|candidate| {
+                candidate.file == Some(file)
+                    && candidate.kind == ScopeKind::File
+                    && offset >= candidate.span.end
+            });
+        }
+        let mut scope = scope?;
         if scope.kind == ScopeKind::File {
             if let Some(namespace) = self
                 .scopes
@@ -2650,7 +2661,7 @@ impl SnapshotBuilder {
         builder.set_scope_file_span(file_scope, file, 0..text.len());
         if let Ok(syntax) = PhpSyntax::parse(text.to_owned()) {
             extract_scopes(&mut builder, syntax.tree().root_node(), file_scope, text);
-            extract_assignments(&mut builder, syntax.tree().root_node(), text);
+            extract_assignments(&mut builder, syntax.tree().root_node(), text, file);
         }
         builder
     }
@@ -2704,12 +2715,20 @@ impl SnapshotBuilder {
             };
             let file_scope =
                 self.new_scope(None, ScopeKind::File, String::new(), None, None, false);
-            if let Some(file) = self.files.records.iter().find(|record| record.path == path) {
-                self.set_scope_file_span(file_scope, file.id, 0..text.len());
+            let file_id = self
+                .files
+                .records
+                .iter()
+                .find(|record| record.path == path)
+                .map(|file| file.id);
+            if let Some(file_id) = file_id {
+                self.set_scope_file_span(file_scope, file_id, 0..text.len());
             }
             if let Ok(syntax) = PhpSyntax::parse(text.clone()) {
                 extract_scopes(self, syntax.tree().root_node(), file_scope, &text);
-                extract_assignments(self, syntax.tree().root_node(), &text);
+                if let Some(file_id) = file_id {
+                    extract_assignments(self, syntax.tree().root_node(), &text, file_id);
+                }
             }
         }
         let semantic = self.snapshot_view();
@@ -2962,7 +2981,7 @@ impl SnapshotBuilder {
                     self.replace_symbols_for_file(file, &path, &text);
                     if let Ok(syntax) = PhpSyntax::parse(text.clone()) {
                         extract_scopes(self, syntax.tree().root_node(), file_scope, &text);
-                        extract_assignments(self, syntax.tree().root_node(), &text);
+                        extract_assignments(self, syntax.tree().root_node(), &text, file);
                         extracted.push((file, path, text, syntax));
                     }
                     Some(file)
@@ -3504,7 +3523,12 @@ fn mark_scope(builder: &mut SnapshotBuilder, id: ScopeId, node: tree_sitter::Nod
     }
 }
 
-fn extract_assignments(builder: &mut SnapshotBuilder, root: tree_sitter::Node<'_>, text: &str) {
+fn extract_assignments(
+    builder: &mut SnapshotBuilder,
+    root: tree_sitter::Node<'_>,
+    text: &str,
+    file: FileId,
+) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "assignment_expression" {
@@ -3518,7 +3542,7 @@ fn extract_assignments(builder: &mut SnapshotBuilder, root: tree_sitter::Node<'_
             };
             let name = node_text(left, text).trim();
             if name.starts_with('$') {
-                if let Some(scope) = assignment_scope(builder, node.start_byte()) {
+                if let Some(scope) = assignment_scope(builder, file, node.start_byte()) {
                     let right_text = node_text(right, text).trim();
                     let raw_type = if right.kind() == "object_creation_expression" {
                         right
@@ -4223,7 +4247,11 @@ fn member_target(
     }
 }
 
-fn innermost_callable_scope(builder: &SnapshotBuilder, offset: usize) -> Option<ScopeId> {
+fn innermost_callable_scope(
+    builder: &SnapshotBuilder,
+    file: FileId,
+    offset: usize,
+) -> Option<ScopeId> {
     builder
         .scopes
         .records
@@ -4235,7 +4263,8 @@ fn innermost_callable_scope(builder: &SnapshotBuilder, offset: usize) -> Option<
                     | ScopeKind::Method
                     | ScopeKind::Closure
                     | ScopeKind::ArrowFunction
-            ) && scope.span.contains(&offset)
+            ) && scope.file == Some(file)
+                && scope.span.contains(&offset)
         })
         .max_by_key(|scope| scope.span.start)
         .map(|scope| scope.id)
@@ -4244,14 +4273,16 @@ fn innermost_callable_scope(builder: &SnapshotBuilder, offset: usize) -> Option<
 /// Selects the lexical scope that owns an assignment. Callable scopes take
 /// precedence; assignments at namespace/file level are attached to the most
 /// specific Namespace scope, falling back to the file scope.
-fn assignment_scope(builder: &SnapshotBuilder, offset: usize) -> Option<ScopeId> {
-    innermost_callable_scope(builder, offset).or_else(|| {
+fn assignment_scope(builder: &SnapshotBuilder, file: FileId, offset: usize) -> Option<ScopeId> {
+    innermost_callable_scope(builder, file, offset).or_else(|| {
         let namespaces = builder
             .scopes
             .records
             .iter()
             .filter(|scope| {
-                scope.kind == ScopeKind::Namespace && scope.span.contains(&offset)
+                scope.file == Some(file)
+                    && scope.kind == ScopeKind::Namespace
+                    && scope.span.contains(&offset)
             });
         namespaces
             .max_by_key(|scope| scope.span.start)
@@ -4265,7 +4296,9 @@ fn assignment_scope(builder: &SnapshotBuilder, offset: usize) -> Option<ScopeId>
                     .records
                     .iter()
                     .filter(|scope| {
-                        scope.kind == ScopeKind::Namespace && scope.span.start <= offset
+                        scope.file == Some(file)
+                            && scope.kind == ScopeKind::Namespace
+                            && scope.span.start <= offset
                     })
                     .max_by_key(|scope| scope.span.start)
             })
@@ -4275,7 +4308,11 @@ fn assignment_scope(builder: &SnapshotBuilder, offset: usize) -> Option<ScopeId>
             .scopes
             .records
             .iter()
-            .find(|scope| scope.kind == ScopeKind::File && scope.span.contains(&offset))
+            .find(|scope| {
+                scope.file == Some(file)
+                    && scope.kind == ScopeKind::File
+                    && scope.span.contains(&offset)
+            })
             .map(|scope| scope.id)
     })
 }
@@ -4583,6 +4620,38 @@ mod tests {
             PersistentFileKey::workspace_lexical(&canonical),
             PersistentFileKey::workspace_physical(&path)
         );
+    }
+
+    #[test]
+    fn scope_lookup_falls_back_to_resident_file_at_eof_without_fabricating_bindings() {
+        let text = "<?php namespace App; function run() { return 1; }";
+        let mut builder = SnapshotBuilder::from_php_text("scope.php", text, SemanticRevision(1));
+        let file_scope = builder
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::File)
+            .map(|scope| scope.id)
+            .unwrap();
+        builder.scopes.records[file_scope.0 as usize].span = 0..text.len() - 1;
+        let snapshot = builder.build();
+        let at_end = snapshot
+            .scope_id_at_file(FileId(0), text.len())
+            .expect("file fallback at exact EOF");
+        assert!(matches!(
+            snapshot.scopes.records[at_end.0 as usize].kind,
+            ScopeKind::Namespace | ScopeKind::File
+        ));
+        let beyond = snapshot
+            .scope_id_at_file(FileId(0), text.len() + 10)
+            .expect("file fallback beyond stale end");
+        assert_eq!(beyond, at_end);
+        assert!(snapshot.scope_id_at_file(FileId(99), text.len()).is_none());
+        assert!(snapshot.lookup_binding(at_end, "$missing").is_none());
+
+        let inside = text.find("return").unwrap();
+        let inner = snapshot.scope_id_at_file(FileId(0), inside).unwrap();
+        assert_eq!(snapshot.scopes.records[inner.0 as usize].kind, ScopeKind::Function);
     }
 
     #[test]
@@ -6564,6 +6633,66 @@ class ParentChild extends ParentBase {
                 resolved: "App\\Child".into()
             })
         );
+    }
+
+    #[test]
+    fn incremental_assignment_scope_is_isolated_to_replaced_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.php");
+        let path_b = dir.path().join("b.php");
+        let text_a = format!(
+            "<?php\nnamespace A;\nfunction overlap() {{\n{}\n}}\n",
+            "    ".repeat(80)
+        );
+        let text_b_initial = "<?php namespace TraitTest;";
+        let text_b = "<?php\nnamespace TraitTest;\n\nclass Base {}\n\nclass Child extends Base {}\n\n$child = new Child();\n$child->\n";
+
+        let mut base_builder = SnapshotBuilder::empty(SemanticRevision(1));
+        base_builder.replace_workspace_file(&path_a, &text_a);
+        base_builder.replace_workspace_file(&path_b, text_b_initial);
+        let base = base_builder.finish();
+
+        let mut incremental = SnapshotBuilder::from_snapshot(&base);
+        incremental.replace_workspace_file(&path_b, text_b);
+        let snapshot = incremental.finish();
+
+        let file_b = snapshot
+            .files
+            .records
+            .iter()
+            .find(|record| record.path == path_b)
+            .map(|record| record.id)
+            .expect("replaced file should remain indexed");
+        let assignment_offset = text_b.find("$child =").unwrap();
+        let completion_offset = text_b.find("$child->").unwrap();
+        let scope_b = snapshot
+            .scope_id_at_file(file_b, completion_offset)
+            .expect("file B should have an applicable scope");
+
+        assert!(
+            text_a.len() > assignment_offset,
+            "test fixture must overlap scope offsets across files"
+        );
+        let registrations: Vec<_> = snapshot
+            .scopes
+            .records
+            .iter()
+            .filter_map(|scope| {
+                scope
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.name == "$child")
+                    .map(|_binding| (scope.id, scope.file, scope.kind))
+            })
+            .collect();
+        assert_eq!(
+            snapshot.lookup_binding(scope_b, "$child").map(|binding| binding.name.as_str()),
+            Some("$child"),
+            "assignment must resolve in the replaced file's scope (scope_id={scope_b:?}, expected_file={file_b:?}, actual_scope_file={:?}, registrations={registrations:?})",
+            snapshot.scopes.records[scope_b.0 as usize].file,
+        );
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].1, Some(file_b));
     }
 
     #[test]
