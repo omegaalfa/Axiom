@@ -4687,7 +4687,7 @@ impl WorkspaceView {
                 path: path.clone(),
                 editor,
             });
-            if debug_completion_enabled() {
+            if debug_input_enabled() {
                 let source = if path
                     .components()
                     .any(|component| component.as_os_str() == "vendor")
@@ -7609,23 +7609,10 @@ fn copy_stub_tree(source: &Path, target: &Path) -> std::io::Result<StubImportRep
 }
 
 #[allow(dead_code)]
-#[cfg(debug_assertions)]
-fn debug_completion_enabled() -> bool {
-    std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
-        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
-    })
-}
-
-#[allow(dead_code)]
-#[cfg(not(debug_assertions))]
-fn debug_completion_enabled() -> bool {
-    false
-}
-
-#[allow(dead_code)]
 fn debug_stubs_enabled() -> bool {
-    debug_completion_enabled()
-        || std::env::var_os("AXIOM_DEBUG_STUBS").is_some_and(|value| {
+    std::env::var_os("AXIOM_DEBUG_INPUT").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    }) || std::env::var_os("AXIOM_DEBUG_STUBS").is_some_and(|value| {
             !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
         })
 }

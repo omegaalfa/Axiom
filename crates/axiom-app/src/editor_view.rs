@@ -132,12 +132,6 @@ pub fn key_bindings() -> Vec<KeyBinding> {
 pub type DocumentSessionId = u64;
 
 static NEXT_DOCUMENT_SESSION: AtomicU64 = AtomicU64::new(1);
-static NATIVE_INSPECTIONS_SCHEDULED: AtomicU64 = AtomicU64::new(0);
-static NATIVE_INSPECTIONS_STARTED: AtomicU64 = AtomicU64::new(0);
-static NATIVE_INSPECTIONS_FINISHED: AtomicU64 = AtomicU64::new(0);
-static NATIVE_INSPECTIONS_DISCARDED: AtomicU64 = AtomicU64::new(0);
-static NATIVE_INSPECTIONS_ACTIVE: AtomicU64 = AtomicU64::new(0);
-static NATIVE_INSPECTIONS_ACTIVE_PEAK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_UI_EDIT_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_UI_HEARTBEAT_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static UI_STAGE: AtomicU64 = AtomicU64::new(0);
@@ -247,27 +241,10 @@ pub struct EditorView {
     semantic_update_generation: u64,
     workspace_root: Option<PathBuf>,
     workspace_source: bool,
-    last_completion_layout: Option<(u32, u32, u32, u32, bool)>,
     editor_scroll_hovered: bool,
     editor_scroll_drag_axis: Option<EditorScrollAxis>,
     editor_scroll_drag_start: Point<Pixels>,
     editor_scroll_drag_start_offset: Point<Pixels>,
-    editor_scroll_drag_id: u64,
-    editor_scroll_drag_started_at: Option<Instant>,
-    editor_scroll_drag_last_move_at: Option<Instant>,
-    editor_scroll_drag_last_move_to_frame_us: Option<u128>,
-    editor_scroll_drag_interval_sum_us: u128,
-    editor_scroll_drag_move_to_frame_sum_us: u128,
-    editor_scroll_drag_move_to_frame_worst_us: u128,
-    editor_scroll_drag_moves: u64,
-    editor_scroll_drag_viewport_moves: u64,
-    editor_scroll_drag_scrollbar_moves: u64,
-    editor_scroll_drag_duplicate_moves: u64,
-    editor_scroll_drag_frames: u64,
-    editor_scroll_drag_offset_repeats: u64,
-    editor_scroll_drag_large_jumps: u64,
-    editor_scroll_drag_last_offset: Option<Point<Pixels>>,
-    editor_scroll_drag_last_source: Option<EditorScrollEventSource>,
     content_width: Pixels,
     line_width_cache: HashMap<usize, Pixels>,
     max_width_line: Option<usize>,
@@ -980,27 +957,10 @@ impl EditorView {
             semantic_update_generation: 0,
             workspace_root: None,
             workspace_source: false,
-            last_completion_layout: None,
             editor_scroll_hovered: false,
             editor_scroll_drag_axis: None,
             editor_scroll_drag_start: Point::default(),
             editor_scroll_drag_start_offset: Point::default(),
-            editor_scroll_drag_id: 0,
-            editor_scroll_drag_started_at: None,
-            editor_scroll_drag_last_move_at: None,
-            editor_scroll_drag_last_move_to_frame_us: None,
-            editor_scroll_drag_interval_sum_us: 0,
-            editor_scroll_drag_move_to_frame_sum_us: 0,
-            editor_scroll_drag_move_to_frame_worst_us: 0,
-            editor_scroll_drag_moves: 0,
-            editor_scroll_drag_viewport_moves: 0,
-            editor_scroll_drag_scrollbar_moves: 0,
-            editor_scroll_drag_duplicate_moves: 0,
-            editor_scroll_drag_frames: 0,
-            editor_scroll_drag_offset_repeats: 0,
-            editor_scroll_drag_large_jumps: 0,
-            editor_scroll_drag_last_offset: None,
-            editor_scroll_drag_last_source: None,
             content_width: px(0.),
             line_width_cache: HashMap::new(),
             max_width_line: None,
@@ -1023,7 +983,7 @@ impl EditorView {
         let inspections_started = std::time::Instant::now();
         view.sync_syntax();
         let native_inspections_us = inspections_started.elapsed().as_micros();
-        if debug_completion_enabled() {
+        if debug_input_enabled() {
             let source = if path
                 .components()
                 .any(|component| component.as_os_str() == "vendor")
@@ -1289,7 +1249,7 @@ impl EditorView {
             } else {
                 resolve_php_class_name(&written_owner, &text)
             };
-            if debug_completion_enabled() {
+            if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
                 tracing::info!(token = %token.text, kind = "Method", written = %written_owner, resolved = %owner_fqn, via = "receiver-type", "[DEFINITION QUERY]");
             }
             if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
@@ -1311,7 +1271,7 @@ impl EditorView {
             return Some(DefinitionQuery::Function);
         }
         let fqn = resolve_php_class_name(&name, &text);
-        if debug_completion_enabled() {
+        if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
             let via = if text
                 .lines()
                 .any(|line| line.trim_start().starts_with("use ") && line.contains(&name))
@@ -1939,17 +1899,9 @@ impl EditorView {
         }
         let text = self.document.content();
         let edit = self.document.take_last_edit();
-        let started = std::time::Instant::now();
+        let syntax_started = Instant::now();
         self.sync_syntax_text(&text, edit.as_ref());
-        let syntax_us = started.elapsed().as_micros();
-        if debug_input_enabled() {
-            tracing::debug!(
-                syntax_us,
-                inspection_sync_us = 0,
-                total_sync_us = started.elapsed().as_micros(),
-                "[EDITOR EDIT PROFILE]"
-            );
-        }
+        let syntax_us = syntax_started.elapsed().as_micros();
         let inspection_started = Instant::now();
         self.schedule_native_inspections(&text, cx);
         let inspection_schedule_us = inspection_started.elapsed().as_micros();
@@ -2131,72 +2083,27 @@ impl EditorView {
         let generation = self.native_inspection_generation;
         let session = self.document_session;
         let sender = self.native_inspection_sender.clone();
-        if debug_native_inspection_enabled() {
-            tracing::info!(
-                generation,
-                session,
-                "event=schedule [NATIVE INSPECTION DEBOUNCE]"
-            );
-        }
         cx.spawn(async move |this, cx| {
             gpui::Timer::after(Duration::from_millis(200)).await;
-            let capture_started = Instant::now();
             let work = match this.update(cx, |editor, _| {
                 if editor.document_session != session
                     || editor.native_inspection_generation != generation
                 {
                     return None;
                 }
-                let text_snapshot_started = Instant::now();
                 let text: Arc<str> = Arc::from(editor.document.content());
-                let text_snapshot_us = text_snapshot_started.elapsed().as_micros();
-                let file_bytes = text.len();
                 let work = editor.capture_native_inspection_work(text, session, generation);
-                Some((work, file_bytes, text_snapshot_us))
+                Some(work)
             }) {
-                Ok(Some((Some(work), file_bytes, text_snapshot_us))) => {
-                    if debug_native_inspection_enabled() {
-                        tracing::debug!(
-                            generation,
-                            file_bytes,
-                            text_snapshot_us,
-                            total_ui_us = capture_started.elapsed().as_micros(),
-                            project_snapshot_skipped = false,
-                            "[NATIVE INSPECTION CAPTURE]"
-                        );
-                    }
-                    work
-                }
-                Ok(Some((None, file_bytes, text_snapshot_us))) => {
-                    if debug_native_inspection_enabled() {
-                        tracing::debug!(
-                            generation,
-                            file_bytes,
-                            text_snapshot_us,
-                            total_ui_us = capture_started.elapsed().as_micros(),
-                            project_snapshot_skipped = true,
-                            "[NATIVE INSPECTION CAPTURE]"
-                        );
-                    }
+                Ok(Some(Some(work))) => work,
+                Ok(Some(None)) => {
                     return;
                 }
                 Ok(None) | Err(_) => {
-                    if debug_native_inspection_enabled() {
-                        tracing::debug!(
-                            generation,
-                            session,
-                            "event=discard_before_capture [NATIVE INSPECTION DEBOUNCE]"
-                        );
-                    }
                     return;
                 }
             };
-            NATIVE_INSPECTIONS_SCHEDULED.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                NATIVE_INSPECTIONS_STARTED.fetch_add(1, Ordering::Relaxed);
-                let active = NATIVE_INSPECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed) + 1;
-                NATIVE_INSPECTIONS_ACTIVE_PEAK.fetch_max(active, Ordering::Relaxed);
-                let started = std::time::Instant::now();
                 let mut diagnostics = compute_unknown_class_inspections(&work.unknown_class);
                 diagnostics.extend(compute_unknown_constant_inspections(&work.unknown_constant));
                 diagnostics.extend(compute_duplicate_class_inspections(&work.duplicate_class));
@@ -2206,16 +2113,6 @@ impl EditorView {
                     generation: work.generation,
                     diagnostics,
                 });
-                NATIVE_INSPECTIONS_FINISHED.fetch_add(1, Ordering::Relaxed);
-                NATIVE_INSPECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
-                if debug_native_inspection_enabled() {
-                    tracing::info!(
-                        generation,
-                        compute_us = started.elapsed().as_micros(),
-                        active,
-                        "[NATIVE INSPECTION WORKER]"
-                    );
-                }
             });
             for _ in 0..600 {
                 gpui::Timer::after(Duration::from_millis(16)).await;
@@ -2228,16 +2125,6 @@ impl EditorView {
             }
         })
         .detach();
-        if debug_native_inspection_enabled() {
-            tracing::debug!(
-                scheduled = NATIVE_INSPECTIONS_SCHEDULED.load(Ordering::Relaxed),
-                started = NATIVE_INSPECTIONS_STARTED.load(Ordering::Relaxed),
-                finished = NATIVE_INSPECTIONS_FINISHED.load(Ordering::Relaxed),
-                discarded_generation = NATIVE_INSPECTIONS_DISCARDED.load(Ordering::Relaxed),
-                active_peak = NATIVE_INSPECTIONS_ACTIVE_PEAK.load(Ordering::Relaxed),
-                "[NATIVE INSPECTION WORKERS]"
-            );
-        }
     }
 
     fn capture_native_inspection_work(
@@ -2246,17 +2133,11 @@ impl EditorView {
         session: DocumentSessionId,
         generation: u64,
     ) -> Option<NativeInspectionWorkItem> {
-        let started = Instant::now();
-        let text_snapshot_us = 0_u128;
-        let project_lock_started = Instant::now();
         let index = self.project_symbols.as_ref()?.try_read().ok()?;
-        let project_lock_wait_us = project_lock_started.elapsed().as_micros();
         if !index.is_ready() {
             return None;
         }
-        let project_symbols_started = Instant::now();
         let symbols = index.symbols().to_vec();
-        let project_symbols_copy_us = project_symbols_started.elapsed().as_micros();
         let project_classes = symbols
             .iter()
             .filter(|s| {
@@ -2300,33 +2181,16 @@ impl EditorView {
                 range: s.range.clone(),
             })
             .collect();
-        let vendor_lock_started = Instant::now();
         let vendor_symbols = self
             .vendor_symbols
             .as_ref()
             .and_then(|v| v.try_read().ok())
             .map(|v| Arc::new(v.clone()));
-        let vendor_lock_wait_us = vendor_lock_started.elapsed().as_micros();
         let semantic_snapshot = self
             .semantic_engine
             .as_ref()
             .map(|engine| engine.snapshot());
         let file_key = PersistentFileKey::workspace_lexical(&self.file_path);
-        if debug_native_inspection_enabled() {
-            tracing::debug!(
-                file_bytes = text.len(),
-                project_lock_wait_us,
-                project_symbols_copy_us,
-                project_symbols_count = symbols.len(),
-                runtime_snapshot_us = 0_u128,
-                vendor_lock_wait_us,
-                vendor_snapshot_us = vendor_lock_wait_us,
-                text_snapshot_us,
-                input_build_us = started.elapsed().as_micros(),
-                project_snapshot_skipped = false,
-                "[NATIVE INSPECTION CAPTURE DETAIL]"
-            );
-        }
         Some(NativeInspectionWorkItem {
             document_session: session,
             generation,
@@ -2368,8 +2232,6 @@ impl EditorView {
             {
                 self.diagnostics.set_native_inspections(result.diagnostics);
                 cx.notify();
-            } else {
-                NATIVE_INSPECTIONS_DISCARDED.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -2410,8 +2272,6 @@ impl EditorView {
     }
 
     fn sync_syntax_text(&mut self, text: &str, edit: Option<&DocumentEdit>) {
-        let started = Instant::now();
-        let mut profile = axiom_syntax::SyntaxUpdateProfile::default();
         if let Some(syntax) = &mut self.syntax {
             let result = match edit {
                 Some(edit) => match syntax
@@ -2426,7 +2286,7 @@ impl EditorView {
                 None => syntax.update_text_profiled(text),
             };
             match result {
-                Ok(value) => profile = value,
+                Ok(_) => {}
                 Err(error) => {
                     self.status = Some(format!("Falha ao atualizar sintaxe PHP: {error}").into())
                 }
@@ -2448,17 +2308,6 @@ impl EditorView {
             })
             .unwrap_or_default();
         self.diagnostics.set_native_syntax(diagnostics);
-        if debug_input_enabled() {
-            tracing::debug!(
-                bytes = text.len(),
-                incremental = profile.incremental,
-                edit_span_bytes = profile.edit_span_bytes,
-                parse_us = profile.parse_us,
-                derived_us = profile.derived_us,
-                total_us = started.elapsed().as_micros(),
-                "[UI SYNTAX DETAIL]"
-            );
-        }
     }
 
     fn sync_lsp(&mut self) {
@@ -2524,13 +2373,6 @@ impl EditorView {
         }
         self.completions.clear();
         let native = self.native_completions();
-        if debug_completion_enabled() {
-            tracing::info!(
-                native_count = native.items.len(),
-                cursor = self.document.cursor_offset(),
-                "[COMPLETION REQUEST]"
-            );
-        }
         if let (Some(lsp), Some(uri), Some(position)) =
             (&self.lsp, &self.lsp_uri, self.lsp_position())
         {
@@ -2705,9 +2547,6 @@ impl EditorView {
             let owner_end = operator_start;
             let (_, owner_expression) = extract_owner_expression(&text, owner_end);
             let owner = owner_expression.trim_start_matches('$');
-            if debug_completion_enabled() && owner_expression.contains("->") {
-                tracing::info!(owner = %owner_expression, "[DEFINITION RECEIVER CHAIN]");
-            }
 
             // For direct instance-member completion, prefer the resident
             // semantic snapshot. It already knows the binding type and walks
@@ -2756,9 +2595,6 @@ impl EditorView {
             if let Some(class_fqn) =
                 self.resolve_receiver_type(&owner_expression, &text[..owner_end])
             {
-                if debug_completion_enabled() {
-                    tracing::info!(trigger = "MemberAccess", receiver_type = %class_fqn, "[COMPLETION CONTEXT]");
-                }
                 let mut members = Vec::new();
                 if let Some(index) = &self.project_symbols
                     && let Ok(index) = index.try_read()
@@ -2810,13 +2646,6 @@ impl EditorView {
                                 .map(|symbol| symbol.fqn.clone())
                         })
                         .unwrap_or_else(|| class_fqn.clone());
-                    if runtime_class_fqn != class_fqn && debug_completion_enabled() {
-                        tracing::info!(
-                            written = %class_fqn,
-                            resolved = %runtime_class_fqn,
-                            "[RUNTIME CLASS RESOLVE]"
-                        );
-                    }
                     members.extend(
                         index
                             .methods_of(&runtime_class_fqn)
@@ -2826,9 +2655,6 @@ impl EditorView {
                                     && (is_static || !symbol.name.starts_with('_'))
                             })
                             .map(|symbol| {
-                                if debug_completion_enabled() {
-                                    tracing::info!(class = %class_fqn, member = %symbol.name, source = %symbol.location.file.display(), "[RUNTIME COMPLETION]");
-                                }
                                 CompletionItem {
                                     label: symbol.name.clone(),
                                     detail: Some(runtime_signature_detail(symbol)),
@@ -2850,10 +2676,6 @@ impl EditorView {
                 }
                 let mut seen = std::collections::HashSet::new();
                 members.retain(|item| seen.insert(item.label.to_ascii_lowercase()));
-                if debug_completion_enabled() {
-                    tracing::info!(runtime_count = members.len(), "[COMPLETION PROVIDER]");
-                    tracing::info!(result_count = members.len(), "[COMPLETION RESULT]");
-                }
                 return NativeCompletionBatch {
                     items: members.into_iter().take(40).collect(),
                     new_prefix: None,
@@ -2869,9 +2691,6 @@ impl EditorView {
                     .into_iter()
                     .take(40)
                     .map(|symbol| {
-                        if debug_completion_enabled() {
-                            tracing::info!(symbol = %symbol.name, source = %symbol.location.file.display(), "[RUNTIME COMPLETION]");
-                        }
                         let import = matches!(symbol.kind, RuntimeKind::Class | RuntimeKind::Interface | RuntimeKind::Trait | RuntimeKind::Enum)
                             .then(|| self.composer_import_edit(&symbol.fqn))
                             .flatten();
@@ -3010,9 +2829,6 @@ impl EditorView {
                 let detail = self
                     .resolve_native_type(&name, context)
                     .map(|ty| ty.to_owned());
-                if debug_completion_enabled() {
-                    tracing::info!(variable = %name, prefix, "[VARIABLE COMPLETION]");
-                }
                 CompletionItem {
                     label: name,
                     detail,
@@ -3124,9 +2940,6 @@ impl EditorView {
                     .collect();
                 if !name.is_empty() {
                     let resolved = self.qualify_type(&name);
-                    if debug_completion_enabled() {
-                        tracing::info!(variable = %variable, written = %name, resolved = %resolved, source = "runtime/project", "[LOCAL TYPE]");
-                    }
                     return Some(resolved);
                 }
             }
@@ -3194,7 +3007,7 @@ impl EditorView {
     fn resolve_receiver_type(&self, owner: &str, context: &str) -> Option<String> {
         let owner = owner.trim();
         if let Some((base, property)) = owner.rsplit_once("->") {
-            let base_type = if base.trim() == "$this" {
+            let _ = if base.trim() == "$this" {
                 declared_class_fqn(context)
             } else {
                 self.resolve_receiver_type(base, context)
@@ -3202,9 +3015,6 @@ impl EditorView {
             }?;
             let property_type = property_type_in_context(context, property.trim())?;
             let resolved = self.resolve_class_name(&property_type, context);
-            if debug_completion_enabled() {
-                tracing::info!(owner, property, base_type = %base_type, resolved = %resolved, "[DEFINITION RECEIVER]");
-            }
             return Some(resolved);
         }
         self.resolve_native_type(owner, context)
@@ -3367,9 +3177,6 @@ impl EditorView {
                 })
         })?;
         let signature = symbol.signature.as_ref()?;
-        if debug_completion_enabled() {
-            tracing::info!(symbol = %format!("{}::{}", symbol.fqn, symbol.name), parameters = signature.parameters.len(), source = %symbol.location.file.display(), "[RUNTIME SIGNATURE]");
-        }
         let active = before[open + 1..].chars().filter(|ch| *ch == ',').count();
         let params = signature
             .parameters
@@ -3855,24 +3662,6 @@ impl EditorView {
         cx.notify();
     }
 
-    fn trace_raw_scroll_event(
-        &self,
-        source: &'static str,
-        event: &'static str,
-        position: Point<Pixels>,
-    ) {
-        if debug_scroll_enabled() {
-            tracing::debug!(
-                source,
-                event,
-                x = ?position.x,
-                y = ?position.y,
-                drag_axis = ?self.editor_scroll_drag_axis,
-                "[SCROLL EVENT RAW]"
-            );
-        }
-    }
-
     fn editor_scroll_drag_start(
         &mut self,
         axis: EditorScrollAxis,
@@ -3882,33 +3671,8 @@ impl EditorView {
     ) {
         let offset = self.scroll.0.borrow().base_handle.offset();
         self.editor_scroll_drag_axis = Some(axis);
-        self.editor_scroll_drag_id = self.editor_scroll_drag_id.wrapping_add(1);
-        self.editor_scroll_drag_started_at = Some(Instant::now());
-        self.editor_scroll_drag_last_move_at = None;
-        self.editor_scroll_drag_last_move_to_frame_us = None;
-        self.editor_scroll_drag_interval_sum_us = 0;
-        self.editor_scroll_drag_move_to_frame_sum_us = 0;
-        self.editor_scroll_drag_move_to_frame_worst_us = 0;
-        self.editor_scroll_drag_moves = 0;
-        self.editor_scroll_drag_viewport_moves = 0;
-        self.editor_scroll_drag_scrollbar_moves = 0;
-        self.editor_scroll_drag_duplicate_moves = 0;
-        self.editor_scroll_drag_frames = 0;
-        self.editor_scroll_drag_offset_repeats = 0;
-        self.editor_scroll_drag_large_jumps = 0;
-        self.editor_scroll_drag_last_offset = Some(offset);
-        self.editor_scroll_drag_last_source = None;
         self.editor_scroll_drag_start = event.position;
         self.editor_scroll_drag_start_offset = offset;
-        if debug_scroll_enabled() {
-            tracing::debug!(
-                drag_id = self.editor_scroll_drag_id,
-                axis = ?axis,
-                mouse = ?event.position,
-                scroll_start = ?offset,
-                "[SCROLLBAR DRAG START]"
-            );
-        }
         cx.notify();
     }
 
@@ -3963,100 +3727,19 @@ impl EditorView {
             EditorScrollAxis::Vertical => next.y = px(-position),
             EditorScrollAxis::Horizontal => next.x = px(-position),
         }
-        let now = Instant::now();
-        let interval_us = self
-            .editor_scroll_drag_last_move_at
-            .map(|last| now.duration_since(last).as_micros());
         let offset_before = handle.offset();
-        let offset_repeated = self.editor_scroll_drag_last_offset == Some(next);
-        let jump_x: f32 = (next.x - offset_before.x).into();
-        let jump_y: f32 = (next.y - offset_before.y).into();
-        let jump = jump_x.abs() > 100.0 || jump_y.abs() > 100.0;
-        self.editor_scroll_drag_moves += 1;
-        match source {
-            EditorScrollEventSource::Viewport => self.editor_scroll_drag_viewport_moves += 1,
-            EditorScrollEventSource::Scrollbar => self.editor_scroll_drag_scrollbar_moves += 1,
-        }
-        if self
-            .editor_scroll_drag_last_source
-            .is_some_and(|last| last != source)
-            && interval_us.is_some_and(|interval| interval < 1_000)
-        {
-            self.editor_scroll_drag_duplicate_moves += 1;
-        }
-        if offset_repeated {
-            self.editor_scroll_drag_offset_repeats += 1;
-        }
-        if jump {
-            self.editor_scroll_drag_large_jumps += 1;
-        }
-        self.editor_scroll_drag_last_move_at = Some(now);
-        if let Some(interval) = interval_us {
-            self.editor_scroll_drag_interval_sum_us += interval;
-        }
-        self.editor_scroll_drag_last_offset = Some(next);
-        self.editor_scroll_drag_last_source = Some(source);
         let changed = next != offset_before;
         if changed {
             handle.set_offset(next);
             cx.notify();
         }
-        if debug_scroll_enabled() {
-            tracing::debug!(
-                drag_id = self.editor_scroll_drag_id,
-                axis = ?axis,
-                handler_source = ?source,
-                timestamp_us = self
-                    .editor_scroll_drag_started_at
-                    .map(|start| start.elapsed().as_micros())
-                    .unwrap_or_default(),
-                interval_us = ?interval_us,
-                mouse_x = ?event.position.x,
-                mouse_y = ?event.position.y,
-                delta_mouse = ?delta,
-                offset_before = ?offset_before,
-                offset_raw = ?next,
-                offset_after = ?handle.offset(),
-                handler_us = 0_u128,
-                notify_called = changed,
-                "[SCROLLBAR DRAG MOVE]"
-            );
-        }
     }
 
     fn editor_scroll_drag_end(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(axis) = self.editor_scroll_drag_axis else {
+        let Some(_axis) = self.editor_scroll_drag_axis else {
             return;
         };
-        if debug_scroll_enabled() {
-            let duration_ms = self
-                .editor_scroll_drag_started_at
-                .map(|start| start.elapsed().as_millis())
-                .unwrap_or_default();
-            let avg_interval_us = self.editor_scroll_drag_moves.saturating_sub(1).max(1);
-            let avg_interval_us =
-                self.editor_scroll_drag_interval_sum_us / u128::from(avg_interval_us);
-            let avg_move_to_frame_us = self.editor_scroll_drag_move_to_frame_sum_us
-                / u128::from(self.editor_scroll_drag_frames.max(1));
-            tracing::debug!(
-                drag_id = self.editor_scroll_drag_id,
-                axis = ?axis,
-                duration_ms,
-                mouse_moves_total = self.editor_scroll_drag_moves,
-                viewport_moves = self.editor_scroll_drag_viewport_moves,
-                scrollbar_moves = self.editor_scroll_drag_scrollbar_moves,
-                duplicate_moves_suspected = self.editor_scroll_drag_duplicate_moves,
-                frames_during_drag = self.editor_scroll_drag_frames,
-                avg_move_interval_us = avg_interval_us,
-                avg_move_to_frame_us,
-                worst_move_to_frame_us = self.editor_scroll_drag_move_to_frame_worst_us,
-                offset_repeated_count = self.editor_scroll_drag_offset_repeats,
-                large_jump_count = self.editor_scroll_drag_large_jumps,
-                "[SCROLLBAR DRAG END]"
-            );
-        }
         self.editor_scroll_drag_axis = None;
-        self.editor_scroll_drag_started_at = None;
         cx.notify();
     }
 
@@ -4799,34 +4482,10 @@ fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
 }
 
 #[cfg(debug_assertions)]
-fn debug_scroll_enabled() -> bool {
-    std::env::var_os("AXIOM_DEBUG_INPUT_SCROLL").is_some_and(|value| {
-        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
-    })
-}
-
-#[cfg(not(debug_assertions))]
-fn debug_scroll_enabled() -> bool {
-    false
-}
-
-#[cfg(debug_assertions)]
 fn debug_input_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     })
-}
-
-#[cfg(debug_assertions)]
-fn debug_native_inspection_enabled() -> bool {
-    std::env::var_os("AXIOM_DEBUG_INPUT_INSPECT").is_some_and(|value| {
-        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
-    })
-}
-
-#[cfg(not(debug_assertions))]
-fn debug_native_inspection_enabled() -> bool {
-    false
 }
 
 #[cfg(debug_assertions)]
@@ -4846,22 +4505,10 @@ fn debug_input_enabled() -> bool {
     false
 }
 
-#[cfg(debug_assertions)]
-fn debug_completion_enabled() -> bool {
-    std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
-        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
-    })
-}
-
 fn utf8_column_to_utf16(line: &str, byte_column: usize) -> usize {
     line.get(..byte_column.min(line.len()))
         .map(|prefix| prefix.encode_utf16().count())
         .unwrap_or_else(|| line.encode_utf16().count())
-}
-
-#[cfg(not(debug_assertions))]
-fn debug_completion_enabled() -> bool {
-    false
 }
 
 impl Render for EditorView {
@@ -5033,36 +4680,6 @@ impl Render for EditorView {
         } else {
             0.0
         };
-        if let Some(axis) = self.editor_scroll_drag_axis {
-            self.editor_scroll_drag_frames += 1;
-            let frame_since_last_move_us = self
-                .editor_scroll_drag_last_move_at
-                .map(|move_at| move_at.elapsed().as_micros());
-            self.editor_scroll_drag_last_move_to_frame_us = frame_since_last_move_us;
-            if let Some(latency) = frame_since_last_move_us {
-                self.editor_scroll_drag_move_to_frame_sum_us += latency;
-                self.editor_scroll_drag_move_to_frame_worst_us =
-                    self.editor_scroll_drag_move_to_frame_worst_us.max(latency);
-            }
-            if debug_scroll_enabled() {
-                tracing::debug!(
-                    drag_id = self.editor_scroll_drag_id,
-                    axis = ?axis,
-                    timestamp_us = self
-                        .editor_scroll_drag_started_at
-                        .map(|start| start.elapsed().as_micros())
-                        .unwrap_or_default(),
-                    offset = ?offset,
-                    thumb_position = if axis == EditorScrollAxis::Vertical {
-                        vertical_top
-                    } else {
-                        horizontal_left
-                    },
-                    frame_since_last_move_us = ?frame_since_last_move_us,
-                    "[SCROLLBAR DRAG FRAME]"
-                );
-            }
-        }
         let line = self.document.line_of_offset(self.document.cursor_offset());
         let line_start = self.document.offset_of_line(line);
         let line_content = self.document.line_content(line);
@@ -5115,30 +4732,6 @@ impl Render for EditorView {
             below_y.min((px(viewport_h) - popup_height).max(px(0.0)))
         };
         popup_y = popup_y.min((px(viewport_h) - popup_height).max(px(0.0)));
-        if self.completions.is_empty() {
-            self.last_completion_layout = None;
-        }
-        if debug_completion_enabled() && !self.completions.is_empty() {
-            let x: f32 = popup_x.into();
-            let y: f32 = popup_y.into();
-            let width: f32 = popup_width.into();
-            let height: f32 = popup_height.into();
-            let key = (x as u32, y as u32, width as u32, height as u32, opens_above);
-            if self.last_completion_layout != Some(key) {
-                self.last_completion_layout = Some(key);
-                tracing::info!(
-                    items = self.completions.len(),
-                    x,
-                    y,
-                    width,
-                    height,
-                    row_height = 28,
-                    max_width = 620,
-                    placement = if opens_above { "above" } else { "below" },
-                    "[COMPLETION LAYOUT]"
-                );
-            }
-        }
         div()
             .flex()
             .flex_col()
@@ -5202,21 +4795,18 @@ impl Render for EditorView {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                            this.trace_raw_scroll_event("viewport", "up", event.position);
                             this.editor_scroll_drag_end(event, window, cx);
                         }),
                     )
                     .on_mouse_up_out(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                            this.trace_raw_scroll_event("viewport", "up_out", event.position);
                             this.editor_scroll_drag_end(event, window, cx);
                         }),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            this.trace_raw_scroll_event("viewport", "down", event.position);
                             this.mouse_down(event, window, cx);
                         }),
                     )
@@ -5261,11 +4851,6 @@ impl Render for EditorView {
                                 .bg(t.scrollbar)
                                 .on_mouse_move(cx.listener(
                                     |this, event: &MouseMoveEvent, window, cx| {
-                                        this.trace_raw_scroll_event(
-                                            "vscroll",
-                                            "move",
-                                            event.position,
-                                        );
                                         this.editor_scroll_drag_move(
                                             EditorScrollEventSource::Scrollbar,
                                             event,
@@ -5277,11 +4862,6 @@ impl Render for EditorView {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                        this.trace_raw_scroll_event(
-                                            "vscroll",
-                                            "down",
-                                            event.position,
-                                        );
                                         this.editor_scroll_drag_start(
                                             EditorScrollAxis::Vertical,
                                             event,
@@ -5293,22 +4873,12 @@ impl Render for EditorView {
                                 .on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                                        this.trace_raw_scroll_event(
-                                            "vscroll",
-                                            "up",
-                                            event.position,
-                                        );
                                         this.editor_scroll_drag_end(event, window, cx);
                                     }),
                                 )
                                 .on_mouse_up_out(
                                     MouseButton::Left,
                                     cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                                        this.trace_raw_scroll_event(
-                                            "vscroll",
-                                            "up_out",
-                                            event.position,
-                                        );
                                         this.editor_scroll_drag_end(event, window, cx);
                                     }),
                                 )
@@ -5343,11 +4913,6 @@ impl Render for EditorView {
                                 .bg(t.scrollbar)
                                 .on_mouse_move(cx.listener(
                                     |this, event: &MouseMoveEvent, window, cx| {
-                                        this.trace_raw_scroll_event(
-                                            "hscroll",
-                                            "move",
-                                            event.position,
-                                        );
                                         this.editor_scroll_drag_move(
                                             EditorScrollEventSource::Scrollbar,
                                             event,
@@ -5359,11 +4924,6 @@ impl Render for EditorView {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                        this.trace_raw_scroll_event(
-                                            "hscroll",
-                                            "down",
-                                            event.position,
-                                        );
                                         this.editor_scroll_drag_start(
                                             EditorScrollAxis::Horizontal,
                                             event,
@@ -5375,22 +4935,12 @@ impl Render for EditorView {
                                 .on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                                        this.trace_raw_scroll_event(
-                                            "hscroll",
-                                            "up",
-                                            event.position,
-                                        );
                                         this.editor_scroll_drag_end(event, window, cx);
                                     }),
                                 )
                                 .on_mouse_up_out(
                                     MouseButton::Left,
                                     cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                                        this.trace_raw_scroll_event(
-                                            "hscroll",
-                                            "up_out",
-                                            event.position,
-                                        );
                                         this.editor_scroll_drag_end(event, window, cx);
                                     }),
                                 )
@@ -5705,13 +5255,6 @@ impl EntityInputHandler for EditorView {
             .unwrap_or_else(|| self.selected_range());
         let smart_arrow =
             text == "-" && range.start == range.end && self.should_expand_member_dash();
-        if smart_arrow && debug_completion_enabled() {
-            tracing::info!(
-                converted = true,
-                receiver = "previous-token",
-                "[SMART ARROW]"
-            );
-        }
         self.document.set_selection(range.start, range.end);
         let insertion = if smart_arrow { "->" } else { text };
         self.insert_text_with_pairs(insertion);

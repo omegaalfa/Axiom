@@ -919,7 +919,7 @@ fn trace_symbol_insert(_: &ProjectSymbol, _: &str) {}
 
 #[cfg(debug_assertions)]
 pub fn trace_path_join(root: &Path, child: &Path, result: &Path, source: &str) {
-    if !std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some_and(|value| {
+    if !std::env::var_os("AXIOM_DEBUG_PATHS").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     }) {
         return;
@@ -1051,7 +1051,7 @@ impl ProjectSymbolIndex {
             files,
         };
         let _ = fs::write(cache_path, serde_json::to_vec(&cache).unwrap_or_default());
-        if std::env::var_os("AXIOM_DEBUG_COMPLETION").is_some() {
+        if std::env::var_os("AXIOM_DEBUG_INPUT").is_some() {
             eprintln!(
                 "[PROJECT CACHE] hit={} reason={} load_ms={}",
                 cached.is_some() && reparsed == 0,
