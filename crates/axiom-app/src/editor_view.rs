@@ -535,9 +535,6 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
             continue;
         };
         let open = arguments_node.start_byte();
-        let Some(close) = arguments_node.end_byte().checked_sub(1) else {
-            continue;
-        };
         if call.kind() == "object_creation_expression" {
             let class_node = call.child_by_field_name("class").or_else(|| {
                 call.named_children(&mut call.walk()).find(|node| {
@@ -583,7 +580,7 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                 || (!arity.variadic && arguments > arity.maximum_count)
             {
                 out.push(ByteDiagnostic {
-                    range: call.byte_range(),
+                    range: arguments_node.start_byte()..arguments_node.end_byte(),
                     severity: Some(DiagnosticSeverity::ERROR),
                     message: if arguments > arity.maximum_count && !arity.variadic {
                         format!(
@@ -729,7 +726,7 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                 let arguments = arguments_node.named_child_count() as usize;
                 if arguments < required || (!variadic && arguments > maximum) {
                     out.push(ByteDiagnostic {
-                        range: callable_start..close + 1,
+                        range: arguments_node.start_byte()..arguments_node.end_byte(),
                         severity: Some(DiagnosticSeverity::ERROR),
                         message: if arguments > maximum && !variadic {
                             format!("Expected at most {maximum} arguments, found {arguments}")
@@ -3815,9 +3812,12 @@ impl EditorView {
             .flat_map(|syntax| syntax.highlights_in(start..end))
             .cloned()
             .collect();
+        // Render at most one marker per line, choosing the most severe
+        // diagnostic when several ranges overlap this line.
         let diagnostic = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.range.end > start && diagnostic.range.start < end);
+            .filter(|diagnostic| diagnostic.range.end > start && diagnostic.range.start < end)
+            .min_by_key(|diagnostic| diagnostic_severity_rank(diagnostic.severity));
         let diagnostic_underline = diagnostic.map(|diagnostic| {
             let from = diagnostic.range.start.max(start) - start;
             let to = diagnostic.range.end.min(end) - start;
@@ -3932,18 +3932,38 @@ impl EditorView {
                 )
             })
             .when_some(diagnostic_underline, |this, (from, to, severity)| {
+                let color = match severity {
+                    Some(DiagnosticSeverity::ERROR) => t.error,
+                    Some(DiagnosticSeverity::WARNING) => t.warning,
+                    Some(DiagnosticSeverity::INFORMATION) => t.info,
+                    Some(DiagnosticSeverity::HINT) => t.accent,
+                    _ => t.warning,
+                };
+                let width: f32 = (to - from).max(px(1.)).into();
+                let wave_step = 2.0_f32;
+                let segment_count = ((width / wave_step).ceil() as usize).max(4);
                 this.child(
                     div()
                         .absolute()
                         .left(px(GUTTER_WIDTH) + px(TEXT_PADDING) + from)
-                        .top(px(LINE_HEIGHT - 3.))
-                        .w((to - from).max(px(1.)))
-                        .h(px(1.))
-                        .bg(if severity == Some(DiagnosticSeverity::ERROR) {
-                            t.error
-                        } else {
-                            t.warning
-                        }),
+                        .top(px(LINE_HEIGHT - 4.))
+                        .w(px(width))
+                        .h(px(4.))
+                        .overflow_hidden()
+                        .children((0..segment_count).map(move |index| {
+                            let phase = index % 4;
+                            div()
+                                .absolute()
+                                .left(px(index as f32 * wave_step))
+                                .top(match phase {
+                                    0 | 2 => px(1.),
+                                    1 => px(0.),
+                                    _ => px(2.),
+                                })
+                                .w(px(wave_step + 1.))
+                                .h(px(0.5))
+                                .bg(color)
+                        })),
                 )
             })
             .into_any_element()
@@ -4709,7 +4729,7 @@ impl Render for EditorView {
                         .map_or(0.0, |v| v.len() as f32 * 6.0 + 12.0)
                     + 54.0
             })
-            .fold(280.0, f32::max);
+            .fold(360.0, f32::max);
         let viewport_width: f32 = viewport.size.width.into();
         let popup_width = px(estimated_width
             .min(520.0)
@@ -5035,7 +5055,7 @@ impl Render for EditorView {
                                                     |row, return_type| {
                                                         row.child(
                                                             div()
-                                                                .max_w(px(120.))
+                                                                .w(px(72.))
                                                                 .flex_none()
                                                                 .overflow_hidden()
                                                                 .ml_1()
@@ -5049,10 +5069,11 @@ impl Render for EditorView {
                                                     |row, source| {
                                                         row.child(
                                                             div()
-                                                                .max_w(px(64.))
+                                                                .w(px(64.))
                                                                 .flex_none()
                                                                 .overflow_hidden()
                                                                 .ml_1()
+                                                                .justify_end()
                                                                 .text_color(t.text_muted)
                                                                 .child(source),
                                                         )
@@ -6217,6 +6238,32 @@ mod diagnostic_store_tests {
         let diagnostics = compute_argument_inspections(&input);
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Expected 1 argument"));
+    }
+
+    #[test]
+    fn argument_diagnostic_range_is_exact_arguments_node() {
+        let text = "<?php class A { public function __construct(string $name) {} } new A();";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("arity-range.php");
+        fs::write(&path, text).unwrap();
+        let mut index = axiom_index::ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = axiom_index::SemanticSnapshot::from_project_index(
+            &index,
+            axiom_index::SemanticRevision(1),
+        );
+        let input = ArgumentInspectionInput {
+            text: Arc::from(text),
+            project_symbols: index.symbols().to_vec(),
+            runtime_symbols: None,
+            semantic_snapshot: Some(Arc::new(snapshot)),
+            file_key: PersistentFileKey::workspace_lexical(&path),
+        };
+        let diagnostics = compute_argument_inspections(&input);
+        let arguments_start = text.rfind("()").expect("arguments node");
+        let expected = arguments_start..arguments_start + 2;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range, expected);
     }
 
     #[test]

@@ -13,8 +13,4 @@ $array = CustomRuntime::hello($name, $age);
 $teste = CustomRuntime::hello($name, $age);
 $teste = new CustomRuntime();
 
-$teste = ArrayIterator::current();
-
-
-    
-    
+$teste = ArrayIterator::current();
