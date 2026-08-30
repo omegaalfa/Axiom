@@ -1,7 +1,8 @@
 use axiom_editor::{Document, DocumentEdit};
 use axiom_index::{
-    DefinitionSyntaxContext, FindUsagesStatus, MemberResolution, PersistentFileKey,
-    ProjectSymbolIndex, ProjectSymbolKind, SemanticEngine, SemanticSnapshot, VendorSymbolIndex,
+    DeclaredType, DefinitionSyntaxContext, FindUsagesStatus, MemberAccess, MemberResolution,
+    PersistentFileKey, ProjectSymbolIndex, ProjectSymbolKind, SemanticEngine, SemanticSnapshot,
+    VendorSymbolIndex,
 };
 use axiom_lsp::{PositionCodec, PositionEncoding, path_to_uri};
 use axiom_php::{RuntimeSymbolIndex, Symbol as RuntimeSymbol, SymbolKind as RuntimeKind};
@@ -539,6 +540,7 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                 | "nullsafe_member_call_expression"
                 | "static_call_expression"
                 | "scoped_call_expression"
+                | "object_creation_expression"
         ) {
             calls.push(node);
         }
@@ -548,13 +550,80 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
 
     let mut out = Vec::new();
     for call in calls {
-        let Some(arguments_node) = call.child_by_field_name("arguments") else {
+        let arguments_node = call.child_by_field_name("arguments").or_else(|| {
+            call.named_children(&mut call.walk())
+                .find(|node| node.kind() == "arguments")
+        });
+        let Some(arguments_node) = arguments_node else {
             continue;
         };
         let open = arguments_node.start_byte();
         let Some(close) = arguments_node.end_byte().checked_sub(1) else {
             continue;
         };
+        if call.kind() == "object_creation_expression" {
+            let class_node = call.child_by_field_name("class").or_else(|| {
+                call.named_children(&mut call.walk()).find(|node| {
+                    matches!(node.kind(), "name" | "qualified_name")
+                })
+            });
+            let Some(class_node) = class_node else {
+                continue;
+            };
+            let class_text = class_node.utf8_text(input.text.as_bytes()).unwrap_or("").trim();
+            let Some(snapshot) = input.semantic_snapshot.as_ref() else {
+                continue;
+            };
+            let Some(scope) = snapshot.scope_id_at(&input.file_key, call.start_byte()) else {
+                continue;
+            };
+            let written = class_text;
+            let Some(resolved) = snapshot.resolve_class_name(scope, written) else {
+                continue;
+            };
+            let receiver = DeclaredType::Named {
+                written: written.to_owned(),
+                resolved: resolved.clone(),
+            };
+            let resolution = snapshot
+                .member_resolver()
+                .resolve_method(scope, &receiver, "__construct", MemberAccess::Instance);
+            let MemberResolution::Resolved(id) = resolution else {
+                // Missing, inaccessible, or incompatible constructors are
+                // handled by their respective semantic policies, not by an
+                // argument-count diagnostic.
+                continue;
+            };
+            let Some(parameters) = snapshot
+                .symbol(id)
+                .and_then(|symbol| symbol.parameters.as_deref())
+            else {
+                continue;
+            };
+            let arity = signature_counts_from_detail(parameters);
+            let arguments = arguments_node.named_child_count() as usize;
+            if arguments < arity.required_count
+                || (!arity.variadic && arguments > arity.maximum_count)
+            {
+                out.push(ByteDiagnostic {
+                    range: call.byte_range(),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: if arguments > arity.maximum_count && !arity.variadic {
+                        format!(
+                            "Expected at most {} arguments, found {arguments}",
+                            arity.maximum_count
+                        )
+                    } else {
+                        format!(
+                            "Expected {} argument{}, found {arguments}",
+                            arity.required_count,
+                            if arity.required_count == 1 { "" } else { "s" }
+                        )
+                    },
+                });
+            }
+            continue;
+        }
         let callable_start = input.text[..open]
             .char_indices()
             .rev()
@@ -1912,12 +1981,22 @@ impl EditorView {
                 let native_started = Instant::now();
                 let native = self.native_completions();
                 let native_total_us = native_started.elapsed().as_micros();
-                let native_empty = native.is_empty();
+                let native_empty = native.items.is_empty();
                 if native_empty {
                     self.completions.clear();
                 } else {
                     let set_started = Instant::now();
-                    self.set_completions(native, cx);
+                    if let Some(prefix_range) = native.new_prefix {
+                        let prefix = &text[prefix_range];
+                        let mut items = native.items;
+                        filter_new_completion_items(&mut items, prefix);
+                        rank_new_completion_items(&mut items, prefix);
+                        self.completions = items;
+                        self.completion_selected = 0;
+                        cx.notify();
+                    } else {
+                        self.set_completions(native.items, cx);
+                    }
                     let set_completions_us = set_started.elapsed().as_micros();
                     let completion_total_us = completion_started.elapsed().as_micros();
                     if debug_ui_stall_enabled() && completion_total_us >= 3_000 {
@@ -2447,7 +2526,7 @@ impl EditorView {
         let native = self.native_completions();
         if debug_completion_enabled() {
             tracing::info!(
-                native_count = native.len(),
+                native_count = native.items.len(),
                 cursor = self.document.cursor_offset(),
                 "[COMPLETION REQUEST]"
             );
@@ -2457,21 +2536,21 @@ impl EditorView {
         {
             lsp.request_completion(uri.clone(), position);
         }
-        if !native.is_empty() {
-            self.set_completions(native, cx);
+        if !native.items.is_empty() {
+            self.set_completions(native.items, cx);
         } else if self.lsp.is_none() {
             self.status = Some("Completion unavailable (no PHP index or language server)".into());
             cx.notify();
         }
     }
 
-    fn native_completions(&self) -> Vec<CompletionItem> {
+    fn native_completions(&self) -> NativeCompletionBatch {
         let _stage = UiStageGuard::new(UI_STAGE_COMPLETION);
         let started = Instant::now();
         let result = self.native_completions_impl();
         if debug_ui_stall_enabled() && started.elapsed().as_micros() >= 3_000 {
             tracing::info!(target: "axiom.ui_stall",
-                candidates = result.len(),
+                candidates = result.items.len(),
                 total_us = started.elapsed().as_micros(),
                 "[UI COMPLETION]"
             );
@@ -2479,7 +2558,7 @@ impl EditorView {
         result
     }
 
-    fn native_completions_impl(&self) -> Vec<CompletionItem> {
+    fn native_completions_impl(&self) -> NativeCompletionBatch {
         let text = self.document.content();
         let cursor = self.document.cursor_offset().min(text.len());
         let before = &text[..cursor];
@@ -2515,14 +2594,20 @@ impl EditorView {
         let prefix = &text[start..cursor];
         let preceded_by_new = before[..start].trim_end().ends_with("new");
         if prefix.starts_with('$') {
-            return self.local_variable_completions(&text[..cursor], prefix);
+            return NativeCompletionBatch {
+                items: self.local_variable_completions(&text[..cursor], prefix),
+                new_prefix: None,
+            };
         }
         let empty_prefix_context = before.ends_with("new ")
             || before.ends_with("extends ")
             || before.ends_with("implements ")
             || before.ends_with("use ");
         if prefix.is_empty() && member_operator.is_none() && !empty_prefix_context {
-            return Vec::new();
+            return NativeCompletionBatch {
+                items: Vec::new(),
+                new_prefix: None,
+            };
         }
         // A class name by itself is also a static-access completion context.
         // This lets `CustomRuntime` expand directly to
@@ -2610,7 +2695,10 @@ impl EditorView {
                         ..Default::default()
                     });
                 }
-                return items.into_iter().take(40).collect();
+                return NativeCompletionBatch {
+                    items: items.into_iter().take(40).collect(),
+                    new_prefix: None,
+                };
             }
         }
         if let Some((operator_start, is_static)) = member_operator {
@@ -2658,7 +2746,10 @@ impl EditorView {
                         })
                         .take(40)
                         .collect::<Vec<_>>();
-                    return members;
+                    return NativeCompletionBatch {
+                        items: members,
+                        new_prefix: None,
+                    };
                 }
             }
 
@@ -2763,7 +2854,10 @@ impl EditorView {
                     tracing::info!(runtime_count = members.len(), "[COMPLETION PROVIDER]");
                     tracing::info!(result_count = members.len(), "[COMPLETION RESULT]");
                 }
-                return members.into_iter().take(40).collect();
+                return NativeCompletionBatch {
+                    items: members.into_iter().take(40).collect(),
+                    new_prefix: None,
+                };
             }
         }
         let mut items = self
@@ -2891,7 +2985,10 @@ impl EditorView {
                 item.detail.as_deref().unwrap_or_default()
             ))
         });
-        items.into_iter().take(40).collect()
+        NativeCompletionBatch {
+            items: items.into_iter().take(40).collect(),
+            new_prefix: preceded_by_new.then_some(start..cursor),
+        }
     }
 
     fn local_variable_completions(&self, context: &str, prefix: &str) -> Vec<CompletionItem> {
@@ -4199,6 +4296,11 @@ impl EditorView {
     }
 }
 
+struct NativeCompletionBatch {
+    items: Vec<CompletionItem>,
+    new_prefix: Option<std::ops::Range<usize>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FindUsagesSource {
     Semantic,
@@ -4677,6 +4779,16 @@ fn rank_new_completion_items(items: &mut [CompletionItem], prefix: &str) {
             _ => 1_u8,
         };
         (text_rank, source_rank, kind_rank)
+    });
+}
+
+fn filter_new_completion_items(items: &mut Vec<CompletionItem>, prefix: &str) {
+    if prefix.is_empty() {
+        return;
+    }
+    items.retain(|item| {
+        item.label.eq_ignore_ascii_case(prefix)
+            || starts_with_ascii_case_insensitive(&item.label, prefix)
     });
 }
 
@@ -5921,7 +6033,7 @@ fn shape(window: &mut Window, text: &str) -> gpui::ShapedLine {
 
 #[cfg(test)]
 mod completion_ranking_tests {
-    use super::rank_new_completion_items;
+    use super::{filter_new_completion_items, rank_new_completion_items};
     use lsp_types::{CompletionItem, CompletionItemKind};
 
     fn item(label: &str, detail: &str, kind: CompletionItemKind) -> CompletionItem {
@@ -5984,6 +6096,17 @@ mod completion_ranking_tests {
         assert_eq!(items, original);
         rank_new_completion_items(&mut items, "Z");
         assert_ne!(items, original);
+    }
+
+    #[test]
+    fn new_prefix_filter_removes_candidates_from_previous_prefixes() {
+        let mut items = vec![
+            item("ArrayIterator", "ArrayIterator • Runtime", CompletionItemKind::CLASS),
+            item("Base", "Base • Project", CompletionItemKind::CLASS),
+            item("Child", "App\\Child • Project", CompletionItemKind::CLASS),
+        ];
+        filter_new_completion_items(&mut items, "Chil");
+        assert_eq!(items.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(), vec!["Child"]);
     }
 }
 
@@ -6386,8 +6509,10 @@ mod diagnostic_store_tests {
     use super::{
         ArgumentInspectionInput, ByteDiagnostic, DiagnosticStore, DuplicateClassDeclaration,
         DuplicateClassInspectionInput, PersistentFileKey, UnknownConstantInspectionInput,
+        ParameterArity,
         compute_argument_inspections, compute_duplicate_class_inspections,
         compute_unknown_constant_inspections,
+        signature_counts_from_detail,
     };
     use std::fs;
     use std::sync::Arc;
@@ -6508,6 +6633,30 @@ mod diagnostic_store_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("semantic.php");
         let text = "<?php class Base { public function run(int $value): void {} } class Child extends Base {} function test(Child $child): void { $child->run(); }";
+        fs::write(&path, text).unwrap();
+        let mut index = axiom_index::ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = axiom_index::SemanticSnapshot::from_project_index(
+            &index,
+            axiom_index::SemanticRevision(1),
+        );
+        let input = ArgumentInspectionInput {
+            text: Arc::from(text),
+            project_symbols: index.symbols().to_vec(),
+            runtime_symbols: None,
+            semantic_snapshot: Some(Arc::new(snapshot)),
+            file_key: PersistentFileKey::workspace_lexical(&path),
+        };
+        let diagnostics = compute_argument_inspections(&input);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("Expected 1 argument"));
+    }
+
+    #[test]
+    fn argument_inspection_validates_object_creation_constructors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("constructors.php");
+        let text = "<?php class Base { public function __construct(string $name) {} } class Child extends Base {} class Optional { public function __construct(?string $value = null) {} } class Variadic { public function __construct(...$values) {} } new Child(); new Child(\"ok\"); new Optional(); new Variadic();";
         fs::write(&path, text).unwrap();
         let mut index = axiom_index::ProjectSymbolIndex::new();
         index.index_project(dir.path()).unwrap();
