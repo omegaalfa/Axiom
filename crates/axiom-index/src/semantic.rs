@@ -3518,7 +3518,7 @@ fn extract_assignments(builder: &mut SnapshotBuilder, root: tree_sitter::Node<'_
             };
             let name = node_text(left, text).trim();
             if name.starts_with('$') {
-                if let Some(scope) = innermost_callable_scope(builder, node.start_byte()) {
+                if let Some(scope) = assignment_scope(builder, node.start_byte()) {
                     let right_text = node_text(right, text).trim();
                     let raw_type = if right.kind() == "object_creation_expression" {
                         right
@@ -3559,7 +3559,13 @@ fn extract_assignments(builder: &mut SnapshotBuilder, root: tree_sitter::Node<'_
                         if let Some(existing) =
                             bindings.iter_mut().find(|existing| existing.name == name)
                         {
-                            *existing = binding;
+                            // AST traversal is stack-based, so assignments
+                            // may be visited in reverse source order. Keep
+                            // the binding from the latest source assignment
+                            // regardless of traversal order.
+                            if existing.declaration_span.start <= binding.declaration_span.start {
+                                *existing = binding;
+                            }
                         } else {
                             bindings.push(binding);
                         }
@@ -4233,6 +4239,45 @@ fn innermost_callable_scope(builder: &SnapshotBuilder, offset: usize) -> Option<
         })
         .max_by_key(|scope| scope.span.start)
         .map(|scope| scope.id)
+}
+
+/// Selects the lexical scope that owns an assignment. Callable scopes take
+/// precedence; assignments at namespace/file level are attached to the most
+/// specific Namespace scope, falling back to the file scope.
+fn assignment_scope(builder: &SnapshotBuilder, offset: usize) -> Option<ScopeId> {
+    innermost_callable_scope(builder, offset).or_else(|| {
+        let namespaces = builder
+            .scopes
+            .records
+            .iter()
+            .filter(|scope| {
+                scope.kind == ScopeKind::Namespace && scope.span.contains(&offset)
+            });
+        namespaces
+            .max_by_key(|scope| scope.span.start)
+            .or_else(|| {
+                // Tree-sitter represents unbracketed namespace bodies with a
+                // declaration span that may end before the body. In that
+                // form, the active namespace is the latest declaration before
+                // the assignment offset.
+                builder
+                    .scopes
+                    .records
+                    .iter()
+                    .filter(|scope| {
+                        scope.kind == ScopeKind::Namespace && scope.span.start <= offset
+                    })
+                    .max_by_key(|scope| scope.span.start)
+            })
+            .map(|scope| scope.id)
+    }).or_else(|| {
+        builder
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::File && scope.span.contains(&offset))
+            .map(|scope| scope.id)
+    })
 }
 
 fn nearest_namespace(builder: &SnapshotBuilder, mut scope: ScopeId) -> String {
@@ -6498,6 +6543,94 @@ class ParentChild extends ParentBase {
                 written: "Future".into(),
                 resolved: "App\\Future".into()
             })
+        );
+    }
+
+    #[test]
+    fn global_new_assignment_registers_in_namespace_scope() {
+        let text = "<?php namespace App; class Child {} $child = new Child();";
+        let snapshot =
+            SnapshotBuilder::from_php_text("global.php", text, SemanticRevision(1)).build();
+        let namespace = snapshot
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::Namespace && scope.namespace == "App")
+            .unwrap();
+        assert_eq!(
+            snapshot.lookup_binding(namespace.id, "$child").unwrap().declared_type,
+            Some(DeclaredType::Named {
+                written: "Child".into(),
+                resolved: "App\\Child".into()
+            })
+        );
+    }
+
+    #[test]
+    fn global_new_assignment_without_namespace_uses_file_scope() {
+        let text = "<?php class Child {} $child = new Child();";
+        let snapshot =
+            SnapshotBuilder::from_php_text("global.php", text, SemanticRevision(1)).build();
+        let file = snapshot
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::File)
+            .unwrap();
+        assert!(snapshot.lookup_binding(file.id, "$child").is_some());
+    }
+
+    #[test]
+    fn namespace_bindings_do_not_contaminate_each_other_and_local_shadows_global() {
+        let text = r#"<?php
+namespace One;
+class A {}
+$value = new A();
+function run() { $value = new A(); return $value; }
+namespace Two;
+class B {}
+$value = new B();
+"#;
+        let snapshot =
+            SnapshotBuilder::from_php_text("namespaces.php", text, SemanticRevision(1)).build();
+        let namespaces: Vec<_> = snapshot
+            .scopes
+            .records
+            .iter()
+            .filter(|scope| scope.kind == ScopeKind::Namespace)
+            .collect();
+        let one = namespaces.iter().find(|scope| scope.namespace == "One").unwrap();
+        let two = namespaces.iter().find(|scope| scope.namespace == "Two").unwrap();
+        assert_eq!(
+            snapshot.lookup_binding(one.id, "$value").unwrap().declared_type,
+            Some(DeclaredType::Named { written: "A".into(), resolved: "One\\A".into() })
+        );
+        assert_eq!(
+            snapshot.lookup_binding(two.id, "$value").unwrap().declared_type,
+            Some(DeclaredType::Named { written: "B".into(), resolved: "Two\\B".into() })
+        );
+        let function = namespaces
+            .iter()
+            .flat_map(|scope| snapshot.scopes.records.iter().filter(move |child| {
+                child.parent == Some(scope.id) && child.kind == ScopeKind::Function
+            }))
+            .next()
+            .unwrap();
+        assert_eq!(
+            snapshot.lookup_binding(function.id, "$value").unwrap().declared_type,
+            Some(DeclaredType::Named { written: "A".into(), resolved: "One\\A".into() })
+        );
+    }
+
+    #[test]
+    fn later_global_assignment_replaces_binding_in_same_scope() {
+        let text = "<?php class A {} class B {} $value = new A(); $value = new B();";
+        let snapshot =
+            SnapshotBuilder::from_php_text("later.php", text, SemanticRevision(1)).build();
+        let file = snapshot.scopes.records.iter().find(|scope| scope.kind == ScopeKind::File).unwrap();
+        assert_eq!(
+            snapshot.lookup_binding(file.id, "$value").unwrap().declared_type,
+            Some(DeclaredType::Named { written: "B".into(), resolved: "B".into() })
         );
     }
 

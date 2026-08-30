@@ -1,7 +1,7 @@
 use axiom_editor::{Document, DocumentEdit};
 use axiom_index::{
-    DefinitionSyntaxContext, FindUsagesStatus, PersistentFileKey, ProjectSymbolIndex,
-    ProjectSymbolKind, SemanticEngine, VendorSymbolIndex,
+    DefinitionSyntaxContext, FindUsagesStatus, MemberResolution, PersistentFileKey,
+    ProjectSymbolIndex, ProjectSymbolKind, SemanticEngine, SemanticSnapshot, VendorSymbolIndex,
 };
 use axiom_lsp::{PositionCodec, PositionEncoding, path_to_uri};
 use axiom_php::{RuntimeSymbolIndex, Symbol as RuntimeSymbol, SymbolKind as RuntimeKind};
@@ -521,33 +521,39 @@ struct ArgumentInspectionInput {
     text: Arc<str>,
     project_symbols: Vec<axiom_index::ProjectSymbol>,
     runtime_symbols: Option<Arc<RuntimeSymbolIndex>>,
+    semantic_snapshot: Option<Arc<SemanticSnapshot>>,
+    file_key: PersistentFileKey,
 }
 
 fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiagnostic> {
-    let mut out = Vec::new();
-    let mut search = 0;
-    while let Some(relative) = input.text[search..].find('(') {
-        let open = search + relative;
-        let code = PhpSyntax::parse(input.text.as_ref())
-            .ok()
-            .is_some_and(|syntax| {
-                syntax
-                    .tree()
-                    .root_node()
-                    .descendant_for_byte_range(open, open + 1)
-                    .is_some_and(|node| {
-                        !matches!(
-                            node.kind(),
-                            "comment" | "string" | "encapsed_string" | "heredoc" | "nowdoc"
-                        )
-                    })
-            });
-        if !code {
-            search = open.saturating_add(1);
-            continue;
+    let Ok(syntax) = PhpSyntax::parse(input.text.as_ref()) else {
+        return Vec::new();
+    };
+    let mut pending = vec![syntax.tree().root_node()];
+    let mut calls = Vec::new();
+    while let Some(node) = pending.pop() {
+        if matches!(
+            node.kind(),
+            "function_call_expression"
+                | "member_call_expression"
+                | "nullsafe_member_call_expression"
+                | "static_call_expression"
+                | "scoped_call_expression"
+        ) {
+            calls.push(node);
         }
-        let Some(close) = matching_paren(&input.text, open) else {
-            break;
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    calls.sort_by_key(|node| node.start_byte());
+
+    let mut out = Vec::new();
+    for call in calls {
+        let Some(arguments_node) = call.child_by_field_name("arguments") else {
+            continue;
+        };
+        let open = arguments_node.start_byte();
+        let Some(close) = arguments_node.end_byte().checked_sub(1) else {
+            continue;
         };
         let callable_start = input.text[..open]
             .char_indices()
@@ -594,47 +600,87 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                         resolve_php_class_name(owner, &input.text)
                     }
                 });
-            let symbol = owner
-                .as_deref()
-                .and_then(|o| {
-                    input.project_symbols.iter().find(|s| {
-                        s.kind == ProjectSymbolKind::Method
-                            && s.fully_qualified_name.starts_with(&format!("{o}::"))
-                            && s.name == name
-                    })
+            let semantic_method = if matches!(
+                call.kind(),
+                "member_call_expression" | "nullsafe_member_call_expression"
+            ) {
+                let receiver = call
+                    .child_by_field_name("object")
+                    .filter(|node| node.kind() == "variable_name")
+                    .and_then(|node| node.utf8_text(input.text.as_bytes()).ok())
+                    .map(str::trim)
+                    .map(str::to_owned);
+                input.semantic_snapshot.as_ref().and_then(|snapshot| {
+                    let scope = snapshot.scope_id_at(&input.file_key, call.start_byte())?;
+                    let receiver = receiver.as_deref()?;
+                    match snapshot
+                        .member_resolver()
+                        .resolve_binding_method(scope, receiver, name)
+                    {
+                        MemberResolution::Resolved(id) => Some(id),
+                        _ => None,
+                    }
                 })
-                .or_else(|| {
-                    owner
-                        .is_none()
-                        .then(|| {
-                            input
-                                .project_symbols
-                                .iter()
-                                .find(|s| s.kind == ProjectSymbolKind::Function && s.name == name)
+            } else {
+                None
+            };
+            let symbol = if semantic_method.is_none() {
+                owner
+                    .as_deref()
+                    .and_then(|o| {
+                        input.project_symbols.iter().find(|s| {
+                            s.kind == ProjectSymbolKind::Method
+                                && s.fully_qualified_name.starts_with(&format!("{o}::"))
+                                && s.name == name
                         })
-                        .flatten()
-                });
-            let detail = symbol
+                    })
+                    .or_else(|| {
+                        owner
+                            .is_none()
+                            .then(|| {
+                                input.project_symbols.iter().find(|s| {
+                                    s.kind == ProjectSymbolKind::Function && s.name == name
+                                })
+                            })
+                            .flatten()
+                    })
+            } else {
+                None
+            };
+            let detail = semantic_method
+                .and_then(|id| input.semantic_snapshot.as_ref()?.symbol(id))
                 .and_then(|s| s.parameters.as_deref())
-                .map(signature_counts_from_detail);
+                .map(signature_counts_from_detail)
+                .or_else(|| {
+                    symbol
+                        .and_then(|s| s.parameters.as_deref())
+                        .map(signature_counts_from_detail)
+                });
             let runtime_detail = input.runtime_symbols.as_ref().and_then(|r| {
                 owner
                     .as_deref()
                     .and_then(|o| r.methods_of(o).find(|s| s.name == name))
                     .and_then(|s| s.signature.as_ref())
-                    .map(|s| {
-                        (
-                            s.parameters
-                                .iter()
-                                .filter(|p| !p.optional && !p.variadic)
-                                .count(),
-                            s.parameters.len(),
-                            s.parameters.iter().any(|p| p.variadic),
-                        )
+                    .map(|s| ParameterArity {
+                        required_count: s
+                            .parameters
+                            .iter()
+                            .filter(|p| !p.optional && !p.variadic)
+                            .count(),
+                        maximum_count: s.parameters.len(),
+                        variadic: s.parameters.iter().any(|p| p.variadic),
                     })
             });
-            if let Some((required, maximum, variadic)) = runtime_detail.or(detail) {
-                let arguments = count_call_arguments(&input.text[open + 1..close]);
+            let counts = if semantic_method.is_some() {
+                detail
+            } else {
+                runtime_detail.or(detail)
+            };
+            if let Some(arity) = counts {
+                let required = arity.required_count;
+                let maximum = arity.maximum_count;
+                let variadic = arity.variadic;
+                let arguments = arguments_node.named_child_count() as usize;
                 if arguments < required || (!variadic && arguments > maximum) {
                     out.push(ByteDiagnostic {
                         range: callable_start..close + 1,
@@ -651,7 +697,6 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                 }
             }
         }
-        search = close.saturating_add(1);
     }
     out
 }
@@ -1846,46 +1891,56 @@ impl EditorView {
         self.schedule_incremental_index_update(&text);
         let semantic_schedule_us = semantic_started.elapsed().as_micros();
         let completion_started = Instant::now();
-        let trigger_started = Instant::now();
-        self.maybe_trigger_completion();
-        let trigger_us = trigger_started.elapsed().as_micros();
-        let cursor = self.document.cursor_offset();
-        let content = self.document.content();
-        if cursor > 0 && matches!(content[..cursor].chars().next_back(), Some('(' | ',')) {
-            self.hover_popup = self.native_signature_help();
-            self.hover_anchor = None;
-        }
-        let native_started = Instant::now();
-        let native = self.native_completions();
-        let native_total_us = native_started.elapsed().as_micros();
-        let native_empty = native.is_empty();
         let clear_started = Instant::now();
-        if native_empty {
-            self.completions.clear();
-        } else {
-            let set_started = Instant::now();
-            self.set_completions(native, cx);
-            let set_completions_us = set_started.elapsed().as_micros();
-            let completion_total_us = completion_started.elapsed().as_micros();
-            if debug_ui_stall_enabled() && completion_total_us >= 3_000 {
-                tracing::info!(target: "axiom.ui_stall",
-                    trigger_us,
-                    native_total_us,
-                    project_search_us = 0_u128,
-                    vendor_search_us = 0_u128,
-                    runtime_search_us = 0_u128,
-                    member_resolution_us = 0_u128,
-                    import_edits_us = 0_u128,
-                    set_completions_us,
-                    clear_completions_us = clear_started.elapsed().as_micros(),
-                    other_us = completion_total_us.saturating_sub(
-                        trigger_us + native_total_us + set_completions_us,
-                    ),
-                    total_us = completion_total_us,
-                    "[UI COMPLETION DETAIL]"
-                );
-            }
-        }
+        let (trigger_us, native_total_us, native_empty) =
+            if !self.is_php_completion_context() {
+                // Keep the rest of the edit pipeline (syntax, indexing, LSP
+                // text synchronization, cursor and rendering) active for
+                // generic files, but never enter the PHP completion pipeline.
+                self.completions.clear();
+                (0_u128, 0_u128, true)
+            } else {
+                let trigger_started = Instant::now();
+                self.maybe_trigger_completion();
+                let trigger_us = trigger_started.elapsed().as_micros();
+                let cursor = self.document.cursor_offset();
+                let content = self.document.content();
+                if cursor > 0 && matches!(content[..cursor].chars().next_back(), Some('(' | ',')) {
+                    self.hover_popup = self.native_signature_help();
+                    self.hover_anchor = None;
+                }
+                let native_started = Instant::now();
+                let native = self.native_completions();
+                let native_total_us = native_started.elapsed().as_micros();
+                let native_empty = native.is_empty();
+                if native_empty {
+                    self.completions.clear();
+                } else {
+                    let set_started = Instant::now();
+                    self.set_completions(native, cx);
+                    let set_completions_us = set_started.elapsed().as_micros();
+                    let completion_total_us = completion_started.elapsed().as_micros();
+                    if debug_ui_stall_enabled() && completion_total_us >= 3_000 {
+                        tracing::info!(target: "axiom.ui_stall",
+                            trigger_us,
+                            native_total_us,
+                            project_search_us = 0_u128,
+                            vendor_search_us = 0_u128,
+                            runtime_search_us = 0_u128,
+                            member_resolution_us = 0_u128,
+                            import_edits_us = 0_u128,
+                            set_completions_us,
+                            clear_completions_us = clear_started.elapsed().as_micros(),
+                            other_us = completion_total_us.saturating_sub(
+                                trigger_us + native_total_us + set_completions_us,
+                            ),
+                            total_us = completion_total_us,
+                            "[UI COMPLETION DETAIL]"
+                        );
+                    }
+                }
+                (trigger_us, native_total_us, native_empty)
+            };
         let completion_us = completion_started.elapsed().as_micros();
         if native_empty {
             if debug_ui_stall_enabled() && completion_us >= 3_000 {
@@ -2173,6 +2228,11 @@ impl EditorView {
             .and_then(|v| v.try_read().ok())
             .map(|v| Arc::new(v.clone()));
         let vendor_lock_wait_us = vendor_lock_started.elapsed().as_micros();
+        let semantic_snapshot = self
+            .semantic_engine
+            .as_ref()
+            .map(|engine| engine.snapshot());
+        let file_key = PersistentFileKey::workspace_lexical(&self.file_path);
         if debug_native_inspection_enabled() {
             tracing::debug!(
                 file_bytes = text.len(),
@@ -2212,6 +2272,8 @@ impl EditorView {
                 text,
                 project_symbols: symbols,
                 runtime_symbols: self.runtime_symbols.clone(),
+                semantic_snapshot,
+                file_key,
             },
         })
     }
@@ -2254,6 +2316,13 @@ impl EditorView {
         {
             lsp.request_completion(uri.clone(), position);
         }
+    }
+
+    /// Returns whether the current document can enter the PHP completion
+    /// pipeline. This is intentionally O(1) and metadata-only: no text
+    /// snapshot, parsing, filesystem access, or provider lookup is involved.
+    fn is_php_completion_context(&self) -> bool {
+        is_php_file(&self.file_path)
     }
 
     fn sync_syntax(&mut self) {
@@ -2367,11 +2436,9 @@ impl EditorView {
     }
 
     fn complete(&mut self, _: &Complete, _: &mut Window, cx: &mut Context<Self>) {
-        // Axiom currently has no resident embedded-language map. Until one
-        // exists, the already-detected PHP file kind is the authoritative
-        // O(1) completion gate; importantly, this runs before any document
-        // snapshot or provider lookup.
-        if !is_php_file(&self.file_path) {
+        // Keep manual completion on the same cheap, metadata-only gate used
+        // by the automatic after-edit path.
+        if !self.is_php_completion_context() {
             self.completions.clear();
             cx.notify();
             return;
@@ -2812,6 +2879,9 @@ impl EditorView {
                     ..Default::default()
                 }
             }));
+        }
+        if preceded_by_new {
+            rank_new_completion_items(&mut items, prefix);
         }
         let mut seen = std::collections::HashSet::new();
         items.retain(|item| {
@@ -4572,6 +4642,50 @@ fn completion_icon(kind: Option<CompletionItemKind>) -> &'static str {
     }
 }
 
+/// Orders candidates already collected for a `new <prefix>` context. This is
+/// deliberately a presentation-only ranking pass: it performs no lookups and
+/// uses only the existing label, detail/source and kind fields.
+fn rank_new_completion_items(items: &mut [CompletionItem], prefix: &str) {
+    items.sort_by_key(|item| {
+        let text_rank = if !prefix.is_empty() && item.label.eq_ignore_ascii_case(prefix) {
+            0_u8 // exact short-name match
+        } else if !prefix.is_empty() && starts_with_ascii_case_insensitive(&item.label, prefix) {
+            1_u8 // short-name prefix match
+        } else {
+            2_u8 // other candidates already accepted by the provider
+        };
+        let source_rank = item
+            .detail
+            .as_deref()
+            .map(|detail| {
+                if detail.contains("Project") {
+                    0_u8
+                } else if detail.contains("Vendor") {
+                    1_u8
+                } else if detail.contains("Runtime") {
+                    2_u8
+                } else {
+                    1_u8
+                }
+            })
+            .unwrap_or(1);
+        let kind_rank = match item.kind {
+            Some(CompletionItemKind::CLASS)
+            | Some(CompletionItemKind::CONSTRUCTOR)
+            | Some(CompletionItemKind::INTERFACE)
+            | Some(CompletionItemKind::ENUM) => 0_u8,
+            _ => 1_u8,
+        };
+        (text_rank, source_rank, kind_rank)
+    });
+}
+
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 #[cfg(debug_assertions)]
 fn debug_scroll_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT_SCROLL").is_some_and(|value| {
@@ -5647,8 +5761,21 @@ fn trim_eol(text: &str) -> &str {
 
 fn matching_paren(text: &str, open: usize) -> Option<usize> {
     let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
     for (offset, ch) in text[open..].char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
         match ch {
+            '\'' | '"' => quote = Some(ch),
             '(' => depth += 1,
             ')' => {
                 depth = depth.checked_sub(1)?;
@@ -5662,21 +5789,40 @@ fn matching_paren(text: &str, open: usize) -> Option<usize> {
     None
 }
 
-fn signature_counts_from_detail(detail: &str) -> (usize, usize, bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParameterArity {
+    required_count: usize,
+    maximum_count: usize,
+    variadic: bool,
+}
+
+fn signature_counts_from_detail(detail: &str) -> ParameterArity {
     let Some(open) = detail.find('(') else {
-        return (0, 0, false);
+        return ParameterArity {
+            required_count: 0,
+            maximum_count: 0,
+            variadic: false,
+        };
     };
     let Some(close) = matching_paren(detail, open) else {
-        return (0, 0, false);
+        return ParameterArity {
+            required_count: 0,
+            maximum_count: 0,
+            variadic: false,
+        };
     };
     let parameters = &detail[open + 1..close];
     if parameters.trim().is_empty() {
-        return (0, 0, false);
+        return ParameterArity {
+            required_count: 0,
+            maximum_count: 0,
+            variadic: false,
+        };
     }
     let mut required = 0;
     let mut maximum = 0;
     let mut variadic = false;
-    for parameter in parameters.split(',') {
+    for parameter in split_signature_parameters(parameters) {
         let parameter = parameter.trim();
         if parameter.is_empty() {
             continue;
@@ -5689,25 +5835,45 @@ fn signature_counts_from_detail(detail: &str) -> (usize, usize, bool) {
             required += 1;
         }
     }
-    (required, maximum, variadic)
+    ParameterArity {
+        required_count: required,
+        maximum_count: maximum,
+        variadic,
+    }
 }
 
-fn count_call_arguments(arguments: &str) -> usize {
-    let trimmed = arguments.trim();
-    if trimmed.is_empty() {
-        return 0;
-    }
-    let mut depth = 0usize;
-    let mut count = 1usize;
-    for ch in trimmed.chars() {
+/// Splits a PHP parameter list only at top-level commas. Types and defaults
+/// may contain nested arrays/calls and quoted strings with commas.
+fn split_signature_parameters(parameters: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut nesting = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in parameters.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
         match ch {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => count += 1,
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => nesting += 1,
+            ')' | ']' | '}' => nesting = nesting.saturating_sub(1),
+            ',' if nesting == 0 => {
+                result.push(&parameters[start..offset]);
+                start = offset + ch.len_utf8();
+            }
             _ => {}
         }
     }
-    count
+    result.push(&parameters[start..]);
+    result
 }
 
 fn strip_snippet_placeholders(snippet: &str) -> String {
@@ -5751,6 +5917,74 @@ fn shape(window: &mut Window, text: &str) -> gpui::ShapedLine {
         strikethrough: None,
     };
     window.text_system().shape_line(text, px(14.), &[run], None)
+}
+
+#[cfg(test)]
+mod completion_ranking_tests {
+    use super::rank_new_completion_items;
+    use lsp_types::{CompletionItem, CompletionItemKind};
+
+    fn item(label: &str, detail: &str, kind: CompletionItemKind) -> CompletionItem {
+        CompletionItem {
+            label: label.to_owned(),
+            detail: Some(detail.to_owned()),
+            kind: Some(kind),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exact_new_class_is_ranked_first() {
+        let mut items = vec![
+            item("ArrayIterator", "ArrayIterator • PHP Runtime", CompletionItemKind::CLASS),
+            item("AliasStatus", "AliasStatus • PHP Runtime", CompletionItemKind::CLASS),
+            item("ChildService", "App\\ChildService • Project", CompletionItemKind::CLASS),
+            item("A", "App\\A • Project", CompletionItemKind::CLASS),
+        ];
+        rank_new_completion_items(&mut items, "A");
+        assert_eq!(items[0].label, "A");
+    }
+
+    #[test]
+    fn prefix_beats_non_matching_project_and_exact_is_case_insensitive() {
+        let mut items = vec![
+            item("ArrayIterator", "ArrayIterator • Project", CompletionItemKind::CLASS),
+            item("Base", "Base • Project", CompletionItemKind::CLASS),
+            item("Baz", "Baz • Project", CompletionItemKind::CLASS),
+            item("ChildImplementation", "ChildImplementation • Runtime", CompletionItemKind::CLASS),
+            item("CHILD", "App\\Child • Project", CompletionItemKind::CLASS),
+        ];
+        rank_new_completion_items(&mut items, "Child");
+        assert_eq!(items[0].label, "CHILD");
+        assert_eq!(items[1].label, "ChildImplementation");
+        assert!(items[2..].iter().all(|candidate| {
+            !candidate.label.starts_with("Child")
+        }));
+    }
+
+    #[test]
+    fn project_wins_when_textual_match_is_equivalent() {
+        let mut items = vec![
+            item("Alpha", "Alpha • PHP Runtime", CompletionItemKind::CLASS),
+            item("Alpha", "App\\Alpha • Project", CompletionItemKind::CLASS),
+        ];
+        rank_new_completion_items(&mut items, "Al");
+        assert_eq!(items[0].detail.as_deref(), Some("App\\Alpha • Project"));
+    }
+
+    #[test]
+    fn ranking_is_stable_for_non_new_contexts() {
+        let mut items = vec![
+            item("Beta", "Beta • PHP Runtime", CompletionItemKind::CLASS),
+            item("Alpha", "App\\Alpha • Project", CompletionItemKind::CLASS),
+        ];
+        let original = items.clone();
+        // The helper is only invoked for `new`; other contexts retain their
+        // existing provider order because no ranking pass is applied.
+        assert_eq!(items, original);
+        rank_new_completion_items(&mut items, "Z");
+        assert_ne!(items, original);
+    }
 }
 
 #[cfg(test)]
@@ -6151,10 +6385,11 @@ mod formatter_tests {
 mod diagnostic_store_tests {
     use super::{
         ArgumentInspectionInput, ByteDiagnostic, DiagnosticStore, DuplicateClassDeclaration,
-        DuplicateClassInspectionInput, UnknownConstantInspectionInput,
+        DuplicateClassInspectionInput, PersistentFileKey, UnknownConstantInspectionInput,
         compute_argument_inspections, compute_duplicate_class_inspections,
         compute_unknown_constant_inspections,
     };
+    use std::fs;
     use std::sync::Arc;
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -6177,8 +6412,119 @@ mod diagnostic_store_tests {
                 return_type: None,
             }],
             runtime_symbols: None,
+            semantic_snapshot: None,
+            file_key: PersistentFileKey::workspace_lexical("test.php"),
         };
         assert_eq!(compute_argument_inspections(&input).len(), 1);
+    }
+
+    #[test]
+    fn argument_inspection_parses_once_and_counts_ast_arguments() {
+        let input = ArgumentInspectionInput {
+            text: Arc::from(
+                "<?php function run(int $value) {} function pair(int $a, int $b) {}\n// fake(1, 2)\nrun(); run(1); run(\"a,b\"); pair(1, 2); run(pair(1, 2));",
+            ),
+            project_symbols: vec![
+                axiom_index::ProjectSymbol {
+                    name: "run".into(),
+                    fully_qualified_name: "run".into(),
+                    kind: axiom_index::ProjectSymbolKind::Function,
+                    file: "test.php".into(),
+                    range: 0..3,
+                    namespace: String::new(),
+                    visibility: axiom_index::Visibility::Public,
+                    modifiers: Vec::new(),
+                    parameters: Some("(int $value)".into()),
+                    return_type: None,
+                },
+                axiom_index::ProjectSymbol {
+                    name: "pair".into(),
+                    fully_qualified_name: "pair".into(),
+                    kind: axiom_index::ProjectSymbolKind::Function,
+                    file: "test.php".into(),
+                    range: 0..4,
+                    namespace: String::new(),
+                    visibility: axiom_index::Visibility::Public,
+                    modifiers: Vec::new(),
+                    parameters: Some("(int $a, int $b)".into()),
+                    return_type: None,
+                },
+            ],
+            runtime_symbols: None,
+            semantic_snapshot: None,
+            file_key: PersistentFileKey::workspace_lexical("test.php"),
+        };
+        let diagnostics = compute_argument_inspections(&input);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("Expected 1 argument"));
+    }
+
+    #[test]
+    fn parameter_arity_handles_defaults_variadics_and_nested_commas() {
+        assert_eq!(
+            signature_counts_from_detail("(array $value)"),
+            ParameterArity {
+                required_count: 1,
+                maximum_count: 1,
+                variadic: false,
+            }
+        );
+        assert_eq!(
+            signature_counts_from_detail("(int $a, ?Foo|Bar $b, Baz&Qux $c)"),
+            ParameterArity {
+                required_count: 3,
+                maximum_count: 3,
+                variadic: false,
+            }
+        );
+        assert_eq!(
+            signature_counts_from_detail("(int $a, array $options = [1, 2, 3])"),
+            ParameterArity {
+                required_count: 1,
+                maximum_count: 2,
+                variadic: false,
+            }
+        );
+        assert_eq!(
+            signature_counts_from_detail("(?Foo $value = null, ...$rest)"),
+            ParameterArity {
+                required_count: 0,
+                maximum_count: 2,
+                variadic: true,
+            }
+        );
+        assert_eq!(
+            signature_counts_from_detail("(string $value = fn(1, 'a,b'))"),
+            ParameterArity {
+                required_count: 0,
+                maximum_count: 1,
+                variadic: false,
+            }
+        );
+    }
+
+    #[test]
+    fn argument_inspection_uses_semantic_inherited_method_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("semantic.php");
+        let text = "<?php class Base { public function run(int $value): void {} } class Child extends Base {} function test(Child $child): void { $child->run(); }";
+        fs::write(&path, text).unwrap();
+        let mut index = axiom_index::ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = axiom_index::SemanticSnapshot::from_project_index(
+            &index,
+            axiom_index::SemanticRevision(1),
+        );
+        let input = ArgumentInspectionInput {
+            text: Arc::from(text),
+            project_symbols: index.symbols().to_vec(),
+            runtime_symbols: None,
+            semantic_snapshot: Some(Arc::new(snapshot)),
+            file_key: PersistentFileKey::workspace_lexical(&path),
+        };
+        let diagnostics = compute_argument_inspections(&input);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("Expected 1 argument"));
     }
 
     #[test]
