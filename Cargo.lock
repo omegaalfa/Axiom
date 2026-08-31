@@ -502,6 +502,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "tree-sitter",
 ]
 
 [[package]]

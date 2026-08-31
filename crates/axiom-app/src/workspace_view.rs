@@ -1500,23 +1500,23 @@ impl WorkspaceView {
                 self.semantic_engine = Some(semantic_engine);
                 if let Some(engine) = &self.semantic_engine {
                     for tab in &self.tabs {
-                        tab.editor.update(cx, |editor, _| {
+                        tab.editor.update(cx, |editor, editor_cx| {
                             let root = self.project.as_ref().unwrap().root_path().to_path_buf();
                             let workspace_source =
                                 axiom_index::is_workspace_source_lexical(&tab.path, &root);
                             editor.set_workspace_root(root, workspace_source);
-                            editor.set_semantic_engine(engine.clone());
+                            editor.set_semantic_engine(engine.clone(), editor_cx);
                         });
                     }
                 }
                 for tab in &self.tabs {
                     let updates = self.semantic_update_sender.clone();
-                    tab.editor.update(cx, |editor, _| {
+                    tab.editor.update(cx, |editor, editor_cx| {
                         let root = self.project.as_ref().unwrap().root_path().to_path_buf();
                         let workspace_source =
                             axiom_index::is_workspace_source_lexical(&tab.path, &root);
                         editor.set_workspace_root(root, workspace_source);
-                        editor.set_project_symbols(shared.clone());
+                        editor.set_project_symbols(shared.clone(), editor_cx);
                         editor
                             .set_semantic_update_sender(updates, self.project_semantic_generation);
                     });
@@ -1676,8 +1676,8 @@ impl WorkspaceView {
                             }
                         }
                         eprintln!(
-                            "[SEM PUB] semantic_revision={} file_id={file_id:?} file_scope={file_scope:?} namespace_scopes={namespace_scopes:?} binding_names={binding_names:?}"
-                            , snapshot.revision.0
+                            "[SEM PUB] semantic_revision={} file_id={file_id:?} file_scope={file_scope:?} namespace_scopes={namespace_scopes:?} binding_names={binding_names:?}",
+                            snapshot.revision.0
                         );
                     }
                 }
@@ -1697,8 +1697,8 @@ impl WorkspaceView {
                     let tabs_started = Instant::now();
                     tabs_count = self.tabs.len();
                     for tab in &self.tabs {
-                        tab.editor.update(cx, |editor, _| {
-                            editor.set_semantic_engine(engine.clone());
+                        tab.editor.update(cx, |editor, editor_cx| {
+                            editor.set_semantic_engine(engine.clone(), editor_cx);
                         });
                     }
                     tabs_update_us = tabs_started.elapsed().as_micros();
@@ -2711,7 +2711,9 @@ impl WorkspaceView {
                     let workspace_source = axiom_index::is_workspace_source_lexical(&path, &root);
                     editor.set_workspace_root(root, workspace_source)
                 });
-                editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+                editor.update(cx, |editor, editor_cx| {
+                    editor.set_project_symbols(index.clone(), editor_cx)
+                });
                 editor.update(cx, |editor, _| {
                     editor.set_semantic_update_sender(
                         self.semantic_update_sender.clone(),
@@ -2720,8 +2722,8 @@ impl WorkspaceView {
                 });
             }
             if let Some(engine) = &self.semantic_engine {
-                editor.update(cx, |editor, _| {
-                    editor.set_semantic_engine(engine.clone());
+                editor.update(cx, |editor, editor_cx| {
+                    editor.set_semantic_engine(engine.clone(), editor_cx);
                 });
             }
             if let Some(vendor) = &self.vendor_index {
@@ -4313,7 +4315,9 @@ impl WorkspaceView {
                 let workspace_source = axiom_index::is_workspace_source_lexical(&path, &root);
                 editor.set_workspace_root(root, workspace_source)
             });
-            editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+            editor.update(cx, |editor, editor_cx| {
+                editor.set_project_symbols(index.clone(), editor_cx)
+            });
             editor.update(cx, |editor, _| {
                 editor.set_semantic_update_sender(
                     self.semantic_update_sender.clone(),
@@ -4325,8 +4329,8 @@ impl WorkspaceView {
             }
         }
         if let Some(engine) = &self.semantic_engine {
-            editor.update(cx, |editor, _| {
-                editor.set_semantic_engine(engine.clone());
+            editor.update(cx, |editor, editor_cx| {
+                editor.set_semantic_engine(engine.clone(), editor_cx);
             });
         }
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
@@ -4385,7 +4389,9 @@ impl WorkspaceView {
                 let workspace_source = axiom_index::is_workspace_source_lexical(&path, &root);
                 editor.set_workspace_root(root, workspace_source)
             });
-            editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+            editor.update(cx, |editor, editor_cx| {
+                editor.set_project_symbols(index.clone(), editor_cx)
+            });
             editor.update(cx, |editor, _| {
                 editor.set_semantic_update_sender(
                     self.semantic_update_sender.clone(),
@@ -4397,8 +4403,8 @@ impl WorkspaceView {
             }
         }
         if let Some(engine) = &self.semantic_engine {
-            editor.update(cx, |editor, _| {
-                editor.set_semantic_engine(engine.clone());
+            editor.update(cx, |editor, editor_cx| {
+                editor.set_semantic_engine(engine.clone(), editor_cx);
             });
         }
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
@@ -4714,7 +4720,9 @@ impl WorkspaceView {
                     let workspace_source = axiom_index::is_workspace_source_lexical(&path, &root);
                     editor.set_workspace_root(root, workspace_source)
                 });
-                editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+                editor.update(cx, |editor, editor_cx| {
+                    editor.set_project_symbols(index.clone(), editor_cx)
+                });
                 editor.update(cx, |editor, _| {
                     editor.set_semantic_update_sender(
                         self.semantic_update_sender.clone(),
@@ -4726,8 +4734,8 @@ impl WorkspaceView {
                 }
             }
             if let Some(engine) = &self.semantic_engine {
-                editor.update(cx, |editor, _| {
-                    editor.set_semantic_engine(engine.clone());
+                editor.update(cx, |editor, editor_cx| {
+                    editor.set_semantic_engine(engine.clone(), editor_cx);
                 });
             }
             cx.observe(&editor, |_, _, cx| cx.notify()).detach();
@@ -4854,7 +4862,9 @@ impl WorkspaceView {
                     let workspace_source = axiom_index::is_workspace_source_lexical(&path, &root);
                     editor.set_workspace_root(root, workspace_source)
                 });
-                editor.update(cx, |editor, _| editor.set_project_symbols(index.clone()));
+                editor.update(cx, |editor, editor_cx| {
+                    editor.set_project_symbols(index.clone(), editor_cx)
+                });
                 editor.update(cx, |editor, _| {
                     editor.set_semantic_update_sender(
                         self.semantic_update_sender.clone(),
@@ -4866,8 +4876,8 @@ impl WorkspaceView {
                 }
             }
             if let Some(engine) = &self.semantic_engine {
-                editor.update(cx, |editor, _| {
-                    editor.set_semantic_engine(engine.clone());
+                editor.update(cx, |editor, editor_cx| {
+                    editor.set_semantic_engine(engine.clone(), editor_cx);
                 });
             }
             cx.observe(&editor, |_, _, cx| cx.notify()).detach();
@@ -7661,8 +7671,8 @@ fn debug_stubs_enabled() -> bool {
     std::env::var_os("AXIOM_DEBUG_INPUT").is_some_and(|value| {
         !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
     }) || std::env::var_os("AXIOM_DEBUG_STUBS").is_some_and(|value| {
-            !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
-        })
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
 }
 
 fn normalize_modifiers(modifiers: Modifiers) -> (bool, bool, bool) {

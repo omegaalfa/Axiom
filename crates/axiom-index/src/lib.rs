@@ -25,9 +25,10 @@ pub use semantic::{
     InterfaceRelationIndexes, MemberAccess, MemberKind, MemberResolution, MemberResolver,
     PersistentFileKey, PersistentSymbolKey, ReferenceConfidence, ReferenceId, ReferenceLocation,
     ReferenceProvider, ReferenceRole, ReferenceTarget, Scope, ScopeId, ScopeKind, ScopeStore,
-    SemanticDefinitionOutcome, SemanticDefinitionResult, SemanticEngine, SemanticReference,
-    SemanticRevision, SemanticSnapshot, SemanticSymbol, SnapshotBuilder, SourceOrigin, SymbolId,
-    UsageLocation, VariableBinding,
+    SemanticDefinitionOutcome, SemanticDefinitionResult, SemanticEngine, SemanticParameter,
+    SemanticReference, SemanticRevision, SemanticSnapshot, SemanticSymbol, SnapshotBuilder,
+    SourceOrigin, SymbolId, TypeCompatibility, UsageLocation, VariableBinding,
+    declared_type_compatibility, declared_type_label,
 };
 pub use source::{
     ComposerSource, DeferredSource, RuntimeSource, SourceCandidate, SourceError, SourceFile,

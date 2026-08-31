@@ -2,7 +2,7 @@ use axiom_editor::{Document, DocumentEdit};
 use axiom_index::{
     DeclaredType, DefinitionSyntaxContext, FindUsagesStatus, MemberAccess, MemberResolution,
     PersistentFileKey, ProjectSymbolIndex, ProjectSymbolKind, SemanticEngine, SemanticSnapshot,
-    VendorSymbolIndex,
+    TypeCompatibility, VendorSymbolIndex, declared_type_compatibility, declared_type_label,
 };
 use axiom_lsp::{PositionCodec, PositionEncoding, path_to_uri};
 use axiom_php::{RuntimeSymbolIndex, Symbol as RuntimeSymbol, SymbolKind as RuntimeKind};
@@ -251,6 +251,7 @@ pub struct EditorView {
     width_cache_line_count: usize,
     width_cache_dirty: bool,
     native_inspection_generation: u64,
+    initial_native_inspection_scheduled: bool,
     native_inspection_sender: Sender<NativeInspectionResult>,
     native_inspection_results: Receiver<NativeInspectionResult>,
     caret_visible: bool,
@@ -287,6 +288,7 @@ struct ByteDiagnostic {
 struct NativeInspectionResult {
     document_session: DocumentSessionId,
     generation: u64,
+    scheduled_at: Instant,
     diagnostics: Vec<ByteDiagnostic>,
 }
 
@@ -298,6 +300,15 @@ struct NativeInspectionWorkItem {
     duplicate_class: DuplicateClassInspectionInput,
     arguments: ArgumentInspectionInput,
 }
+
+enum NativeInspectionCapture {
+    Ready(NativeInspectionWorkItem),
+    RetryLockBusy,
+    Unavailable,
+}
+
+const NATIVE_INSPECTION_CAPTURE_RETRY_DELAY_MS: u64 = 15;
+const NATIVE_INSPECTION_CAPTURE_MAX_LOCK_RETRIES: usize = 3;
 
 #[derive(Clone)]
 struct UnknownClassInspectionInput {
@@ -526,25 +537,85 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
     calls.sort_by_key(|node| node.start_byte());
 
     let mut out = Vec::new();
+    let debug_flow = debug_native_inspection_flow_enabled();
+    let mut member_calls = 0usize;
+    let mut semantic_resolved = 0usize;
+    let mut semantic_binding_missing = 0usize;
+    let mut semantic_scope_missing = 0usize;
+    let mut fallback_used = 0usize;
     for call in calls {
+        let is_member_call = matches!(
+            call.kind(),
+            "member_call_expression" | "nullsafe_member_call_expression"
+        );
+        if debug_flow && is_member_call {
+            eprintln!(
+                "[NATIVE CALL] stage=collected kind={} start={} end={}",
+                call.kind(),
+                call.start_byte(),
+                call.end_byte()
+            );
+        }
         let arguments_node = call.child_by_field_name("arguments").or_else(|| {
             call.named_children(&mut call.walk())
                 .find(|node| node.kind() == "arguments")
         });
+        if debug_flow && is_member_call {
+            eprintln!(
+                "[NATIVE CALL] stage=arguments found={}",
+                arguments_node.is_some()
+            );
+        }
         let Some(arguments_node) = arguments_node else {
+            if debug_flow && is_member_call {
+                let object_kind = call
+                    .child_by_field_name("object")
+                    .map(|node| node.kind())
+                    .unwrap_or("missing");
+                let name_text = call
+                    .child_by_field_name("name")
+                    .and_then(|node| node.utf8_text(input.text.as_bytes()).ok())
+                    .unwrap_or("missing");
+                let name_text = name_text
+                    .get(..name_text.len().min(64))
+                    .unwrap_or(name_text);
+                eprintln!(
+                    "[NATIVE CALL] stage=ast_fields object_kind={} name_text={} arguments_found=false",
+                    object_kind, name_text
+                );
+            }
             continue;
         };
+        if debug_flow && is_member_call {
+            let object_kind = call
+                .child_by_field_name("object")
+                .map(|node| node.kind())
+                .unwrap_or("missing");
+            let name_text = call
+                .child_by_field_name("name")
+                .and_then(|node| node.utf8_text(input.text.as_bytes()).ok())
+                .unwrap_or("missing");
+            let name_text = name_text
+                .get(..name_text.len().min(64))
+                .unwrap_or(name_text);
+            eprintln!(
+                "[NATIVE CALL] stage=ast_fields object_kind={} name_text={} arguments_found=true",
+                object_kind, name_text
+            );
+        }
         let open = arguments_node.start_byte();
         if call.kind() == "object_creation_expression" {
             let class_node = call.child_by_field_name("class").or_else(|| {
-                call.named_children(&mut call.walk()).find(|node| {
-                    matches!(node.kind(), "name" | "qualified_name")
-                })
+                call.named_children(&mut call.walk())
+                    .find(|node| matches!(node.kind(), "name" | "qualified_name"))
             });
             let Some(class_node) = class_node else {
                 continue;
             };
-            let class_text = class_node.utf8_text(input.text.as_bytes()).unwrap_or("").trim();
+            let class_text = class_node
+                .utf8_text(input.text.as_bytes())
+                .unwrap_or("")
+                .trim();
             let Some(snapshot) = input.semantic_snapshot.as_ref() else {
                 continue;
             };
@@ -559,9 +630,12 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                 written: written.to_owned(),
                 resolved: resolved.clone(),
             };
-            let resolution = snapshot
-                .member_resolver()
-                .resolve_method(scope, &receiver, "__construct", MemberAccess::Instance);
+            let resolution = snapshot.member_resolver().resolve_method(
+                scope,
+                &receiver,
+                "__construct",
+                MemberAccess::Instance,
+            );
             let MemberResolution::Resolved(id) = resolution else {
                 // Missing, inaccessible, or incompatible constructors are
                 // handled by their respective semantic policies, not by an
@@ -596,6 +670,15 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                     },
                 });
             }
+            emit_project_type_diagnostics(
+                input,
+                snapshot,
+                scope,
+                id,
+                arguments_node,
+                &mut out,
+                debug_flow,
+            );
             continue;
         }
         let callable_start = input.text[..open]
@@ -613,6 +696,14 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
             .map(|(_, n)| n)
             .unwrap_or(callable)
             .trim_start_matches('$');
+        if debug_flow && is_member_call {
+            let callable_log = callable.get(..callable.len().min(96)).unwrap_or(callable);
+            let name_log = name.get(..name.len().min(64)).unwrap_or(name);
+            eprintln!(
+                "[NATIVE CALL] stage=textual_callable callable={} name={}",
+                callable_log, name_log
+            );
+        }
         if !name.is_empty() {
             let owner = callable
                 .rsplit_once("::")
@@ -647,27 +738,74 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                 call.kind(),
                 "member_call_expression" | "nullsafe_member_call_expression"
             ) {
+                if debug_flow {
+                    member_calls += 1;
+                }
                 let receiver = call
                     .child_by_field_name("object")
                     .filter(|node| node.kind() == "variable_name")
                     .and_then(|node| node.utf8_text(input.text.as_bytes()).ok())
                     .map(str::trim)
                     .map(str::to_owned);
+                if debug_flow {
+                    eprintln!(
+                        "[NATIVE CALL] stage=semantic_entry receiver={} method={}",
+                        receiver.as_deref().unwrap_or("unknown"),
+                        name
+                    );
+                }
                 input.semantic_snapshot.as_ref().and_then(|snapshot| {
-                    let scope = snapshot.scope_id_at(&input.file_key, call.start_byte())?;
-                    let receiver = receiver.as_deref()?;
-                    match snapshot
+                    let Some(scope) = snapshot.scope_id_at(&input.file_key, call.start_byte()) else {
+                        if debug_flow {
+                            semantic_scope_missing += 1;
+                            eprintln!(
+                                "[NATIVE CALL] stage=semantic_result scope_found=false binding_found=false resolved=false"
+                            );
+                        }
+                        return None;
+                    };
+                    let Some(receiver) = receiver.as_deref() else {
+                        if debug_flow {
+                            eprintln!(
+                                "[NATIVE CALL] stage=semantic_result scope_found=true binding_found=false resolved=false"
+                            );
+                        }
+                        return None;
+                    };
+                    let binding_found = debug_flow && snapshot.lookup_binding(scope, receiver).is_some();
+                    let result = match snapshot
                         .member_resolver()
                         .resolve_binding_method(scope, receiver, name)
                     {
                         MemberResolution::Resolved(id) => Some(id),
                         _ => None,
+                    };
+                    if debug_flow {
+                        if result.is_some() {
+                            semantic_resolved += 1;
+                        } else {
+                            semantic_binding_missing += 1;
+                        }
+                        eprintln!(
+                            "[NATIVE CALL] stage=semantic_result scope_found=true binding_found={} resolved={}",
+                            binding_found,
+                            result.is_some()
+                        );
                     }
+                    result
                 })
             } else {
                 None
             };
             let symbol = if semantic_method.is_none() {
+                if debug_flow
+                    && matches!(
+                        call.kind(),
+                        "member_call_expression" | "nullsafe_member_call_expression"
+                    )
+                {
+                    fallback_used += 1;
+                }
                 owner
                     .as_deref()
                     .and_then(|o| {
@@ -739,7 +877,32 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                     });
                 }
             }
+            if let (Some(id), Some(snapshot)) = (semantic_method, input.semantic_snapshot.as_ref())
+            {
+                if let Some(scope) = snapshot.scope_id_at(&input.file_key, call.start_byte()) {
+                    emit_project_type_diagnostics(
+                        input,
+                        snapshot,
+                        scope,
+                        id,
+                        arguments_node,
+                        &mut out,
+                        debug_flow,
+                    );
+                }
+            }
         }
+    }
+    if debug_flow {
+        eprintln!(
+            "[NATIVE INSPECT] stage=argument_summary member_calls={} semantic_resolved={} semantic_binding_missing={} semantic_scope_missing={} fallback_used={} argument_diagnostics={}",
+            member_calls,
+            semantic_resolved,
+            semantic_binding_missing,
+            semantic_scope_missing,
+            fallback_used,
+            out.len()
+        );
     }
     out
 }
@@ -964,6 +1127,7 @@ impl EditorView {
             width_cache_line_count: initial_line_count,
             width_cache_dirty: true,
             native_inspection_generation: 0,
+            initial_native_inspection_scheduled: false,
             native_inspection_sender,
             native_inspection_results,
             caret_visible: true,
@@ -1324,10 +1488,15 @@ impl EditorView {
         self.sync_syntax();
     }
 
-    pub fn set_project_symbols(&mut self, symbols: Arc<std::sync::RwLock<ProjectSymbolIndex>>) {
+    pub fn set_project_symbols(
+        &mut self,
+        symbols: Arc<std::sync::RwLock<ProjectSymbolIndex>>,
+        cx: &mut Context<Self>,
+    ) {
         self.project_symbols = Some(symbols);
         self.project_index_revision = Some(Arc::new(AtomicU64::new(0)));
         self.sync_syntax();
+        self.maybe_schedule_initial_native_inspections(cx);
     }
 
     pub fn set_semantic_update_sender(
@@ -1353,8 +1522,25 @@ impl EditorView {
         self.sync_syntax();
     }
 
-    pub fn set_semantic_engine(&mut self, engine: Arc<SemanticEngine>) {
+    pub fn set_semantic_engine(&mut self, engine: Arc<SemanticEngine>, cx: &mut Context<Self>) {
         self.semantic_engine = Some(engine);
+        self.maybe_schedule_initial_native_inspections(cx);
+    }
+
+    fn maybe_schedule_initial_native_inspections(&mut self, cx: &mut Context<Self>) {
+        if self.initial_native_inspection_scheduled || self.project_symbols.is_none() {
+            return;
+        }
+        let index_ready = self
+            .project_symbols
+            .as_ref()
+            .and_then(|index| index.try_read().ok())
+            .is_some_and(|index| index.is_ready());
+        if !index_ready {
+            return;
+        }
+        self.initial_native_inspection_scheduled = true;
+        self.schedule_native_inspections("", cx);
     }
 
     pub fn close_lsp_document(&self) {
@@ -1910,65 +2096,64 @@ impl EditorView {
         let semantic_schedule_us = semantic_started.elapsed().as_micros();
         let completion_started = Instant::now();
         let clear_started = Instant::now();
-        let (trigger_us, native_total_us, native_empty) =
-            if !self.is_php_completion_context() {
-                // Keep the rest of the edit pipeline (syntax, indexing, LSP
-                // text synchronization, cursor and rendering) active for
-                // generic files, but never enter the PHP completion pipeline.
+        let (trigger_us, native_total_us, native_empty) = if !self.is_php_completion_context() {
+            // Keep the rest of the edit pipeline (syntax, indexing, LSP
+            // text synchronization, cursor and rendering) active for
+            // generic files, but never enter the PHP completion pipeline.
+            self.completions.clear();
+            (0_u128, 0_u128, true)
+        } else {
+            let trigger_started = Instant::now();
+            self.maybe_trigger_completion();
+            let trigger_us = trigger_started.elapsed().as_micros();
+            let cursor = self.document.cursor_offset();
+            let content = self.document.content();
+            if cursor > 0 && matches!(content[..cursor].chars().next_back(), Some('(' | ',')) {
+                self.hover_popup = self.native_signature_help();
+                self.hover_anchor = None;
+            }
+            let native_started = Instant::now();
+            let native = self.native_completions();
+            let native_total_us = native_started.elapsed().as_micros();
+            let native_empty = native.items.is_empty();
+            if native_empty {
                 self.completions.clear();
-                (0_u128, 0_u128, true)
             } else {
-                let trigger_started = Instant::now();
-                self.maybe_trigger_completion();
-                let trigger_us = trigger_started.elapsed().as_micros();
-                let cursor = self.document.cursor_offset();
-                let content = self.document.content();
-                if cursor > 0 && matches!(content[..cursor].chars().next_back(), Some('(' | ',')) {
-                    self.hover_popup = self.native_signature_help();
-                    self.hover_anchor = None;
-                }
-                let native_started = Instant::now();
-                let native = self.native_completions();
-                let native_total_us = native_started.elapsed().as_micros();
-                let native_empty = native.items.is_empty();
-                if native_empty {
-                    self.completions.clear();
+                let set_started = Instant::now();
+                if let Some(prefix_range) = native.new_prefix {
+                    let prefix = &text[prefix_range];
+                    let mut items = native.items;
+                    filter_new_completion_items(&mut items, prefix);
+                    rank_new_completion_items(&mut items, prefix);
+                    self.completions = items;
+                    self.completion_selected = 0;
+                    cx.notify();
                 } else {
-                    let set_started = Instant::now();
-                    if let Some(prefix_range) = native.new_prefix {
-                        let prefix = &text[prefix_range];
-                        let mut items = native.items;
-                        filter_new_completion_items(&mut items, prefix);
-                        rank_new_completion_items(&mut items, prefix);
-                        self.completions = items;
-                        self.completion_selected = 0;
-                        cx.notify();
-                    } else {
-                        self.set_completions(native.items, cx);
-                    }
-                    let set_completions_us = set_started.elapsed().as_micros();
-                    let completion_total_us = completion_started.elapsed().as_micros();
-                    if debug_ui_stall_enabled() && completion_total_us >= 3_000 {
-                        tracing::info!(target: "axiom.ui_stall",
-                            trigger_us,
-                            native_total_us,
-                            project_search_us = 0_u128,
-                            vendor_search_us = 0_u128,
-                            runtime_search_us = 0_u128,
-                            member_resolution_us = 0_u128,
-                            import_edits_us = 0_u128,
-                            set_completions_us,
-                            clear_completions_us = clear_started.elapsed().as_micros(),
-                            other_us = completion_total_us.saturating_sub(
-                                trigger_us + native_total_us + set_completions_us,
-                            ),
-                            total_us = completion_total_us,
-                            "[UI COMPLETION DETAIL]"
-                        );
-                    }
+                    self.set_completions(native.items, cx);
                 }
-                (trigger_us, native_total_us, native_empty)
-            };
+                let set_completions_us = set_started.elapsed().as_micros();
+                let completion_total_us = completion_started.elapsed().as_micros();
+                if debug_ui_stall_enabled() && completion_total_us >= 3_000 {
+                    tracing::info!(target: "axiom.ui_stall",
+                        trigger_us,
+                        native_total_us,
+                        project_search_us = 0_u128,
+                        vendor_search_us = 0_u128,
+                        runtime_search_us = 0_u128,
+                        member_resolution_us = 0_u128,
+                        import_edits_us = 0_u128,
+                        set_completions_us,
+                        clear_completions_us = clear_started.elapsed().as_micros(),
+                        other_us = completion_total_us.saturating_sub(
+                            trigger_us + native_total_us + set_completions_us,
+                        ),
+                        total_us = completion_total_us,
+                        "[UI COMPLETION DETAIL]"
+                    );
+                }
+            }
+            (trigger_us, native_total_us, native_empty)
+        };
         let completion_us = completion_started.elapsed().as_micros();
         if native_empty {
             if debug_ui_stall_enabled() && completion_us >= 3_000 {
@@ -2080,34 +2265,129 @@ impl EditorView {
         let generation = self.native_inspection_generation;
         let session = self.document_session;
         let sender = self.native_inspection_sender.clone();
+        let scheduled_at = Instant::now();
+        if debug_native_inspection_flow_enabled() {
+            eprintln!(
+                "[NATIVE INSPECT] stage=scheduled generation={} document_session={}",
+                generation, session
+            );
+        }
         cx.spawn(async move |this, cx| {
             gpui::Timer::after(Duration::from_millis(200)).await;
-            let work = match this.update(cx, |editor, _| {
+            let mut lock_retries = 0usize;
+            let work = loop {
+                let capture = match this.update(cx, |editor, _| {
                 if editor.document_session != session
                     || editor.native_inspection_generation != generation
                 {
                     return None;
                 }
+                if lock_retries == 0 && debug_native_inspection_flow_enabled() {
+                    eprintln!(
+                        "[NATIVE INSPECT] stage=timer_expired generation={} elapsed_from_schedule_ms={}",
+                        generation,
+                        scheduled_at.elapsed().as_millis()
+                    );
+                }
+                let capture_started = Instant::now();
+                if debug_native_inspection_flow_enabled() {
+                    eprintln!(
+                        "[NATIVE INSPECT] stage=capture_start generation={}",
+                        generation
+                    );
+                }
                 let text: Arc<str> = Arc::from(editor.document.content());
                 let work = editor.capture_native_inspection_work(text, session, generation);
-                Some(work)
-            }) {
-                Ok(Some(Some(work))) => work,
-                Ok(Some(None)) => {
-                    return;
+                if let NativeInspectionCapture::Ready(work) = &work {
+                    let vendor_symbols_count = if work.unknown_class.vendor_symbols.is_some() {
+                        "resident-count-unavailable"
+                    } else {
+                        "0"
+                    };
+                    let semantic_revision = work
+                        .arguments
+                        .semantic_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.revision.0);
+                    if debug_native_inspection_flow_enabled() {
+                        eprintln!(
+                            "[NATIVE INSPECT] stage=capture_end generation={} capture_ms={} semantic_revision={:?} project_symbols_count={} vendor_symbols_count={} text_bytes={}",
+                            generation,
+                            capture_started.elapsed().as_millis(),
+                            semantic_revision,
+                            work.arguments.project_symbols.len(),
+                            vendor_symbols_count,
+                            work.arguments.text.len()
+                        );
+                    }
+                } else if matches!(work, NativeInspectionCapture::Unavailable)
+                    && debug_native_inspection_flow_enabled()
+                {
+                    eprintln!(
+                        "[NATIVE INSPECT] stage=capture_end generation={} capture_ms={} semantic_revision=None project_symbols_count=0 vendor_symbols_count=0 text_bytes=0",
+                        generation,
+                        capture_started.elapsed().as_millis()
+                    );
                 }
-                Ok(None) | Err(_) => {
-                    return;
+                Some(work)
+                }) {
+                    Ok(Some(capture)) => capture,
+                    Ok(None) | Err(_) => return,
+                };
+                match capture {
+                    NativeInspectionCapture::Ready(work) => break work,
+                    NativeInspectionCapture::Unavailable => return,
+                    NativeInspectionCapture::RetryLockBusy => {
+                        if lock_retries >= NATIVE_INSPECTION_CAPTURE_MAX_LOCK_RETRIES {
+                            if debug_native_inspection_flow_enabled() {
+                                eprintln!(
+                                    "[NATIVE INSPECT] stage=capture_aborted generation={} reason=lock_busy_retries_exhausted",
+                                    generation
+                                );
+                            }
+                            return;
+                        }
+                        lock_retries += 1;
+                        if debug_native_inspection_flow_enabled() {
+                            eprintln!(
+                                "[NATIVE INSPECT] stage=capture_retry generation={} attempt={} reason=project_index_lock_busy",
+                                generation, lock_retries
+                            );
+                        }
+                        gpui::Timer::after(Duration::from_millis(
+                            NATIVE_INSPECTION_CAPTURE_RETRY_DELAY_MS,
+                        ))
+                        .await;
+                    }
                 }
             };
+            let worker_started = Instant::now();
+            if debug_native_inspection_flow_enabled() {
+                eprintln!(
+                    "[NATIVE INSPECT] stage=worker_start generation={}",
+                    generation
+                );
+            }
             std::thread::spawn(move || {
                 let mut diagnostics = compute_unknown_class_inspections(&work.unknown_class);
                 diagnostics.extend(compute_unknown_constant_inspections(&work.unknown_constant));
                 diagnostics.extend(compute_duplicate_class_inspections(&work.duplicate_class));
-                diagnostics.extend(compute_argument_inspections(&work.arguments));
+                let argument_diagnostics = compute_argument_inspections(&work.arguments);
+                let argument_diagnostics_count = argument_diagnostics.len();
+                diagnostics.extend(argument_diagnostics);
+                if debug_native_inspection_flow_enabled() {
+                    eprintln!(
+                        "[NATIVE INSPECT] stage=worker_end generation={} worker_ms={} diagnostics_count={} argument_diagnostics_count={}",
+                        generation,
+                        worker_started.elapsed().as_millis(),
+                        diagnostics.len(),
+                        argument_diagnostics_count
+                    );
+                }
                 let _ = sender.send(NativeInspectionResult {
                     document_session: work.document_session,
                     generation: work.generation,
+                    scheduled_at,
                     diagnostics,
                 });
             });
@@ -2129,10 +2409,16 @@ impl EditorView {
         text: Arc<str>,
         session: DocumentSessionId,
         generation: u64,
-    ) -> Option<NativeInspectionWorkItem> {
-        let index = self.project_symbols.as_ref()?.try_read().ok()?;
+    ) -> NativeInspectionCapture {
+        let Some(project_symbols) = self.project_symbols.as_ref() else {
+            return NativeInspectionCapture::Unavailable;
+        };
+        let index = match project_symbols.try_read() {
+            Ok(index) => index,
+            Err(_) => return NativeInspectionCapture::RetryLockBusy,
+        };
         if !index.is_ready() {
-            return None;
+            return NativeInspectionCapture::Unavailable;
         }
         let symbols = index.symbols().to_vec();
         let project_classes = symbols
@@ -2188,7 +2474,7 @@ impl EditorView {
             .as_ref()
             .map(|engine| engine.snapshot());
         let file_key = PersistentFileKey::workspace_lexical(&self.file_path);
-        Some(NativeInspectionWorkItem {
+        NativeInspectionCapture::Ready(NativeInspectionWorkItem {
             document_session: session,
             generation,
             unknown_class: UnknownClassInspectionInput {
@@ -2224,11 +2510,32 @@ impl EditorView {
             latest = Some(result);
         }
         if let Some(result) = latest {
+            if debug_native_inspection_flow_enabled() {
+                eprintln!(
+                    "[NATIVE INSPECT] stage=result_received generation={} current_generation={}",
+                    result.generation, self.native_inspection_generation
+                );
+            }
             if result.document_session == self.document_session
                 && result.generation == self.native_inspection_generation
             {
+                let diagnostics_count = result.diagnostics.len();
                 self.diagnostics.set_native_inspections(result.diagnostics);
+                if debug_native_inspection_flow_enabled() {
+                    eprintln!(
+                        "[NATIVE INSPECT] stage=result_applied diagnostics_count={} elapsed_total_ms={}",
+                        diagnostics_count,
+                        result.scheduled_at.elapsed().as_millis()
+                    );
+                }
                 cx.notify();
+            } else if debug_native_inspection_flow_enabled() {
+                let reason = if result.document_session != self.document_session {
+                    "session"
+                } else {
+                    "generation"
+                };
+                eprintln!("[NATIVE INSPECT] stage=result_discarded reason={}", reason);
             }
         }
     }
@@ -2602,8 +2909,13 @@ impl EditorView {
                         file_key.normalized_path,
                         binding.is_some(),
                         binding_type,
-                        if semantic_items.is_some() { "semantic" } else { "fallback" },
-                        semantic_items.map_or_else(|| "unavailable".to_owned(), |count| count.to_string())
+                        if semantic_items.is_some() {
+                            "semantic"
+                        } else {
+                            "fallback"
+                        },
+                        semantic_items
+                            .map_or_else(|| "unavailable".to_owned(), |count| count.to_string())
                     );
                 }
                 if let Some(scope) = snapshot.scope_id_at(&file_key, cursor)
@@ -2703,14 +3015,12 @@ impl EditorView {
                                     && symbol.is_static == is_static
                                     && (is_static || !symbol.name.starts_with('_'))
                             })
-                            .map(|symbol| {
-                                CompletionItem {
-                                    label: symbol.name.clone(),
-                                    detail: Some(runtime_signature_detail(symbol)),
-                                    kind: Some(CompletionItemKind::METHOD),
-                                    insert_text: runtime_call_insert_text(symbol),
-                                    ..Default::default()
-                                }
+                            .map(|symbol| CompletionItem {
+                                label: symbol.name.clone(),
+                                detail: Some(runtime_signature_detail(symbol)),
+                                kind: Some(CompletionItemKind::METHOD),
+                                insert_text: runtime_call_insert_text(symbol),
+                                ..Default::default()
                             }),
                     );
                 }
@@ -2750,29 +3060,38 @@ impl EditorView {
                     .into_iter()
                     .take(40)
                     .map(|symbol| {
-                        let import = matches!(symbol.kind, RuntimeKind::Class | RuntimeKind::Interface | RuntimeKind::Trait | RuntimeKind::Enum)
-                            .then(|| self.composer_import_edit(&symbol.fqn))
-                            .flatten();
-                        CompletionItem {
-                        label: symbol.name.clone(),
-                        detail: Some(
-                            if matches!(symbol.kind, RuntimeKind::Function | RuntimeKind::Method) {
-                                runtime_signature_detail(symbol)
-                            } else {
-                                format!("{:?} • PHP Runtime", symbol.kind)
-                            },
-                        ),
-                        kind: Some(match symbol.kind {
-                            RuntimeKind::Function => CompletionItemKind::FUNCTION,
+                        let import = matches!(
+                            symbol.kind,
                             RuntimeKind::Class
-                            | RuntimeKind::Interface
-                            | RuntimeKind::Trait
-                            | RuntimeKind::Enum => CompletionItemKind::CLASS,
-                            _ => CompletionItemKind::VALUE,
-                        }),
-                        insert_text: runtime_call_insert_text(symbol),
-                        additional_text_edits: import.map(|edit| vec![edit]),
-                        ..Default::default()
+                                | RuntimeKind::Interface
+                                | RuntimeKind::Trait
+                                | RuntimeKind::Enum
+                        )
+                        .then(|| self.composer_import_edit(&symbol.fqn))
+                        .flatten();
+                        CompletionItem {
+                            label: symbol.name.clone(),
+                            detail: Some(
+                                if matches!(
+                                    symbol.kind,
+                                    RuntimeKind::Function | RuntimeKind::Method
+                                ) {
+                                    runtime_signature_detail(symbol)
+                                } else {
+                                    format!("{:?} • PHP Runtime", symbol.kind)
+                                },
+                            ),
+                            kind: Some(match symbol.kind {
+                                RuntimeKind::Function => CompletionItemKind::FUNCTION,
+                                RuntimeKind::Class
+                                | RuntimeKind::Interface
+                                | RuntimeKind::Trait
+                                | RuntimeKind::Enum => CompletionItemKind::CLASS,
+                                _ => CompletionItemKind::VALUE,
+                            }),
+                            insert_text: runtime_call_insert_text(symbol),
+                            additional_text_edits: import.map(|edit| vec![edit]),
+                            ..Default::default()
                         }
                     })
                     .collect::<Vec<_>>()
@@ -4591,6 +4910,13 @@ pub(crate) fn debug_semantic_binding_flow_enabled() -> bool {
     })
 }
 
+#[cfg(debug_assertions)]
+fn debug_native_inspection_flow_enabled() -> bool {
+    std::env::var_os("AXIOM_DEBUG_NATIVE_INSPECTION_FLOW").is_some_and(|value| {
+        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
+    })
+}
+
 #[cfg(not(debug_assertions))]
 fn debug_completion_flow_enabled() -> bool {
     false
@@ -4598,6 +4924,11 @@ fn debug_completion_flow_enabled() -> bool {
 
 #[cfg(not(debug_assertions))]
 pub(crate) fn debug_semantic_binding_flow_enabled() -> bool {
+    false
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_native_inspection_flow_enabled() -> bool {
     false
 }
 
@@ -5551,6 +5882,76 @@ fn matching_paren(text: &str, open: usize) -> Option<usize> {
     None
 }
 
+fn emit_project_type_diagnostics(
+    input: &ArgumentInspectionInput,
+    snapshot: &SemanticSnapshot,
+    scope: axiom_index::ScopeId,
+    symbol_id: axiom_index::SymbolId,
+    arguments_node: tree_sitter::Node<'_>,
+    out: &mut Vec<ByteDiagnostic>,
+    debug_flow: bool,
+) {
+    let Some(symbol) = snapshot.symbol(symbol_id) else {
+        return;
+    };
+    if symbol.structured_parameters.is_empty() {
+        return;
+    }
+    let resolver = axiom_index::ExpressionResolver::new(snapshot, scope);
+    let parameters = &symbol.structured_parameters;
+    let mut parameter_index = 0usize;
+    for argument in arguments_node.named_children(&mut arguments_node.walk()) {
+        // Named arguments and unpacking need dedicated mapping semantics; do
+        // not guess at their parameter or type in this conservative phase.
+        if argument.kind() == "named_argument" || argument.kind() == "variadic_unpacking" {
+            if debug_flow {
+                eprintln!("[NATIVE TYPE] expected=unknown actual=unknown result=unknown");
+            }
+            parameter_index += 1;
+            continue;
+        }
+        let Some(parameter) = parameters
+            .get(parameter_index)
+            .or_else(|| parameters.last().filter(|parameter| parameter.variadic))
+        else {
+            break;
+        };
+        if let Some(expected) = parameter.declared_type.as_ref() {
+            if let Some(actual) = resolver.infer_ast_expression_type(argument, input.text.as_ref())
+            {
+                let compatibility = declared_type_compatibility(snapshot, expected, &actual);
+                if debug_flow {
+                    let result = match compatibility {
+                        TypeCompatibility::Compatible => "compatible",
+                        TypeCompatibility::Incompatible => "incompatible",
+                        TypeCompatibility::Unknown => "unknown",
+                    };
+                    eprintln!(
+                        "[NATIVE TYPE] expected={} actual={} result={}",
+                        declared_type_label(expected),
+                        declared_type_label(&actual),
+                        result
+                    );
+                }
+                if compatibility == TypeCompatibility::Incompatible {
+                    out.push(ByteDiagnostic {
+                        range: argument.start_byte()..argument.end_byte(),
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: format!(
+                            "Expected {}, found {}",
+                            declared_type_label(expected),
+                            declared_type_label(&actual)
+                        ),
+                    });
+                }
+            }
+        }
+        if !parameter.variadic {
+            parameter_index += 1;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParameterArity {
     required_count: usize,
@@ -5698,9 +6099,21 @@ mod completion_ranking_tests {
     #[test]
     fn exact_new_class_is_ranked_first() {
         let mut items = vec![
-            item("ArrayIterator", "ArrayIterator • PHP Runtime", CompletionItemKind::CLASS),
-            item("AliasStatus", "AliasStatus • PHP Runtime", CompletionItemKind::CLASS),
-            item("ChildService", "App\\ChildService • Project", CompletionItemKind::CLASS),
+            item(
+                "ArrayIterator",
+                "ArrayIterator • PHP Runtime",
+                CompletionItemKind::CLASS,
+            ),
+            item(
+                "AliasStatus",
+                "AliasStatus • PHP Runtime",
+                CompletionItemKind::CLASS,
+            ),
+            item(
+                "ChildService",
+                "App\\ChildService • Project",
+                CompletionItemKind::CLASS,
+            ),
             item("A", "App\\A • Project", CompletionItemKind::CLASS),
         ];
         rank_new_completion_items(&mut items, "A");
@@ -5710,18 +6123,28 @@ mod completion_ranking_tests {
     #[test]
     fn prefix_beats_non_matching_project_and_exact_is_case_insensitive() {
         let mut items = vec![
-            item("ArrayIterator", "ArrayIterator • Project", CompletionItemKind::CLASS),
+            item(
+                "ArrayIterator",
+                "ArrayIterator • Project",
+                CompletionItemKind::CLASS,
+            ),
             item("Base", "Base • Project", CompletionItemKind::CLASS),
             item("Baz", "Baz • Project", CompletionItemKind::CLASS),
-            item("ChildImplementation", "ChildImplementation • Runtime", CompletionItemKind::CLASS),
+            item(
+                "ChildImplementation",
+                "ChildImplementation • Runtime",
+                CompletionItemKind::CLASS,
+            ),
             item("CHILD", "App\\Child • Project", CompletionItemKind::CLASS),
         ];
         rank_new_completion_items(&mut items, "Child");
         assert_eq!(items[0].label, "CHILD");
         assert_eq!(items[1].label, "ChildImplementation");
-        assert!(items[2..].iter().all(|candidate| {
-            !candidate.label.starts_with("Child")
-        }));
+        assert!(
+            items[2..]
+                .iter()
+                .all(|candidate| { !candidate.label.starts_with("Child") })
+        );
     }
 
     #[test]
@@ -5751,12 +6174,22 @@ mod completion_ranking_tests {
     #[test]
     fn new_prefix_filter_removes_candidates_from_previous_prefixes() {
         let mut items = vec![
-            item("ArrayIterator", "ArrayIterator • Runtime", CompletionItemKind::CLASS),
+            item(
+                "ArrayIterator",
+                "ArrayIterator • Runtime",
+                CompletionItemKind::CLASS,
+            ),
             item("Base", "Base • Project", CompletionItemKind::CLASS),
             item("Child", "App\\Child • Project", CompletionItemKind::CLASS),
         ];
         filter_new_completion_items(&mut items, "Chil");
-        assert_eq!(items.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(), vec!["Child"]);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Child"]
+        );
     }
 }
 
@@ -6158,10 +6591,9 @@ mod formatter_tests {
 mod diagnostic_store_tests {
     use super::{
         ArgumentInspectionInput, ByteDiagnostic, DiagnosticStore, DuplicateClassDeclaration,
-        DuplicateClassInspectionInput, PersistentFileKey, UnknownConstantInspectionInput,
-        ParameterArity,
-        compute_argument_inspections, compute_duplicate_class_inspections,
-        compute_unknown_constant_inspections,
+        DuplicateClassInspectionInput, ParameterArity, PersistentFileKey,
+        UnknownConstantInspectionInput, compute_argument_inspections,
+        compute_duplicate_class_inspections, compute_unknown_constant_inspections,
         signature_counts_from_detail,
     };
     use std::fs;

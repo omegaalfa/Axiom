@@ -120,6 +120,114 @@ pub enum DeclaredType {
     Unknown(String),
 }
 
+/// Conservative result of comparing an expected parameter type with the type
+/// inferred for an argument. `Unknown` is deliberately distinct from
+/// `Incompatible`: callers must not report an error when the model lacks
+/// enough information to prove a mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeCompatibility {
+    Compatible,
+    Incompatible,
+    Unknown,
+}
+
+/// Compares two already-resolved semantic types without parsing or I/O.
+/// Nominal class compatibility follows the inheritance/interface relations
+/// already resident in `snapshot`.
+pub fn declared_type_compatibility(
+    snapshot: &SemanticSnapshot,
+    expected: &DeclaredType,
+    actual: &DeclaredType,
+) -> TypeCompatibility {
+    if expected == actual {
+        return TypeCompatibility::Compatible;
+    }
+    if matches!(expected, DeclaredType::Builtin(BuiltinType::Mixed)) {
+        return if matches!(actual, DeclaredType::Unknown(_)) {
+            TypeCompatibility::Unknown
+        } else {
+            TypeCompatibility::Compatible
+        };
+    }
+    if matches!(expected, DeclaredType::Unknown(_)) || matches!(actual, DeclaredType::Unknown(_)) {
+        return TypeCompatibility::Unknown;
+    }
+
+    match (expected, actual) {
+        (DeclaredType::Nullable(_expected), DeclaredType::Builtin(BuiltinType::Null)) => {
+            TypeCompatibility::Compatible
+        }
+        (DeclaredType::Nullable(expected), DeclaredType::Nullable(actual)) => {
+            declared_type_compatibility(snapshot, expected, actual)
+        }
+        (DeclaredType::Nullable(expected), actual) => {
+            declared_type_compatibility(snapshot, expected, actual)
+        }
+        (DeclaredType::Union(expected), actual) => {
+            let mut saw_unknown = false;
+            for member in expected {
+                match declared_type_compatibility(snapshot, member, actual) {
+                    TypeCompatibility::Compatible => return TypeCompatibility::Compatible,
+                    TypeCompatibility::Unknown => saw_unknown = true,
+                    TypeCompatibility::Incompatible => {}
+                }
+            }
+            if saw_unknown {
+                TypeCompatibility::Unknown
+            } else {
+                TypeCompatibility::Incompatible
+            }
+        }
+        (DeclaredType::Intersection(expected), actual) => {
+            let mut saw_unknown = false;
+            for member in expected {
+                match declared_type_compatibility(snapshot, member, actual) {
+                    TypeCompatibility::Compatible => {}
+                    TypeCompatibility::Unknown => saw_unknown = true,
+                    TypeCompatibility::Incompatible => return TypeCompatibility::Incompatible,
+                }
+            }
+            if saw_unknown {
+                TypeCompatibility::Unknown
+            } else {
+                TypeCompatibility::Compatible
+            }
+        }
+        (
+            DeclaredType::Named {
+                resolved: expected, ..
+            },
+            DeclaredType::Named {
+                resolved: actual, ..
+            },
+        ) => {
+            let resolver = snapshot.member_resolver();
+            if resolver.is_same_or_subclass(actual, expected) {
+                TypeCompatibility::Compatible
+            } else if !snapshot.symbols_for_fqn(expected).is_empty()
+                && !snapshot.symbols_for_fqn(actual).is_empty()
+            {
+                TypeCompatibility::Incompatible
+            } else {
+                TypeCompatibility::Unknown
+            }
+        }
+        (DeclaredType::Builtin(expected), DeclaredType::Builtin(actual)) => {
+            if expected == actual {
+                TypeCompatibility::Compatible
+            } else if matches!(
+                (expected, actual),
+                (BuiltinType::Bool, BuiltinType::True | BuiltinType::False)
+            ) {
+                TypeCompatibility::Compatible
+            } else {
+                TypeCompatibility::Incompatible
+            }
+        }
+        _ => TypeCompatibility::Unknown,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VariableBinding {
     pub name: String,
@@ -366,9 +474,19 @@ pub struct SemanticSymbol {
     pub visibility: Visibility,
     pub modifiers: Vec<String>,
     pub parameters: Option<String>,
+    #[serde(default)]
+    pub structured_parameters: Vec<SemanticParameter>,
     pub return_type: Option<String>,
     pub owner: Option<SymbolId>,
     pub owner_key: Option<PersistentSymbolKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticParameter {
+    pub name: Option<String>,
+    pub declared_type: Option<DeclaredType>,
+    pub optional: bool,
+    pub variadic: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -503,6 +621,7 @@ pub struct MemberResolver<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expression {
     Variable(String),
+    Literal(DeclaredType),
     New(String),
     FunctionCall(String),
     MethodCall {
@@ -530,6 +649,7 @@ impl<'a> ExpressionResolver<'a> {
                 .snapshot
                 .lookup_binding(self.scope, name)
                 .and_then(|binding| binding.declared_type.clone()),
+            Expression::Literal(kind) => Some(kind.clone()),
             Expression::New(name) => {
                 self.snapshot
                     .resolve_class_name(self.scope, name)
@@ -566,6 +686,17 @@ impl<'a> ExpressionResolver<'a> {
                 self.return_type_of(id)
             }
         }
+    }
+
+    /// Infers the type of an already parsed AST expression. This bridge does
+    /// not parse or perform I/O; callers provide the existing syntax node.
+    pub fn infer_ast_expression_type(
+        &self,
+        node: tree_sitter::Node<'_>,
+        text: &str,
+    ) -> Option<DeclaredType> {
+        let expression = expression_from_ast(node, text)?;
+        self.infer_expression_type(&expression)
     }
 
     pub fn resolve_member_chain(
@@ -659,11 +790,37 @@ fn declared_type_from_snapshot(
 
 fn expression_from_ast(node: tree_sitter::Node<'_>, text: &str) -> Option<Expression> {
     match node.kind() {
+        "integer" => Some(Expression::Literal(DeclaredType::Builtin(BuiltinType::Int))),
+        "float" => Some(Expression::Literal(DeclaredType::Builtin(
+            BuiltinType::Float,
+        ))),
+        "string" | "encapsed_string" => Some(Expression::Literal(DeclaredType::Builtin(
+            BuiltinType::String,
+        ))),
+        "boolean" => match node_text(node, text).trim() {
+            "true" => Some(Expression::Literal(DeclaredType::Builtin(
+                BuiltinType::True,
+            ))),
+            "false" => Some(Expression::Literal(DeclaredType::Builtin(
+                BuiltinType::False,
+            ))),
+            _ => None,
+        },
+        "null" => Some(Expression::Literal(DeclaredType::Builtin(
+            BuiltinType::Null,
+        ))),
+        "array_creation_expression" => Some(Expression::Literal(DeclaredType::Builtin(
+            BuiltinType::Array,
+        ))),
         "variable_name" => Some(Expression::Variable(
             node_text(node, text).trim().to_owned(),
         )),
         "object_creation_expression" => node
             .child_by_field_name("class")
+            .or_else(|| {
+                node.named_children(&mut node.walk())
+                    .find(|child| matches!(child.kind(), "name" | "qualified_name"))
+            })
             .map(|class| Expression::New(node_text(class, text).trim().to_owned())),
         "parenthesized_expression" => node
             .named_children(&mut node.walk())
@@ -690,9 +847,16 @@ fn expression_from_ast(node: tree_sitter::Node<'_>, text: &str) -> Option<Expres
                 access: MemberAccess::Static,
             })
         }
-        "function_call_expression" => node
-            .child_by_field_name("function")
-            .map(|function| Expression::FunctionCall(node_text(function, text).trim().to_owned())),
+        "function_call_expression" => node.child_by_field_name("function").and_then(|function| {
+            let name = node_text(function, text).trim();
+            if name.eq_ignore_ascii_case("array") {
+                Some(Expression::Literal(DeclaredType::Builtin(
+                    BuiltinType::Array,
+                )))
+            } else {
+                Some(Expression::FunctionCall(name.to_owned()))
+            }
+        }),
         _ => None,
     }
 }
@@ -2532,6 +2696,7 @@ impl SnapshotBuilder {
                 visibility: source.visibility,
                 modifiers: source.modifiers,
                 parameters: source.parameters,
+                structured_parameters: Vec::new(),
                 return_type: source.return_type,
                 owner: None,
                 owner_key: None,
@@ -3112,6 +3277,7 @@ impl SnapshotBuilder {
                 visibility: source.visibility,
                 modifiers: source.modifiers,
                 parameters: source.parameters,
+                structured_parameters: Vec::new(),
                 return_type: source.return_type,
                 owner: None,
                 owner_key: None,
@@ -3456,6 +3622,7 @@ fn extract_scopes(
             );
             mark_scope(builder, child, node);
             add_parameters(builder, child, node.child_by_field_name("parameters"), text);
+            populate_structured_parameters(builder, child, node, text);
             if scope_kind == ScopeKind::Method && !is_static {
                 let class = builder.scopes.records[child.0 as usize].class_name.clone();
                 if let Some(class) = class {
@@ -4274,47 +4441,45 @@ fn innermost_callable_scope(
 /// precedence; assignments at namespace/file level are attached to the most
 /// specific Namespace scope, falling back to the file scope.
 fn assignment_scope(builder: &SnapshotBuilder, file: FileId, offset: usize) -> Option<ScopeId> {
-    innermost_callable_scope(builder, file, offset).or_else(|| {
-        let namespaces = builder
-            .scopes
-            .records
-            .iter()
-            .filter(|scope| {
+    innermost_callable_scope(builder, file, offset)
+        .or_else(|| {
+            let namespaces = builder.scopes.records.iter().filter(|scope| {
                 scope.file == Some(file)
                     && scope.kind == ScopeKind::Namespace
                     && scope.span.contains(&offset)
             });
-        namespaces
-            .max_by_key(|scope| scope.span.start)
-            .or_else(|| {
-                // Tree-sitter represents unbracketed namespace bodies with a
-                // declaration span that may end before the body. In that
-                // form, the active namespace is the latest declaration before
-                // the assignment offset.
-                builder
-                    .scopes
-                    .records
-                    .iter()
-                    .filter(|scope| {
-                        scope.file == Some(file)
-                            && scope.kind == ScopeKind::Namespace
-                            && scope.span.start <= offset
-                    })
-                    .max_by_key(|scope| scope.span.start)
-            })
-            .map(|scope| scope.id)
-    }).or_else(|| {
-        builder
-            .scopes
-            .records
-            .iter()
-            .find(|scope| {
-                scope.file == Some(file)
-                    && scope.kind == ScopeKind::File
-                    && scope.span.contains(&offset)
-            })
-            .map(|scope| scope.id)
-    })
+            namespaces
+                .max_by_key(|scope| scope.span.start)
+                .or_else(|| {
+                    // Tree-sitter represents unbracketed namespace bodies with a
+                    // declaration span that may end before the body. In that
+                    // form, the active namespace is the latest declaration before
+                    // the assignment offset.
+                    builder
+                        .scopes
+                        .records
+                        .iter()
+                        .filter(|scope| {
+                            scope.file == Some(file)
+                                && scope.kind == ScopeKind::Namespace
+                                && scope.span.start <= offset
+                        })
+                        .max_by_key(|scope| scope.span.start)
+                })
+                .map(|scope| scope.id)
+        })
+        .or_else(|| {
+            builder
+                .scopes
+                .records
+                .iter()
+                .find(|scope| {
+                    scope.file == Some(file)
+                        && scope.kind == ScopeKind::File
+                        && scope.span.contains(&offset)
+                })
+                .map(|scope| scope.id)
+        })
 }
 
 fn nearest_namespace(builder: &SnapshotBuilder, mut scope: ScopeId) -> String {
@@ -4383,6 +4548,102 @@ fn add_parameters(
             continue;
         }
         stack.extend(node.named_children(&mut node.walk()));
+    }
+}
+
+fn populate_structured_parameters(
+    builder: &mut SnapshotBuilder,
+    scope: ScopeId,
+    callable: tree_sitter::Node<'_>,
+    text: &str,
+) {
+    let Some(parameters) = callable.child_by_field_name("parameters") else {
+        return;
+    };
+    let Some(current_scope) = builder.scopes.records.get(scope.0 as usize) else {
+        return;
+    };
+    let kind = match callable.kind() {
+        "method_declaration" => ProjectSymbolKind::Method,
+        "function_definition" => ProjectSymbolKind::Function,
+        _ => return,
+    };
+    let Some(name) = callable
+        .child_by_field_name("name")
+        .map(|node| node_text(node, text).trim().to_owned())
+    else {
+        return;
+    };
+    let fqn = current_scope
+        .class_name
+        .as_ref()
+        .map(|class| format!("{class}::{name}"))
+        .unwrap_or_else(|| {
+            if current_scope.namespace.is_empty() {
+                name.clone()
+            } else {
+                format!("{}\\{name}", current_scope.namespace)
+            }
+        });
+    let Some(file) = current_scope.file else {
+        return;
+    };
+    let mut structured = Vec::new();
+    let mut stack = vec![parameters];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "simple_parameter" | "variadic_parameter" | "property_promotion_parameter"
+        ) {
+            let name = node
+                .child_by_field_name("name")
+                .map(|node| node_text(node, text).trim().to_owned());
+            let declared_type = node
+                .child_by_field_name("type")
+                .map(|node| declared_type(node_text(node, text).trim(), builder, scope));
+            structured.push(SemanticParameter {
+                name,
+                declared_type,
+                optional: node.child_by_field_name("default_value").is_some(),
+                variadic: node.kind() == "variadic_parameter",
+            });
+            continue;
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+
+    structured.reverse();
+    if let Some(symbol) = builder
+        .symbols
+        .records
+        .iter_mut()
+        .filter(|symbol| {
+            symbol.file == file && symbol.kind == kind && symbol.fully_qualified_name == fqn
+        })
+        .min_by_key(|symbol| symbol.range.start.abs_diff(callable.start_byte()))
+    {
+        symbol.structured_parameters = structured;
+    }
+}
+
+/// Stable, source-like label for diagnostics.  Formatting only inspects the
+/// resolved type and never performs name lookup or I/O.
+pub fn declared_type_label(ty: &DeclaredType) -> String {
+    match ty {
+        DeclaredType::Named { resolved, .. } => resolved.clone(),
+        DeclaredType::Builtin(kind) => format!("{kind:?}").to_ascii_lowercase(),
+        DeclaredType::Nullable(inner) => format!("?{}", declared_type_label(inner)),
+        DeclaredType::Union(types) => types
+            .iter()
+            .map(declared_type_label)
+            .collect::<Vec<_>>()
+            .join("|"),
+        DeclaredType::Intersection(types) => types
+            .iter()
+            .map(declared_type_label)
+            .collect::<Vec<_>>()
+            .join("&"),
+        DeclaredType::Unknown(name) => name.clone(),
     }
 }
 
@@ -4651,7 +4912,10 @@ mod tests {
 
         let inside = text.find("return").unwrap();
         let inner = snapshot.scope_id_at_file(FileId(0), inside).unwrap();
-        assert_eq!(snapshot.scopes.records[inner.0 as usize].kind, ScopeKind::Function);
+        assert_eq!(
+            snapshot.scopes.records[inner.0 as usize].kind,
+            ScopeKind::Function
+        );
     }
 
     #[test]
@@ -5607,6 +5871,121 @@ function testAlias(AliasChild $child): void { $child->run(); }
                 .unwrap()
                 .declared_type,
             Some(DeclaredType::Builtin(BuiltinType::Int))
+        );
+    }
+
+    #[test]
+    fn declared_type_compatibility_is_conservative_and_nominal() {
+        let snapshot = SnapshotBuilder::from_php_text(
+            "compat.php",
+            "<?php namespace App; class Base {} class Child extends Base {}",
+            SemanticRevision(2),
+        )
+        .build();
+        let builtin = |kind| DeclaredType::Builtin(kind);
+        let named = |name: &str| DeclaredType::Named {
+            written: name.to_owned(),
+            resolved: name.to_owned(),
+        };
+        let check = |expected: &DeclaredType, actual: &DeclaredType| {
+            declared_type_compatibility(&snapshot, expected, actual)
+        };
+
+        assert_eq!(
+            check(&builtin(BuiltinType::String), &builtin(BuiltinType::String)),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&builtin(BuiltinType::String), &builtin(BuiltinType::Int)),
+            TypeCompatibility::Incompatible
+        );
+        assert_eq!(
+            check(&builtin(BuiltinType::Int), &builtin(BuiltinType::Int)),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&builtin(BuiltinType::Int), &builtin(BuiltinType::String)),
+            TypeCompatibility::Incompatible
+        );
+        assert_eq!(
+            check(&builtin(BuiltinType::Mixed), &builtin(BuiltinType::Int)),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&builtin(BuiltinType::Null), &builtin(BuiltinType::Null)),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&builtin(BuiltinType::String), &builtin(BuiltinType::Null)),
+            TypeCompatibility::Incompatible
+        );
+
+        let nullable = DeclaredType::Nullable(Box::new(builtin(BuiltinType::String)));
+        assert_eq!(
+            check(&nullable, &builtin(BuiltinType::Null)),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&nullable, &builtin(BuiltinType::String)),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&nullable, &builtin(BuiltinType::Int)),
+            TypeCompatibility::Incompatible
+        );
+
+        let union = DeclaredType::Union(vec![
+            builtin(BuiltinType::Int),
+            builtin(BuiltinType::String),
+        ]);
+        assert_eq!(
+            check(&union, &builtin(BuiltinType::Int)),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&union, &builtin(BuiltinType::String)),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&union, &builtin(BuiltinType::Bool)),
+            TypeCompatibility::Incompatible
+        );
+        let unknown = DeclaredType::Unknown("value".into());
+        assert_eq!(check(&union, &unknown), TypeCompatibility::Unknown);
+        assert_eq!(
+            check(&builtin(BuiltinType::String), &unknown),
+            TypeCompatibility::Unknown
+        );
+
+        assert_eq!(
+            check(&named("App\\Base"), &named("App\\Base")),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&named("App\\Base"), &named("App\\Child")),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&named("App\\Child"), &named("App\\Base")),
+            TypeCompatibility::Incompatible
+        );
+
+        let intersection = DeclaredType::Intersection(vec![named("MissingA"), named("MissingB")]);
+        assert_eq!(
+            check(&intersection, &named("App\\Child")),
+            TypeCompatibility::Unknown
+        );
+        assert_eq!(
+            check(&builtin(BuiltinType::Bool), &builtin(BuiltinType::True)),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&builtin(BuiltinType::Bool), &builtin(BuiltinType::False)),
+            TypeCompatibility::Compatible
+        );
+        assert_eq!(
+            check(&builtin(BuiltinType::True), &builtin(BuiltinType::False)),
+            TypeCompatibility::Incompatible
         );
     }
 
@@ -6627,11 +7006,123 @@ class ParentChild extends ParentBase {
             .find(|scope| scope.kind == ScopeKind::Namespace && scope.namespace == "App")
             .unwrap();
         assert_eq!(
-            snapshot.lookup_binding(namespace.id, "$child").unwrap().declared_type,
+            snapshot
+                .lookup_binding(namespace.id, "$child")
+                .unwrap()
+                .declared_type,
             Some(DeclaredType::Named {
                 written: "Child".into(),
                 resolved: "App\\Child".into()
             })
+        );
+    }
+
+    #[test]
+    fn expression_resolver_infers_ast_literal_types() {
+        let snapshot =
+            SnapshotBuilder::from_php_text("literal.php", "<?php", SemanticRevision(1)).build();
+        let scope = snapshot.scopes.records.first().unwrap().id;
+        let resolver = ExpressionResolver::new(&snapshot, scope);
+        let cases = [
+            ("22", BuiltinType::Int),
+            ("22.5", BuiltinType::Float),
+            ("'nome'", BuiltinType::String),
+            ("\"nome\"", BuiltinType::String),
+            ("true", BuiltinType::True),
+            ("false", BuiltinType::False),
+            ("null", BuiltinType::Null),
+            ("[]", BuiltinType::Array),
+            ("array(1, 2)", BuiltinType::Array),
+            ("(22)", BuiltinType::Int),
+        ];
+        for (source, expected) in cases {
+            let text = format!("<?php {source};");
+            let syntax = PhpSyntax::parse(&text).unwrap();
+            let mut pending = vec![syntax.tree().root_node()];
+            let expression = loop {
+                let Some(node) = pending.pop() else {
+                    break None;
+                };
+                if matches!(
+                    node.kind(),
+                    "integer"
+                        | "float"
+                        | "string"
+                        | "encapsed_string"
+                        | "boolean"
+                        | "null"
+                        | "array_creation_expression"
+                        | "function_call_expression"
+                        | "parenthesized_expression"
+                ) {
+                    break expression_from_ast(node, &text);
+                }
+                pending.extend(node.named_children(&mut node.walk()));
+            };
+            let expression = expression.expect(source);
+            assert_eq!(
+                resolver.infer_expression_type(&expression),
+                Some(DeclaredType::Builtin(expected)),
+                "source: {source}"
+            );
+        }
+        assert!(
+            expression_from_ast(
+                PhpSyntax::parse("<?php $unknown;")
+                    .unwrap()
+                    .tree()
+                    .root_node(),
+                "<?php $unknown;"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn semantic_symbols_preserve_structured_parameters_from_ast() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("params.php"),
+            "<?php namespace App; class Base {} class Child extends Base { public function run(int $a, ?Base $b = null, string ...$rest): void {} public function context(self $x, static $y, parent $p): void {} }",
+        )
+        .unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(3));
+        let run = snapshot
+            .symbols_for_fqn("App\\Child::run")
+            .first()
+            .and_then(|id| snapshot.symbol(*id))
+            .unwrap();
+        assert_eq!(run.structured_parameters.len(), 3);
+        assert_eq!(run.structured_parameters[0].name.as_deref(), Some("$a"));
+        assert_eq!(
+            run.structured_parameters[0].declared_type,
+            Some(DeclaredType::Builtin(BuiltinType::Int))
+        );
+        assert!(!run.structured_parameters[0].optional);
+        assert!(matches!(
+            run.structured_parameters[1].declared_type,
+            Some(DeclaredType::Nullable(_))
+        ));
+        assert!(run.structured_parameters[1].optional);
+        assert_eq!(run.structured_parameters[2].variadic, true);
+        assert!(!run.structured_parameters[2].optional);
+
+        let context = snapshot
+            .symbols_for_fqn("App\\Child::context")
+            .first()
+            .and_then(|id| snapshot.symbol(*id))
+            .unwrap();
+        assert_eq!(context.structured_parameters.len(), 3);
+        assert!(
+            matches!(context.structured_parameters[0].declared_type, Some(DeclaredType::Named { ref resolved, .. }) if resolved == "App\\Child")
+        );
+        assert!(
+            matches!(context.structured_parameters[1].declared_type, Some(DeclaredType::Named { ref resolved, .. }) if resolved == "App\\Child")
+        );
+        assert!(
+            matches!(context.structured_parameters[2].declared_type, Some(DeclaredType::Named { ref resolved, .. }) if resolved == "App\\Base")
         );
     }
 
@@ -6686,7 +7177,9 @@ class ParentChild extends ParentBase {
             })
             .collect();
         assert_eq!(
-            snapshot.lookup_binding(scope_b, "$child").map(|binding| binding.name.as_str()),
+            snapshot
+                .lookup_binding(scope_b, "$child")
+                .map(|binding| binding.name.as_str()),
             Some("$child"),
             "assignment must resolve in the replaced file's scope (scope_id={scope_b:?}, expected_file={file_b:?}, actual_scope_file={:?}, registrations={registrations:?})",
             snapshot.scopes.records[scope_b.0 as usize].file,
@@ -6728,26 +7221,52 @@ $value = new B();
             .iter()
             .filter(|scope| scope.kind == ScopeKind::Namespace)
             .collect();
-        let one = namespaces.iter().find(|scope| scope.namespace == "One").unwrap();
-        let two = namespaces.iter().find(|scope| scope.namespace == "Two").unwrap();
+        let one = namespaces
+            .iter()
+            .find(|scope| scope.namespace == "One")
+            .unwrap();
+        let two = namespaces
+            .iter()
+            .find(|scope| scope.namespace == "Two")
+            .unwrap();
         assert_eq!(
-            snapshot.lookup_binding(one.id, "$value").unwrap().declared_type,
-            Some(DeclaredType::Named { written: "A".into(), resolved: "One\\A".into() })
+            snapshot
+                .lookup_binding(one.id, "$value")
+                .unwrap()
+                .declared_type,
+            Some(DeclaredType::Named {
+                written: "A".into(),
+                resolved: "One\\A".into()
+            })
         );
         assert_eq!(
-            snapshot.lookup_binding(two.id, "$value").unwrap().declared_type,
-            Some(DeclaredType::Named { written: "B".into(), resolved: "Two\\B".into() })
+            snapshot
+                .lookup_binding(two.id, "$value")
+                .unwrap()
+                .declared_type,
+            Some(DeclaredType::Named {
+                written: "B".into(),
+                resolved: "Two\\B".into()
+            })
         );
         let function = namespaces
             .iter()
-            .flat_map(|scope| snapshot.scopes.records.iter().filter(move |child| {
-                child.parent == Some(scope.id) && child.kind == ScopeKind::Function
-            }))
+            .flat_map(|scope| {
+                snapshot.scopes.records.iter().filter(move |child| {
+                    child.parent == Some(scope.id) && child.kind == ScopeKind::Function
+                })
+            })
             .next()
             .unwrap();
         assert_eq!(
-            snapshot.lookup_binding(function.id, "$value").unwrap().declared_type,
-            Some(DeclaredType::Named { written: "A".into(), resolved: "One\\A".into() })
+            snapshot
+                .lookup_binding(function.id, "$value")
+                .unwrap()
+                .declared_type,
+            Some(DeclaredType::Named {
+                written: "A".into(),
+                resolved: "One\\A".into()
+            })
         );
     }
 
@@ -6756,10 +7275,21 @@ $value = new B();
         let text = "<?php class A {} class B {} $value = new A(); $value = new B();";
         let snapshot =
             SnapshotBuilder::from_php_text("later.php", text, SemanticRevision(1)).build();
-        let file = snapshot.scopes.records.iter().find(|scope| scope.kind == ScopeKind::File).unwrap();
+        let file = snapshot
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::File)
+            .unwrap();
         assert_eq!(
-            snapshot.lookup_binding(file.id, "$value").unwrap().declared_type,
-            Some(DeclaredType::Named { written: "B".into(), resolved: "B".into() })
+            snapshot
+                .lookup_binding(file.id, "$value")
+                .unwrap()
+                .declared_type,
+            Some(DeclaredType::Named {
+                written: "B".into(),
+                resolved: "B".into()
+            })
         );
     }
 
@@ -7280,6 +7810,7 @@ function run(User $user): void { foo(); echo $user->name; $user->name = 'A'; ech
             visibility: Visibility::Unknown,
             modifiers: Vec::new(),
             parameters: None,
+            structured_parameters: Vec::new(),
             return_type: None,
             owner: None,
             owner_key: None,

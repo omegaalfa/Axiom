@@ -15,6 +15,7 @@ bench = false
 
 [dependencies]
 gpui.workspace = true
+tree-sitter.workspace = true
 axiom-editor = { path = "../axiom-editor" }
 axiom-lsp = { path = "../axiom-lsp" }
 axiom-php = { path = "../axiom-php" }
