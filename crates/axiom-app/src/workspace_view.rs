@@ -18,8 +18,8 @@ use axiom_app::shell_state::{
 };
 use axiom_editor::Document;
 use axiom_index::{
-    FindUsagesOptions, PersistentFileKey, ProjectSymbolIndex, ReferenceRole, SemanticEngine,
-    SemanticRevision, SemanticSnapshot, SnapshotBuilder, VendorSymbolIndex,
+    FindUsagesOptions, ProjectSymbolIndex, ReferenceRole, SemanticEngine, SemanticRevision,
+    SemanticSnapshot, SnapshotBuilder, VendorSymbolIndex,
 };
 use axiom_lsp::{PositionCodec, ServerStatus, uri_to_path};
 use axiom_php::{RuntimeSymbolIndex, StubProvider};
@@ -1639,57 +1639,9 @@ impl WorkspaceView {
                     crate::editor_view::UI_STAGE_SEMANTIC_PUBLISH,
                 );
                 let publish_started = Instant::now();
-                if crate::editor_view::debug_semantic_binding_flow_enabled() {
-                    if let Some(path) = self
-                        .active
-                        .and_then(|index| self.tabs.get(index))
-                        .map(|tab| tab.path.clone())
-                    {
-                        let key = PersistentFileKey::workspace_lexical(&path);
-                        let file_id = snapshot.file_id(&key);
-                        let mut file_scope = None;
-                        let mut namespace_scopes = Vec::new();
-                        let mut binding_names = Vec::new();
-                        if let Some(file_id) = file_id {
-                            for scope in snapshot
-                                .scopes
-                                .records
-                                .iter()
-                                .filter(|scope| scope.file == Some(file_id))
-                            {
-                                if scope.kind == axiom_index::ScopeKind::File {
-                                    file_scope = Some((scope.span.start, scope.span.end));
-                                } else if scope.kind == axiom_index::ScopeKind::Namespace
-                                    && namespace_scopes.len() < 8
-                                {
-                                    namespace_scopes.push((
-                                        scope.id,
-                                        scope.span.start,
-                                        scope.span.end,
-                                    ));
-                                }
-                                for binding in &scope.bindings {
-                                    if binding_names.len() < 16 {
-                                        binding_names.push((binding.name.clone(), scope.id));
-                                    }
-                                }
-                            }
-                        }
-                        eprintln!(
-                            "[SEM PUB] semantic_revision={} file_id={file_id:?} file_scope={file_scope:?} namespace_scopes={namespace_scopes:?} binding_names={binding_names:?}",
-                            snapshot.revision.0
-                        );
-                    }
-                }
                 let published = engine.publish(snapshot);
                 publish_us = publish_started.elapsed().as_micros();
                 let revision = engine.snapshot().revision.0;
-                if crate::editor_view::debug_semantic_binding_flow_enabled() {
-                    eprintln!(
-                        "[SEM PUB] phase=after semantic_revision={} published={}",
-                        revision, published
-                    );
-                }
                 if published {
                     let _stage = crate::editor_view::UiStageGuard::new(
                         crate::editor_view::UI_STAGE_TAB_UPDATE,

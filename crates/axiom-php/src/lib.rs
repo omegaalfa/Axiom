@@ -1,7 +1,7 @@
 //! Native PHP symbol model and in-memory runtime stub index.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env, fmt, fs, io,
     ops::Range,
     path::{Path, PathBuf},
@@ -323,30 +323,63 @@ pub struct RuntimeSymbolIndex {
     functions: HashMap<String, Vec<Symbol>>,
     constants: HashMap<String, Vec<Symbol>>,
     members: HashMap<String, Vec<Symbol>>,
+    #[serde(skip)]
+    prefix_symbols: BTreeMap<String, Vec<RuntimeSymbolRef>>,
     symbol_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeSymbolRef {
+    bucket: RuntimeSymbolBucket,
+    key: String,
+    index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeSymbolBucket {
+    Classes,
+    Functions,
+    Constants,
 }
 
 impl RuntimeSymbolIndex {
     pub fn insert(&mut self, symbol: Symbol) {
         self.symbol_count += 1;
+        let name_key = fold_name(&symbol.name);
+        let fqn_key = fold_name(&symbol.fqn);
         match symbol.kind {
             SymbolKind::Class | SymbolKind::Interface | SymbolKind::Trait | SymbolKind::Enum => {
-                self.classes
-                    .entry(fold_name(&symbol.fqn))
-                    .or_default()
-                    .push(symbol);
+                let key = fold_name(&symbol.fqn);
+                let symbols = self.classes.entry(key.clone()).or_default();
+                let reference = RuntimeSymbolRef {
+                    bucket: RuntimeSymbolBucket::Classes,
+                    key,
+                    index: symbols.len(),
+                };
+                symbols.push(symbol);
+                self.insert_prefix_reference(name_key, fqn_key, reference);
             }
             SymbolKind::Function => {
-                self.functions
-                    .entry(fold_name(&symbol.fqn))
-                    .or_default()
-                    .push(symbol);
+                let key = fold_name(&symbol.fqn);
+                let symbols = self.functions.entry(key.clone()).or_default();
+                let reference = RuntimeSymbolRef {
+                    bucket: RuntimeSymbolBucket::Functions,
+                    key,
+                    index: symbols.len(),
+                };
+                symbols.push(symbol);
+                self.insert_prefix_reference(name_key, fqn_key, reference);
             }
             SymbolKind::GlobalConstant => {
-                self.constants
-                    .entry(symbol.fqn.clone())
-                    .or_default()
-                    .push(symbol);
+                let key = symbol.fqn.clone();
+                let symbols = self.constants.entry(key.clone()).or_default();
+                let reference = RuntimeSymbolRef {
+                    bucket: RuntimeSymbolBucket::Constants,
+                    key,
+                    index: symbols.len(),
+                };
+                symbols.push(symbol);
+                self.insert_prefix_reference(name_key, fqn_key, reference);
             }
             SymbolKind::Method | SymbolKind::Property | SymbolKind::ClassConstant => {
                 if let Some((owner, _)) = symbol.fqn.rsplit_once("::") {
@@ -407,16 +440,46 @@ impl RuntimeSymbolIndex {
 
     pub fn search_prefix(&self, prefix: &str) -> Vec<&Symbol> {
         let prefix = fold_name(prefix);
-        self.classes
-            .values()
-            .chain(self.functions.values())
-            .chain(self.constants.values())
-            .flat_map(|items| items.iter())
-            .filter(|symbol| {
-                fold_name(&symbol.name).starts_with(&prefix)
-                    || fold_name(&symbol.fqn).starts_with(&prefix)
+        let upper = format!("{prefix}\u{10ffff}");
+        let mut seen = std::collections::HashSet::new();
+        self.prefix_symbols
+            .range(prefix..=upper)
+            .flat_map(|(_, references)| references)
+            .filter(|reference| {
+                seen.insert((
+                    reference.bucket as u8,
+                    reference.key.clone(),
+                    reference.index,
+                ))
+            })
+            .filter_map(|reference| {
+                let symbols = match reference.bucket {
+                    RuntimeSymbolBucket::Classes => self.classes.get(&reference.key),
+                    RuntimeSymbolBucket::Functions => self.functions.get(&reference.key),
+                    RuntimeSymbolBucket::Constants => self.constants.get(&reference.key),
+                }?;
+                symbols.get(reference.index)
             })
             .collect()
+    }
+
+    fn insert_prefix_reference(
+        &mut self,
+        name_key: String,
+        fqn_key: String,
+        reference: RuntimeSymbolRef,
+    ) {
+        let distinct_fqn = fqn_key != name_key;
+        self.prefix_symbols
+            .entry(name_key)
+            .or_default()
+            .push(reference.clone());
+        if distinct_fqn {
+            self.prefix_symbols
+                .entry(fqn_key)
+                .or_default()
+                .push(reference);
+        }
     }
 
     /// Iterates over every runtime declaration. This is intentionally a

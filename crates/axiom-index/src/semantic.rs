@@ -224,6 +224,8 @@ pub fn declared_type_compatibility(
                 TypeCompatibility::Incompatible
             }
         }
+        (DeclaredType::Named { .. }, DeclaredType::Builtin(_))
+        | (DeclaredType::Builtin(_), DeclaredType::Named { .. }) => TypeCompatibility::Incompatible,
         _ => TypeCompatibility::Unknown,
     }
 }
@@ -790,6 +792,10 @@ fn declared_type_from_snapshot(
 
 fn expression_from_ast(node: tree_sitter::Node<'_>, text: &str) -> Option<Expression> {
     match node.kind() {
+        "argument" => node
+            .named_children(&mut node.walk())
+            .next()
+            .and_then(|expression| expression_from_ast(expression, text)),
         "integer" => Some(Expression::Literal(DeclaredType::Builtin(BuiltinType::Int))),
         "float" => Some(Expression::Literal(DeclaredType::Builtin(
             BuiltinType::Float,
@@ -4870,6 +4876,27 @@ mod tests {
         assert_eq!(first.normalized_path, "src/Unsaved.php");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn workspace_lexical_normalizes_windows_separators_and_dot_segments() {
+        let backslashes = PersistentFileKey::workspace_lexical(r"c:\work\.\src\..\src\A.php");
+        let slashes = PersistentFileKey::workspace_lexical("c:/work/src/A.php");
+        assert_eq!(backslashes, slashes);
+        assert_eq!(slashes.normalized_path, "c:/work/src/A.php");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_lexical_normalizes_unc_forms_without_wsl_drive_equivalence() {
+        let ordinary = PersistentFileKey::workspace_lexical(r"\\server\share\src\A.php");
+        let extended = PersistentFileKey::workspace_lexical(r"\\?\UNC\server\share\src\A.php");
+        assert_eq!(ordinary, extended);
+        assert_ne!(
+            PersistentFileKey::workspace_lexical("/mnt/c/work/src/A.php"),
+            PersistentFileKey::workspace_lexical("C:/work/src/A.php")
+        );
+    }
+
     #[test]
     fn workspace_lexical_matches_physical_index_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -5876,12 +5903,15 @@ function testAlias(AliasChild $child): void { $child->run(); }
 
     #[test]
     fn declared_type_compatibility_is_conservative_and_nominal() {
-        let snapshot = SnapshotBuilder::from_php_text(
-            "compat.php",
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("compat.php"),
             "<?php namespace App; class Base {} class Child extends Base {}",
-            SemanticRevision(2),
         )
-        .build();
+        .unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(2));
         let builtin = |kind| DeclaredType::Builtin(kind);
         let named = |name: &str| DeclaredType::Named {
             written: name.to_owned(),
@@ -5948,6 +5978,10 @@ function testAlias(AliasChild $child): void { $child->run(); }
         );
         assert_eq!(
             check(&union, &builtin(BuiltinType::Bool)),
+            TypeCompatibility::Incompatible
+        );
+        assert_eq!(
+            check(&union, &named("App\\Child")),
             TypeCompatibility::Incompatible
         );
         let unknown = DeclaredType::Unknown("value".into());
@@ -7075,6 +7109,28 @@ class ParentChild extends ParentBase {
                 "<?php $unknown;"
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn expression_resolver_unwraps_call_argument_nodes() {
+        let text = "<?php consume(22);";
+        let syntax = PhpSyntax::parse(text).unwrap();
+        let mut pending = vec![syntax.tree().root_node()];
+        let argument = loop {
+            let node = pending.pop().expect("argument node");
+            if node.kind() == "argument" {
+                break node;
+            }
+            pending.extend(node.named_children(&mut node.walk()));
+        };
+        let snapshot =
+            SnapshotBuilder::from_php_text("argument.php", text, SemanticRevision(1)).build();
+        let scope = snapshot.scopes.records.first().unwrap().id;
+
+        assert_eq!(
+            ExpressionResolver::new(&snapshot, scope).infer_ast_expression_type(argument, text),
+            Some(DeclaredType::Builtin(BuiltinType::Int))
         );
     }
 

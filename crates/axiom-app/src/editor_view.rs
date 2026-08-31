@@ -251,6 +251,7 @@ pub struct EditorView {
     width_cache_line_count: usize,
     width_cache_dirty: bool,
     native_inspection_generation: u64,
+    native_inspection_latest_generation: Arc<AtomicU64>,
     initial_native_inspection_scheduled: bool,
     native_inspection_sender: Sender<NativeInspectionResult>,
     native_inspection_results: Receiver<NativeInspectionResult>,
@@ -288,13 +289,13 @@ struct ByteDiagnostic {
 struct NativeInspectionResult {
     document_session: DocumentSessionId,
     generation: u64,
-    scheduled_at: Instant,
     diagnostics: Vec<ByteDiagnostic>,
 }
 
 struct NativeInspectionWorkItem {
     document_session: DocumentSessionId,
     generation: u64,
+    latest_generation: Arc<AtomicU64>,
     unknown_class: UnknownClassInspectionInput,
     unknown_constant: UnknownConstantInspectionInput,
     duplicate_class: DuplicateClassInspectionInput,
@@ -309,6 +310,40 @@ enum NativeInspectionCapture {
 
 const NATIVE_INSPECTION_CAPTURE_RETRY_DELAY_MS: u64 = 15;
 const NATIVE_INSPECTION_CAPTURE_MAX_LOCK_RETRIES: usize = 3;
+
+fn run_native_inspection_rules<UnknownClass, UnknownConstant, DuplicateClass, Arguments>(
+    latest_generation: &AtomicU64,
+    generation: u64,
+    unknown_class: UnknownClass,
+    unknown_constant: UnknownConstant,
+    duplicate_class: DuplicateClass,
+    arguments: Arguments,
+) -> Option<Vec<ByteDiagnostic>>
+where
+    UnknownClass: FnOnce() -> Vec<ByteDiagnostic>,
+    UnknownConstant: FnOnce() -> Vec<ByteDiagnostic>,
+    DuplicateClass: FnOnce() -> Vec<ByteDiagnostic>,
+    Arguments: FnOnce() -> Vec<ByteDiagnostic>,
+{
+    let stale = || latest_generation.load(Ordering::Acquire) != generation;
+    if stale() {
+        return None;
+    }
+    let mut diagnostics = unknown_class();
+    if stale() {
+        return None;
+    }
+    diagnostics.extend(unknown_constant());
+    if stale() {
+        return None;
+    }
+    diagnostics.extend(duplicate_class());
+    if stale() {
+        return None;
+    }
+    diagnostics.extend(arguments());
+    Some(diagnostics)
+}
 
 #[derive(Clone)]
 struct UnknownClassInspectionInput {
@@ -537,72 +572,14 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
     calls.sort_by_key(|node| node.start_byte());
 
     let mut out = Vec::new();
-    let debug_flow = debug_native_inspection_flow_enabled();
-    let mut member_calls = 0usize;
-    let mut semantic_resolved = 0usize;
-    let mut semantic_binding_missing = 0usize;
-    let mut semantic_scope_missing = 0usize;
-    let mut fallback_used = 0usize;
     for call in calls {
-        let is_member_call = matches!(
-            call.kind(),
-            "member_call_expression" | "nullsafe_member_call_expression"
-        );
-        if debug_flow && is_member_call {
-            eprintln!(
-                "[NATIVE CALL] stage=collected kind={} start={} end={}",
-                call.kind(),
-                call.start_byte(),
-                call.end_byte()
-            );
-        }
         let arguments_node = call.child_by_field_name("arguments").or_else(|| {
             call.named_children(&mut call.walk())
                 .find(|node| node.kind() == "arguments")
         });
-        if debug_flow && is_member_call {
-            eprintln!(
-                "[NATIVE CALL] stage=arguments found={}",
-                arguments_node.is_some()
-            );
-        }
         let Some(arguments_node) = arguments_node else {
-            if debug_flow && is_member_call {
-                let object_kind = call
-                    .child_by_field_name("object")
-                    .map(|node| node.kind())
-                    .unwrap_or("missing");
-                let name_text = call
-                    .child_by_field_name("name")
-                    .and_then(|node| node.utf8_text(input.text.as_bytes()).ok())
-                    .unwrap_or("missing");
-                let name_text = name_text
-                    .get(..name_text.len().min(64))
-                    .unwrap_or(name_text);
-                eprintln!(
-                    "[NATIVE CALL] stage=ast_fields object_kind={} name_text={} arguments_found=false",
-                    object_kind, name_text
-                );
-            }
             continue;
         };
-        if debug_flow && is_member_call {
-            let object_kind = call
-                .child_by_field_name("object")
-                .map(|node| node.kind())
-                .unwrap_or("missing");
-            let name_text = call
-                .child_by_field_name("name")
-                .and_then(|node| node.utf8_text(input.text.as_bytes()).ok())
-                .unwrap_or("missing");
-            let name_text = name_text
-                .get(..name_text.len().min(64))
-                .unwrap_or(name_text);
-            eprintln!(
-                "[NATIVE CALL] stage=ast_fields object_kind={} name_text={} arguments_found=true",
-                object_kind, name_text
-            );
-        }
         let open = arguments_node.start_byte();
         if call.kind() == "object_creation_expression" {
             let class_node = call.child_by_field_name("class").or_else(|| {
@@ -670,15 +647,7 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                     },
                 });
             }
-            emit_project_type_diagnostics(
-                input,
-                snapshot,
-                scope,
-                id,
-                arguments_node,
-                &mut out,
-                debug_flow,
-            );
+            emit_project_type_diagnostics(input, snapshot, scope, id, arguments_node, &mut out);
             continue;
         }
         let callable_start = input.text[..open]
@@ -696,14 +665,6 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
             .map(|(_, n)| n)
             .unwrap_or(callable)
             .trim_start_matches('$');
-        if debug_flow && is_member_call {
-            let callable_log = callable.get(..callable.len().min(96)).unwrap_or(callable);
-            let name_log = name.get(..name.len().min(64)).unwrap_or(name);
-            eprintln!(
-                "[NATIVE CALL] stage=textual_callable callable={} name={}",
-                callable_log, name_log
-            );
-        }
         if !name.is_empty() {
             let owner = callable
                 .rsplit_once("::")
@@ -738,41 +699,20 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                 call.kind(),
                 "member_call_expression" | "nullsafe_member_call_expression"
             ) {
-                if debug_flow {
-                    member_calls += 1;
-                }
                 let receiver = call
                     .child_by_field_name("object")
                     .filter(|node| node.kind() == "variable_name")
                     .and_then(|node| node.utf8_text(input.text.as_bytes()).ok())
                     .map(str::trim)
                     .map(str::to_owned);
-                if debug_flow {
-                    eprintln!(
-                        "[NATIVE CALL] stage=semantic_entry receiver={} method={}",
-                        receiver.as_deref().unwrap_or("unknown"),
-                        name
-                    );
-                }
                 input.semantic_snapshot.as_ref().and_then(|snapshot| {
-                    let Some(scope) = snapshot.scope_id_at(&input.file_key, call.start_byte()) else {
-                        if debug_flow {
-                            semantic_scope_missing += 1;
-                            eprintln!(
-                                "[NATIVE CALL] stage=semantic_result scope_found=false binding_found=false resolved=false"
-                            );
-                        }
+                    let Some(scope) = snapshot.scope_id_at(&input.file_key, call.start_byte())
+                    else {
                         return None;
                     };
                     let Some(receiver) = receiver.as_deref() else {
-                        if debug_flow {
-                            eprintln!(
-                                "[NATIVE CALL] stage=semantic_result scope_found=true binding_found=false resolved=false"
-                            );
-                        }
                         return None;
                     };
-                    let binding_found = debug_flow && snapshot.lookup_binding(scope, receiver).is_some();
                     let result = match snapshot
                         .member_resolver()
                         .resolve_binding_method(scope, receiver, name)
@@ -780,32 +720,12 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                         MemberResolution::Resolved(id) => Some(id),
                         _ => None,
                     };
-                    if debug_flow {
-                        if result.is_some() {
-                            semantic_resolved += 1;
-                        } else {
-                            semantic_binding_missing += 1;
-                        }
-                        eprintln!(
-                            "[NATIVE CALL] stage=semantic_result scope_found=true binding_found={} resolved={}",
-                            binding_found,
-                            result.is_some()
-                        );
-                    }
                     result
                 })
             } else {
                 None
             };
             let symbol = if semantic_method.is_none() {
-                if debug_flow
-                    && matches!(
-                        call.kind(),
-                        "member_call_expression" | "nullsafe_member_call_expression"
-                    )
-                {
-                    fallback_used += 1;
-                }
                 owner
                     .as_deref()
                     .and_then(|o| {
@@ -887,22 +807,10 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                         id,
                         arguments_node,
                         &mut out,
-                        debug_flow,
                     );
                 }
             }
         }
-    }
-    if debug_flow {
-        eprintln!(
-            "[NATIVE INSPECT] stage=argument_summary member_calls={} semantic_resolved={} semantic_binding_missing={} semantic_scope_missing={} fallback_used={} argument_diagnostics={}",
-            member_calls,
-            semantic_resolved,
-            semantic_binding_missing,
-            semantic_scope_missing,
-            fallback_used,
-            out.len()
-        );
     }
     out
 }
@@ -1127,6 +1035,7 @@ impl EditorView {
             width_cache_line_count: initial_line_count,
             width_cache_dirty: true,
             native_inspection_generation: 0,
+            native_inspection_latest_generation: Arc::new(AtomicU64::new(0)),
             initial_native_inspection_scheduled: false,
             native_inspection_sender,
             native_inspection_results,
@@ -2104,16 +2013,15 @@ impl EditorView {
             (0_u128, 0_u128, true)
         } else {
             let trigger_started = Instant::now();
-            self.maybe_trigger_completion();
+            self.maybe_trigger_completion(&text);
             let trigger_us = trigger_started.elapsed().as_micros();
             let cursor = self.document.cursor_offset();
-            let content = self.document.content();
-            if cursor > 0 && matches!(content[..cursor].chars().next_back(), Some('(' | ',')) {
-                self.hover_popup = self.native_signature_help();
+            if cursor > 0 && matches!(text[..cursor].chars().next_back(), Some('(' | ',')) {
+                self.hover_popup = self.native_signature_help_for_text(&text);
                 self.hover_anchor = None;
             }
             let native_started = Instant::now();
-            let native = self.native_completions();
+            let native = self.native_completions_for_text(&text);
             let native_total_us = native_started.elapsed().as_micros();
             let native_empty = native.items.is_empty();
             if native_empty {
@@ -2263,73 +2171,23 @@ impl EditorView {
     fn schedule_native_inspections(&mut self, _: &str, cx: &mut Context<Self>) {
         self.native_inspection_generation = self.native_inspection_generation.wrapping_add(1);
         let generation = self.native_inspection_generation;
+        self.native_inspection_latest_generation
+            .store(generation, Ordering::Release);
         let session = self.document_session;
         let sender = self.native_inspection_sender.clone();
-        let scheduled_at = Instant::now();
-        if debug_native_inspection_flow_enabled() {
-            eprintln!(
-                "[NATIVE INSPECT] stage=scheduled generation={} document_session={}",
-                generation, session
-            );
-        }
         cx.spawn(async move |this, cx| {
             gpui::Timer::after(Duration::from_millis(200)).await;
             let mut lock_retries = 0usize;
             let work = loop {
                 let capture = match this.update(cx, |editor, _| {
-                if editor.document_session != session
-                    || editor.native_inspection_generation != generation
-                {
-                    return None;
-                }
-                if lock_retries == 0 && debug_native_inspection_flow_enabled() {
-                    eprintln!(
-                        "[NATIVE INSPECT] stage=timer_expired generation={} elapsed_from_schedule_ms={}",
-                        generation,
-                        scheduled_at.elapsed().as_millis()
-                    );
-                }
-                let capture_started = Instant::now();
-                if debug_native_inspection_flow_enabled() {
-                    eprintln!(
-                        "[NATIVE INSPECT] stage=capture_start generation={}",
-                        generation
-                    );
-                }
-                let text: Arc<str> = Arc::from(editor.document.content());
-                let work = editor.capture_native_inspection_work(text, session, generation);
-                if let NativeInspectionCapture::Ready(work) = &work {
-                    let vendor_symbols_count = if work.unknown_class.vendor_symbols.is_some() {
-                        "resident-count-unavailable"
-                    } else {
-                        "0"
-                    };
-                    let semantic_revision = work
-                        .arguments
-                        .semantic_snapshot
-                        .as_ref()
-                        .map(|snapshot| snapshot.revision.0);
-                    if debug_native_inspection_flow_enabled() {
-                        eprintln!(
-                            "[NATIVE INSPECT] stage=capture_end generation={} capture_ms={} semantic_revision={:?} project_symbols_count={} vendor_symbols_count={} text_bytes={}",
-                            generation,
-                            capture_started.elapsed().as_millis(),
-                            semantic_revision,
-                            work.arguments.project_symbols.len(),
-                            vendor_symbols_count,
-                            work.arguments.text.len()
-                        );
+                    if editor.document_session != session
+                        || editor.native_inspection_generation != generation
+                    {
+                        return None;
                     }
-                } else if matches!(work, NativeInspectionCapture::Unavailable)
-                    && debug_native_inspection_flow_enabled()
-                {
-                    eprintln!(
-                        "[NATIVE INSPECT] stage=capture_end generation={} capture_ms={} semantic_revision=None project_symbols_count=0 vendor_symbols_count=0 text_bytes=0",
-                        generation,
-                        capture_started.elapsed().as_millis()
-                    );
-                }
-                Some(work)
+                    let text: Arc<str> = Arc::from(editor.document.content());
+                    let work = editor.capture_native_inspection_work(text, session, generation);
+                    Some(work)
                 }) {
                     Ok(Some(capture)) => capture,
                     Ok(None) | Err(_) => return,
@@ -2339,21 +2197,9 @@ impl EditorView {
                     NativeInspectionCapture::Unavailable => return,
                     NativeInspectionCapture::RetryLockBusy => {
                         if lock_retries >= NATIVE_INSPECTION_CAPTURE_MAX_LOCK_RETRIES {
-                            if debug_native_inspection_flow_enabled() {
-                                eprintln!(
-                                    "[NATIVE INSPECT] stage=capture_aborted generation={} reason=lock_busy_retries_exhausted",
-                                    generation
-                                );
-                            }
                             return;
                         }
                         lock_retries += 1;
-                        if debug_native_inspection_flow_enabled() {
-                            eprintln!(
-                                "[NATIVE INSPECT] stage=capture_retry generation={} attempt={} reason=project_index_lock_busy",
-                                generation, lock_retries
-                            );
-                        }
                         gpui::Timer::after(Duration::from_millis(
                             NATIVE_INSPECTION_CAPTURE_RETRY_DELAY_MS,
                         ))
@@ -2361,33 +2207,20 @@ impl EditorView {
                     }
                 }
             };
-            let worker_started = Instant::now();
-            if debug_native_inspection_flow_enabled() {
-                eprintln!(
-                    "[NATIVE INSPECT] stage=worker_start generation={}",
-                    generation
-                );
-            }
             std::thread::spawn(move || {
-                let mut diagnostics = compute_unknown_class_inspections(&work.unknown_class);
-                diagnostics.extend(compute_unknown_constant_inspections(&work.unknown_constant));
-                diagnostics.extend(compute_duplicate_class_inspections(&work.duplicate_class));
-                let argument_diagnostics = compute_argument_inspections(&work.arguments);
-                let argument_diagnostics_count = argument_diagnostics.len();
-                diagnostics.extend(argument_diagnostics);
-                if debug_native_inspection_flow_enabled() {
-                    eprintln!(
-                        "[NATIVE INSPECT] stage=worker_end generation={} worker_ms={} diagnostics_count={} argument_diagnostics_count={}",
-                        generation,
-                        worker_started.elapsed().as_millis(),
-                        diagnostics.len(),
-                        argument_diagnostics_count
-                    );
-                }
+                let Some(diagnostics) = run_native_inspection_rules(
+                    &work.latest_generation,
+                    work.generation,
+                    || compute_unknown_class_inspections(&work.unknown_class),
+                    || compute_unknown_constant_inspections(&work.unknown_constant),
+                    || compute_duplicate_class_inspections(&work.duplicate_class),
+                    || compute_argument_inspections(&work.arguments),
+                ) else {
+                    return;
+                };
                 let _ = sender.send(NativeInspectionResult {
                     document_session: work.document_session,
                     generation: work.generation,
-                    scheduled_at,
                     diagnostics,
                 });
             });
@@ -2477,6 +2310,7 @@ impl EditorView {
         NativeInspectionCapture::Ready(NativeInspectionWorkItem {
             document_session: session,
             generation,
+            latest_generation: self.native_inspection_latest_generation.clone(),
             unknown_class: UnknownClassInspectionInput {
                 text: text.clone(),
                 project_classes,
@@ -2510,47 +2344,19 @@ impl EditorView {
             latest = Some(result);
         }
         if let Some(result) = latest {
-            if debug_native_inspection_flow_enabled() {
-                eprintln!(
-                    "[NATIVE INSPECT] stage=result_received generation={} current_generation={}",
-                    result.generation, self.native_inspection_generation
-                );
-            }
             if result.document_session == self.document_session
                 && result.generation == self.native_inspection_generation
             {
-                let diagnostics_count = result.diagnostics.len();
                 self.diagnostics.set_native_inspections(result.diagnostics);
-                if debug_native_inspection_flow_enabled() {
-                    eprintln!(
-                        "[NATIVE INSPECT] stage=result_applied diagnostics_count={} elapsed_total_ms={}",
-                        diagnostics_count,
-                        result.scheduled_at.elapsed().as_millis()
-                    );
-                }
                 cx.notify();
-            } else if debug_native_inspection_flow_enabled() {
-                let reason = if result.document_session != self.document_session {
-                    "session"
-                } else {
-                    "generation"
-                };
-                eprintln!("[NATIVE INSPECT] stage=result_discarded reason={}", reason);
             }
         }
     }
 
-    fn maybe_trigger_completion(&self) {
-        let Some((lsp, uri, position)) = self
-            .lsp
-            .as_ref()
-            .zip(self.lsp_uri.as_ref())
-            .zip(self.lsp_position())
-            .map(|((lsp, uri), position)| (lsp, uri, position))
-        else {
+    fn maybe_trigger_completion(&self, text: &str) {
+        let (Some(lsp), Some(uri)) = (self.lsp.as_ref(), self.lsp_uri.as_ref()) else {
             return;
         };
-        let text = self.document.content();
         let tail = &text[..self.document.cursor_offset().min(text.len())];
         if tail.ends_with("->")
             || tail.ends_with("::")
@@ -2559,6 +2365,11 @@ impl EditorView {
             || tail.ends_with("implements ")
             || tail.ends_with("use ")
         {
+            let position = PositionCodec::offset_to_position(
+                text,
+                self.document.cursor_offset(),
+                lsp.encoding(),
+            );
             lsp.request_completion(uri.clone(), position);
         }
     }
@@ -2691,9 +2502,14 @@ impl EditorView {
     }
 
     fn native_completions(&self) -> NativeCompletionBatch {
+        let text = self.document.content();
+        self.native_completions_for_text(&text)
+    }
+
+    fn native_completions_for_text(&self, text: &str) -> NativeCompletionBatch {
         let _stage = UiStageGuard::new(UI_STAGE_COMPLETION);
         let started = Instant::now();
-        let result = self.native_completions_impl();
+        let result = self.native_completions_impl(text);
         if debug_ui_stall_enabled() && started.elapsed().as_micros() >= 3_000 {
             tracing::info!(target: "axiom.ui_stall",
                 candidates = result.items.len(),
@@ -2704,8 +2520,7 @@ impl EditorView {
         result
     }
 
-    fn native_completions_impl(&self) -> NativeCompletionBatch {
-        let text = self.document.content();
+    fn native_completions_impl(&self, text: &str) -> NativeCompletionBatch {
         let cursor = self.document.cursor_offset().min(text.len());
         let before = &text[..cursor];
         let member_operator = before
@@ -2861,63 +2676,6 @@ impl EditorView {
             if !is_static && let Some(engine) = &self.semantic_engine {
                 let snapshot = engine.snapshot();
                 let file_key = PersistentFileKey::workspace_lexical(&self.file_path);
-                let lexical_file_id = snapshot.file_id(&file_key);
-                if !is_static && debug_semantic_binding_flow_enabled() {
-                    let scope_id = lexical_file_id
-                        .and_then(|file_id| snapshot.scope_id_at_file(file_id, cursor));
-                    let scope_kind = scope_id
-                        .and_then(|scope| snapshot.scope(scope))
-                        .map(|scope| format!("{:?}", scope.kind))
-                        .unwrap_or_else(|| "unknown".to_owned());
-                    let binding = scope_id
-                        .and_then(|scope| snapshot.lookup_binding(scope, &owner_expression));
-                    let binding_type = binding
-                        .and_then(|binding| binding.declared_type.as_ref())
-                        .map(|ty| format!("{ty:?}"))
-                        .unwrap_or_else(|| "unknown".to_owned());
-                    eprintln!(
-                        "[SEM COMP] semantic_revision={} file_id={lexical_file_id:?} scope_id={scope_id:?} scope_kind={} receiver={} binding_found={} binding_type={}",
-                        snapshot.revision.0,
-                        scope_kind,
-                        owner_expression,
-                        binding.is_some(),
-                        binding_type
-                    );
-                }
-                if debug_completion_flow_enabled() {
-                    let scope_id = lexical_file_id
-                        .and_then(|file_id| snapshot.scope_id_at_file(file_id, cursor));
-                    let binding = scope_id
-                        .and_then(|scope| snapshot.lookup_binding(scope, &owner_expression));
-                    let semantic_items = binding.map(|_| {
-                        snapshot
-                            .member_resolver()
-                            .completion_methods_for_binding(
-                                scope_id.expect("binding scope exists"),
-                                &owner_expression,
-                                prefix,
-                            )
-                            .len()
-                    });
-                    let binding_type = binding
-                        .and_then(|binding| binding.declared_type.as_ref())
-                        .map(|ty| format!("{ty:?}"))
-                        .unwrap_or_else(|| "unknown".to_owned());
-                    eprintln!(
-                        "[COMP FLOW] revision={} requested_lexical={:?} lexical_file_id={lexical_file_id:?} resident_identity_file_id=unavailable scope_id={scope_id:?} binding_found={} binding_type={} branch={} semantic_items={} fallback_items=pending",
-                        snapshot.revision.0,
-                        file_key.normalized_path,
-                        binding.is_some(),
-                        binding_type,
-                        if semantic_items.is_some() {
-                            "semantic"
-                        } else {
-                            "fallback"
-                        },
-                        semantic_items
-                            .map_or_else(|| "unavailable".to_owned(), |count| count.to_string())
-                    );
-                }
                 if let Some(scope) = snapshot.scope_id_at(&file_key, cursor)
                     && snapshot.lookup_binding(scope, &owner_expression).is_some()
                 {
@@ -3035,16 +2793,6 @@ impl EditorView {
                 }
                 let mut seen = std::collections::HashSet::new();
                 members.retain(|item| seen.insert(item.label.to_ascii_lowercase()));
-                if debug_completion_flow_enabled() {
-                    eprintln!(
-                        "[COMP FLOW] revision={} requested_lexical=fallback lexical_file_id=unknown resident_identity_file_id=unavailable scope_id=unknown binding_found=unknown binding_type=unknown branch=fallback semantic_items=0 fallback_items={}",
-                        self.semantic_engine
-                            .as_ref()
-                            .map(|engine| engine.snapshot().revision.0)
-                            .unwrap_or_default(),
-                        members.len()
-                    );
-                }
                 return NativeCompletionBatch {
                     items: members.into_iter().take(40).collect(),
                     new_prefix: None,
@@ -3497,6 +3245,10 @@ impl EditorView {
 
     fn native_signature_help(&self) -> Option<String> {
         let text = self.document.content();
+        self.native_signature_help_for_text(&text)
+    }
+
+    fn native_signature_help_for_text(&self, text: &str) -> Option<String> {
         let cursor = self.document.cursor_offset().min(text.len());
         let before = &text[..cursor];
         let open = before.rfind('(')?;
@@ -4896,42 +4648,6 @@ fn debug_ui_stall_enabled() -> bool {
     })
 }
 
-#[cfg(debug_assertions)]
-fn debug_completion_flow_enabled() -> bool {
-    std::env::var_os("AXIOM_DEBUG_COMPLETION_FLOW").is_some_and(|value| {
-        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
-    })
-}
-
-#[cfg(debug_assertions)]
-pub(crate) fn debug_semantic_binding_flow_enabled() -> bool {
-    std::env::var_os("AXIOM_DEBUG_SEMANTIC_BINDING_FLOW").is_some_and(|value| {
-        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
-    })
-}
-
-#[cfg(debug_assertions)]
-fn debug_native_inspection_flow_enabled() -> bool {
-    std::env::var_os("AXIOM_DEBUG_NATIVE_INSPECTION_FLOW").is_some_and(|value| {
-        !matches!(value.to_string_lossy().as_ref(), "" | "0" | "false" | "off")
-    })
-}
-
-#[cfg(not(debug_assertions))]
-fn debug_completion_flow_enabled() -> bool {
-    false
-}
-
-#[cfg(not(debug_assertions))]
-pub(crate) fn debug_semantic_binding_flow_enabled() -> bool {
-    false
-}
-
-#[cfg(not(debug_assertions))]
-fn debug_native_inspection_flow_enabled() -> bool {
-    false
-}
-
 #[cfg(not(debug_assertions))]
 fn debug_ui_stall_enabled() -> bool {
     false
@@ -5889,7 +5605,6 @@ fn emit_project_type_diagnostics(
     symbol_id: axiom_index::SymbolId,
     arguments_node: tree_sitter::Node<'_>,
     out: &mut Vec<ByteDiagnostic>,
-    debug_flow: bool,
 ) {
     let Some(symbol) = snapshot.symbol(symbol_id) else {
         return;
@@ -5904,9 +5619,6 @@ fn emit_project_type_diagnostics(
         // Named arguments and unpacking need dedicated mapping semantics; do
         // not guess at their parameter or type in this conservative phase.
         if argument.kind() == "named_argument" || argument.kind() == "variadic_unpacking" {
-            if debug_flow {
-                eprintln!("[NATIVE TYPE] expected=unknown actual=unknown result=unknown");
-            }
             parameter_index += 1;
             continue;
         }
@@ -5920,19 +5632,6 @@ fn emit_project_type_diagnostics(
             if let Some(actual) = resolver.infer_ast_expression_type(argument, input.text.as_ref())
             {
                 let compatibility = declared_type_compatibility(snapshot, expected, &actual);
-                if debug_flow {
-                    let result = match compatibility {
-                        TypeCompatibility::Compatible => "compatible",
-                        TypeCompatibility::Incompatible => "incompatible",
-                        TypeCompatibility::Unknown => "unknown",
-                    };
-                    eprintln!(
-                        "[NATIVE TYPE] expected={} actual={} result={}",
-                        declared_type_label(expected),
-                        declared_type_label(&actual),
-                        result
-                    );
-                }
                 if compatibility == TypeCompatibility::Incompatible {
                     out.push(ByteDiagnostic {
                         range: argument.start_byte()..argument.end_byte(),
@@ -6594,12 +6293,38 @@ mod diagnostic_store_tests {
         DuplicateClassInspectionInput, ParameterArity, PersistentFileKey,
         UnknownConstantInspectionInput, compute_argument_inspections,
         compute_duplicate_class_inspections, compute_unknown_constant_inspections,
-        signature_counts_from_detail,
+        run_native_inspection_rules, signature_counts_from_detail,
     };
+    use std::cell::Cell;
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn stale_native_inspection_stops_before_subsequent_rules() {
+        let latest_generation = AtomicU64::new(1);
+        let first_rule_ran = Cell::new(false);
+
+        let result = run_native_inspection_rules(
+            &latest_generation,
+            1,
+            || {
+                first_rule_ran.set(true);
+                latest_generation.store(2, Ordering::Release);
+                Vec::new()
+            },
+            || panic!("unknown constant inspection must not run after staleness"),
+            || panic!("duplicate class inspection must not run after staleness"),
+            || panic!("argument inspection must not run after staleness"),
+        );
+
+        assert!(first_rule_ran.get());
+        assert!(result.is_none());
+    }
 
     #[test]
     fn argument_inspection_is_pure_and_send_sync() {
@@ -6782,6 +6507,63 @@ mod diagnostic_store_tests {
         let expected = arguments_start..arguments_start + 2;
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].range, expected);
+    }
+
+    #[test]
+    fn argument_type_inspection_is_conservative_and_marks_only_mismatches() {
+        let text = r#"<?php
+class Base {}
+class Child extends Base {}
+class Other {}
+class Service {
+    public function __construct(string $name) {}
+    public function check(int|string $union, ?string $nullable, mixed $anything, Base $base, int ...$numbers): void {}
+}
+function test(Service $service, $unknown): void {
+    new Service(22);
+    $service->check(1, null, new Other(), new Child(), 2, 3);
+    $service->check('ok', 'name', $unknown, new Child(), 4);
+    $service->check(new Other(), null, null, new Other(), 5, 'bad');
+}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("argument-types.php");
+        fs::write(&path, text).unwrap();
+        let mut index = axiom_index::ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = axiom_index::SemanticSnapshot::from_project_index(
+            &index,
+            axiom_index::SemanticRevision(1),
+        );
+        let input = ArgumentInspectionInput {
+            text: Arc::from(text),
+            project_symbols: index.symbols().to_vec(),
+            runtime_symbols: None,
+            semantic_snapshot: Some(Arc::new(snapshot)),
+            file_key: PersistentFileKey::workspace_lexical(&path),
+        };
+
+        let diagnostics = compute_argument_inspections(&input);
+        let other_ranges = text
+            .match_indices("new Other()")
+            .map(|(start, value)| start..start + value.len())
+            .collect::<Vec<_>>();
+        let number_start = text.find("new Service(22)").unwrap() + "new Service(".len();
+        let bad_start = text.rfind("'bad'").unwrap();
+        let expected = vec![
+            number_start..number_start + 2,
+            other_ranges[1].clone(),
+            other_ranges[2].clone(),
+            bad_start..bad_start + "'bad'".len(),
+        ];
+        let actual = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.range.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.message.starts_with("Expected ") && !diagnostic.message.contains("unknown")
+        }));
     }
 
     #[test]

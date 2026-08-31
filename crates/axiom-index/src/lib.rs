@@ -83,6 +83,8 @@ pub struct IndexReport {
 pub struct ProjectSymbolIndex {
     files: BTreeMap<PathBuf, Arc<str>>,
     symbols: Vec<ProjectSymbol>,
+    prefix_names: BTreeMap<String, Vec<usize>>,
+    prefix_fqns: BTreeMap<String, Vec<usize>>,
     ready: bool,
 }
 
@@ -104,6 +106,7 @@ pub struct VendorSymbolIndex {
     /// directory belong to the workspace and must not be exposed as Vendor.
     vendor_root: Option<PathBuf>,
     classmap: BTreeMap<String, PathBuf>,
+    class_names: BTreeMap<String, Vec<String>>,
     psr4: Vec<(String, Vec<PathBuf>)>,
     parsed: BTreeMap<String, Vec<ProjectSymbol>>,
     parsed_files: BTreeMap<String, (PathBuf, u64, u128)>,
@@ -205,6 +208,7 @@ impl VendorSymbolIndex {
                 started.elapsed().as_millis()
             );
         }
+        index.rebuild_class_name_index();
         Ok(index)
     }
 
@@ -225,13 +229,16 @@ impl VendorSymbolIndex {
                     started.elapsed().as_millis()
                 );
             }
-            return Ok(Self {
+            let mut index = Self {
                 vendor_root: Some(canonical_or(root.join("vendor"))),
                 classmap: cache.classmap,
+                class_names: BTreeMap::new(),
                 psr4: cache.psr4,
                 parsed: BTreeMap::new(),
                 parsed_files: BTreeMap::new(),
-            });
+            };
+            index.rebuild_class_name_index();
+            return Ok(index);
         }
         let index = Self::load(root)?;
         if let Some(parent) = cache_path.parent() {
@@ -620,15 +627,23 @@ impl VendorSymbolIndex {
     }
 
     pub fn classes_matching(&self, prefix: &str) -> Vec<String> {
-        self.classmap
-            .keys()
-            .filter(|fqn| {
-                fqn.rsplit('\\')
-                    .next()
-                    .is_some_and(|name| name.starts_with(prefix))
-            })
+        let upper = format!("{prefix}\u{10ffff}");
+        self.class_names
+            .range(prefix.to_owned()..=upper)
+            .flat_map(|(_, fqns)| fqns.iter())
             .cloned()
             .collect()
+    }
+
+    fn rebuild_class_name_index(&mut self) {
+        self.class_names.clear();
+        for fqn in self.classmap.keys() {
+            let name = fqn.rsplit('\\').next().unwrap_or(fqn);
+            self.class_names
+                .entry(name.to_owned())
+                .or_default()
+                .push(fqn.clone());
+        }
     }
 }
 
@@ -964,6 +979,7 @@ impl ProjectSymbolIndex {
                 let _ = self.index_file_with_source(&path, "InitialProjectScan");
             }
         }
+        self.rebuild_prefix_index();
         self.ready = true;
         Ok(self.report())
     }
@@ -1031,6 +1047,7 @@ impl ProjectSymbolIndex {
         }
         let snapshot_restore_us = snapshot_started.elapsed().as_micros();
         let removed = cached_files.saturating_sub(discovered.len());
+        self.rebuild_prefix_index();
         self.ready = true;
         let mut files = BTreeMap::new();
         for file in &discovered {
@@ -1152,6 +1169,9 @@ impl ProjectSymbolIndex {
         let count = output.len();
         self.files.insert(path, Arc::from(text));
         self.symbols.extend(output);
+        if self.ready {
+            self.rebuild_prefix_index();
+        }
         Ok(count)
     }
 
@@ -1160,6 +1180,7 @@ impl ProjectSymbolIndex {
         self.files.remove(&path);
         let before = self.symbols.len();
         self.symbols.retain(|symbol| symbol.file != path);
+        self.rebuild_prefix_index();
         before - self.symbols.len()
     }
 
@@ -1209,13 +1230,35 @@ impl ProjectSymbolIndex {
             .collect()
     }
     pub fn search_prefix(&self, prefix: &str) -> Vec<&ProjectSymbol> {
-        let mut result: Vec<_> = self
-            .symbols
-            .iter()
-            .filter(|s| s.name.starts_with(prefix) || s.fully_qualified_name.starts_with(prefix))
-            .collect();
+        let upper = format!("{prefix}\u{10ffff}");
+        let mut indexes = std::collections::BTreeSet::new();
+        for (_, matches) in self.prefix_names.range(prefix.to_owned()..=upper.clone()) {
+            indexes.extend(matches.iter().copied());
+        }
+        for (_, matches) in self.prefix_fqns.range(prefix.to_owned()..=upper) {
+            indexes.extend(matches.iter().copied());
+        }
+        let mut result: Vec<&ProjectSymbol> = indexes
+            .into_iter()
+            .filter_map(|index| self.symbols.get(index))
+            .collect::<Vec<_>>();
         result.sort_by_key(|s| (!s.name.starts_with(prefix), s.name.to_lowercase()));
         result
+    }
+
+    fn rebuild_prefix_index(&mut self) {
+        self.prefix_names.clear();
+        self.prefix_fqns.clear();
+        for (index, symbol) in self.symbols.iter().enumerate() {
+            self.prefix_names
+                .entry(symbol.name.clone())
+                .or_default()
+                .push(index);
+            self.prefix_fqns
+                .entry(symbol.fully_qualified_name.clone())
+                .or_default()
+                .push(index);
+        }
     }
 }
 
@@ -1536,6 +1579,41 @@ fn symbol_node(node: Node<'_>) -> Option<(ProjectSymbolKind, Node<'_>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_prefix_index_tracks_initial_incremental_and_removed_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Service.php");
+        fs::write(
+            &path,
+            "<?php namespace App; class AlphaService {} function alpha_helper() {}",
+        )
+        .unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+
+        assert!(
+            index
+                .search_prefix("Alpha")
+                .iter()
+                .any(|symbol| { symbol.fully_qualified_name == "App\\AlphaService" })
+        );
+        assert!(
+            index
+                .search_prefix("App\\Alpha")
+                .iter()
+                .any(|symbol| { symbol.fully_qualified_name == "App\\AlphaService" })
+        );
+
+        index
+            .index_file_text(&path, "<?php namespace App; class BetaService {}")
+            .unwrap();
+        assert!(index.search_prefix("Alpha").is_empty());
+        assert_eq!(index.search_prefix("Beta").len(), 1);
+
+        index.remove_file(&path);
+        assert!(index.search_prefix("Beta").is_empty());
+    }
 
     #[test]
     fn workspace_source_uses_discovery_exclusions_and_root_boundary() {
