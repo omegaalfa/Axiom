@@ -1997,9 +1997,9 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn find(&mut self, _: &Find, _: &mut Window, cx: &mut Context<Self>) {
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
         self.open_menu = None;
-        self.status = "Find UI is deferred; editor text search is not implemented yet".into();
+        self.dispatch_editor_action(crate::editor_view::Find, window, cx);
         cx.notify();
     }
 

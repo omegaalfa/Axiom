@@ -79,6 +79,11 @@ actions!(
         Reformat,
         SignatureHelp,
         CompleteStatement,
+        Find,
+        FindNext,
+        FindPrevious,
+        CloseFind,
+        FindBackspace,
         Escape,
     ]
 );
@@ -125,6 +130,10 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-alt-l", Reformat, Some("Editor")),
         KeyBinding::new("ctrl-shift-space", SignatureHelp, Some("Editor")),
         KeyBinding::new("ctrl-shift-enter", CompleteStatement, Some("Editor")),
+        KeyBinding::new("enter", FindNext, Some("FindInput")),
+        KeyBinding::new("shift-enter", FindPrevious, Some("FindInput")),
+        KeyBinding::new("escape", CloseFind, Some("FindInput")),
+        KeyBinding::new("backspace", FindBackspace, Some("FindInput")),
         KeyBinding::new("escape", Escape, Some("Editor")),
     ]
 }
@@ -208,6 +217,9 @@ pub struct EditorView {
     document: Document,
     syntax: Option<PhpSyntax>,
     focus: FocusHandle,
+    find_focus: FocusHandle,
+    find_focus_pending: bool,
+    find: FindState,
     scroll: UniformListScrollHandle,
     selection_anchor: Option<usize>,
     preferred_x: Option<Pixels>,
@@ -277,6 +289,50 @@ enum EditorScrollAxis {
 enum EditorScrollEventSource {
     Viewport,
     Scrollbar,
+}
+
+#[derive(Debug, Default)]
+struct FindState {
+    visible: bool,
+    query: String,
+    matches: Vec<Range<usize>>,
+    current: Option<usize>,
+}
+
+impl FindState {
+    fn refresh(&mut self, text: &str) {
+        self.matches.clear();
+        self.current = None;
+        if self.query.is_empty() {
+            return;
+        }
+        self.matches.extend(
+            text.match_indices(&self.query)
+                .map(|(start, value)| start..start + value.len()),
+        );
+        self.current = (!self.matches.is_empty()).then_some(0);
+    }
+
+    fn next(&mut self) -> Option<Range<usize>> {
+        let len = self.matches.len();
+        let current = self.current?;
+        let next = (current + 1) % len;
+        self.current = Some(next);
+        Some(self.matches[next].clone())
+    }
+
+    fn previous(&mut self) -> Option<Range<usize>> {
+        let len = self.matches.len();
+        let current = self.current?;
+        let previous = (current + len - 1) % len;
+        self.current = Some(previous);
+        Some(self.matches[previous].clone())
+    }
+
+    fn current_match(&self) -> Option<Range<usize>> {
+        self.current
+            .and_then(|current| self.matches.get(current).cloned())
+    }
 }
 
 #[derive(Clone)]
@@ -1023,6 +1079,9 @@ impl EditorView {
             document,
             syntax,
             focus: cx.focus_handle(),
+            find_focus: cx.focus_handle(),
+            find_focus_pending: false,
+            find: FindState::default(),
             scroll: UniformListScrollHandle::new(),
             selection_anchor: None,
             preferred_x: None,
@@ -2018,6 +2077,14 @@ impl EditorView {
             self.width_cache_dirty = true;
         }
         let text = self.document.content();
+        if self.find.visible {
+            self.find.refresh(&text);
+            if let Some(range) = self.find.current_match() {
+                self.document.set_selection(range.start, range.end);
+                self.selection_anchor = Some(range.start);
+                self.ensure_cursor_visible();
+            }
+        }
         let edit = self.document.take_last_edit();
         let syntax_started = Instant::now();
         self.sync_syntax_text(&text, edit.as_ref());
@@ -3268,6 +3335,56 @@ impl EditorView {
         }
     }
 
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.find.visible = true;
+        let text = self.document.content();
+        self.find.refresh(&text);
+        if let Some(range) = self.find.current_match() {
+            self.select_find_match(range, cx);
+        }
+        self.find_focus_pending = true;
+        window.focus(&self.find_focus);
+        cx.notify();
+    }
+
+    fn select_find_match(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        self.document.set_selection(range.start, range.end);
+        self.selection_anchor = Some(range.start);
+        self.preferred_x = None;
+        self.ensure_cursor_visible();
+        cx.notify();
+    }
+
+    fn find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(range) = self.find.next() {
+            self.select_find_match(range, cx);
+        }
+    }
+
+    fn find_previous(&mut self, _: &FindPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(range) = self.find.previous() {
+            self.select_find_match(range, cx);
+        }
+    }
+
+    fn close_find(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
+        self.find.visible = false;
+        self.find_focus_pending = false;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn find_backspace(&mut self, _: &FindBackspace, _: &mut Window, cx: &mut Context<Self>) {
+        self.find.query.pop();
+        let text = self.document.content();
+        self.find.refresh(&text);
+        if let Some(range) = self.find.current_match() {
+            self.select_find_match(range, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
     fn signature_help(&mut self, _: &SignatureHelp, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.native_signature_help() {
             self.hover_popup = Some(text);
@@ -4506,6 +4623,20 @@ fn php_heredoc_delimiter(line: &str) -> Option<String> {
     .then(|| delimiter.to_owned())
 }
 
+fn utf16_offset_to_byte(text: &str, offset: usize) -> usize {
+    let mut units = 0;
+    for (byte, character) in text.char_indices() {
+        if units >= offset {
+            return byte;
+        }
+        units += character.len_utf16();
+        if units >= offset {
+            return byte + character.len_utf8();
+        }
+    }
+    text.len()
+}
+
 fn runtime_signature_detail(symbol: &axiom_php::Symbol) -> String {
     let signature = symbol
         .signature
@@ -4755,6 +4886,13 @@ impl Render for EditorView {
         self.poll_native_inspection_results(cx);
         let t = theme();
         let m = metrics();
+        if self.find.visible && self.find_focus_pending {
+            window.focus(&self.find_focus);
+            self.find_focus_pending = false;
+        }
+        let find_query = self.find.query.clone();
+        let find_count = self.find.matches.len();
+        let find_position = self.find.current.map_or(0, |current| current + 1);
         let combined_diagnostics = self.diagnostics.combined();
         let status = self.status.clone().or_else(|| {
             combined_diagnostics
@@ -4955,6 +5093,7 @@ impl Render for EditorView {
         };
         popup_y = popup_y.min((px(viewport_h) - popup_height).max(px(0.0)));
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -4996,6 +5135,11 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::reformat))
             .on_action(cx.listener(Self::signature_help))
             .on_action(cx.listener(Self::complete_statement))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
+            .on_action(cx.listener(Self::close_find))
+            .on_action(cx.listener(Self::find_backspace))
             .on_action(cx.listener(Self::escape))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -5378,6 +5522,60 @@ impl Render for EditorView {
                         )
                     }),
             )
+            .when(self.find.visible, |this| {
+                let find_focus = self.find_focus.clone();
+                this.child(
+                    div()
+                        .id("editor-find-bar")
+                        .absolute()
+                        .top(px(8.))
+                        .right(px(18.))
+                        .w(px(390.))
+                        .h(px(38.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded(m.border_radius_medium)
+                        .bg(t.popup_background)
+                        .border_1()
+                        .border_color(t.border)
+                        .shadow_lg()
+                        .occlude()
+                        .child(
+                            div()
+                                .id("editor-find-input")
+                                .relative()
+                                .flex_1()
+                                .h(px(26.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded(m.border_radius_small)
+                                .bg(t.editor_background)
+                                .border_1()
+                                .border_color(t.border_subtle)
+                                .key_context("FindInput")
+                                .track_focus(&find_focus)
+                                .on_mouse_down(MouseButton::Left, move |_, window, _| {
+                                    window.focus(&find_focus)
+                                })
+                                .child(if find_query.is_empty() {
+                                    SharedString::from("Find")
+                                } else {
+                                    SharedString::from(find_query)
+                                })
+                                .child(EditorFindInputElement {
+                                    editor: cx.entity(),
+                                    focus: self.find_focus.clone(),
+                                }),
+                        )
+                        .child(format!("{find_position}/{find_count}"))
+                        .child(Self::find_button("↑", FindPrevious))
+                        .child(Self::find_button("↓", FindNext))
+                        .child(Self::find_button("×", CloseFind)),
+                )
+            })
             .when_some(status, |this, status| {
                 this.child(
                     div()
@@ -5391,6 +5589,73 @@ impl Render for EditorView {
     }
 }
 
+struct EditorFindInputElement {
+    editor: Entity<EditorView>,
+    focus: FocusHandle,
+}
+
+impl IntoElement for EditorFindInputElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for EditorFindInputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: gpui::Bounds<Pixels>,
+        _: &mut (),
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.handle_input(
+            &self.focus,
+            ElementInputHandler::new(bounds, self.editor.clone()),
+            cx,
+        );
+    }
+}
+
 impl Focusable for EditorView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -5398,6 +5663,19 @@ impl Focusable for EditorView {
 }
 
 impl EditorView {
+    fn find_button(label: &'static str, action: impl Action) -> impl IntoElement {
+        div()
+            .id(label)
+            .w(px(24.))
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor(CursorStyle::PointingHand)
+            .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+            .child(label)
+    }
+
     fn insert_text_with_pairs(&mut self, text: &str) {
         if text.len() == 1 {
             let closing = match text.as_bytes()[0] as char {
@@ -5433,9 +5711,15 @@ impl EntityInputHandler for EditorView {
         &mut self,
         range: Range<usize>,
         actual: &mut Option<Range<usize>>,
-        _: &mut Window,
+        window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
+        if self.find.visible && self.find_focus.is_focused(window) {
+            actual.replace(range.clone());
+            let start = utf16_offset_to_byte(&self.find.query, range.start);
+            let end = utf16_offset_to_byte(&self.find.query, range.end);
+            return Some(self.find.query[start..end].to_owned());
+        }
         let range = self.range_from_utf16(&range);
         actual.replace(self.range_to_utf16(&range));
         Some(self.document.text_in_range(range.start, range.end))
@@ -5444,9 +5728,16 @@ impl EntityInputHandler for EditorView {
     fn selected_text_range(
         &mut self,
         _: bool,
-        _: &mut Window,
+        window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if self.find.visible && self.find_focus.is_focused(window) {
+            let end = self.find.query.encode_utf16().count();
+            return Some(UTF16Selection {
+                range: end..end,
+                reversed: false,
+            });
+        }
         Some(UTF16Selection {
             range: self.range_to_utf16(&self.selected_range()),
             reversed: false,
@@ -5467,9 +5758,26 @@ impl EntityInputHandler for EditorView {
         &mut self,
         range: Option<Range<usize>>,
         text: &str,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.find.visible && self.find_focus.is_focused(window) {
+            let range = range.unwrap_or_else(|| {
+                let end = self.find.query.encode_utf16().count();
+                end..end
+            });
+            let start = utf16_offset_to_byte(&self.find.query, range.start);
+            let end = utf16_offset_to_byte(&self.find.query, range.end);
+            self.find.query.replace_range(start..end, text);
+            let document_text = self.document.content();
+            self.find.refresh(&document_text);
+            if let Some(range) = self.find.current_match() {
+                self.select_find_match(range, cx);
+            } else {
+                cx.notify();
+            }
+            return;
+        }
         self.reset_caret_blink(cx);
         let range = range
             .as_ref()
@@ -5523,9 +5831,12 @@ impl EntityInputHandler for EditorView {
     fn character_index_for_point(
         &mut self,
         _: gpui::Point<Pixels>,
-        _: &mut Window,
+        window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
+        if self.find.visible && self.find_focus.is_focused(window) {
+            return Some(self.find.query.encode_utf16().count());
+        }
         Some(self.offset_to_utf16(self.document.cursor_offset()))
     }
 }
@@ -5964,10 +6275,11 @@ mod completion_ranking_tests {
 #[cfg(test)]
 mod formatter_tests {
     use super::{
-        Arc, DefinitionQuery, EditorView, FindUsagesSource, ProjectSymbolIndex, VendorSymbolIndex,
-        completion_presentation, declared_class_fqn, declared_parent_fqn, extract_owner_expression,
-        find_usages_source, native_format_php, property_type_in_context, resolve_php_class_name,
-        resolve_vendor_definition_target, supports_native_format, vendor_lookup_needed,
+        Arc, DefinitionQuery, EditorView, FindState, FindUsagesSource, ProjectSymbolIndex,
+        VendorSymbolIndex, completion_presentation, declared_class_fqn, declared_parent_fqn,
+        extract_owner_expression, find_usages_source, native_format_php, property_type_in_context,
+        resolve_php_class_name, resolve_vendor_definition_target, supports_native_format,
+        vendor_lookup_needed,
     };
     use axiom_index::FindUsagesStatus;
     use lsp_types::CompletionItem;
@@ -6175,6 +6487,86 @@ mod formatter_tests {
     fn native_formatter_provider_is_restricted_to_php_paths() {
         assert!(supports_native_format(std::path::Path::new("example.php")));
         assert!(!supports_native_format(std::path::Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn document_find_covers_single_multiple_zero_and_boundary_matches() {
+        let mut find = FindState {
+            query: "one".into(),
+            ..Default::default()
+        };
+        find.refresh("one two one");
+        assert_eq!(find.matches, vec![0..3, 8..11]);
+        assert_eq!(find.current_match(), Some(0..3));
+
+        find.query = "missing".into();
+        find.refresh("one two one");
+        assert!(find.matches.is_empty());
+        assert_eq!(find.current_match(), None);
+
+        find.query = "end".into();
+        find.refresh("start end");
+        assert_eq!(find.matches, vec![6..9]);
+
+        find.query = "Start".into();
+        find.refresh("start Start");
+        assert_eq!(find.matches, vec![6..11]);
+    }
+
+    #[test]
+    fn document_find_next_previous_wrap() {
+        let mut find = FindState {
+            query: "x".into(),
+            ..Default::default()
+        };
+        find.refresh("x x x");
+        assert_eq!(find.next(), Some(2..3));
+        assert_eq!(find.next(), Some(4..5));
+        assert_eq!(find.next(), Some(0..1));
+        assert_eq!(find.previous(), Some(4..5));
+    }
+
+    #[test]
+    fn document_find_uses_utf8_byte_ranges_for_unicode() {
+        let mut find = FindState {
+            query: "ação".into(),
+            ..Default::default()
+        };
+        find.refresh("ação e ação");
+        assert_eq!(find.matches, vec![0..6, 9..15]);
+        assert_eq!(&"ação e ação"[find.matches[1].clone()], "ação");
+    }
+
+    #[test]
+    fn document_find_refreshes_after_edit_and_is_document_local() {
+        let mut first = FindState {
+            query: "needle".into(),
+            ..Default::default()
+        };
+        let mut second = FindState {
+            query: "needle".into(),
+            ..Default::default()
+        };
+        first.refresh("needle");
+        second.refresh("other document");
+        assert_eq!(first.matches, vec![0..6]);
+        assert!(second.matches.is_empty());
+
+        first.refresh("edited without the term");
+        assert!(first.matches.is_empty());
+    }
+
+    #[test]
+    fn closing_document_find_preserves_content() {
+        let content = "unchanged".to_owned();
+        let mut find = FindState {
+            visible: true,
+            query: "change".into(),
+            ..Default::default()
+        };
+        find.refresh(&content);
+        find.visible = false;
+        assert_eq!(content, "unchanged");
     }
 
     #[gpui::test]
