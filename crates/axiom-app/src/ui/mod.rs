@@ -1,5 +1,6 @@
 pub mod components;
 pub mod icons;
+pub mod input_line;
 pub mod metrics;
 pub mod theme;
 

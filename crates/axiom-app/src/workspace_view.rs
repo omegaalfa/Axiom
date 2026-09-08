@@ -29,8 +29,8 @@ use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
     LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollHandle, SharedString, Style, TextRun, Timer, UTF16Selection, Window, actions, div,
-    prelude::*, px, relative,
+    ScrollHandle, SharedString, Style, Timer, UTF16Selection, Window, actions, div, prelude::*, px,
+    relative,
 };
 
 use crate::{
@@ -40,9 +40,7 @@ use crate::{
     ui::{
         components::tooltip,
         icons::{ActivityIcon, activity_icon, file_icon},
-        metrics,
-        metrics::{CODE_FONT_FAMILY, code_font},
-        theme,
+        metrics, theme,
     },
 };
 
@@ -290,6 +288,10 @@ pub struct WorkspaceView {
     explorer_extends: String,
     explorer_implements: String,
     modal_input_focus: FocusHandle,
+    modal_input_geometry: crate::ui::input_line::InputGeometry,
+    modal_caret_visible: bool,
+    modal_caret_activity: Instant,
+    modal_caret_toggle: Instant,
     modal_focus_pending: bool,
     delete_focus_pending: bool,
     explorer_selection: UTF16Selection,
@@ -847,6 +849,10 @@ impl WorkspaceView {
             explorer_extends: String::new(),
             explorer_implements: String::new(),
             modal_input_focus: cx.focus_handle(),
+            modal_input_geometry: Default::default(),
+            modal_caret_visible: true,
+            modal_caret_activity: Instant::now(),
+            modal_caret_toggle: Instant::now(),
             modal_focus_pending: false,
             delete_focus_pending: false,
             explorer_selection: UTF16Selection {
@@ -937,6 +943,17 @@ impl WorkspaceView {
                             crate::editor_view::UI_STAGE_POLL_CYCLE,
                         );
                         let cycle_started = Instant::now();
+                        if this.explorer_operation.is_some()
+                            && crate::ui::input_line::blink_due(
+                                cycle_started,
+                                this.modal_caret_activity,
+                                this.modal_caret_toggle,
+                            )
+                        {
+                            this.modal_caret_visible = !this.modal_caret_visible;
+                            this.modal_caret_toggle = cycle_started;
+                            cx.notify();
+                        }
                         let poll_started = Instant::now();
                         this.poll_lsp(cx);
                         let lsp_us = poll_started.elapsed().as_micros();
@@ -3109,14 +3126,17 @@ impl WorkspaceView {
             }
             return;
         }
-        if self.explorer_operation.is_some() {
+        if self.explorer_operation.is_some() && self.modal_input_focus.is_focused(window) {
             if debug_input_enabled() && !matches!(key.as_str(), "escape" | "enter") {
                 tracing::info!(key = %key, "[MODAL INPUT]");
             }
             match key.as_str() {
                 "escape" => self.cancel_explorer_operation(cx),
                 "enter" => self.confirm_explorer_operation(cx),
-                _ if self.modal_key_edit(&key, event.keystroke.modifiers, cx) => {}
+                _ if self.modal_key_edit(&key, event.keystroke.modifiers, cx) => {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                }
                 _ => {}
             }
             return;
@@ -3784,6 +3804,7 @@ impl WorkspaceView {
         text: &str,
         cx: &mut Context<Self>,
     ) {
+        self.reset_modal_caret();
         if self
             .explorer_operation
             .as_ref()
@@ -3837,7 +3858,15 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn reset_modal_caret(&mut self) {
+        self.modal_caret_visible = true;
+        let now = Instant::now();
+        self.modal_caret_activity = now;
+        self.modal_caret_toggle = now;
+    }
+
     fn modal_key_edit(&mut self, key: &str, modifiers: Modifiers, cx: &mut Context<Self>) -> bool {
+        self.reset_modal_caret();
         let length = self.explorer_input.encode_utf16().count();
         let start = self
             .explorer_selection
@@ -3877,11 +3906,35 @@ impl WorkspaceView {
             cx.notify();
             return true;
         }
+        if modifiers.control && key == "v" {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.modal_replace_range(start..end, &text, cx);
+            }
+            return true;
+        }
+        if modifiers.control && key == "x" {
+            let range = utf16_to_byte_offset(&self.explorer_input, start)
+                ..utf16_to_byte_offset(&self.explorer_input, end);
+            if let Some((text, caret)) =
+                crate::ui::input_line::cut_selection(&mut self.explorer_input, range)
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                let caret = byte_to_utf16_offset(&self.explorer_input, caret);
+                self.explorer_selection = UTF16Selection {
+                    range: caret..caret,
+                    reversed: false,
+                };
+                cx.notify();
+            }
+            return true;
+        }
         if key == "backspace" {
             if start != end {
                 self.modal_replace_range(start..end, "", cx);
             } else if start > 0 {
-                self.modal_replace_range(start - 1..start, "", cx);
+                let previous =
+                    crate::ui::input_line::adjacent_utf16(&self.explorer_input, start, false);
+                self.modal_replace_range(previous..start, "", cx);
             }
             return true;
         }
@@ -3889,15 +3942,24 @@ impl WorkspaceView {
             if start != end {
                 self.modal_replace_range(start..end, "", cx);
             } else if end < length {
-                self.modal_replace_range(end..end + 1, "", cx);
+                let next = crate::ui::input_line::adjacent_utf16(&self.explorer_input, end, true);
+                self.modal_replace_range(end..next, "", cx);
             }
             return true;
         }
         if matches!(key, "left" | "right") {
             let next = if key == "left" {
-                start.saturating_sub(1)
+                if start != end {
+                    start
+                } else {
+                    crate::ui::input_line::adjacent_utf16(&self.explorer_input, start, false)
+                }
             } else {
-                end.min(length).saturating_add(1).min(length)
+                if start != end {
+                    end
+                } else {
+                    crate::ui::input_line::adjacent_utf16(&self.explorer_input, end, true)
+                }
             };
             self.explorer_selection = UTF16Selection {
                 range: next..next,
@@ -5643,7 +5705,7 @@ impl WorkspaceView {
 
     fn render_explorer_operation(
         &self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = theme();
@@ -5664,16 +5726,6 @@ impl WorkspaceView {
             .range
             .end
             .min(self.explorer_input.encode_utf16().count());
-        let caret_x: f32 = modal_text_line(window, &self.explorer_input)
-            .x_for_index(utf16_to_byte_offset(&self.explorer_input, caret))
-            .into();
-        let input_before = utf16_slice(&self.explorer_input, 0, selection_start);
-        let input_selected = utf16_slice(&self.explorer_input, selection_start, selection_end);
-        let input_after = utf16_slice(
-            &self.explorer_input,
-            selection_end,
-            self.explorer_input.encode_utf16().count(),
-        );
         let input_width =
             ((self.explorer_input.encode_utf16().count() as f32) * 8.0 + 24.0).clamp(140.0, 300.0);
         let title = match self.explorer_operation {
@@ -5728,41 +5780,17 @@ impl WorkspaceView {
                         move |event, window, cx| {
                             cx.stop_propagation();
                             workspace.update(cx, |this, cx| {
-                                let before = this.explorer_selection.range.clone();
                                 window.focus(&this.modal_input_focus);
-                                let absolute_x: f32 = event.position.x.into();
-                                // The input is inside the fixed modal at
-                                // left=320, border=1, padding=12+8. Keep this
-                                // origin in one place for mouse and caret
-                                // diagnostics; the text hit-test itself uses
-                                // GPUI's shaped line metrics.
-                                let text_origin_x = 341.0;
-                                let local_text_x = absolute_x - text_origin_x;
-                                let (byte_index, utf16_index) =
-                                    modal_hit_test(window, &this.explorer_input, local_text_x);
+                                this.reset_modal_caret();
+                                let byte = this.modal_input_geometry.hit_test(event.position.x);
+                                let range = if event.click_count == 2 {
+                                    axiom_app::interaction::word_range_at(&this.explorer_input, byte)
+                                } else { byte..byte };
                                 this.explorer_selection = UTF16Selection {
-                                    range: utf16_index..utf16_index,
+                                    range: byte_to_utf16_offset(&this.explorer_input, range.start)
+                                        ..byte_to_utf16_offset(&this.explorer_input, range.end),
                                     reversed: false,
                                 };
-                                if debug_input_enabled() {
-                                    let text_width: f32 = modal_text_width(window, &this.explorer_input).into();
-                                    let input_selection = this
-                                        .selected_text_range(false, window, cx)
-                                        .map(|selection| selection.range);
-                                    tracing::info!(
-                                        local_x = local_text_x,
-                                        absolute_x,
-                                        text_origin_x,
-                                        text_width,
-                                        "[RENAME INPUT CLICK]"
-                                    );
-                                    tracing::info!(byte_index, utf16_index, "[RENAME HIT TEST]");
-                                    tracing::info!(before = ?before, after = ?this.explorer_selection.range, "[RENAME SELECTION]");
-                                    tracing::info!(
-                                        selected_range = ?input_selection,
-                                        "[INPUT HANDLER SELECTION]"
-                                    );
-                                }
                                 cx.notify();
                             });
                         }
@@ -5779,39 +5807,14 @@ impl WorkspaceView {
                             });
                         }
                     })
-                    .child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .h_full()
-                            .font_family(CODE_FONT_FAMILY)
-                            .child(
-                                div()
-                                    .flex()
-                                    .h_full()
-                                    .items_center()
-                                    .child(input_before)
-                                    .child(
-                                        div()
-                                            .when(!input_selected.is_empty(), |this| this.bg(t.selection))
-                                            .child(input_selected),
-                                    )
-                                    .child(input_after),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(caret_x))
-                                    .top(px(4.))
-                                    .w(px(1.))
-                                    .h(px(25.))
-                                    .bg(t.text_primary),
-                            ),
-                    )
-                    .child(WorkspaceInputElement {
-                        workspace: workspace.clone(),
-                        focus: self.modal_input_focus.clone(),
-                    }),
+                    .overflow_hidden()
+                    .child(crate::ui::input_line::render(
+                        workspace.clone(), self.modal_input_focus.clone(), self.explorer_input.clone(),
+                        utf16_to_byte_offset(&self.explorer_input, selection_start)
+                            ..utf16_to_byte_offset(&self.explorer_input, selection_end),
+                        utf16_to_byte_offset(&self.explorer_input, caret), self.modal_caret_visible,
+                        self.modal_input_geometry.clone(),
+                    )),
             )
             .child(
                 div()
@@ -6784,6 +6787,7 @@ impl Render for WorkspaceView {
             self.focus_active_editor = false;
         }
         if self.explorer_operation.is_some() && self.modal_focus_pending {
+            self.reset_modal_caret();
             window.focus(&self.modal_input_focus);
             self.modal_focus_pending = false;
             if debug_input_enabled() {
@@ -7237,6 +7241,7 @@ impl EntityInputHandler for WorkspaceView {
         let (query, caret) = replace_utf16_range(&query, range.clone(), text);
         if editing_explorer {
             self.explorer_input = query;
+            self.reset_modal_caret();
             let length = self.explorer_input.encode_utf16().count();
             self.explorer_selection = UTF16Selection {
                 range: caret..caret,
@@ -7306,13 +7311,12 @@ impl EntityInputHandler for WorkspaceView {
     fn character_index_for_point(
         &mut self,
         point: gpui::Point<gpui::Pixels>,
-        window: &mut Window,
+        _window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
         Some(if self.explorer_operation.is_some() {
-            let x: f32 = point.x.into();
-            let (_, utf16_index) = modal_hit_test(window, &self.explorer_input, x);
-            utf16_index
+            let byte = self.modal_input_geometry.hit_test(point.x);
+            byte_to_utf16_offset(&self.explorer_input, byte)
         } else if self.settings_visible && !self.command_palette_visible {
             self.settings_query.encode_utf16().count()
         } else {
@@ -7424,31 +7428,7 @@ fn replace_utf16_range(
     (result, caret)
 }
 
-fn modal_text_line(window: &mut Window, text: &str) -> gpui::ShapedLine {
-    let text: SharedString = text.to_owned().into();
-    let run = TextRun {
-        len: text.len(),
-        font: code_font(),
-        color: window.text_style().color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    window.text_system().shape_line(text, px(14.), &[run], None)
-}
-
-fn modal_text_width(window: &mut Window, text: &str) -> Pixels {
-    modal_text_line(window, text).width
-}
-
-fn modal_hit_test(window: &mut Window, text: &str, local_text_x: f32) -> (usize, usize) {
-    let shaped = modal_text_line(window, text);
-    let byte_index = shaped
-        .closest_index_for_x(px(local_text_x.max(0.0)))
-        .min(text.len());
-    (byte_index, byte_to_utf16_offset(text, byte_index))
-}
-
+#[cfg(test)]
 fn utf16_slice(text: &str, start: usize, end: usize) -> String {
     let (start, end) = if start <= end {
         (start, end)
@@ -7676,6 +7656,75 @@ mod modifier_tests {
             assert!(!workspace.explorer_new_menu_open);
             assert!(workspace.explorer_operation.is_none());
         });
+    }
+
+    #[gpui::test]
+    fn new_file_input_clipboard_selection_and_unicode_editing(cx: &mut gpui::TestAppContext) {
+        let (view, cx) =
+            cx.add_window_view(move |_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        view.update(cx, |workspace, cx| {
+            workspace.explorer_operation = Some(super::ExplorerOperation::NewFile(
+                std::path::PathBuf::from("E:/dev"),
+            ));
+            workspace.explorer_input = "old.txt".into();
+            let control = gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            };
+            assert!(workspace.modal_key_edit("a", control, cx));
+            assert_eq!(workspace.explorer_selection.range, 0..7);
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("a🙂b.txt".into()));
+            assert!(workspace.modal_key_edit("v", control, cx));
+            assert_eq!(workspace.explorer_input, "a🙂b.txt");
+            workspace.explorer_selection.range = 3..3;
+            workspace.modal_key_edit("left", Default::default(), cx);
+            assert_eq!(workspace.explorer_selection.range, 1..1);
+            workspace.modal_key_edit("right", Default::default(), cx);
+            assert_eq!(workspace.explorer_selection.range, 3..3);
+            workspace.modal_key_edit("backspace", Default::default(), cx);
+            assert_eq!(workspace.explorer_input, "ab.txt");
+            workspace.modal_key_edit("delete", Default::default(), cx);
+            assert_eq!(workspace.explorer_input, "a.txt");
+            assert!(matches!(
+                workspace.explorer_operation,
+                Some(super::ExplorerOperation::NewFile(_))
+            ));
+        });
+    }
+
+    #[gpui::test]
+    fn new_file_cut_consumes_shortcut_and_collapses_unicode_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let handle = cx.add_window(|_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        handle
+            .update(cx, |workspace, window, cx| {
+                workspace.explorer_operation =
+                    Some(super::ExplorerOperation::NewFile("E:/dev".into()));
+                workspace.explorer_input = "a🙂b.txt".into();
+                workspace.explorer_selection.range = 1..3;
+                window.focus(&workspace.modal_input_focus);
+                let event = gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        key: "x".into(),
+                        key_char: None,
+                        modifiers: gpui::Modifiers {
+                            control: true,
+                            ..Default::default()
+                        },
+                    },
+                    is_held: false,
+                };
+                workspace.handle_workspace_keydown(&event, window, cx);
+                assert_eq!(workspace.explorer_input, "ab.txt");
+                assert_eq!(workspace.explorer_selection.range, 1..1);
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "🙂");
+                workspace.handle_workspace_keydown(&event, window, cx);
+                assert_eq!(workspace.explorer_input, "ab.txt");
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "🙂");
+                assert!(workspace.modal_caret_visible);
+            })
+            .unwrap();
     }
 
     #[gpui::test]
