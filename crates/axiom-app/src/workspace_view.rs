@@ -4465,6 +4465,8 @@ impl WorkspaceView {
                     uri,
                     edits,
                     generation,
+                    document_session,
+                    document_revision,
                 } => {
                     if !self.accept_lsp_generation(&uri, LspRequestKind::Formatting, generation) {
                         continue;
@@ -4474,8 +4476,9 @@ impl WorkspaceView {
                         .iter()
                         .find(|tab| tab.editor.read(cx).lsp_uri() == Some(&uri))
                     {
-                        tab.editor
-                            .update(cx, |editor, cx| editor.apply_formatting(&edits, cx));
+                        tab.editor.update(cx, |editor, cx| {
+                            editor.apply_formatting(&edits, document_session, document_revision, cx)
+                        });
                     }
                 }
                 IdeLspEvent::SignatureHelp {

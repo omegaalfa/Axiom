@@ -3239,8 +3239,14 @@ impl EditorView {
             && lsp.status() == axiom_lsp::ServerStatus::Ready
         {
             tracing::info!("[FORMAT] provider=lsp");
-            lsp.request_formatting(uri.clone(), 4, true);
-        } else {
+            lsp.request_formatting(
+                uri.clone(),
+                4,
+                true,
+                self.document_session,
+                self.edit_generation,
+            );
+        } else if supports_native_format(&self.file_path) {
             let formatted = native_format_php(&self.document.content());
             if formatted != self.document.content() {
                 let cursor = self.document.cursor_offset();
@@ -3254,6 +3260,10 @@ impl EditorView {
                 self.status = Some("Axiom PHP Formatter: no changes".into());
                 tracing::info!("[FORMAT] provider=axiom-native changes=0");
             }
+            cx.notify();
+        } else {
+            self.status = Some("No formatter available for this file".into());
+            tracing::info!("[FORMAT] provider=none");
             cx.notify();
         }
     }
@@ -3391,7 +3401,17 @@ impl EditorView {
         }
     }
 
-    pub fn apply_formatting(&mut self, edits: &[lsp_types::TextEdit], cx: &mut Context<Self>) {
+    pub fn apply_formatting(
+        &mut self,
+        edits: &[lsp_types::TextEdit],
+        document_session: DocumentSessionId,
+        document_revision: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.document_session != document_session || self.edit_generation != document_revision {
+            tracing::info!("[FORMAT] discarded=stale");
+            return;
+        }
         if edits.is_empty() {
             self.status = Some("Formatter returned no changes".into());
             cx.notify();
@@ -4373,12 +4393,6 @@ fn native_format_php(text: &str) -> String {
     let mut heredoc: Option<String> = None;
     for (line_index, raw_line) in text.lines().enumerate() {
         let trimmed = raw_line.trim();
-        if trimmed.is_empty() {
-            if line_index > 0 {
-                result.push('\n');
-            }
-            continue;
-        }
         if let Some(delimiter) = heredoc.as_ref() {
             if line_index > 0 {
                 result.push('\n');
@@ -4389,42 +4403,41 @@ fn native_format_php(text: &str) -> String {
             }
             continue;
         }
-        let heredoc_start = trimmed
-            .find("<<<")
-            .and_then(|marker| {
-                let value = trimmed[marker + 3..].trim_start();
-                let value = value
-                    .strip_prefix('\'')
-                    .or_else(|| value.strip_prefix('"'))?;
-                let quote = value.chars().next_back()?;
-                if quote == '\'' || quote == '"' {
-                    return None;
-                }
-                Some(value.to_owned())
-            })
-            .or_else(|| {
-                let value = trimmed.strip_prefix("<<<")?.trim_start();
-                let delimiter = value
-                    .split(|ch: char| ch.is_whitespace() || ch == ';')
-                    .next()
-                    .filter(|value| !value.is_empty())?;
-                Some(delimiter.trim_matches(['\'', '"']).to_owned())
-            });
-        let closes =
-            trimmed.starts_with('}') || trimmed.starts_with(']') || trimmed.starts_with(')');
+        let preserves_quoted_text = quote.is_some();
+        if trimmed.is_empty() && !preserves_quoted_text {
+            if line_index > 0 {
+                result.push('\n');
+            }
+            continue;
+        }
+        let heredoc_start = (!preserves_quoted_text)
+            .then(|| php_heredoc_delimiter(trimmed))
+            .flatten();
+        let closes = !preserves_quoted_text
+            && (trimmed.starts_with('}') || trimmed.starts_with(']') || trimmed.starts_with(')'));
         if closes {
             indent = indent.saturating_sub(1);
         }
         if line_index > 0 {
             result.push('\n');
         }
-        result.push_str(&"    ".repeat(indent));
-        result.push_str(trimmed);
+        if preserves_quoted_text {
+            result.push_str(raw_line);
+        } else {
+            result.push_str(&"    ".repeat(indent));
+            result.push_str(trimmed);
+        }
         if let Some(delimiter) = heredoc_start.filter(|delimiter| !delimiter.is_empty()) {
             heredoc = Some(delimiter);
             continue;
         }
-        let mut chars = trimmed.chars().peekable();
+        let mut chars = if preserves_quoted_text {
+            raw_line
+        } else {
+            trimmed
+        }
+        .chars()
+        .peekable();
         let mut opens = 0usize;
         let mut closes_on_line = 0usize;
         while let Some(ch) = chars.next() {
@@ -4463,6 +4476,34 @@ fn native_format_php(text: &str) -> String {
         result.push('\n');
     }
     result
+}
+
+fn supports_native_format(path: &Path) -> bool {
+    is_php_file(path)
+}
+
+fn php_heredoc_delimiter(line: &str) -> Option<String> {
+    let marker = line.find("<<<")?;
+    let value = line[marker + 3..].trim_start();
+    let (delimiter, rest) = match value.chars().next()? {
+        quote @ ('\'' | '"') => {
+            let value = &value[quote.len_utf8()..];
+            let end = value.find(quote)?;
+            (&value[..end], &value[end + quote.len_utf8()..])
+        }
+        _ => {
+            let end = value
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .unwrap_or(value.len());
+            (&value[..end], &value[end..])
+        }
+    };
+    (!delimiter.is_empty()
+        && delimiter
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && rest.trim().is_empty())
+    .then(|| delimiter.to_owned())
 }
 
 fn runtime_signature_detail(symbol: &axiom_php::Symbol) -> String {
@@ -5926,7 +5967,7 @@ mod formatter_tests {
         Arc, DefinitionQuery, EditorView, FindUsagesSource, ProjectSymbolIndex, VendorSymbolIndex,
         completion_presentation, declared_class_fqn, declared_parent_fqn, extract_owner_expression,
         find_usages_source, native_format_php, property_type_in_context, resolve_php_class_name,
-        resolve_vendor_definition_target, vendor_lookup_needed,
+        resolve_vendor_definition_target, supports_native_format, vendor_lookup_needed,
     };
     use axiom_index::FindUsagesStatus;
     use lsp_types::CompletionItem;
@@ -6113,6 +6154,92 @@ mod formatter_tests {
         assert!(output.contains("    $text = \"{ not a block }\";"));
         assert!(output.contains("    // } remains a comment"));
         assert!(output.contains("    return $text;"));
+    }
+
+    #[test]
+    fn native_formatter_preserves_significant_multiline_literal_whitespace() {
+        let input = "<?php\nfunction render(){\n$text = \"first\n  keep two leading spaces  \nlast\";\n$heredoc = <<<EOT\n  keep heredoc spaces  \nEOT;\n$nowdoc = <<<'TXT'\n  keep nowdoc spaces  \nTXT;\n}\n";
+        let output = native_format_php(input);
+        assert!(output.contains("$text = \"first\n  keep two leading spaces  \nlast\";"));
+        assert!(output.contains("$heredoc = <<<EOT\n  keep heredoc spaces  \nEOT;"));
+        assert!(output.contains("$nowdoc = <<<'TXT'\n  keep nowdoc spaces  \nTXT;"));
+    }
+
+    #[test]
+    fn native_formatter_changes_plain_text_when_called_as_the_unguarded_fallback() {
+        let plain_text = "heading {\nbody\n}\n";
+        assert_ne!(native_format_php(plain_text), plain_text);
+    }
+
+    #[test]
+    fn native_formatter_provider_is_restricted_to_php_paths() {
+        assert!(supports_native_format(std::path::Path::new("example.php")));
+        assert!(!supports_native_format(std::path::Path::new("notes.txt")));
+    }
+
+    #[gpui::test]
+    fn stale_formatting_response_does_not_replace_newer_document_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let path = std::env::temp_dir().join("axiom-stale-formatting.php");
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_document(
+                path,
+                axiom_editor::Document::from_content("value\n"),
+                None,
+                cx,
+            )
+        });
+        view.update(cx, |editor, cx| {
+            let request_session = editor.document_session;
+            let request_revision = editor.edit_generation;
+            editor.document.move_cursor("value".len());
+            editor.document.insert_text("!");
+            editor.after_edit(cx);
+            editor.apply_formatting(
+                &[lsp_types::TextEdit {
+                    range: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 0),
+                        lsp_types::Position::new(0, 5),
+                    ),
+                    new_text: "formatted".into(),
+                }],
+                request_session,
+                request_revision,
+                cx,
+            );
+            assert_eq!(editor.document.content(), "value!\n");
+        });
+    }
+
+    #[gpui::test]
+    fn current_formatting_response_is_applied(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join("axiom-current-formatting.php");
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_document(
+                path,
+                axiom_editor::Document::from_content("value\n"),
+                None,
+                cx,
+            )
+        });
+        view.update(cx, |editor, cx| {
+            let request_session = editor.document_session;
+            let request_revision = editor.edit_generation;
+            editor.apply_formatting(
+                &[lsp_types::TextEdit {
+                    range: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 0),
+                        lsp_types::Position::new(0, 5),
+                    ),
+                    new_text: "formatted".into(),
+                }],
+                request_session,
+                request_revision,
+                cx,
+            );
+            assert_eq!(editor.document.content(), "formatted\n");
+        });
     }
 
     #[test]

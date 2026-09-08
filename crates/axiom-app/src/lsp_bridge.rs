@@ -27,6 +27,8 @@ pub enum IdeLspEvent {
         uri: Uri,
         edits: Vec<lsp_types::TextEdit>,
         generation: u64,
+        document_session: u64,
+        document_revision: u64,
     },
     SignatureHelp {
         uri: Uri,
@@ -430,7 +432,14 @@ impl LspBridge {
             .detach();
     }
 
-    pub fn request_formatting(&self, uri: Uri, tab_size: u32, insert_spaces: bool) {
+    pub fn request_formatting(
+        &self,
+        uri: Uri,
+        tab_size: u32,
+        insert_spaces: bool,
+        document_session: u64,
+        document_revision: u64,
+    ) {
         let generation = self.next_generation(&uri, LspRequestKind::Formatting);
         let Some(server) = &self.server else { return };
         let pending = match server.lock().expect("LSP lock poisoned").formatting(
@@ -454,6 +463,8 @@ impl LspBridge {
                         uri,
                         edits: edits.unwrap_or_default(),
                         generation,
+                        document_session,
+                        document_revision,
                     },
                     Err(error) => IdeLspEvent::Error(error.to_string()),
                 };
