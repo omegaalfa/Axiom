@@ -650,6 +650,34 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
             emit_project_type_diagnostics(input, snapshot, scope, id, arguments_node, &mut out);
             continue;
         }
+        if call.kind() == "function_call_expression"
+            && let Some(snapshot) = input.semantic_snapshot.as_ref()
+            && let Some(function) = call.child_by_field_name("function")
+            && matches!(function.kind(), "name" | "qualified_name")
+            && let Ok(written) = function.utf8_text(input.text.as_bytes())
+            && let Some(scope) = snapshot.scope_id_at(&input.file_key, call.start_byte())
+            && let Some(resolved) = snapshot.resolve_function_name(scope, written)
+        {
+            // Use the resolved FQN rather than an arbitrary short-name match.
+            // Dynamic calls and ambiguous declarations have no safe type contract.
+            let mut functions = snapshot
+                .symbols_for_fqn(&resolved)
+                .iter()
+                .filter_map(|id| snapshot.symbol(*id))
+                .filter(|symbol| symbol.kind == ProjectSymbolKind::Function);
+            if let Some(function) = functions.next()
+                && functions.next().is_none()
+            {
+                emit_project_type_diagnostics(
+                    input,
+                    snapshot,
+                    scope,
+                    function.id,
+                    arguments_node,
+                    &mut out,
+                );
+            }
+        }
         let callable_start = input.text[..open]
             .char_indices()
             .rev()
@@ -6564,6 +6592,63 @@ function test(Service $service, $unknown): void {
         assert!(diagnostics.iter().all(|diagnostic| {
             diagnostic.message.starts_with("Expected ") && !diagnostic.message.contains("unknown")
         }));
+    }
+
+    #[test]
+    fn global_function_argument_types_validate_only_known_mismatches() {
+        let text = r#"<?php
+function a(int|string $x) {}
+a(10);
+a('ok');
+a(true);
+function b(?string $x) {}
+b(null);
+b('ok');
+b(10);
+function c(mixed $x) {}
+c(123);
+c('abc');
+c(null);
+function d($x) {}
+d(123);
+d($qualquer);
+a($qualquer);
+b($qualquer);
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("global-argument-types.php");
+        fs::write(&path, text).unwrap();
+        let mut index = axiom_index::ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = axiom_index::SemanticSnapshot::from_project_index(
+            &index,
+            axiom_index::SemanticRevision(1),
+        );
+        let input = ArgumentInspectionInput {
+            text: Arc::from(text),
+            project_symbols: index.symbols().to_vec(),
+            runtime_symbols: None,
+            semantic_snapshot: Some(Arc::new(snapshot)),
+            file_key: PersistentFileKey::workspace_lexical(&path),
+        };
+        let diagnostics = compute_argument_inspections(&input);
+        let actual = diagnostics
+            .iter()
+            .map(|diagnostic| (&text[diagnostic.range.clone()], diagnostic.message.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                ("true", "Expected int|string, found true"),
+                ("10", "Expected ?string, found int"),
+            ]
+        );
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.severity == Some(lsp_types::DiagnosticSeverity::ERROR)
+        }));
+        let mut without_snapshot = input;
+        without_snapshot.semantic_snapshot = None;
+        assert!(compute_argument_inspections(&without_snapshot).is_empty());
     }
 
     #[test]

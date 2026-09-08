@@ -99,6 +99,58 @@ Near-term direction includes a PHP type engine, PHPDoc/type inference, deeper
 inspections, refactorings, Windows-native validation, an AI agent foundation,
 and a future plugin architecture. See the [project roadmap](docs/ROADMAP.md).
 
+# Compilar em debug
+```
+cargo build -p axiom-app --locked
+```
+# Compilar em release
+```
+cargo build --release -p axiom-app --locked
+```
+
+# Compilar release com saída mais limpa
+```
+cargo build --release -p axiom-app --locked --quiet
+```
+
+# Só verificar se compila, sem gerar binário final
+```
+cargo check -p axiom-app --locked
+```
+
+# Rodar direto em debug
+```
+cargo run -p axiom-app --locked -- .
+```
+
+# Rodar direto em release
+
+```
+cargo run --release -p axiom-app --locked -- .
+```
+
+ Sobre --quiet — acredito que era isso que você quis dizer, não --quit.
+
+Ele só reduz a quantidade de mensagens no terminal:
+```
+cargo build --release -p axiom-app --locked --quiet
+```
+Depois, para abrir o executável já compilado:
+```
+.\target\release\axiom.exe .
+```
+Se quiser o fluxo que eu mais recomendo para testar performance do Axiom:
+``` 
+cd E:\dev\Axiom
+cargo build --release -p axiom-app --locked --quiet
+.\target\release\axiom.exe .
+```
+
+E para desenvolvimento rápido, sem esperar build release:
+```
+cargo run -p axiom-app --locked -- .
+```
+
 ## Repository and contribution
 
 The official repository is [github.com/omegaalfa/Axiom](https://github.com/omegaalfa/Axiom).
