@@ -90,6 +90,9 @@ actions!(
         FindSelectAll,
         FindPaste,
         FindCut,
+        FindReplace,
+        FindReplaceAll,
+        ToggleReplace,
         Escape,
     ]
 );
@@ -146,6 +149,18 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-a", FindSelectAll, Some("FindInput")),
         KeyBinding::new("secondary-v", FindPaste, Some("FindInput")),
         KeyBinding::new("secondary-x", FindCut, Some("FindInput")),
+        KeyBinding::new("ctrl-enter", FindReplace, Some("FindInput")),
+        KeyBinding::new("ctrl-shift-enter", FindReplaceAll, Some("FindInput")),
+        KeyBinding::new("enter", FindReplace, Some("ReplaceInput")),
+        KeyBinding::new("escape", CloseFind, Some("ReplaceInput")),
+        KeyBinding::new("ctrl-shift-enter", FindReplaceAll, Some("ReplaceInput")),
+        KeyBinding::new("backspace", FindBackspace, Some("ReplaceInput")),
+        KeyBinding::new("delete", FindDelete, Some("ReplaceInput")),
+        KeyBinding::new("left", FindLeft, Some("ReplaceInput")),
+        KeyBinding::new("right", FindRight, Some("ReplaceInput")),
+        KeyBinding::new("secondary-a", FindSelectAll, Some("ReplaceInput")),
+        KeyBinding::new("secondary-v", FindPaste, Some("ReplaceInput")),
+        KeyBinding::new("secondary-x", FindCut, Some("ReplaceInput")),
         KeyBinding::new("escape", Escape, Some("Editor")),
     ]
 }
@@ -230,8 +245,12 @@ pub struct EditorView {
     syntax: Option<PhpSyntax>,
     focus: FocusHandle,
     find_focus: FocusHandle,
+    replace_focus: FocusHandle,
     find_focus_pending: bool,
     find: FindState,
+    replace: crate::ui::input_line::TextInput,
+    find_revision: u64,
+    replace_input_geometry: crate::ui::input_line::InputGeometry,
     find_input_bounds: crate::ui::input_line::InputGeometry,
     scroll: UniformListScrollHandle,
     selection_anchor: Option<usize>,
@@ -307,13 +326,25 @@ enum EditorScrollEventSource {
 #[derive(Debug, Default)]
 struct FindState {
     visible: bool,
-    query: String,
+    replace_expanded: bool,
+    #[cfg(test)]
+    refresh_count: usize,
+    input: crate::ui::input_line::TextInput,
     matches: Vec<Range<usize>>,
     current: Option<usize>,
-    selection_anchor: usize,
-    selection_active: usize,
 }
 
+impl std::ops::Deref for FindState {
+    type Target = crate::ui::input_line::TextInput;
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
+impl std::ops::DerefMut for FindState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.input
+    }
+}
 impl FindState {
     fn open(&mut self, editor_selection: Option<&str>) {
         if self.visible {
@@ -327,76 +358,21 @@ impl FindState {
         self.visible = true;
     }
 
-    fn selection(&self) -> Range<usize> {
-        self.selection_anchor.min(self.selection_active)
-            ..self.selection_anchor.max(self.selection_active)
-    }
-
-    fn set_caret(&mut self, offset: usize) {
-        let offset = floor_char_boundary(&self.query, offset.min(self.query.len()));
-        self.selection_anchor = offset;
-        self.selection_active = offset;
-    }
-
-    fn select_all(&mut self) {
-        self.selection_anchor = 0;
-        self.selection_active = self.query.len();
-    }
-
-    fn replace_selection(&mut self, text: &str) -> bool {
-        let selection = self.selection();
-        if selection.is_empty() && text.is_empty() {
-            return false;
-        }
-        self.query.replace_range(selection.clone(), text);
-        self.set_caret(selection.start + text.len());
-        true
-    }
-
-    fn move_left(&mut self) {
-        let selection = self.selection();
-        let offset = if !selection.is_empty() {
-            selection.start
-        } else {
-            self.query[..self.selection_active]
-                .char_indices()
-                .next_back()
-                .map_or(0, |(offset, _)| offset)
-        };
-        self.set_caret(offset);
-    }
-
-    fn move_right(&mut self) {
-        let selection = self.selection();
-        let offset = if !selection.is_empty() {
-            selection.end
-        } else {
-            self.query[self.selection_active..]
-                .chars()
-                .next()
-                .map_or(self.query.len(), |character| {
-                    self.selection_active + character.len_utf8()
-                })
-        };
-        self.set_caret(offset);
-    }
-
-    fn select_word_at(&mut self, offset: usize) {
-        let range = axiom_app::interaction::word_range_at(&self.query, offset);
-        self.selection_anchor = range.start;
-        self.selection_active = range.end;
-    }
-
     fn refresh(&mut self, text: &str) {
+        #[cfg(test)]
+        {
+            self.refresh_count += 1;
+        }
         self.matches.clear();
         self.current = None;
         if self.query.is_empty() {
             return;
         }
-        self.matches.extend(
-            text.match_indices(&self.query)
-                .map(|(start, value)| start..start + value.len()),
-        );
+        let matches = text
+            .match_indices(&self.query)
+            .map(|(start, value)| start..start + value.len())
+            .collect::<Vec<_>>();
+        self.matches.extend(matches);
         self.current = (!self.matches.is_empty()).then_some(0);
     }
 
@@ -1167,8 +1143,12 @@ impl EditorView {
             syntax,
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
+            replace_focus: cx.focus_handle(),
             find_focus_pending: false,
             find: FindState::default(),
+            replace: Default::default(),
+            find_revision: 0,
+            replace_input_geometry: Default::default(),
             find_input_bounds: Default::default(),
             scroll: UniformListScrollHandle::new(),
             selection_anchor: None,
@@ -2167,6 +2147,7 @@ impl EditorView {
         let text = self.document.content();
         if self.find.visible {
             self.find.refresh(&text);
+            self.find_revision = self.document.buffer_revision();
             if let Some(range) = self.find.current_match() {
                 self.document.set_selection(range.start, range.end);
                 self.selection_anchor = Some(range.start);
@@ -3428,6 +3409,7 @@ impl EditorView {
         self.find.open(selected.as_deref());
         let text = self.document.content();
         self.find.refresh(&text);
+        self.find_revision = self.document.buffer_revision();
         if let Some(range) = self.find.current_match() {
             self.select_find_match(range, cx);
         }
@@ -3464,7 +3446,14 @@ impl EditorView {
         cx.notify();
     }
 
-    fn find_backspace(&mut self, _: &FindBackspace, _: &mut Window, cx: &mut Context<Self>) {
+    fn find_backspace(&mut self, _: &FindBackspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.replace_focus.is_focused(window) {
+            if self.replace.backspace() {
+                self.reset_caret_blink(cx);
+            }
+            cx.notify();
+            return;
+        }
         let selection = self.find.selection();
         let changed = if !selection.is_empty() {
             self.find.replace_selection("")
@@ -3483,7 +3472,14 @@ impl EditorView {
         }
     }
 
-    fn find_delete(&mut self, _: &FindDelete, _: &mut Window, cx: &mut Context<Self>) {
+    fn find_delete(&mut self, _: &FindDelete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.replace_focus.is_focused(window) {
+            if self.replace.delete() {
+                self.reset_caret_blink(cx);
+            }
+            cx.notify();
+            return;
+        }
         let selection = self.find.selection();
         let changed = if !selection.is_empty() {
             self.find.replace_selection("")
@@ -3503,25 +3499,51 @@ impl EditorView {
         }
     }
 
-    fn find_left(&mut self, _: &FindLeft, _: &mut Window, cx: &mut Context<Self>) {
+    fn find_left(&mut self, _: &FindLeft, window: &mut Window, cx: &mut Context<Self>) {
+        if self.replace_focus.is_focused(window) {
+            self.replace.move_left();
+            self.reset_caret_blink(cx);
+            cx.notify();
+            return;
+        }
         self.find.move_left();
         self.reset_caret_blink(cx);
         cx.notify();
     }
 
-    fn find_right(&mut self, _: &FindRight, _: &mut Window, cx: &mut Context<Self>) {
+    fn find_right(&mut self, _: &FindRight, window: &mut Window, cx: &mut Context<Self>) {
+        if self.replace_focus.is_focused(window) {
+            self.replace.move_right();
+            self.reset_caret_blink(cx);
+            cx.notify();
+            return;
+        }
         self.find.move_right();
         self.reset_caret_blink(cx);
         cx.notify();
     }
 
-    fn find_select_all(&mut self, _: &FindSelectAll, _: &mut Window, cx: &mut Context<Self>) {
+    fn find_select_all(&mut self, _: &FindSelectAll, window: &mut Window, cx: &mut Context<Self>) {
+        if self.replace_focus.is_focused(window) {
+            self.replace.select_all();
+            self.reset_caret_blink(cx);
+            cx.notify();
+            return;
+        }
         self.find.select_all();
         self.reset_caret_blink(cx);
         cx.notify();
     }
 
-    fn find_paste(&mut self, _: &FindPaste, _: &mut Window, cx: &mut Context<Self>) {
+    fn find_paste(&mut self, _: &FindPaste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.replace_focus.is_focused(window) {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.replace.replace_selection(&text);
+                self.reset_caret_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             if self.find.replace_selection(&text) {
                 self.refresh_find_after_query_change(cx);
@@ -3530,7 +3552,21 @@ impl EditorView {
     }
 
     fn find_cut(&mut self, _: &FindCut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.find.visible || !self.find_focus.is_focused(window) {
+        if self.replace_focus.is_focused(window) {
+            let range = self.replace.selection();
+            if let Some((text, caret)) =
+                crate::ui::input_line::cut_selection(&mut self.replace.query, range)
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.replace.set_caret(caret);
+                self.reset_caret_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        if !self.find.visible
+            || (!self.find_focus.is_focused(window) && !self.replace_focus.is_focused(window))
+        {
             return;
         }
         let range = self.find.selection();
@@ -3543,9 +3579,69 @@ impl EditorView {
         }
     }
 
+    fn find_replace(&mut self, _: &FindReplace, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find.visible
+            || (!self.find_focus.is_focused(window) && !self.replace_focus.is_focused(window))
+        {
+            return;
+        }
+        if self.find_revision != self.document.buffer_revision() {
+            self.refresh_find_after_query_change(cx);
+        }
+        let Some(range) = self.find.current_match() else {
+            return;
+        };
+        let replacement = self.replace.query.clone();
+        self.document.replace_range(range.clone(), &replacement);
+        self.after_edit(cx);
+        if !self.find.matches.is_empty() {
+            let next = self
+                .find
+                .matches
+                .iter()
+                .position(|candidate| candidate.start >= range.start + replacement.len())
+                .unwrap_or(0);
+            self.find.current = Some(next);
+            self.select_find_match(self.find.matches[next].clone(), cx);
+        }
+    }
+
+    fn find_replace_all(
+        &mut self,
+        _: &FindReplaceAll,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.find.visible
+            || (!self.find_focus.is_focused(window) && !self.replace_focus.is_focused(window))
+        {
+            return;
+        }
+        if self.find_revision != self.document.buffer_revision() {
+            self.refresh_find_after_query_change(cx);
+        }
+        if self.find.matches.is_empty() {
+            return;
+        }
+        let text = self.document.content();
+        let transformed =
+            crate::ui::input_line::replace_all_text(&text, &self.find.matches, &self.replace.query);
+        self.document.replace_range(0..text.len(), &transformed);
+        self.after_edit(cx);
+    }
+
+    fn toggle_replace(&mut self, _: &ToggleReplace, window: &mut Window, cx: &mut Context<Self>) {
+        self.find.replace_expanded = !self.find.replace_expanded;
+        if !self.find.replace_expanded && self.replace_focus.is_focused(window) {
+            window.focus(&self.find_focus);
+        }
+        cx.notify();
+    }
+
     fn refresh_find_after_query_change(&mut self, cx: &mut Context<Self>) {
         let text = self.document.content();
         self.find.refresh(&text);
+        self.find_revision = self.document.buffer_revision();
         self.reset_caret_blink(cx);
         if let Some(range) = self.find.current_match() {
             self.select_find_match(range, cx);
@@ -4810,13 +4906,6 @@ fn byte_range_to_utf16(text: &str, range: Range<usize>) -> Range<usize> {
     text[..range.start].encode_utf16().count()..text[..range.end].encode_utf16().count()
 }
 
-fn floor_char_boundary(text: &str, mut offset: usize) -> usize {
-    while offset > 0 && !text.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
-}
-
 fn runtime_signature_detail(symbol: &axiom_php::Symbol) -> String {
     let signature = symbol
         .signature
@@ -5072,6 +5161,8 @@ impl Render for EditorView {
         }
         let find_query = self.find.query.clone();
         let find_selection = self.find.selection();
+        let replace_query = self.replace.query.clone();
+        let replace_selection = self.replace.selection();
         let show_find_caret =
             self.find_focus.is_focused(window) && self.caret_visible && find_selection.is_empty();
         let find_count = self.find.matches.len();
@@ -5329,6 +5420,9 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::find_select_all))
             .on_action(cx.listener(Self::find_paste))
             .on_action(cx.listener(Self::find_cut))
+            .on_action(cx.listener(Self::find_replace))
+            .on_action(cx.listener(Self::find_replace_all))
+            .on_action(cx.listener(Self::toggle_replace))
             .on_action(cx.listener(Self::escape))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -5719,7 +5813,7 @@ impl Render for EditorView {
                         .absolute()
                         .top(px(8.))
                         .right(px(18.))
-                        .w(px(390.))
+                        .w(px(480.))
                         .h(px(38.))
                         .px_2()
                         .flex()
@@ -5731,6 +5825,14 @@ impl Render for EditorView {
                         .border_color(t.border)
                         .shadow_lg()
                         .occlude()
+                        .child(Self::find_button(
+                            if self.find.replace_expanded {
+                                "▾"
+                            } else {
+                                "▸"
+                            },
+                            ToggleReplace,
+                        ))
                         .child(
                             div()
                                 .id("editor-find-input")
@@ -5797,6 +5899,78 @@ impl Render for EditorView {
                         .child(Self::find_button("×", CloseFind)),
                 )
             })
+            .when(self.find.visible && self.find.replace_expanded, |this| {
+                let replace_focus = self.replace_focus.clone();
+                let replace_focus_for_click = replace_focus.clone();
+                let replace_selection_for_render = replace_selection.clone();
+                this.child(
+                    div()
+                        .id("editor-replace-bar")
+                        .absolute()
+                        .top(px(45.))
+                        .right(px(18.))
+                        .w(px(480.))
+                        .h(px(38.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded(m.border_radius_medium)
+                        .bg(t.popup_background)
+                        .border_1()
+                        .border_color(t.border)
+                        .shadow_lg()
+                        .occlude()
+                        .child(div().w(px(24.)).flex_shrink_0())
+                        .child(
+                            div()
+                                .id("editor-replace-input")
+                                .relative()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .h(px(26.))
+                                .px_2()
+                                .rounded(m.border_radius_small)
+                                .bg(t.editor_background)
+                                .border_1()
+                                .border_color(t.border_subtle)
+                                .overflow_hidden()
+                                .key_context("ReplaceInput")
+                                .track_focus(&replace_focus)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        window.focus(&replace_focus_for_click);
+                                        let offset =
+                                            this.replace_input_geometry.hit_test(event.position.x);
+                                        if event.click_count == 2 {
+                                            this.replace.select_word_at(offset);
+                                        } else if event.modifiers.shift {
+                                            this.replace.selection_active = offset;
+                                        } else {
+                                            this.replace.set_caret(offset);
+                                        }
+                                        this.reset_caret_blink(cx);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(crate::ui::input_line::render(
+                                    cx.entity(),
+                                    replace_focus.clone(),
+                                    replace_query,
+                                    replace_selection_for_render,
+                                    self.replace.selection_active,
+                                    replace_focus.is_focused(window)
+                                        && self.caret_visible
+                                        && replace_selection.is_empty(),
+                                    self.replace_input_geometry.clone(),
+                                )),
+                        )
+                        .child(Self::find_button("Replace", FindReplace))
+                        .child(Self::find_button("Replace All", FindReplaceAll)),
+                )
+            })
             .when_some(status, |this, status| {
                 this.child(
                     div()
@@ -5820,12 +5994,16 @@ impl EditorView {
     fn find_button(label: &'static str, action: impl Action) -> impl IntoElement {
         div()
             .id(label)
-            .w(px(24.))
+            .debug_selector(move || label.to_owned())
+            .min_w(px(24.))
+            .px_1()
+            .flex_shrink_0()
             .h(px(24.))
             .flex()
             .items_center()
             .justify_center()
             .cursor(CursorStyle::PointingHand)
+            .tooltip(move |_, cx| crate::ui::components::tooltip(label, cx))
             .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
             .child(label)
     }
@@ -5874,6 +6052,12 @@ impl EntityInputHandler for EditorView {
             let end = utf16_offset_to_byte(&self.find.query, range.end);
             return Some(self.find.query[start..end].to_owned());
         }
+        if self.find.visible && self.replace_focus.is_focused(window) {
+            actual.replace(range.clone());
+            let start = utf16_offset_to_byte(&self.replace.query, range.start);
+            let end = utf16_offset_to_byte(&self.replace.query, range.end);
+            return Some(self.replace.query[start..end].to_owned());
+        }
         let range = self.range_from_utf16(&range);
         actual.replace(self.range_to_utf16(&range));
         Some(self.document.text_in_range(range.start, range.end))
@@ -5890,6 +6074,13 @@ impl EntityInputHandler for EditorView {
             return Some(UTF16Selection {
                 range: byte_range_to_utf16(&self.find.query, selection),
                 reversed: self.find.selection_active < self.find.selection_anchor,
+            });
+        }
+        if self.find.visible && self.replace_focus.is_focused(window) {
+            let selection = self.replace.selection();
+            return Some(UTF16Selection {
+                range: byte_range_to_utf16(&self.replace.query, selection),
+                reversed: self.replace.selection_active < self.replace.selection_anchor,
             });
         }
         Some(UTF16Selection {
@@ -5930,6 +6121,18 @@ impl EntityInputHandler for EditorView {
             if self.find.replace_selection(text) {
                 self.refresh_find_after_query_change(cx);
             }
+            return;
+        }
+        if self.find.visible && self.replace_focus.is_focused(window) {
+            if let Some(range) = range {
+                self.replace.selection_anchor =
+                    utf16_offset_to_byte(&self.replace.query, range.start);
+                self.replace.selection_active =
+                    utf16_offset_to_byte(&self.replace.query, range.end);
+            }
+            self.replace.replace_selection(text);
+            self.reset_caret_blink(cx);
+            cx.notify();
             return;
         }
         self.reset_caret_blink(cx);
@@ -5995,6 +6198,10 @@ impl EntityInputHandler for EditorView {
         if self.find.visible && self.find_focus.is_focused(window) {
             let byte = self.find_input_bounds.hit_test(point.x);
             return Some(self.find.query[..byte].encode_utf16().count());
+        }
+        if self.find.visible && self.replace_focus.is_focused(window) {
+            let byte = self.replace_input_geometry.hit_test(point.x);
+            return Some(self.replace.query[..byte].encode_utf16().count());
         }
         Some(self.offset_to_utf16(self.document.cursor_offset()))
     }
@@ -6433,12 +6640,150 @@ mod completion_ranking_tests {
 
 #[cfg(test)]
 mod formatter_tests {
+    #[gpui::test]
+    fn replace_all_rendered_button_replaces_every_match(cx: &mut gpui::TestAppContext) {
+        for (source, query, replacement, expected) in [
+            ("foo foo foo foo", "foo", "bar", "bar bar bar bar"),
+            ("foofoofoo", "foo", "x", "xxx"),
+            ("ação🙂ação", "ação", "🌍", "🌍🙂🌍"),
+            ("foofoo", "foo", "", ""),
+            ("foo foo", "foo", "longer", "longer longer"),
+            ("foofoo", "foo", "foo!", "foo!foo!"),
+            ("none", "foo", "bar", "none"),
+        ] {
+            let (editor, cx) = cx.add_window_view(|window, cx| {
+                let mut editor = EditorView::from_document(
+                    "replace.txt".into(),
+                    axiom_editor::Document::from_content(source),
+                    None,
+                    cx,
+                );
+                editor.find.visible = true;
+                editor.find.replace_expanded = true;
+                editor.find.query = query.into();
+                editor.find.refresh(source);
+                editor.find_revision = editor.document.buffer_revision();
+                editor.replace.query = replacement.into();
+                window.focus(&editor.replace_focus);
+                editor
+            });
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds("Replace All").expect("rendered All button");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            editor.update(cx, |editor, _| {
+                assert_eq!(editor.document.content(), expected);
+                assert_eq!(editor.edit_generation, u64::from(source != expected));
+                assert_eq!(
+                    editor.find.matches.len(),
+                    expected.match_indices(query).count()
+                );
+                assert_eq!(
+                    editor.find.current,
+                    (!editor.find.matches.is_empty()).then_some(0)
+                );
+                assert_eq!(editor.find_revision, editor.document.buffer_revision());
+                assert_eq!(
+                    editor.find.refresh_count,
+                    if source == expected { 1 } else { 2 }
+                );
+                if source != expected {
+                    assert!(editor.document.undo());
+                    assert_eq!(editor.document.content(), source);
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn replace_toggle_preserves_state_and_current_button_advances(cx: &mut gpui::TestAppContext) {
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            let mut editor = EditorView::from_document(
+                "replace.txt".into(),
+                axiom_editor::Document::from_content("foo foo foo"),
+                None,
+                cx,
+            );
+            editor.find.visible = true;
+            editor.find.query = "foo".into();
+            editor.find.refresh("foo foo foo");
+            editor.find_revision = editor.document.buffer_revision();
+            editor.replace.query = "bar".into();
+            window.focus(&editor.find_focus);
+            editor
+        });
+        assert!(cx.debug_bounds("Replace").is_none());
+        let bounds = cx.debug_bounds("▸").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        editor.update(cx, |editor, _| {
+            assert!(editor.find.replace_expanded);
+            assert_eq!(editor.find.matches, vec![0..3, 4..7, 8..11]);
+            assert_eq!(editor.edit_generation, 0);
+            assert_eq!(editor.find.refresh_count, 1);
+        });
+        for (expected, next) in [
+            ("bar foo foo", Some(4..7)),
+            ("bar bar foo", Some(8..11)),
+            ("bar bar bar", None),
+        ] {
+            let bounds = cx.debug_bounds("Replace").unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            editor.update(cx, |editor, _| {
+                assert_eq!(editor.document.content(), expected);
+                assert_eq!(editor.find.current_match(), next);
+            });
+        }
+        let bounds = cx.debug_bounds("▾").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        editor.update(cx, |editor, _| {
+            assert!(!editor.find.replace_expanded);
+            assert_eq!(editor.replace.query, "bar");
+            assert_eq!(editor.find.query, "foo");
+            assert_eq!(editor.edit_generation, 3);
+            assert_eq!(editor.find.refresh_count, 4);
+        });
+    }
+
+    #[gpui::test]
+    fn replace_all_click_revalidates_stale_ranges_and_batches_thousand_matches(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "foo ".repeat(1000);
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            let mut editor = EditorView::from_document(
+                "replace.txt".into(),
+                axiom_editor::Document::from_content("foo"),
+                None,
+                cx,
+            );
+            editor.find.visible = true;
+            editor.find.replace_expanded = true;
+            editor.find.query = "foo".into();
+            editor.find.refresh("foo");
+            editor.find_revision = editor.document.buffer_revision();
+            editor.document.replace_range(0..3, &source);
+            editor.replace.query = "bar".into();
+            window.focus(&editor.replace_focus);
+            editor
+        });
+        let bounds = cx.debug_bounds("Replace All").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        editor.update(cx, |editor, _| {
+            assert_eq!(editor.document.content(), "bar ".repeat(1000));
+            assert_eq!(editor.edit_generation, 1);
+            // Initial scan, stale validation, then one refresh after the batch.
+            assert_eq!(editor.find.refresh_count, 3);
+            assert!(editor.find.matches.is_empty());
+            assert_eq!(editor.find.current, None);
+            assert!(editor.document.undo());
+            assert_eq!(editor.document.content(), source);
+        });
+    }
     use super::{
-        Arc, DefinitionQuery, EditorView, FindState, FindUsagesSource, ProjectSymbolIndex,
-        VendorSymbolIndex, completion_presentation, declared_class_fqn, declared_parent_fqn,
-        extract_owner_expression, find_usages_source, native_format_php, property_type_in_context,
-        resolve_php_class_name, resolve_vendor_definition_target, supports_native_format,
-        vendor_lookup_needed,
+        Arc, DefinitionQuery, EditorView, FindReplace, FindReplaceAll, FindState, FindUsagesSource,
+        ProjectSymbolIndex, VendorSymbolIndex, completion_presentation, declared_class_fqn,
+        declared_parent_fqn, extract_owner_expression, find_usages_source, native_format_php,
+        property_type_in_context, resolve_php_class_name, resolve_vendor_definition_target,
+        supports_native_format, vendor_lookup_needed,
     };
     use axiom_index::FindUsagesStatus;
     use lsp_types::CompletionItem;
@@ -6651,7 +6996,10 @@ mod formatter_tests {
     #[test]
     fn document_find_covers_single_multiple_zero_and_boundary_matches() {
         let mut find = FindState {
-            query: "one".into(),
+            input: crate::ui::input_line::TextInput {
+                query: "one".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         find.refresh("one two one");
@@ -6675,7 +7023,10 @@ mod formatter_tests {
     #[test]
     fn document_find_next_previous_wrap() {
         let mut find = FindState {
-            query: "x".into(),
+            input: crate::ui::input_line::TextInput {
+                query: "x".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         find.refresh("x x x");
@@ -6688,7 +7039,10 @@ mod formatter_tests {
     #[test]
     fn document_find_uses_utf8_byte_ranges_for_unicode() {
         let mut find = FindState {
-            query: "ação".into(),
+            input: crate::ui::input_line::TextInput {
+                query: "ação".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         find.refresh("ação e ação");
@@ -6699,11 +7053,17 @@ mod formatter_tests {
     #[test]
     fn document_find_refreshes_after_edit_and_is_document_local() {
         let mut first = FindState {
-            query: "needle".into(),
+            input: crate::ui::input_line::TextInput {
+                query: "needle".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut second = FindState {
-            query: "needle".into(),
+            input: crate::ui::input_line::TextInput {
+                query: "needle".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         first.refresh("needle");
@@ -6720,7 +7080,10 @@ mod formatter_tests {
         let content = "unchanged".to_owned();
         let mut find = FindState {
             visible: true,
-            query: "change".into(),
+            input: crate::ui::input_line::TextInput {
+                query: "change".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         find.refresh(&content);
@@ -6745,9 +7108,12 @@ mod formatter_tests {
     fn reopening_find_and_select_all_cover_the_entire_term() {
         let mut find = FindState {
             visible: true,
-            query: "search term".into(),
-            selection_anchor: 3,
-            selection_active: 3,
+            input: crate::ui::input_line::TextInput {
+                query: "search term".into(),
+                selection_anchor: 3,
+                selection_active: 3,
+                ..Default::default()
+            },
             ..Default::default()
         };
         find.open(None);
@@ -6760,9 +7126,12 @@ mod formatter_tests {
     #[test]
     fn find_paste_and_typing_replace_selection_with_unicode() {
         let mut find = FindState {
-            query: "old value".into(),
-            selection_anchor: 0,
-            selection_active: 3,
+            input: crate::ui::input_line::TextInput {
+                query: "old value".into(),
+                selection_anchor: 0,
+                selection_active: 3,
+                ..Default::default()
+            },
             ..Default::default()
         };
         find.replace_selection("ação");
@@ -6778,7 +7147,10 @@ mod formatter_tests {
     #[test]
     fn find_double_click_selects_a_unicode_word() {
         let mut find = FindState {
-            query: "uma ação aqui".into(),
+            input: crate::ui::input_line::TextInput {
+                query: "uma ação aqui".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         find.select_word_at("uma a".len());
@@ -6788,11 +7160,15 @@ mod formatter_tests {
     #[test]
     fn moving_find_caret_does_not_recalculate_matches() {
         let mut find = FindState {
-            query: "term".into(),
+            input: crate::ui::input_line::TextInput {
+                query: "term".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         find.refresh("term term");
-        find.set_caret(find.query.len());
+        let query_len = find.query.len();
+        find.set_caret(query_len);
         let matches = find.matches.clone();
         let current = find.current;
         find.move_left();
@@ -6837,6 +7213,71 @@ mod formatter_tests {
                 editor.cut(&super::Cut, window, cx);
                 assert_eq!(editor.document.content(), " tail");
                 assert_eq!(editor.find.query, " tail");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn replace_current_and_replace_all_are_single_safe_document_edits(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let handle = cx.add_window(|_, cx| {
+            EditorView::from_document(
+                std::path::PathBuf::from("replace.php"),
+                axiom_editor::Document::from_content("foo foo foo"),
+                None,
+                cx,
+            )
+        });
+        handle
+            .update(cx, |editor, window, cx| {
+                editor.find.visible = true;
+                editor.find.query = "foo".into();
+                editor.find.refresh("foo foo foo");
+                editor.find_revision = editor.document.buffer_revision();
+                editor.replace.query = "bar🙂".into();
+                editor.find.current = Some(1);
+                window.focus(&editor.find_focus);
+                editor.find_replace(&FindReplace, window, cx);
+                assert_eq!(editor.document.content(), "foo bar🙂 foo");
+                assert_eq!(editor.find.matches.len(), 2);
+
+                editor.find.current = Some(0);
+                let before_all = editor.edit_generation;
+                editor.replace.query = "x".into();
+                editor.find_replace_all(&FindReplaceAll, window, cx);
+                assert_eq!(editor.document.content(), "x bar🙂 x");
+                assert_eq!(editor.edit_generation, before_all + 1);
+                assert!(editor.document.undo());
+                assert_eq!(editor.document.content(), "foo bar🙂 foo");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn replacement_input_does_not_recompute_find_and_no_match_is_noop(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let handle = cx.add_window(|_, cx| {
+            EditorView::from_document(
+                std::path::PathBuf::from("replace-empty.php"),
+                axiom_editor::Document::from_content("abc"),
+                None,
+                cx,
+            )
+        });
+        handle
+            .update(cx, |editor, window, cx| {
+                editor.find.visible = true;
+                editor.find.query = "missing".into();
+                editor.find.refresh("abc");
+                editor.find_revision = editor.document.buffer_revision();
+                let matches = editor.find.matches.clone();
+                editor.replace.query = "new".into();
+                assert_eq!(editor.find.matches, matches);
+                window.focus(&editor.find_focus);
+                editor.find_replace_all(&FindReplaceAll, window, cx);
+                assert_eq!(editor.document.content(), "abc");
             })
             .unwrap();
     }

@@ -153,6 +153,19 @@ impl Document {
         self.buffer.text().to_string()
     }
 
+    /// Resident buffer revision, including undo/redo revisions.
+    pub fn buffer_revision(&self) -> u64 {
+        self.buffer.rev()
+    }
+
+    /// One explicit replacement, isolated from adjacent typing in undo history.
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str) {
+        let start = self.normalize_offset(range.start);
+        let end = self.normalize_offset(range.end);
+        let cursor = start + normalized_text_len(text, self.line_ending);
+        self.apply_edit(Selection::region(start, end), text, EditType::Other, cursor);
+    }
+
     pub fn take_last_edit(&mut self) -> Option<DocumentEdit> {
         self.edit_batch_invalid = false;
         self.last_edit.take()

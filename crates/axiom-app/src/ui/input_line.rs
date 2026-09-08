@@ -24,6 +24,18 @@ pub fn cut_selection(text: &mut String, range: Range<usize>) -> Option<(String, 
     Some((selected, range.start))
 }
 
+pub fn replace_all_text(text: &str, ranges: &[Range<usize>], replacement: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for range in ranges {
+        output.push_str(&text[cursor..range.start]);
+        output.push_str(replacement);
+        cursor = range.end;
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
 #[derive(Clone, Default)]
 pub struct InputGeometry(Rc<RefCell<Option<(ShapedLine, Point<Pixels>)>>>);
 
@@ -142,6 +154,15 @@ mod tests {
         assert_eq!(text, "a.txt");
     }
 
+    #[test]
+    fn replace_all_text_handles_sizes_empty_and_adjacent_ranges() {
+        let ranges = vec![0..1, 1..2, 3..4];
+        assert_eq!(replace_all_text("abcd", &ranges, "🙂"), "🙂🙂c🙂");
+        assert_eq!(replace_all_text("abc", &[0..1, 1..2, 2..3], ""), "");
+        assert_eq!(replace_all_text("abc", &[], "x"), "abc");
+        assert_eq!(replace_all_text("aba", &[0..1, 2..3], "aba"), "abababa");
+    }
+
     #[gpui::test]
     fn ui_input_click_and_caret_share_glyphs_and_actual_origin(cx: &mut gpui::TestAppContext) {
         let cx = cx.add_empty_window();
@@ -199,4 +220,130 @@ pub fn adjacent_utf16(text: &str, offset: usize, forward: bool) -> usize {
         units += ch.len_utf16();
     }
     if forward { units } else { previous }
+}
+
+#[derive(Debug, Default)]
+pub struct TextInput {
+    pub query: String,
+    pub selection_anchor: usize,
+    pub selection_active: usize,
+}
+impl TextInput {
+    pub fn selection(&self) -> Range<usize> {
+        self.selection_anchor.min(self.selection_active)
+            ..self.selection_anchor.max(self.selection_active)
+    }
+
+    pub fn set_caret(&mut self, offset: usize) {
+        let offset = {
+            let mut offset = offset.min(self.query.len());
+            while !self.query.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            offset
+        };
+        self.selection_anchor = offset;
+        self.selection_active = offset;
+    }
+
+    pub fn select_all(&mut self) {
+        self.selection_anchor = 0;
+        self.selection_active = self.query.len();
+    }
+
+    pub fn replace_selection(&mut self, text: &str) -> bool {
+        let selection = self.selection();
+        if selection.is_empty() && text.is_empty() {
+            return false;
+        }
+        self.query.replace_range(selection.clone(), text);
+        self.set_caret(selection.start + text.len());
+        true
+    }
+
+    pub fn move_left(&mut self) {
+        let selection = self.selection();
+        let offset = if !selection.is_empty() {
+            selection.start
+        } else {
+            self.query[..self.selection_active]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(offset, _)| offset)
+        };
+        self.set_caret(offset);
+    }
+
+    pub fn move_right(&mut self) {
+        let selection = self.selection();
+        let offset = if !selection.is_empty() {
+            selection.end
+        } else {
+            self.query[self.selection_active..]
+                .chars()
+                .next()
+                .map_or(self.query.len(), |character| {
+                    self.selection_active + character.len_utf8()
+                })
+        };
+        self.set_caret(offset);
+    }
+
+    pub fn backspace(&mut self) -> bool {
+        let selection = self.selection();
+        if !selection.is_empty() {
+            return self.replace_selection("");
+        }
+        if self.selection_active == 0 {
+            return false;
+        }
+        let previous = self.query[..self.selection_active]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(offset, _)| offset);
+        self.selection_anchor = previous;
+        self.replace_selection("")
+    }
+
+    pub fn delete(&mut self) -> bool {
+        let selection = self.selection();
+        if !selection.is_empty() {
+            return self.replace_selection("");
+        }
+        if self.selection_active == self.query.len() {
+            return false;
+        }
+        let next = self.selection_active
+            + self.query[self.selection_active..]
+                .chars()
+                .next()
+                .map_or(0, char::len_utf8);
+        self.selection_active = next;
+        self.replace_selection("")
+    }
+
+    pub fn select_word_at(&mut self, offset: usize) {
+        let range = word_range_at(&self.query, offset);
+        self.selection_anchor = range.start;
+        self.selection_active = range.end;
+    }
+}
+
+fn word_range_at(text: &str, offset: usize) -> Range<usize> {
+    let offset = offset.min(text.len());
+    let is_word = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let mut start = offset;
+    while start > 0 {
+        let previous = text[..start].char_indices().next_back();
+        if previous.is_some_and(|(_, ch)| is_word(ch)) {
+            start = previous.unwrap().0;
+        } else {
+            break;
+        }
+    }
+    let end = text[offset..]
+        .char_indices()
+        .find(|(_, ch)| !is_word(*ch))
+        .map_or(text.len(), |(byte, _)| offset + byte);
+    start..end
 }
