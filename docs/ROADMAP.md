@@ -1,190 +1,52 @@
 # Roadmap do Axiom
 
-## Axiom AI — FUTURO
+Estado real: **pre-alpha experimental**. O workspace compila no Windows com Rust 1.88 e já possui editor PHP, índice semântico residente e navegação funcional. Ainda não há contrato de estabilidade nem cobertura de IDE completa.
 
-Direção futura: painel de IA e abstração de provedores para integração com o
-Hermes Agent, com contexto do projeto, índice semântico, execução controlada,
-revisão de diffs, permissões, traces e skills com aprovação humana.
+## Concluído
 
-Ciclo conceitual: Execute → Evaluate → Extract → Retrieve.
-Nenhuma integração, dependência, chamada de modelo ou telemetry é implementada
-nesta etapa.
+- ✅ Workspace Cargo, janela GPUI, abas, árvore de projeto, abrir/salvar e terminal.
+- ✅ Editor com buffer, seleção, clipboard, undo/redo, syntax highlighting PHP, números de linha e Find local.
+- ✅ Índice incremental/persistente com Project, Vendor e Runtime, identidade de caminho Windows e prefix lookups.
+- ✅ LSP bridge com sessões/revisões e descarte de respostas obsoletas.
+- ✅ Diagnostics nativos de aridade e tipos para constructors, métodos e funções globais; ranges exatos e tipos union/nullable/mixed/variadic.
+- ✅ Formatting PHP conservador, guard de linguagem, preservação de literais multilinha e validação de revisão.
+- ✅ Find/Replace Current/All, References/Find Usages e Go to Implementation básicos com snapshots e dirty buffers.
+- ✅ Modal Create PHP Type com Class/Interface/Trait/Enum, inputs independentes, PSR-4 residente e auto-link Name → File.
 
+## Parcial
 
-Este roadmap define as fases de desenvolvimento do Axiom, sempre
-garantindo que a aplicação permaneça compilável e executável ao final de cada
-fase.
+- 🟡 Completion: lookup e ranking existem, mas faltam inferência de intenção, expected type e edição semântica.
+- 🟡 References/Find Usages: classes, métodos, propriedades, funções e constantes indexadas; variáveis locais/parâmetros e casos ambíguos permanecem limitados.
+- 🟡 Go to Implementation: interfaces e métodos indexados funcionam; subclasses genéricas, overrides abstratos e consumidores de traits ainda não são completos.
+- 🟡 Project model: Composer PSR-4/PSR-0, watcher e normalização existem; VFS e resolução abrangente de módulos ainda faltam.
+- 🟡 Create PHP Type: namespace PSR-4 básico funciona; autocomplete de bases/interfaces, imports/FQN, validação avançada e File Structure estão pendentes.
+- 🟡 Formatting: provider nativo seguro existe; providers externos e format-on-save continuam fora do escopo.
 
-## Fase 0 — Bootstrap (atual)
+## Pendente / futuro
 
-**Objetivo:** Janela abre no Windows 10, logging, settings básicas,
-estrutura de workspace.
+File Structure, identidade de variáveis e parâmetros, safe rename local, hierarchy completa, quick documentation, imports seguros, refactorings, Composer/PHPUnit/Xdebug, Git, debugger, plugins e distribuição.
 
-**Entregas:**
-- [x] Cargo workspace
-- [x] Janela com GPUI
-- [x] Logging estruturado (tracing)
-- [x] Estrutura de diretórios (docs, crates, assets, etc.)
-- [x] CI básico (GitHub Actions)
-- [ ] Documentação inicial (ARCHITECTURE.md, ROADMAP.md, ADRs)
+## Próximas fases recomendadas
 
-**Milestone:** Axiom 0.1.0 — Bootstrap ✓
+1. Consolidar e testar a independência/UX do Create PHP Type.
+2. Tornar PSR-4 e imports/FQN seguros, sem filesystem no typing.
+3. Implementar File Structure e identidade de variáveis/parâmetros.
+4. Safe rename local e navegação adicional.
+5. Completion de Extends/Implements baseada em índices residentes.
+6. Composer/PHP ecosystem, Git e debugger.
+7. Plugins e distribuição.
 
-## Fase 1 — Editor Básico
+## Guardrails de performance do editor
 
-**Objetivo:** Editor de texto funcional, abas, syntax highlighting, find.
-
-**Entregas:**
-- [ ] Explorador de projeto (file tree)
-- [ ] Editor com ropey (buffer)
-- [ ] Abas (múltiplos arquivos abertos)
-- [ ] Abrir/Salvar arquivos
-- [ ] Syntax highlighting (inicial, via regex ou Tree-sitter)
-- [ ] Números de linha
-- [ ] Find (Ctrl+F)
-- [ ] Undo/Redo
-- [ ] Seleção de texto
-- [ ] Copiar/Colar
-- [ ] Atalhos básicos
-
-**Milestone:** Axiom 0.1.0 — Editor PHP
-
-## Fase 2 — Tree-sitter
-
-**Objetivo:** Parsing incremental e syntax highlighting baseado em Tree-sitter.
-
-**Entregas:**
-- [ ] Gramáticas Tree-sitter (PHP, HTML, JS, TS, CSS, JSON, YAML, Markdown, SQL)
-- [ ] Parser incremental
-- [ ] Syntax highlighting baseado em árvore
-- [ ] Outline (estrutura do arquivo)
-- [ ] Code folding
-- [ ] Bracket matching
-- [ ] Seleção estrutural
-
-## Fase 3 — Project Model
-
-**Objetivo:** Compreender projetos PHP.
-
-**Entregas:**
-- [ ] Detecção de `composer.json`
-- [ ] Parsing de autoload PSR-4/PSR-0
-- [ ] File watcher (notify)
-- [ ] VFS (Virtual File System)
-- [ ] Normalização de caminhos Windows
-
-## Fase 4 — LSP
-
-**Objetivo:** Integrar Intelephense e Phpactor via LSP.
-
-**Entregas:**
-- [ ] Cliente LSP genérico
-- [ ] Autocomplete
-- [ ] Hover
-- [ ] Go to Definition
-- [ ] Find References
-- [ ] Rename
-- [ ] Diagnostics
-- [ ] Quick fixes básicos
-
-## Fase 5 — Index Próprio
-
-**Objetivo:** Índice de símbolos persistente.
-
-**Entregas:**
-- [ ] SQLite para persistência
-- [ ] Indexação em background
-- [ ] Go to Class / Go to Symbol
-- [ ] Busca rápida de símbolos
-- [ ] Incremental indexing
-
-## Fase 6 — PHP Semantic Engine
-
-**Objetivo:** Motor próprio de inteligência PHP.
-
-**Entregas:**
-- [ ] Sistema de tipos PHP completo
-- [ ] Parser de PHPDoc
-- [ ] Resolução de símbolos
-- [ ] Inferência de tipos básica
-- [ ] Herança, traits, interfaces
-
-## Fase 7 — IDE Completa
-
-**Objetivo:** Funcionalidades completas de IDE.
-
-**Entregas:**
-- [ ] Terminal integrado (portable-pty)
-- [ ] Git (git2)
-- [ ] Composer UI
-- [ ] PHPUnit runner
-- [ ] Xdebug via DAP
-- [ ] Command Palette
-- [ ] Breadcrumbs
-
-## Fase 8 — Refactoring
-
-**Objetivo:** Refatorações semânticas.
-
-**Entregas:**
-- [ ] Safe Rename
-- [ ] Extract Method / Variable
-- [ ] Inline Variable
-- [ ] Move Class
-- [ ] Change Namespace
-- [ ] Safe Delete
-- [ ] Generate Constructor / Getter / Setter
-
-## Fase 9 — Plugins
-
-**Objetivo:** Sistema de extensões.
-
-**Entregas:**
-- [ ] Wasmtime runtime
-- [ ] Extension API
-- [ ] Extension manifest
-- [ ] Capabilities restritas
-- [ ] Plugins oficiais (Docker, SQL, frameworks)
-
-## Fase 10 — Distribuição
-
-**Objetivo:** Instalação profissional.
-
-**Entregas:**
-- [ ] Instalador Windows (WiX / NSIS)
-- [ ] Auto-updater assinado
-- [ ] Release pipeline
-- [ ] Code signing
-- [ ] Associação de arquivos (.php, .phtml)
-- [ ] Menu de contexto
-
-## Milestones
-
-| Versão  | Nome                      | Status     |
-| ------- | ------------------------- | ---------- |
-| 0.1.0   | Bootstrap                 | 🚧 em curso |
-| 0.1.1   | Editor PHP                | 📋 planned |
-| 0.2.0   | PHP Intelligence (LSP)    | 📋 planned |
-| 0.3.0   | Native PHP Intelligence   | 📋 planned |
-| 1.0.0   | Axiom IDE             | 📋 future  |
+- Não adicionar trabalho pesado à UI thread, `document.content()` por tecla, parse completo por tecla/render, filesystem/canonicalize/metadata no hot path ou scans O(project/vendor/scopes) durante typing/completion.
+- Não reconstruir índices durante completion; evitar locks bloqueantes e espera síncrona na UI.
+- Preferir snapshots/índices residentes, workers para trabalho pesado e checks de generation/revision/session.
+- Toda feature que toque editor, completion, diagnostics, semantic, indexação ou LSP deve demonstrar ausência de regressão no typing.
 
 ## Princípios
 
-1. **Incremental:** cada entrega deve compilar e executar.
-2. **Modular:** componentes desacoplados, substituindo LSP por native quando
-   for vantajoso.
-3. **Performance:** nunca bloquear a UI thread.
-4. **Windows-first:** priorizar compatibilidade com Windows 10/11.
-5. **Original:** não copiar visual, nomes internos ou propriedades
-   intelectuais de outras IDEs.
-## Axiom AI — FUTURO
+Cada fase deve compilar e executar no Windows, ser modular, incremental e validada por testes focados antes de ampliar o escopo.
 
-Futuramente, a arquitetura poderá incorporar um painel de IA e uma abstração
-de provedores para integração com o Hermes Agent. Essa direção poderá expor
-contexto do projeto, índice semântico, execução controlada de terminal/testes,
-revisão/aplicação de diffs, permissões, traces de sessão e skills com aprovação
-humana.
+## Evidências principais
 
-O ciclo conceitual previsto é: Execute → Evaluate → Extract → Retrieve.
-Nenhuma integração, dependência, chamada de modelo ou telemetry é implementada
-nesta etapa.
+As capacidades acima são implementadas em `crates/axiom-app/src/workspace_view.rs`, `editor_view.rs`, `ui/input_line.rs`, `crates/axiom-index/src/semantic.rs` e `crates/axiom-project/src/lib.rs`, com testes unitários nos próprios módulos. O estado permanece experimental.
