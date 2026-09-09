@@ -1,8 +1,8 @@
 use axiom_editor::{Document, DocumentEdit};
 use axiom_index::{
-    DeclaredType, DefinitionSyntaxContext, FindUsagesStatus, MemberAccess, MemberResolution,
-    PersistentFileKey, ProjectSymbolIndex, ProjectSymbolKind, SemanticEngine, SemanticSnapshot,
-    TypeCompatibility, VendorSymbolIndex, declared_type_compatibility, declared_type_label,
+    DeclaredType, DefinitionSyntaxContext, MemberAccess, MemberResolution, PersistentFileKey,
+    ProjectSymbolIndex, ProjectSymbolKind, SemanticEngine, SemanticSnapshot, TypeCompatibility,
+    VendorSymbolIndex, declared_type_compatibility, declared_type_label,
 };
 use axiom_lsp::{PositionCodec, PositionEncoding, path_to_uri};
 use axiom_php::{RuntimeSymbolIndex, Symbol as RuntimeSymbol, SymbolKind as RuntimeKind};
@@ -1248,6 +1248,14 @@ impl EditorView {
 
     pub fn document_content(&self) -> String {
         self.document.content()
+    }
+
+    pub fn references_revision(&self) -> u64 {
+        self.document.buffer_revision()
+    }
+
+    pub fn references_text_snapshot(&self) -> impl ToString + Send + 'static {
+        self.document.text_snapshot()
     }
 
     pub fn definition_syntax_context(&self, offset: usize) -> Option<DefinitionSyntaxContext> {
@@ -4532,6 +4540,27 @@ impl EditorView {
             .into_any_element()
     }
 
+    /// Geometry requested only by the visible semantic overlay.
+    pub fn semantic_popup_anchor(&self, window: &mut Window) -> Point<Pixels> {
+        let scroll = self.scroll.0.borrow();
+        let bounds = scroll.base_handle.bounds();
+        let offset = scroll.base_handle.offset();
+        let cursor = self.document.cursor_offset();
+        let line = self.document.line_of_offset(cursor);
+        let start = self.document.offset_of_line(line);
+        let content = self.document.line_content(line);
+        let text = trim_eol(content.as_ref());
+        let x = shape(window, text).x_for_index(cursor.saturating_sub(start).min(text.len()));
+        gpui::point(
+            (bounds.left() + px(GUTTER_WIDTH + TEXT_PADDING) + x + offset.x)
+                .max(bounds.left())
+                .min(bounds.right()),
+            (bounds.top() + px((line as f32 + 1.) * LINE_HEIGHT) + offset.y)
+                .max(bounds.top())
+                .min(bounds.bottom()),
+        )
+    }
+
     fn context_action(
         label: &'static str,
         action: impl Action,
@@ -4560,25 +4589,48 @@ impl EditorView {
             })
             .child(label)
     }
+
+    fn context_command_action(
+        label: &'static str,
+        action: impl Action,
+        focus: FocusHandle,
+        enabled: bool,
+        shortcut: &'static str,
+    ) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        div()
+            .id(SharedString::from(format!("context-command-{label}")))
+            .h(m.toolbar_height)
+            .px_3()
+            .flex()
+            .items_center()
+            .text_color(if enabled {
+                t.text_primary
+            } else {
+                t.text_muted
+            })
+            .when(enabled, |this| {
+                this.hover(move |style| style.bg(t.hover))
+                    .on_click(move |_, window, cx| {
+                        window.focus(&focus);
+                        window.dispatch_action(action.boxed_clone(), cx);
+                    })
+            })
+            .child(label)
+            .child(
+                div()
+                    .ml_auto()
+                    .text_color(t.text_muted)
+                    .text_size(px(11.))
+                    .child(shortcut),
+            )
+    }
 }
 
 struct NativeCompletionBatch {
     items: Vec<CompletionItem>,
     new_prefix: Option<std::ops::Range<usize>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FindUsagesSource {
-    Semantic,
-    LegacyOrLsp,
-}
-
-pub(crate) fn find_usages_source(status: FindUsagesStatus) -> FindUsagesSource {
-    if matches!(status, FindUsagesStatus::Complete) {
-        FindUsagesSource::Semantic
-    } else {
-        FindUsagesSource::LegacyOrLsp
-    }
 }
 
 #[cfg(test)]
@@ -5782,17 +5834,26 @@ impl Render for EditorView {
                                 ))
                                 .child(Self::context_action("Paste", Paste, focus.clone(), true))
                                 .child(separator())
-                                .child(Self::context_action(
+                                .child(Self::context_command_action(
                                     "Go to Definition",
                                     Definition,
                                     focus.clone(),
                                     php_navigation,
+                                    "Ctrl+B",
                                 ))
-                                .child(Self::context_action(
-                                    "Find References",
+                                .child(Self::context_command_action(
+                                    "Go to Implementation",
+                                    crate::workspace_view::GoToImplementation,
+                                    focus.clone(),
+                                    php_navigation,
+                                    "Ctrl+Alt+B",
+                                ))
+                                .child(Self::context_command_action(
+                                    "Find Usages",
                                     References,
                                     focus.clone(),
                                     php_navigation,
+                                    "Alt+F7",
                                 ))
                                 .child(Self::context_action(
                                     "Completion",
@@ -6779,13 +6840,12 @@ mod formatter_tests {
         });
     }
     use super::{
-        Arc, DefinitionQuery, EditorView, FindReplace, FindReplaceAll, FindState, FindUsagesSource,
+        Arc, DefinitionQuery, EditorView, FindReplace, FindReplaceAll, FindState,
         ProjectSymbolIndex, VendorSymbolIndex, completion_presentation, declared_class_fqn,
-        declared_parent_fqn, extract_owner_expression, find_usages_source, native_format_php,
-        property_type_in_context, resolve_php_class_name, resolve_vendor_definition_target,
-        supports_native_format, vendor_lookup_needed,
+        declared_parent_fqn, extract_owner_expression, native_format_php, property_type_in_context,
+        resolve_php_class_name, resolve_vendor_definition_target, supports_native_format,
+        vendor_lookup_needed,
     };
-    use axiom_index::FindUsagesStatus;
     use lsp_types::CompletionItem;
     use std::time::Duration;
 
@@ -6937,22 +6997,6 @@ mod formatter_tests {
             declared_class_fqn(trait_source).as_deref(),
             Some("Example\\Helpers")
         );
-    }
-
-    #[test]
-    fn find_usages_source_policy_routes_only_complete_to_semantic() {
-        assert_eq!(
-            find_usages_source(FindUsagesStatus::Complete),
-            FindUsagesSource::Semantic
-        );
-        for status in [
-            FindUsagesStatus::Partial,
-            FindUsagesStatus::Ambiguous,
-            FindUsagesStatus::Deferred,
-            FindUsagesStatus::Stale,
-        ] {
-            assert_eq!(find_usages_source(status), FindUsagesSource::LegacyOrLsp);
-        }
     }
 
     #[test]

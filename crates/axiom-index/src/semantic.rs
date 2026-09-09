@@ -1385,6 +1385,13 @@ impl SemanticSnapshot {
         self.files.by_key.get(key).copied()
     }
 
+    /// Validates query/navigation text against the already indexed buffer.
+    pub fn matches_file_text(&self, key: &PersistentFileKey, text: &str) -> bool {
+        self.file_id(key)
+            .and_then(|file| self.file_fingerprints.get(&file))
+            .is_some_and(|expected| *expected == text_fingerprint(text))
+    }
+
     /// Finds the lexical scope containing a byte offset in a snapshot file.
     /// The file key must already be present in the snapshot; this method never
     /// canonicalizes, parses, or touches the filesystem.
@@ -1530,6 +1537,74 @@ impl SemanticSnapshot {
             .get(&interface_method)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Explicit navigation query using only the current file's declarations /
+    /// references and the resident interface reverse indexes. None means that
+    /// identity or this category cannot be resolved conservatively.
+    pub fn implementation_targets_at(
+        &self,
+        file: impl AsRef<Path>,
+        offset: usize,
+    ) -> Option<Vec<SymbolId>> {
+        let file = self.file_id(&PersistentFileKey::workspace(file))?;
+        let declarations: Vec<_> = self
+            .symbols_for_file(file)
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.symbol(*id)
+                    .is_some_and(|symbol| symbol.range.contains(&offset))
+            })
+            .collect();
+        let symbol = match declarations.as_slice() {
+            [symbol] => *symbol,
+            [] => {
+                let references: Vec<_> = self
+                    .references_for_file(file)
+                    .iter()
+                    .filter_map(|id| self.reference(*id))
+                    .filter(|reference| reference.span.contains(&offset))
+                    .collect();
+                match references.as_slice() {
+                    [reference] => match reference.target {
+                        ReferenceTarget::Resolved(id) => id,
+                        _ => return None,
+                    },
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let declaration = self.symbol(symbol)?;
+        let candidates = match declaration.kind {
+            ProjectSymbolKind::Interface => self.implementers_of(symbol),
+            ProjectSymbolKind::Method
+                if declaration
+                    .owner
+                    .and_then(|owner| self.symbol(owner))
+                    .is_some_and(|owner| owner.kind == ProjectSymbolKind::Interface) =>
+            {
+                self.implementations_of(symbol)
+            }
+            _ => return None,
+        };
+        Some(
+            candidates
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.symbol(*id).is_some_and(|target| {
+                        !target
+                            .modifiers
+                            .iter()
+                            .any(|modifier| modifier == "abstract")
+                            && (target.kind != ProjectSymbolKind::Method
+                                || target.visibility == Visibility::Public)
+                    })
+                })
+                .collect(),
+        )
     }
 
     fn rebuild_interface_relations(&mut self) {
@@ -3396,6 +3471,14 @@ impl SemanticEngine {
             .read()
             .expect("semantic snapshot lock poisoned")
             .clone()
+    }
+
+    /// Nonblocking snapshot acquisition for explicit UI queries.
+    pub fn try_snapshot(&self) -> Option<Arc<SemanticSnapshot>> {
+        self.current
+            .try_read()
+            .ok()
+            .map(|snapshot| snapshot.clone())
     }
 
     /// High-level query boundary for editor/workspace consumers. The caller
@@ -6765,6 +6848,11 @@ class ParentChild extends ParentBase {
             })
             .collect();
         assert_eq!(direct_names, vec!["A", "B", "Override"]);
+        let targets = snapshot.implementation_targets_at(
+            &service,
+            "<?php interface Service".find("Service").unwrap() + 1,
+        );
+        assert_eq!(targets.unwrap().len(), 5);
         let implementer_names: Vec<_> = snapshot
             .implementers_of(service_id)
             .iter()
@@ -7438,6 +7526,89 @@ $value = new B();
                 .iter()
                 .all(|usage| usage.provider == ReferenceProvider::Semantic)
         );
+    }
+
+    #[test]
+    fn find_usages_keeps_namespaces_members_and_local_scopes_separate() {
+        let text = r#"<?php
+namespace A;
+trait T { function shared() {} }
+class Base { function run() {} public $value; }
+class Child extends Base { use T; }
+class Other extends Base { function run() {} public $value; }
+function same() {}
+function useA(Child $a, Other $b) { same(); $a->run(); $b->run(); $a->shared(); echo $a->value; echo $b->value; }
+namespace B;
+class Base {}
+function same() {}
+function useB() { same(); $local = 1; $fn = function($local) { return $local; }; }
+"#;
+        let mut builder = SnapshotBuilder::empty(SemanticRevision(1));
+        builder.replace_workspace_file("identity.php", text);
+        let snapshot = builder.finish();
+        for (name, count) in [
+            ("A\\same", 1),
+            ("B\\same", 1),
+            ("A\\Base::run", 1),
+            ("A\\Other::run", 1),
+            ("A\\T::shared", 1),
+            ("A\\Base::$value", 1),
+            ("A\\Other::$value", 1),
+        ] {
+            let ids = snapshot.symbols_for_fqn(name);
+            assert_eq!(ids.len(), 1, "{name}");
+            let result = snapshot.find_usages(ids[0], FindUsagesOptions::default());
+            assert_eq!(result.usages.len(), count, "{name}");
+        }
+        let result = snapshot.find_usages_at(
+            "identity.php",
+            text.rfind("$local").unwrap() + 1,
+            FindUsagesOptions::default(),
+        );
+        assert!(
+            result.usages.is_empty(),
+            "local binding must not resolve to the enclosing function"
+        );
+    }
+
+    #[test]
+    fn find_usages_cross_file_aliases_dirty_replacement_and_removal() {
+        let declaration = "<?php namespace A; class Item {} function work() {}";
+        let usage = "<?php namespace B; use A\\Item as Alias; use function A\\work as execute; class Item {} function work() {} function test(Alias $a, Item $b) { execute(); work(); }";
+        let mut builder = SnapshotBuilder::empty(SemanticRevision(1));
+        builder.replace_workspace_file("a.php", declaration);
+        builder.replace_workspace_file("b.php", usage);
+        let snapshot = builder.finish();
+        for name in ["A\\Item", "B\\Item", "A\\work", "B\\work"] {
+            let symbol = snapshot.symbols_for_fqn(name)[0];
+            let result = snapshot.find_usages(symbol, FindUsagesOptions::default());
+            assert_eq!(result.usages.len(), 1, "{name}");
+            assert_eq!(result.usages[0].file, PersistentFileKey::workspace("b.php"));
+        }
+        let dirty = "<?php namespace B; function test() { \\A\\work(); \\A\\work(); }";
+        assert!(!snapshot.matches_file_text(&PersistentFileKey::workspace("b.php"), dirty));
+        let mut builder = SnapshotBuilder::from_snapshot(&snapshot);
+        builder.replace_workspace_file("b.php", dirty);
+        let updated = builder.finish();
+        assert!(updated.matches_file_text(&PersistentFileKey::workspace("b.php"), dirty));
+        let result = updated.find_usages(
+            updated.symbols_for_fqn("A\\work")[0],
+            FindUsagesOptions::default(),
+        );
+        assert_eq!(result.usages.len(), 2);
+        let mut builder = SnapshotBuilder::from_snapshot(&updated);
+        builder.remove_file("b.php");
+        let removed = builder.finish();
+        assert!(
+            removed
+                .find_usages(
+                    removed.symbols_for_fqn("A\\work")[0],
+                    FindUsagesOptions::default()
+                )
+                .usages
+                .is_empty()
+        );
+        assert!(!removed.matches_file_text(&PersistentFileKey::workspace("b.php"), dirty));
     }
 
     #[test]

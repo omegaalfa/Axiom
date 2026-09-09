@@ -45,11 +45,6 @@ pub enum IdeLspEvent {
         locations: Vec<Location>,
         generation: u64,
     },
-    References {
-        uri: Uri,
-        locations: Vec<Location>,
-        generation: u64,
-    },
     Error(String),
     Stopped,
 }
@@ -59,7 +54,6 @@ pub enum LspRequestKind {
     Completion,
     Hover,
     Definition,
-    References,
     Formatting,
     SignatureHelp,
 }
@@ -397,36 +391,6 @@ impl LspBridge {
                         },
                         Err(error) => IdeLspEvent::Error(error.to_string()),
                     };
-                events.lock().expect("event lock poisoned").push(event);
-            })
-            .detach();
-    }
-
-    pub fn request_references(&self, uri: Uri, position: Position) {
-        let generation = self.next_generation(&uri, LspRequestKind::References);
-        let Some(server) = &self.server else { return };
-        let pending = match server
-            .lock()
-            .expect("LSP lock poisoned")
-            .references(uri.clone(), position)
-        {
-            Ok(pending) => pending,
-            Err(error) => {
-                self.push(IdeLspEvent::Error(error.to_string()));
-                return;
-            }
-        };
-        let events = self.pending_events.clone();
-        background_executor()
-            .spawn(async move {
-                let event = match pending.recv::<Option<Vec<Location>>>(DEFAULT_REQUEST_TIMEOUT) {
-                    Ok(response) => IdeLspEvent::References {
-                        uri,
-                        locations: response.unwrap_or_default(),
-                        generation,
-                    },
-                    Err(error) => IdeLspEvent::Error(error.to_string()),
-                };
                 events.lock().expect("event lock poisoned").push(event);
             })
             .detach();

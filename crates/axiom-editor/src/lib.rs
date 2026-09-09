@@ -153,6 +153,11 @@ impl Document {
         self.buffer.text().to_string()
     }
 
+    /// Cheap immutable rope snapshot for explicit background queries.
+    pub fn text_snapshot(&self) -> Rope {
+        self.buffer.text().clone()
+    }
+
     /// Resident buffer revision, including undo/redo revisions.
     pub fn buffer_revision(&self) -> u64 {
         self.buffer.rev()

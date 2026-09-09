@@ -84,6 +84,20 @@ pub fn registry() -> Vec<CommandDescriptor> {
             "ctrl-b",
         ),
         command(
+            "navigate.implementation",
+            "Go to Implementation",
+            "Navigates to semantic implementations of the interface under the caret.",
+            "Navigate",
+            "ctrl-alt-b",
+        ),
+        command(
+            "navigate.references",
+            "Find Usages",
+            "Finds references to the symbol under the caret.",
+            "Navigate",
+            "alt-f7",
+        ),
+        command(
             "navigate.class",
             "Go to Class",
             "Searches indexed PHP classes and opens their declaration.",

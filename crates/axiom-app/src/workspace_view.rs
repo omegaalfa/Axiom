@@ -72,6 +72,8 @@ actions!(
         GoToClass,
         GoToSymbol,
         DebugInput,
+        GoToImplementation,
+        CloseFindUsages,
     ]
 );
 
@@ -89,6 +91,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-left", NavigateBack, None),
         KeyBinding::new("alt-right", NavigateForward, None),
         KeyBinding::new("f12", DebugInput, None),
+        KeyBinding::new("ctrl-alt-b", GoToImplementation, None),
+        KeyBinding::new("alt-f7", crate::editor_view::References, None),
     ]
 }
 
@@ -119,7 +123,319 @@ enum TargetTextSource {
 struct FindUsageTarget {
     file: PathBuf,
     span: std::ops::Range<usize>,
-    role: ReferenceRole,
+    role: Option<ReferenceRole>,
+    position: lsp_types::Position,
+    label: String,
+    snippet: String,
+}
+
+struct FindUsagesContext {
+    kind: NavigationQueryKind,
+    project_generation: u64,
+    snapshot: Arc<axiom_index::SemanticSnapshot>,
+    documents: Vec<(PathBuf, u64, u64)>,
+    source_session: u64,
+}
+
+// Shared presentation for both semantic result lists; no document/query access.
+fn semantic_row_colors(selected: bool, hovered: bool) -> (gpui::Rgba, gpui::Rgba) {
+    let t = theme();
+    (
+        if selected {
+            t.inactive_selection
+        } else {
+            t.popup_background
+        },
+        if selected {
+            t.accent
+        } else if hovered {
+            t.border
+        } else {
+            t.popup_background
+        },
+    )
+}
+
+fn semantic_row_height() -> Pixels {
+    (metrics().ui_font_size + metrics().spacing_xs) * 2. + metrics().spacing_xs
+}
+
+fn semantic_list_height(count: usize) -> Pixels {
+    semantic_row_height() * count.min(10) as f32
+}
+
+fn semantic_popup_geometry(
+    anchor: Point<Pixels>,
+    viewport: gpui::Size<Pixels>,
+    count: usize,
+) -> gpui::Bounds<Pixels> {
+    let margin = metrics().spacing_sm;
+    let width = px(420.).min((viewport.width - margin * 2.).max(px(0.)));
+    let header = metrics().ui_font_size + metrics().spacing_xs * 3. + px(1.);
+    let height = (header + semantic_list_height(count.max(1)) + px(2.))
+        .min((viewport.height - margin * 2.).max(px(0.)));
+    let x = if anchor.x + margin + width <= viewport.width - margin {
+        anchor.x + margin
+    } else {
+        anchor.x - width - margin
+    };
+    let y = if anchor.y + margin + height <= viewport.height - margin {
+        anchor.y + margin
+    } else {
+        anchor.y - metrics().editor_line_height - height - margin
+    };
+    gpui::Bounds::new(
+        gpui::point(
+            x.max(margin).min((viewport.width - width).max(px(0.))),
+            y.max(margin).min((viewport.height - height).max(px(0.))),
+        ),
+        gpui::size(width, height),
+    )
+}
+
+#[cfg(test)]
+mod semantic_popup_visual_tests {
+    use super::*;
+
+    #[test]
+    fn hover_preserves_selection_background_and_accent() {
+        let selected = semantic_row_colors(true, false);
+        assert_eq!(selected, semantic_row_colors(true, true));
+        assert_eq!(selected.0, theme().inactive_selection);
+        assert_eq!(selected.1, theme().accent);
+        assert_ne!(selected.0, theme().accent);
+        let normal = semantic_row_colors(false, false);
+        let hovered = semantic_row_colors(false, true);
+        assert_eq!(normal.0, hovered.0);
+        assert_ne!(normal.1, hovered.1);
+    }
+
+    #[test]
+    fn compact_list_fits_one_two_and_caps_large_results() {
+        assert_eq!(semantic_list_height(0), px(0.));
+        assert_eq!(semantic_list_height(1), px(36.));
+        assert_eq!(semantic_list_height(2), px(72.));
+        assert_eq!(semantic_list_height(1000), px(360.));
+    }
+
+    #[test]
+    fn contextual_popup_flips_and_stays_in_viewport() {
+        let viewport = gpui::size(px(800.), px(600.));
+        let normal = semantic_popup_geometry(gpui::point(px(100.), px(100.)), viewport, 2);
+        assert_eq!(normal.origin, gpui::point(px(107.), px(107.)));
+        assert_eq!(normal.size.width, px(420.));
+        let right = semantic_popup_geometry(gpui::point(px(790.), px(100.)), viewport, 2);
+        assert!(right.right() < px(790.));
+        let bottom = semantic_popup_geometry(gpui::point(px(100.), px(590.)), viewport, 2);
+        assert!(bottom.bottom() < px(590.));
+        for (width, height) in [(800., 600.), (300., 150.), (8., 8.)] {
+            let viewport = gpui::size(px(width), px(height));
+            for (x, y) in [(0., 0.), (width, height), (-100., -100.)] {
+                let bounds = semantic_popup_geometry(gpui::point(px(x), px(y)), viewport, 1000);
+                assert!(bounds.left() >= px(0.) && bounds.top() >= px(0.));
+                assert!(bounds.right() <= viewport.width && bounds.bottom() <= viewport.height);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_render_stays_virtualized_and_hover_has_no_state_or_io() {
+        let source = include_str!("workspace_view.rs");
+        let render = source
+            .rsplit("    fn render_find_usages(")
+            .next()
+            .unwrap()
+            .split("    fn project_panel_resize_start(")
+            .next()
+            .unwrap();
+        assert!(render.contains("gpui::uniform_list("));
+        assert!(render.contains("context.kind.title()"));
+        assert!(render.contains(".border_color(t.border_subtle)"));
+        assert!(render.contains("index + 1 < this.find_usages.len()"));
+        assert!(render.contains("target.file.display().to_string()"));
+        for forbidden in [
+            "fs::",
+            "document.content()",
+            "find_usages_at(",
+            "implementation_targets_at(",
+            "on_mouse_move",
+            "on_hover",
+        ] {
+            assert!(
+                !render.contains(forbidden),
+                "unexpected render work: {forbidden}"
+            );
+        }
+        let compact: String = render.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("style.border_color(semantic_row_colors(selected,true).1)"));
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavigationQueryKind {
+    References,
+    Implementations,
+}
+
+impl NavigationQueryKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::References => "Find Usages",
+            Self::Implementations => "Go to Implementation",
+        }
+    }
+}
+
+/// Runs only on the existing GPUI background executor. Each result file is read once.
+fn prepare_find_usages(
+    snapshot: &axiom_index::SemanticSnapshot,
+    path: &Path,
+    offset: usize,
+    mut texts: HashMap<axiom_index::PersistentFileKey, String>,
+) -> Result<(Vec<FindUsageTarget>, axiom_index::FindUsagesStatus), &'static str> {
+    let source_key = axiom_index::PersistentFileKey::workspace_lexical(path);
+    if !texts
+        .get(&source_key)
+        .is_some_and(|text| snapshot.matches_file_text(&source_key, text))
+    {
+        return Err("Find Usages: current buffer is not indexed yet; retry after indexing");
+    }
+    // Do not silently omit dirty references that have not reached the snapshot yet.
+    for (key, text) in &texts {
+        if (snapshot.file_id(key).is_some() || axiom_project::is_php_file(&key.normalized_path))
+            && !snapshot.matches_file_text(key, text)
+        {
+            return Err("Find Usages: an open buffer is not indexed yet; retry after indexing");
+        }
+    }
+    let mut result = snapshot.find_usages_at(path, offset, FindUsagesOptions::default());
+    if result.usages.is_empty() && result.status != axiom_index::FindUsagesStatus::Complete {
+        return Err("Find Usages: unresolved, ambiguous or unsupported symbol");
+    }
+    let mut targets = Vec::with_capacity(result.usages.len());
+    result.usages.sort_by(|a, b| {
+        a.file
+            .normalized_path
+            .cmp(&b.file.normalized_path)
+            .then_with(|| a.span.start.cmp(&b.span.start))
+            .then_with(|| a.span.end.cmp(&b.span.end))
+    });
+    let mut previous_file = None;
+    let mut previous_offset = 0;
+    let mut previous_position = lsp_types::Position::default();
+    for usage in result.usages {
+        let file = PathBuf::from(&usage.file.normalized_path);
+        if !texts.contains_key(&usage.file) {
+            let text = fs::read_to_string(&file)
+                .map_err(|_| "Reference file unavailable; retry after indexing")?;
+            if !snapshot.matches_file_text(&usage.file, &text) {
+                return Err("Reference file changed; retry after indexing");
+            }
+            texts.insert(usage.file.clone(), text);
+        }
+        let text = &texts[&usage.file];
+        if text.get(usage.span.clone()).is_none() {
+            return Err("Reference range is stale; retry after indexing");
+        }
+        if previous_file.as_ref() != Some(&usage.file) {
+            previous_offset = 0;
+            previous_position = lsp_types::Position::default();
+        }
+        // Sorted ranges permit one forward pass per file, including UTF-16 columns.
+        let delta = PositionCodec::offset_to_position(
+            &text[previous_offset..],
+            usage.span.start - previous_offset,
+            Default::default(),
+        );
+        let position = lsp_types::Position::new(
+            previous_position.line + delta.line,
+            if delta.line == 0 {
+                previous_position.character + delta.character
+            } else {
+                delta.character
+            },
+        );
+        previous_file = Some(usage.file);
+        previous_offset = usage.span.start;
+        previous_position = position;
+        let display = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("document");
+        let label = format!(
+            "{}:{}:{}",
+            display,
+            position.line + 1,
+            position.character + 1
+        );
+        let snippet = text[text[..usage.span.start].rfind('\n').map_or(0, |i| i + 1)..]
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        targets.push(FindUsageTarget {
+            file,
+            span: usage.span,
+            role: Some(usage.role),
+            position,
+            label,
+            snippet,
+        });
+    }
+    targets.dedup_by(|a, b| a.file == b.file && a.span == b.span);
+    Ok((targets, result.status))
+}
+
+fn prepare_implementations(
+    snapshot: &axiom_index::SemanticSnapshot,
+    path: &Path,
+    offset: usize,
+) -> Result<Vec<FindUsageTarget>, &'static str> {
+    let ids = snapshot
+        .implementation_targets_at(path, offset)
+        .ok_or("No semantic implementation target under caret")?;
+    let mut targets = Vec::with_capacity(ids.len());
+    for id in ids {
+        let symbol = snapshot
+            .symbol(id)
+            .ok_or("Implementation symbol became stale")?;
+        let file = snapshot
+            .file(symbol.file)
+            .ok_or("Implementation file unavailable")?;
+        let text = fs::read_to_string(&file.path).map_err(|_| "Implementation file unavailable")?;
+        let position =
+            PositionCodec::offset_to_position(&text, symbol.range.start, Default::default());
+        let display = file
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("document");
+        targets.push(FindUsageTarget {
+            file: file.path.clone(),
+            span: symbol.range.clone(),
+            role: None,
+            position,
+            label: format!(
+                "{}:{}:{}",
+                display,
+                position.line + 1,
+                position.character + 1
+            ),
+            snippet: text[text[..symbol.range.start].rfind('\n').map_or(0, |i| i + 1)..]
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+        });
+    }
+    targets.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then_with(|| a.span.start.cmp(&b.span.start))
+    });
+    Ok(targets)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,7 +667,11 @@ pub struct WorkspaceView {
     vendor_definition_inflight: HashSet<String>,
     find_usages: Vec<FindUsageTarget>,
     find_usages_visible: bool,
-    find_usages_source: crate::editor_view::FindUsagesSource,
+    find_usages_context: Option<Arc<FindUsagesContext>>,
+    find_usages_selected: usize,
+    find_usages_focus: FocusHandle,
+    find_usages_focus_pending: bool,
+    find_usages_scroll: gpui::UniformListScrollHandle,
     heartbeat_last_tick: Option<Instant>,
     heartbeat_summary_at: Instant,
     heartbeat_ticks: u64,
@@ -915,7 +1235,11 @@ impl WorkspaceView {
             vendor_definition_inflight: HashSet::new(),
             find_usages: Vec::new(),
             find_usages_visible: false,
-            find_usages_source: crate::editor_view::FindUsagesSource::LegacyOrLsp,
+            find_usages_context: None,
+            find_usages_selected: 0,
+            find_usages_focus: cx.focus_handle(),
+            find_usages_focus_pending: false,
+            find_usages_scroll: gpui::UniformListScrollHandle::new(),
             heartbeat_last_tick: None,
             heartbeat_summary_at: Instant::now(),
             heartbeat_ticks: 0,
@@ -2725,72 +3049,280 @@ impl WorkspaceView {
     ) {
         self.find_usages.clear();
         self.find_usages_visible = false;
-        let Some(tab_index) = self.active else {
-            return;
-        };
-        let Some(tab) = self.tabs.get(tab_index) else {
+        self.find_usages_context = None;
+        let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) else {
             return;
         };
         let editor = tab.editor.read(cx);
         let path = tab.path.clone();
         let offset = editor.current_cursor_offset();
-        let uri = editor.lsp_uri().cloned();
-        let position = editor.current_lsp_position();
-        if let Some(engine) = &self.semantic_engine {
-            let result = engine.find_usages_at(&path, offset, FindUsagesOptions::default());
-            let source = crate::editor_view::find_usages_source(result.status);
-            self.find_usages_source = source;
-            if matches!(source, crate::editor_view::FindUsagesSource::Semantic) {
-                self.find_usages = result
-                    .usages
-                    .into_iter()
-                    .map(|usage| FindUsageTarget {
-                        file: PathBuf::from(usage.file.normalized_path),
-                        span: usage.span,
-                        role: usage.role,
-                    })
-                    .collect();
-                self.find_usages.sort_by(|left, right| {
-                    left.file
-                        .cmp(&right.file)
-                        .then_with(|| left.span.start.cmp(&right.span.start))
-                        .then_with(|| left.span.end.cmp(&right.span.end))
-                });
-                self.find_usages_visible = !self.find_usages.is_empty();
-                self.status =
-                    format!("{} referência(s) encontrada(s)", self.find_usages.len()).into();
-                cx.notify();
-                return;
-            }
-        }
-        self.find_usages_source = crate::editor_view::FindUsagesSource::LegacyOrLsp;
-        if let (Some(lsp), Some(uri), Some(position)) = (&self.lsp, uri, position) {
-            lsp.request_references(uri, position);
-        } else {
-            self.status = "No references found (language server unavailable)".into();
+        let source_session = editor.document_session();
+        let Some(snapshot) = self
+            .semantic_engine
+            .as_ref()
+            .and_then(|engine| engine.try_snapshot())
+        else {
+            self.status =
+                "Find Usages: semantic snapshot unavailable; retry when indexing finishes".into();
             cx.notify();
+            return;
+        };
+        // Rope clones retain resident text without materializing buffers on the UI.
+        let buffers = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let editor = tab.editor.read(cx);
+                (
+                    axiom_index::PersistentFileKey::workspace_lexical(&tab.path),
+                    editor.references_text_snapshot(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let context = Arc::new(FindUsagesContext {
+            kind: NavigationQueryKind::References,
+            project_generation: self.project_semantic_generation,
+            snapshot,
+            documents: self.references_document_stamps(cx),
+            source_session,
+        });
+        self.find_usages_context = Some(context.clone());
+        self.status = "Finding usages…".into();
+        cx.notify();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let query_context = context.clone();
+            let result = executor
+                .spawn(async move {
+                    let buffers = buffers
+                        .into_iter()
+                        .map(|(key, rope)| (key, rope.to_string()))
+                        .collect();
+                    prepare_find_usages(&query_context.snapshot, &path, offset, buffers)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.references_context_current(&context, cx) {
+                    return;
+                }
+                match result {
+                    Ok((targets, status)) => {
+                        this.find_usages = targets;
+                        this.find_usages_selected = 0;
+                        this.find_usages_visible = true;
+                        this.status =
+                            format!("{} referência(s); {:?}", this.find_usages.len(), status)
+                                .into();
+                        this.find_usages_focus_pending = true;
+                    }
+                    Err(message) => {
+                        this.status = message.into();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn go_to_implementation(
+        &mut self,
+        _: &GoToImplementation,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) else {
+            return;
+        };
+        let path = tab.path.clone();
+        let offset = tab.editor.read(cx).current_cursor_offset();
+        let source_text = tab.editor.read(cx).references_text_snapshot().to_string();
+        let Some(snapshot) = self.semantic_engine.as_ref().and_then(|e| e.try_snapshot()) else {
+            self.status = "Go to Implementation: semantic snapshot unavailable".into();
+            cx.notify();
+            return;
+        };
+        let session = tab.editor.read(cx).document_session();
+        let context = Arc::new(FindUsagesContext {
+            kind: NavigationQueryKind::Implementations,
+            project_generation: self.project_semantic_generation,
+            snapshot,
+            documents: self.references_document_stamps(cx),
+            source_session: session,
+        });
+        self.find_usages_context = Some(context.clone());
+        self.status = "Finding implementations…".into();
+        let source_key = axiom_index::PersistentFileKey::workspace_lexical(&path);
+        if !context
+            .snapshot
+            .matches_file_text(&source_key, &source_text)
+        {
+            self.status = "Go to Implementation: current buffer is not indexed yet".into();
+            cx.notify();
+            return;
         }
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let query_context = context.clone();
+            let result = executor
+                .spawn(
+                    async move { prepare_implementations(&query_context.snapshot, &path, offset) },
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.references_context_current(&context, cx) {
+                    return;
+                }
+                match result {
+                    Ok(mut targets) if targets.len() == 1 => {
+                        let target = targets.remove(0);
+                        this.navigate_to_definition_preloaded(
+                            DefinitionTarget {
+                                path: target.file,
+                                position: target.position,
+                            },
+                            None,
+                            cx,
+                        );
+                    }
+                    Ok(targets) => {
+                        this.find_usages = targets;
+                        this.find_usages_selected = 0;
+                        this.find_usages_visible = !this.find_usages.is_empty();
+                        this.find_usages_focus_pending = this.find_usages_visible;
+                        this.status = if this.find_usages_visible {
+                            format!("{} implementação(ões)", this.find_usages.len()).into()
+                        } else {
+                            "No implementations found".into()
+                        };
+                    }
+                    Err(message) => {
+                        this.status = message.into();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn close_find_usages(
+        &mut self,
+        _: &CloseFindUsages,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_usages_visible = false;
+        self.find_usages.clear();
+        self.find_usages_context = None;
+        self.restore_editor_focus(window, cx);
+        cx.notify();
+    }
+
+    fn references_document_stamps(&self, cx: &App) -> Vec<(PathBuf, u64, u64)> {
+        self.tabs
+            .iter()
+            .map(|tab| {
+                let editor = tab.editor.read(cx);
+                (
+                    tab.path.clone(),
+                    editor.document_session(),
+                    editor.references_revision(),
+                )
+            })
+            .collect()
+    }
+
+    fn references_context_current(&self, context: &Arc<FindUsagesContext>, cx: &App) -> bool {
+        self.find_usages_context
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, context))
+            && context.project_generation == self.project_semantic_generation
+            && self.references_document_stamps(cx) == context.documents
+            && self
+                .active
+                .and_then(|i| self.tabs.get(i))
+                .is_some_and(|tab| tab.editor.read(cx).document_session() == context.source_session)
+            && self
+                .semantic_engine
+                .as_ref()
+                .and_then(|engine| engine.try_snapshot())
+                .is_some_and(|snapshot| Arc::ptr_eq(&snapshot, &context.snapshot))
     }
 
     fn open_find_usage(&mut self, target: FindUsageTarget, cx: &mut Context<Self>) {
-        let path = target.file.clone();
-        let Some((text, text_source)) = self.current_text_for_path(&path, cx) else {
+        let Some(context) = self.find_usages_context.clone() else {
             return;
         };
-        if debug_input_enabled() {
-            tracing::info!(
-                file = %path.display(),
-                span = ?target.span,
-                text_source = ?text_source,
-                text_len = text.len(),
-                text_at_span = text.get(target.span.clone()).unwrap_or(""),
-                "[NAVIGATION TARGET]"
-            );
+        if !self.references_context_current(&context, cx) {
+            self.find_usages_visible = false;
+            self.status = "Find Usages changed; run the query again".into();
+            cx.notify();
+            return;
         }
-        let position =
-            PositionCodec::offset_to_position(&text, target.span.start, Default::default());
-        self.find_usages_visible = false;
-        self.navigate_to_definition(DefinitionTarget { path, position }, cx);
+        let target_key = axiom_index::PersistentFileKey::workspace_lexical(&target.file);
+        if let Some(index) = self.tabs.iter().position(|tab| {
+            axiom_index::PersistentFileKey::workspace_lexical(&tab.path) == target_key
+        }) {
+            // The query fingerprint and unchanged buffer revision already validate
+            // this target. Open/unsaved buffers must never be reopened from disk.
+            if let Some(origin) = self.active.and_then(|i| self.tabs.get(i)).and_then(|tab| {
+                tab.editor
+                    .read(cx)
+                    .current_lsp_position()
+                    .map(|position| NavigationLocation {
+                        path: tab.path.clone(),
+                        position,
+                    })
+            }) {
+                self.navigation_back.push(origin);
+                self.navigation_forward.clear();
+            }
+            self.active = Some(index);
+            self.focus_active_editor = true;
+            self.find_usages_visible = false;
+            self.tabs[index].editor.update(cx, |editor, cx| {
+                editor.reveal_lsp_position(target.position, cx)
+            });
+            cx.notify();
+            return;
+        }
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let query_context = context.clone();
+            let result = executor
+                .spawn(async move {
+                    let path = fs::canonicalize(&target.file).ok()?;
+                    let document = Document::from_file(&path).ok()?;
+                    let text = document.content();
+                    let key = axiom_index::PersistentFileKey::workspace_lexical(&target.file);
+                    query_context
+                        .snapshot
+                        .matches_file_text(&key, &text)
+                        .then_some((
+                            DefinitionTarget {
+                                path,
+                                position: target.position,
+                            },
+                            document,
+                        ))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.references_context_current(&context, cx) {
+                    return;
+                }
+                this.find_usages_visible = false;
+                if let Some((target, document)) = result {
+                    this.navigate_to_definition_preloaded(target, Some(document), cx);
+                } else {
+                    this.status =
+                        "Reference file changed or was removed; run Find Usages again".into();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn dispatch_editor_action<A: Action + Clone + 'static>(
@@ -4622,47 +5154,6 @@ impl WorkspaceView {
                         }
                     }
                 }
-                IdeLspEvent::References {
-                    uri,
-                    locations,
-                    generation,
-                } => {
-                    if !self.accept_lsp_generation(&uri, LspRequestKind::References, generation) {
-                        continue;
-                    }
-                    self.find_usages_source = crate::editor_view::FindUsagesSource::LegacyOrLsp;
-                    self.find_usages = locations
-                        .into_iter()
-                        .filter_map(|location| {
-                            let path = uri_to_path(&location.uri).ok()?;
-                            let text = fs::read_to_string(&path).ok()?;
-                            let start = PositionCodec::position_to_offset(
-                                &text,
-                                location.range.start,
-                                Default::default(),
-                            );
-                            let end = PositionCodec::position_to_offset(
-                                &text,
-                                location.range.end,
-                                Default::default(),
-                            );
-                            Some(FindUsageTarget {
-                                file: path,
-                                span: start..end,
-                                role: ReferenceRole::MethodCall,
-                            })
-                        })
-                        .collect();
-                    self.find_usages.sort_by(|left, right| {
-                        left.file
-                            .cmp(&right.file)
-                            .then_with(|| left.span.start.cmp(&right.span.start))
-                            .then_with(|| left.span.end.cmp(&right.span.end))
-                    });
-                    self.find_usages_visible = !self.find_usages.is_empty();
-                    self.status =
-                        format!("{} referência(s) encontrada(s)", self.find_usages.len()).into();
-                }
                 IdeLspEvent::Error(error) => {
                     self.status = format!("Language Server: {error}").into();
                 }
@@ -4673,7 +5164,21 @@ impl WorkspaceView {
     }
 
     fn navigate_to_definition(&mut self, target: DefinitionTarget, cx: &mut Context<Self>) {
-        let path = match fs::canonicalize(&target.path) {
+        self.navigate_to_definition_preloaded(target, None, cx);
+    }
+
+    fn navigate_to_definition_preloaded(
+        &mut self,
+        target: DefinitionTarget,
+        preloaded: Option<Document>,
+        cx: &mut Context<Self>,
+    ) {
+        let path = match preloaded
+            .as_ref()
+            .map(|_| target.path.clone())
+            .map(Ok)
+            .unwrap_or_else(|| fs::canonicalize(&target.path))
+        {
             Ok(path) => path,
             Err(error) => {
                 self.status = format!("Falha ao abrir definition: {error}").into();
@@ -4712,7 +5217,10 @@ impl WorkspaceView {
             let open_started = Instant::now();
             axiom_index::trace_path("document_load_request", "Other", &path);
             let disk_started = Instant::now();
-            let document = match Document::from_file(&path) {
+            let document = match preloaded
+                .map(Ok)
+                .unwrap_or_else(|| Document::from_file(&path))
+            {
                 Ok(document) => document,
                 Err(error) => {
                     self.status = format!("Falha ao abrir definition: {error}").into();
@@ -5030,16 +5538,31 @@ impl WorkspaceView {
             .child(div().flex_1())
     }
 
-    fn render_find_usages(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_find_usages(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
-        let workspace = cx.entity();
+        let title = self
+            .find_usages_context
+            .as_ref()
+            .map_or("Find Usages", |context| context.kind.title());
+        let anchor = self
+            .active
+            .and_then(|i| self.tabs.get(i))
+            .map(|tab| tab.editor.read(cx).semantic_popup_anchor(window))
+            .unwrap_or(gpui::point(m.spacing_lg, m.panel_header_height));
+        let geometry =
+            semantic_popup_geometry(anchor, window.viewport_size(), self.find_usages.len());
+        let list_height = semantic_list_height(self.find_usages.len()).min(
+            (geometry.size.height - (m.ui_font_size + m.spacing_xs * 3. + px(3.))).max(px(0.)),
+        );
         div()
+            .id("find-usages-popup")
             .absolute()
-            .top(px(48.))
-            .right(px(24.))
-            .w(px(520.))
-            .max_h(px(360.))
+            .top(geometry.origin.y)
+            .left(geometry.origin.x)
+            .w(geometry.size.width)
+            .max_h(geometry.size.height)
+            .overflow_hidden()
             .flex()
             .flex_col()
             .bg(t.popup_background)
@@ -5047,47 +5570,176 @@ impl WorkspaceView {
             .border_color(t.border)
             .rounded(m.border_radius_medium)
             .shadow_lg()
+            .occlude()
+            .track_focus(&self.find_usages_focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        this.find_usages_visible = false;
+                        this.find_usages_context = None;
+                        if let Some(tab) = this.active.and_then(|i| this.tabs.get(i)) {
+                            window.focus(&tab.editor.read(cx).focus_handle(cx));
+                        }
+                    }
+                    "enter" => {
+                        if let Some(target) =
+                            this.find_usages.get(this.find_usages_selected).cloned()
+                        {
+                            this.open_find_usage(target, cx);
+                        }
+                    }
+                    "up" | "down" if !this.find_usages.is_empty() => {
+                        let len = this.find_usages.len();
+                        this.find_usages_selected = if event.keystroke.key == "up" {
+                            this.find_usages_selected.saturating_sub(1)
+                        } else {
+                            (this.find_usages_selected + 1).min(len - 1)
+                        };
+                        this.find_usages_scroll
+                            .scroll_to_item(this.find_usages_selected, gpui::ScrollStrategy::Top);
+                    }
+                    "home" if !this.find_usages.is_empty() => this.find_usages_selected = 0,
+                    "end" if !this.find_usages.is_empty() => {
+                        this.find_usages_selected = this.find_usages.len() - 1
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
+                window.prevent_default();
+                cx.notify();
+            }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()
+                    .id("find-usages-header")
+                    .flex_none()
+                    .border_b_1()
+                    .border_color(t.border_subtle)
+                    .flex()
+                    .items_center()
+                    .justify_between()
                     .px_3()
-                    .py_2()
-                    .child(format!("Find Usages ({})", self.find_usages.len())),
-            )
-            .children(
-                self.find_usages
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(index, target)| {
-                        let workspace = workspace.clone();
-                        let (line, character) = self
-                            .current_text_for_path(&target.file, cx)
-                            .map(|(text, _)| {
-                                let position = PositionCodec::offset_to_position(
-                                    &text,
-                                    target.span.start,
-                                    Default::default(),
-                                );
-                                (position.line + 1, position.character + 1)
-                            })
-                            .unwrap_or((0, 0));
-                        let label = format!("{}:{}:{}", target.file.display(), line, character);
+                    .py(m.spacing_xs)
+                    .text_size(m.ui_font_size)
+                    .line_height(m.ui_font_size + m.spacing_xs)
+                    .child(format!(
+                        "{} · {} result{}",
+                        title,
+                        self.find_usages.len(),
+                        if self.find_usages.len() == 1 { "" } else { "s" }
+                    ))
+                    .child(
                         div()
-                            .id(("find-usage", index))
-                            .h(m.toolbar_height)
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .text_color(t.text_primary)
-                            .hover(move |style| style.bg(t.hover))
-                            .on_click(move |_, _, cx| {
-                                workspace.update(cx, |this, cx| {
-                                    this.open_find_usage(target.clone(), cx)
-                                });
-                            })
-                            .child(label)
-                    }),
+                            .id("find-usages-close")
+                            .px_2()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|style| style.bg(t.hover))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_find_usages(&CloseFindUsages, window, cx);
+                            }))
+                            .child("×"),
+                    ),
             )
+            .when(self.find_usages.is_empty(), |this| {
+                this.child(div().px_3().py_2().child("No usages found"))
+            })
+            .when(!self.find_usages.is_empty(), |this| {
+                this.child(
+                    gpui::uniform_list(
+                        "find-usages-rows",
+                        self.find_usages.len(),
+                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                            range
+                                .map(|index| {
+                                    let target = this.find_usages[index].clone();
+                                    let filename = target
+                                        .file
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("document")
+                                        .to_owned();
+                                    let position = target.position;
+                                    let snippet = target.snippet.clone();
+                                    let click_target = target.clone();
+                                    let selected = index == this.find_usages_selected;
+                                    let (background, border) = semantic_row_colors(selected, false);
+                                    div()
+                                        .id(("find-usage", index))
+                                        .w_full()
+                                        .relative()
+                                        .h(semantic_row_height())
+                                        .py(m.spacing_xs / 2.)
+                                        .px_3()
+                                        .flex()
+                                        .flex_col()
+                                        .text_size(m.ui_font_size)
+                                        .line_height(m.ui_font_size + m.spacing_xs)
+                                        .overflow_hidden()
+                                        .cursor(CursorStyle::PointingHand)
+                                        .text_color(t.text_primary)
+                                        .bg(background)
+                                        .border_l_2()
+                                        .border_color(border)
+                                        .hover(move |style| {
+                                            style
+                                                .border_color(semantic_row_colors(selected, true).1)
+                                        })
+                                        .tooltip({
+                                            let full_path = target.file.display().to_string();
+                                            move |_, cx| tooltip(full_path.clone(), cx)
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.open_find_usage(click_target.clone(), cx);
+                                        }))
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .flex()
+                                                .justify_between()
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .overflow_hidden()
+                                                        .child(filename),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_size(px(11.))
+                                                        .text_color(t.text_muted)
+                                                        .child(format!(
+                                                            "{}:{}",
+                                                            position.line + 1,
+                                                            position.character + 1
+                                                        )),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_color(t.text_secondary)
+                                                .text_size(px(11.))
+                                                .overflow_hidden()
+                                                .child(snippet),
+                                        )
+                                        .when(index + 1 < this.find_usages.len(), |row| {
+                                            row.child(
+                                                div()
+                                                    .absolute()
+                                                    .bottom(px(0.))
+                                                    .left(m.spacing_md)
+                                                    .right(m.spacing_md)
+                                                    .h(px(1.))
+                                                    .bg(t.border_subtle),
+                                            )
+                                        })
+                                })
+                                .collect()
+                        }),
+                    )
+                    .h(list_height)
+                    .track_scroll(self.find_usages_scroll.clone()),
+                )
+            })
     }
 
     fn project_panel_resize_start(
@@ -6204,6 +6856,10 @@ impl WorkspaceView {
                         "Find References",
                         crate::editor_view::References,
                     ))
+                    .child(Self::action_item(
+                        "Go to Implementation",
+                        GoToImplementation,
+                    ))
             })
             .when(menu == Some(MenuKind::Help), |this| {
                 this.child(self.command_item(
@@ -6759,6 +7415,10 @@ impl Drop for WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.find_usages_focus_pending {
+            self.find_usages_focus_pending = false;
+            window.focus(&self.find_usages_focus);
+        }
         let t = theme();
         let m = metrics();
         let workspace = cx.entity();
@@ -6871,6 +7531,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::native_definition_action))
             .on_action(cx.listener(Self::find_usages_action))
+            .on_action(cx.listener(Self::go_to_implementation))
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::settings))
             .on_action(cx.listener(Self::debug_input))
@@ -6993,7 +7654,19 @@ impl Render for WorkspaceView {
                 )
             })
             .when(self.find_usages_visible, |this| {
-                this.child(self.render_find_usages(cx))
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .id("find-usages-dismiss-layer")
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                            this.close_find_usages(&CloseFindUsages, window, cx);
+                        })),
+                )
+                .child(self.render_find_usages(window, cx))
             })
             .when(self.explorer_context.is_some(), |this| {
                 this.child(
@@ -7628,6 +8301,241 @@ fn tab_display_path(path: &Path, project_root: Option<&Path>, runtime_root: &Pat
 
 #[cfg(test)]
 mod modifier_tests {
+    #[gpui::test]
+    fn references_action_and_enter_use_indexed_unsaved_buffer(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unsaved.php");
+        let text = "<?php function run() {} run(); run();";
+        let mut builder = axiom_index::SnapshotBuilder::empty(axiom_index::SemanticRevision(1));
+        builder.replace_workspace_file(&path, text);
+        let engine =
+            std::sync::Arc::new(axiom_index::SemanticEngine::from_snapshot(builder.finish()));
+        let (workspace, cx) =
+            cx.add_window_view(|_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        let editor = cx.new(|cx| {
+            let mut editor = EditorView::from_document(
+                path.clone(),
+                axiom_editor::Document::from_content(text),
+                None,
+                cx,
+            );
+            editor.reveal_lsp_position(
+                axiom_lsp::PositionCodec::offset_to_position(
+                    text,
+                    text.find("run").unwrap(),
+                    Default::default(),
+                ),
+                cx,
+            );
+            editor
+        });
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.semantic_engine = Some(engine);
+                workspace.tabs.push(OpenTab {
+                    path: path.clone(),
+                    editor: editor.clone(),
+                });
+                workspace.active = Some(0);
+                workspace.find_usages_action(&crate::editor_view::References, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert!(workspace.find_usages_visible, "{}", workspace.status);
+            assert_eq!(workspace.find_usages.len(), 2);
+        });
+        cx.simulate_keystrokes("down enter");
+        workspace.update(cx, |workspace, cx| {
+            assert!(!workspace.find_usages_visible);
+            assert_eq!(workspace.tabs.len(), 1);
+            assert_eq!(
+                editor.read(cx).current_cursor_offset(),
+                text.rfind("run").unwrap()
+            );
+            assert_eq!(editor.read(cx).document_content(), text);
+            assert!(!path.exists());
+        });
+        // The edit happens before the UI can apply the asynchronous query result.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.find_usages_action(&crate::editor_view::References, window, cx);
+                editor.update(cx, |editor, cx| {
+                    editor.apply_formatting(
+                        &[lsp_types::TextEdit {
+                            range: lsp_types::Range::default(),
+                            new_text: " ".into(),
+                        }],
+                        editor.document_session(),
+                        0,
+                        cx,
+                    )
+                });
+            })
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert!(
+                !workspace.find_usages_visible,
+                "stale response must not reopen the popup"
+            );
+            assert!(workspace.find_usages.is_empty());
+        });
+    }
+
+    #[test]
+    fn implementation_preparation_uses_interface_identity_and_deterministic_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let interface = dir.path().join("Cache.php");
+        let redis = dir.path().join("Redis.php");
+        let file = dir.path().join("main.php");
+        let interface_text = "<?php interface Cache { public function get(): void; }";
+        let redis_text =
+            "<?php class RedisCache implements \\Cache { public function get(): void {} }";
+        let main_text = "<?php class Unrelated {}\n";
+        std::fs::write(&interface, interface_text).unwrap();
+        std::fs::write(&redis, redis_text).unwrap();
+        std::fs::write(&file, main_text).unwrap();
+        let mut index = axiom_index::ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = axiom_index::SemanticSnapshot::from_project_index(
+            &index,
+            axiom_index::SemanticRevision(1),
+        );
+        let interface_id = snapshot.symbols_for_fqn("Cache")[0];
+        let interface_offset = snapshot.symbol(interface_id).unwrap().range.start + 1;
+        let targets =
+            super::prepare_implementations(&snapshot, &interface, interface_offset).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file.file_name(), redis.file_name());
+        assert!(
+            super::prepare_implementations(
+                &snapshot,
+                &file,
+                main_text.find("Unrelated").unwrap() + 1
+            )
+            .is_err()
+        );
+    }
+    #[gpui::test]
+    fn references_popup_keyboard_and_empty_results(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx) =
+            cx.add_window_view(|_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.find_usages_visible = true;
+            workspace.find_usages_focus_pending = true;
+            for index in 0..1000 {
+                workspace.find_usages.push(super::FindUsageTarget {
+                    file: "example.php".into(),
+                    span: index..index + 1,
+                    role: Some(axiom_index::ReferenceRole::FunctionCall),
+                    position: lsp_types::Position::new(index as u32, 0),
+                    label: format!("example.php:{index}"),
+                    snippet: "$value".into(),
+                });
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down down up");
+        workspace.update(cx, |workspace, cx| {
+            assert_eq!(workspace.find_usages_selected, 1);
+            cx.notify();
+        });
+        cx.simulate_keystrokes("home end");
+        workspace.update(cx, |workspace, cx| {
+            assert_eq!(workspace.find_usages_selected, 999);
+            workspace.find_usages.clear();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter escape");
+        workspace.update(cx, |workspace, _| assert!(!workspace.find_usages_visible));
+    }
+
+    #[test]
+    fn references_preparation_prefers_dirty_text_and_rejects_stale_snapshot() {
+        use axiom_index::{PersistentFileKey, SemanticRevision, SnapshotBuilder};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dirty.php");
+        std::fs::write(&path, "<?php function old() {}").unwrap();
+        let dirty = "<?php function run() {} run(); run();";
+        let mut builder = SnapshotBuilder::empty(SemanticRevision(1));
+        builder.replace_workspace_file(&path, dirty);
+        let snapshot = builder.finish();
+        let key = PersistentFileKey::workspace(&path);
+        let buffers = std::collections::HashMap::from([(key.clone(), dirty.to_owned())]);
+        let (targets, _) =
+            super::prepare_find_usages(&snapshot, &path, dirty.find("run").unwrap(), buffers)
+                .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets[0].span.start < targets[1].span.start);
+        assert!(
+            targets
+                .iter()
+                .all(|target| &dirty[target.span.clone()] == "run")
+        );
+        let buffers = std::collections::HashMap::from([(key, format!("{dirty} run();"))]);
+        assert!(super::prepare_find_usages(&snapshot, &path, 15, buffers).is_err());
+    }
+
+    #[gpui::test]
+    fn references_context_rejects_edit_session_project_and_replaced_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, cx) =
+            cx.add_window_view(|_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        let path = std::path::PathBuf::from("references.php");
+        let editor = cx.new(|cx| {
+            EditorView::from_document(
+                path.clone(),
+                axiom_editor::Document::from_content("<?php function run() {} run();"),
+                None,
+                cx,
+            )
+        });
+        workspace.update(cx, |workspace, cx| {
+            let snapshot = std::sync::Arc::new(axiom_index::SemanticSnapshot::default());
+            workspace.semantic_engine = Some(std::sync::Arc::new(
+                axiom_index::SemanticEngine::from_snapshot((*snapshot).clone()),
+            ));
+            let snapshot = workspace.semantic_engine.as_ref().unwrap().snapshot();
+            workspace.tabs.push(OpenTab {
+                path: path.clone(),
+                editor: editor.clone(),
+            });
+            workspace.active = Some(0);
+            let context = std::sync::Arc::new(super::FindUsagesContext {
+                kind: super::NavigationQueryKind::References,
+                project_generation: workspace.project_semantic_generation,
+                snapshot,
+                documents: workspace.references_document_stamps(cx),
+                source_session: editor.read(cx).document_session(),
+            });
+            workspace.find_usages_context = Some(context.clone());
+            assert!(workspace.references_context_current(&context, cx));
+            workspace.project_semantic_generation += 1;
+            assert!(!workspace.references_context_current(&context, cx));
+            workspace.project_semantic_generation -= 1;
+            workspace.tabs[0].path = "renamed.php".into();
+            assert!(!workspace.references_context_current(&context, cx));
+            workspace.tabs[0].path = path;
+            editor.update(cx, |editor, cx| {
+                editor.apply_formatting(
+                    &[lsp_types::TextEdit {
+                        range: lsp_types::Range::default(),
+                        new_text: " ".into(),
+                    }],
+                    editor.document_session(),
+                    0,
+                    cx,
+                );
+            });
+            assert!(!workspace.references_context_current(&context, cx));
+            workspace.find_usages_context = None;
+            assert!(!workspace.references_context_current(&context, cx));
+        });
+    }
     use super::{
         EditorView, EntryKind, ExplorerContext, OpenTab, SemanticDefinitionRoute, StartupTarget,
         WorkspaceView, byte_to_utf16_offset, normalize_modifiers, replace_utf16_range,
