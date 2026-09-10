@@ -2,6 +2,7 @@
 
 mod editor_view;
 mod lsp_bridge;
+mod modal_type_completion;
 mod syntax_theme;
 mod terminal_view;
 mod ui;

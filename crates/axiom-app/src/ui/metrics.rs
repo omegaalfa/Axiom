@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use gpui::{Font, FontFallbacks, Pixels, font, px};
 
 pub const CODE_FONT_FAMILY: &str = "Cascadia Mono";
-pub const CODE_FONT_FALLBACKS: &[&str] = &["Consolas", "DejaVu Sans Mono"];
+pub const CODE_FONT_FALLBACKS: &[&str] = &["Consolas"];
 
 /// The shared code/terminal font. GPUI adds its own platform fallback stack
 /// after these explicitly preferred monospace families.

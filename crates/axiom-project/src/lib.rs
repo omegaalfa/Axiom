@@ -314,23 +314,45 @@ impl Project {
 
     pub fn path_to_namespace(&self, path: impl AsRef<Path>) -> Option<String> {
         let path = normalize_existing_or_lexical(path.as_ref());
-        self.psr4.iter().find_map(|mapping| {
-            let relative = path.strip_prefix(&mapping.directory).ok()?;
-            let parent = relative.parent()?;
-            let suffix = parent
-                .components()
-                .filter_map(|component| match component {
-                    Component::Normal(value) => value.to_str(),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\\");
-            Some(if suffix.is_empty() {
-                mapping.namespace_prefix.trim_end_matches('\\').to_owned()
-            } else {
-                format!("{}{}", mapping.namespace_prefix, suffix)
+        // Accept both a selected directory and the historical file-shaped
+        // input. The modal now passes the directory directly; callers that
+        // provide `Foo.php` retain the old convenient behavior without I/O.
+        let directory = if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".php"))
+        {
+            path.parent().unwrap_or(path.as_path())
+        } else {
+            path.as_path()
+        };
+        self.psr4
+            .iter()
+            .enumerate()
+            .filter_map(|(index, mapping)| {
+                let relative = directory.strip_prefix(&mapping.directory).ok()?;
+                let suffix = relative
+                    .components()
+                    .filter_map(|component| match component {
+                        Component::Normal(value) => value.to_str(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\\");
+                Some((
+                    mapping.directory.components().count(),
+                    index,
+                    if suffix.is_empty() {
+                        mapping.namespace_prefix.trim_end_matches('\\').to_owned()
+                    } else {
+                        format!("{}{}", mapping.namespace_prefix, suffix)
+                    },
+                ))
             })
-        })
+            .max_by(|(base_a, index_a, _), (base_b, index_b, _)| {
+                base_a.cmp(base_b).then_with(|| index_b.cmp(index_a))
+            })
+            .map(|(_, _, namespace)| namespace)
     }
 }
 
@@ -539,6 +561,33 @@ mod tests {
                 .iter()
                 .any(|mapping| mapping.dev && mapping.namespace_prefix == "Tests\\")
         );
+    }
+
+    #[test]
+    fn path_to_namespace_accepts_directories_and_prefers_specific_roots() {
+        let root = tempdir().unwrap();
+        for directory in ["src", "src/Domain/Billing", "generated", "tests/Unit"] {
+            fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        fs::write(
+            root.path().join("composer.json"),
+            r#"{"autoload":{"psr-4":{"App\\":"src/","App\\Domain\\":"src/Domain/","Gen\\":["src/","generated/"]}},"autoload-dev":{"psr-4":{"Tests\\":"tests/"}}}"#,
+        )
+        .unwrap();
+        let project = Project::open(root.path()).unwrap();
+        assert_eq!(
+            project.path_to_namespace(root.path().join("src")),
+            Some("App".into())
+        );
+        assert_eq!(
+            project.path_to_namespace(root.path().join("src/Domain/Billing")),
+            Some("App\\Domain\\Billing".into())
+        );
+        assert_eq!(
+            project.path_to_namespace(root.path().join("tests/Unit")),
+            Some("Tests\\Unit".into())
+        );
+        assert_eq!(project.path_to_namespace(root.path().join("outside")), None);
     }
 
     #[test]

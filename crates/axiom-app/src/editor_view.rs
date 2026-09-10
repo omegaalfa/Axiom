@@ -4661,7 +4661,7 @@ impl EditorView {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TypeCompletionContext {
+pub(crate) enum TypeCompletionContext {
     New,
     ClassExtends,
     ClassImplements,
@@ -4693,7 +4693,7 @@ fn type_completion_context(
     TypeCompletionContext::GenericType
 }
 
-fn type_kind_allowed(context: TypeCompletionContext, kind: ProjectSymbolKind) -> bool {
+pub(crate) fn type_kind_allowed(context: TypeCompletionContext, kind: ProjectSymbolKind) -> bool {
     match context {
         TypeCompletionContext::New | TypeCompletionContext::ClassExtends => {
             kind == ProjectSymbolKind::Class
@@ -4705,7 +4705,7 @@ fn type_kind_allowed(context: TypeCompletionContext, kind: ProjectSymbolKind) ->
     }
 }
 
-fn runtime_type_kind_allowed(context: TypeCompletionContext, kind: RuntimeKind) -> bool {
+pub(crate) fn runtime_type_kind_allowed(context: TypeCompletionContext, kind: RuntimeKind) -> bool {
     match context {
         TypeCompletionContext::New | TypeCompletionContext::ClassExtends => {
             kind == RuntimeKind::Class
@@ -5205,7 +5205,7 @@ fn completion_icon(kind: Option<CompletionItemKind>) -> &'static str {
 /// Orders candidates already collected for a `new <prefix>` context. This is
 /// deliberately a presentation-only ranking pass: it performs no lookups and
 /// uses only the existing label, detail/source and kind fields.
-fn rank_new_completion_items(items: &mut [CompletionItem], prefix: &str) {
+pub(crate) fn rank_new_completion_items(items: &mut [CompletionItem], prefix: &str) {
     items.sort_by_key(|item| {
         let text_rank = if !prefix.is_empty() && item.label.eq_ignore_ascii_case(prefix) {
             0_u8 // exact short-name match

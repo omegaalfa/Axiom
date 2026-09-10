@@ -110,6 +110,14 @@ pub struct VendorSymbolIndex {
     psr4: Vec<(String, Vec<PathBuf>)>,
     parsed: BTreeMap<String, Vec<ProjectSymbol>>,
     parsed_files: BTreeMap<String, (PathBuf, u64, u128)>,
+    type_names: BTreeMap<String, Vec<VendorTypeMatch>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendorTypeMatch {
+    pub fqn: String,
+    pub short_name: String,
+    pub kind: ProjectSymbolKind,
 }
 
 const VENDOR_CACHE_SCHEMA: u32 = 2;
@@ -236,6 +244,7 @@ impl VendorSymbolIndex {
                 psr4: cache.psr4,
                 parsed: BTreeMap::new(),
                 parsed_files: BTreeMap::new(),
+                type_names: BTreeMap::new(),
             };
             index.rebuild_class_name_index();
             return Ok(index);
@@ -587,6 +596,24 @@ impl VendorSymbolIndex {
             );
         }
         self.parsed.insert(fqn.to_owned(), symbols.clone());
+        for symbol in symbols.iter().filter(|symbol| {
+            matches!(
+                symbol.kind,
+                ProjectSymbolKind::Class
+                    | ProjectSymbolKind::Interface
+                    | ProjectSymbolKind::Trait
+                    | ProjectSymbolKind::Enum
+            )
+        }) {
+            self.type_names
+                .entry(symbol.name.clone())
+                .or_default()
+                .push(VendorTypeMatch {
+                    fqn: symbol.fully_qualified_name.clone(),
+                    short_name: symbol.name.clone(),
+                    kind: symbol.kind,
+                });
+        }
         if let Ok(metadata) = fs::metadata(&path) {
             let modified = metadata
                 .modified()
@@ -632,6 +659,23 @@ impl VendorSymbolIndex {
             .range(prefix.to_owned()..=upper)
             .flat_map(|(_, fqns)| fqns.iter())
             .cloned()
+            .collect()
+    }
+
+    /// Returns type declarations whose kind is already resident. This never
+    /// parses or loads a file; callers that need a declaration must populate
+    /// the normal vendor parse cache first.
+    pub fn types_matching(&self, prefix: &str) -> Vec<VendorTypeMatch> {
+        self.types_matching_limited(prefix, usize::MAX)
+    }
+
+    /// Bounds resident candidate materialization without parsing Vendor files.
+    pub fn types_matching_limited(&self, prefix: &str, limit: usize) -> Vec<VendorTypeMatch> {
+        let upper = format!("{prefix}\u{10ffff}");
+        self.type_names
+            .range(prefix.to_owned()..=upper)
+            .flat_map(|(_, values)| values.iter().cloned())
+            .take(limit)
             .collect()
     }
 
@@ -1244,6 +1288,21 @@ impl ProjectSymbolIndex {
             .collect::<Vec<_>>();
         result.sort_by_key(|s| (!s.name.starts_with(prefix), s.name.to_lowercase()));
         result
+    }
+
+    /// A bounded view of the existing short-name/FQN indexes for interactive UI.
+    /// The budget counts index entries, including duplicates, before allocation.
+    pub fn search_prefix_limited(&self, prefix: &str, limit: usize) -> Vec<&ProjectSymbol> {
+        let upper = format!("{prefix}\u{10ffff}");
+        let mut seen = std::collections::HashSet::new();
+        self.prefix_names
+            .range(prefix.to_owned()..=upper.clone())
+            .chain(self.prefix_fqns.range(prefix.to_owned()..=upper))
+            .flat_map(|(_, indexes)| indexes.iter().copied())
+            .take(limit)
+            .filter(|index| seen.insert(*index))
+            .filter_map(|index| self.symbols.get(index))
+            .collect()
     }
 
     fn rebuild_prefix_index(&mut self) {
@@ -1903,6 +1962,49 @@ mod tests {
         let symbols = index.symbols_of("Pkg\\A");
         assert!(symbols.iter().any(|symbol| symbol.name == "own"));
         assert!(!index.parsed.contains_key("Pkg\\B"));
+    }
+
+    #[test]
+    fn vendor_types_matching_preserves_declaration_kinds_without_lookup_io() {
+        let mut index = VendorSymbolIndex::default();
+        for (name, kind) in [
+            ("BaseService", ProjectSymbolKind::Class),
+            ("CacheInterface", ProjectSymbolKind::Interface),
+            ("ServiceTrait", ProjectSymbolKind::Trait),
+            ("ServiceStatus", ProjectSymbolKind::Enum),
+        ] {
+            index
+                .type_names
+                .entry(name.to_owned())
+                .or_default()
+                .push(VendorTypeMatch {
+                    fqn: format!("App\\{name}"),
+                    short_name: name.to_owned(),
+                    kind,
+                });
+        }
+        assert_eq!(
+            index.types_matching("Base")[0].kind,
+            ProjectSymbolKind::Class
+        );
+        assert_eq!(
+            index.types_matching("Cache")[0].kind,
+            ProjectSymbolKind::Interface
+        );
+        assert_eq!(
+            index.types_matching("ServiceT")[0].kind,
+            ProjectSymbolKind::Trait
+        );
+        assert_eq!(
+            index.types_matching("ServiceS")[0].kind,
+            ProjectSymbolKind::Enum
+        );
+        assert!(
+            index
+                .types_matching("Service")
+                .iter()
+                .any(|item| item.kind == ProjectSymbolKind::Enum)
+        );
     }
 
     #[test]

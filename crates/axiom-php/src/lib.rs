@@ -439,12 +439,18 @@ impl RuntimeSymbolIndex {
     }
 
     pub fn search_prefix(&self, prefix: &str) -> Vec<&Symbol> {
+        self.search_prefix_limited(prefix, usize::MAX)
+    }
+
+    /// Bounds work using the existing resident prefix index.
+    pub fn search_prefix_limited(&self, prefix: &str, limit: usize) -> Vec<&Symbol> {
         let prefix = fold_name(prefix);
         let upper = format!("{prefix}\u{10ffff}");
         let mut seen = std::collections::HashSet::new();
         self.prefix_symbols
             .range(prefix..=upper)
             .flat_map(|(_, references)| references)
+            .take(limit)
             .filter(|reference| {
                 seen.insert((
                     reference.bucket as u8,

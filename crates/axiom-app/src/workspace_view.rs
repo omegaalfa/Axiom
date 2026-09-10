@@ -164,6 +164,24 @@ fn semantic_list_height(count: usize) -> Pixels {
     semantic_row_height() * count.min(10) as f32
 }
 
+fn valid_php_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_alphabetic())
+        && chars.all(|c| c == '_' || c.is_alphanumeric())
+}
+
+fn valid_php_namespace(value: &str) -> bool {
+    let value = value.trim().trim_matches('\\');
+    value.is_empty() || value.split('\\').all(valid_php_identifier)
+}
+
+fn relative_directory_label(root: Option<&Path>, directory: &Path) -> String {
+    root.and_then(|root| directory.strip_prefix(root).ok())
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.display().to_string().replace('\\', "/"))
+        .unwrap_or_else(|| ".".into())
+}
+
 fn semantic_popup_geometry(
     anchor: Point<Pixels>,
     viewport: gpui::Size<Pixels>,
@@ -268,6 +286,24 @@ mod semantic_popup_visual_tests {
         }
         let compact: String = render.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(compact.contains("style.border_color(semantic_row_colors(selected,true).1)"));
+    }
+
+    #[test]
+    fn php_creation_validation_and_psr4_directory_label_are_conservative() {
+        assert!(!valid_php_identifier(""));
+        assert!(valid_php_identifier("UserService"));
+        assert!(valid_php_identifier("Éxample_2"));
+        assert!(!valid_php_identifier("User-Service"));
+        assert!(valid_php_namespace("App\\Service"));
+        assert!(valid_php_namespace("\\App\\Service\\"));
+        assert!(!valid_php_namespace("App\\Bad-Name"));
+        assert_eq!(
+            relative_directory_label(
+                Some(Path::new("/workspace")),
+                Path::new("/workspace/App/Service")
+            ),
+            "App/Service"
+        );
     }
 }
 
@@ -500,6 +536,15 @@ enum ExplorerOperation {
     Rename(PathBuf),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModalField {
+    Name,
+    Namespace,
+    File,
+    Extends,
+    Implements,
+}
+
 enum ExplorerFsResult {
     Create(Option<PathBuf>),
     Rename { old: PathBuf, new: PathBuf },
@@ -600,11 +645,24 @@ pub struct WorkspaceView {
     explorer_new_menu_open: bool,
     explorer_operation: Option<ExplorerOperation>,
     explorer_input: String,
+    explorer_file: String,
+    explorer_file_auto: bool,
+    explorer_modal_field: ModalField,
+    explorer_namespace_selection: UTF16Selection,
+    explorer_file_selection: UTF16Selection,
+    explorer_extends_selection: UTF16Selection,
+    explorer_implements_selection: UTF16Selection,
     explorer_namespace: String,
     explorer_extends: String,
     explorer_implements: String,
+    modal_inputs: [Entity<ModalInput>; 5],
+    modal_type_items: Vec<lsp_types::CompletionItem>,
+    modal_type_selected: usize,
+    modal_type_range: std::ops::Range<usize>,
+    modal_type_scroll: ScrollHandle,
+    modal_field_focus: [FocusHandle; 5],
+    modal_field_geometry: [crate::ui::input_line::InputGeometry; 5],
     modal_input_focus: FocusHandle,
-    modal_input_geometry: crate::ui::input_line::InputGeometry,
     modal_caret_visible: bool,
     modal_caret_activity: Instant,
     modal_caret_toggle: Instant,
@@ -1117,6 +1175,22 @@ impl WorkspaceView {
     }
 
     pub fn new(startup: StartupTarget, cx: &mut Context<Self>) -> Self {
+        let owner = cx.entity().downgrade();
+        let modal_inputs = [
+            ModalField::Name,
+            ModalField::Namespace,
+            ModalField::File,
+            ModalField::Extends,
+            ModalField::Implements,
+        ]
+        .map(|field| {
+            cx.new(|_| ModalInput {
+                owner: owner.clone(),
+                field,
+            })
+        });
+        let modal_field_focus: [FocusHandle; 5] = std::array::from_fn(|_| cx.focus_handle());
+        let modal_input_focus = modal_field_focus[0].clone();
         let recent_path = recent_projects_path();
         let recent_projects = recent_path
             .as_deref()
@@ -1165,11 +1239,36 @@ impl WorkspaceView {
             explorer_new_menu_open: false,
             explorer_operation: None,
             explorer_input: String::new(),
+            explorer_file: String::new(),
+            explorer_file_auto: true,
+            explorer_modal_field: ModalField::Name,
+            modal_type_items: Vec::new(),
+            modal_type_selected: 0,
+            modal_type_range: 0..0,
+            modal_type_scroll: ScrollHandle::new(),
+            explorer_namespace_selection: UTF16Selection {
+                range: 0..0,
+                reversed: false,
+            },
+            explorer_file_selection: UTF16Selection {
+                range: 0..0,
+                reversed: false,
+            },
+            explorer_extends_selection: UTF16Selection {
+                range: 0..0,
+                reversed: false,
+            },
+            explorer_implements_selection: UTF16Selection {
+                range: 0..0,
+                reversed: false,
+            },
             explorer_namespace: String::new(),
             explorer_extends: String::new(),
             explorer_implements: String::new(),
-            modal_input_focus: cx.focus_handle(),
-            modal_input_geometry: Default::default(),
+            modal_inputs,
+            modal_field_focus,
+            modal_field_geometry: Default::default(),
+            modal_input_focus,
             modal_caret_visible: true,
             modal_caret_activity: Instant::now(),
             modal_caret_toggle: Instant::now(),
@@ -3658,13 +3757,29 @@ impl WorkspaceView {
             }
             return;
         }
-        if self.explorer_operation.is_some() && self.modal_input_focus.is_focused(window) {
+        if self.explorer_operation.is_some()
+            && self
+                .modal_field_focus
+                .iter()
+                .any(|focus| focus.is_focused(window))
+        {
             if debug_input_enabled() && !matches!(key.as_str(), "escape" | "enter") {
                 tracing::info!(key = %key, "[MODAL INPUT]");
             }
             match key.as_str() {
+                _ if self.modal_completion_key(&key, cx) => {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                }
                 "escape" => self.cancel_explorer_operation(cx),
                 "enter" => self.confirm_explorer_operation(cx),
+                "tab" => {
+                    self.cycle_modal_field(event.keystroke.modifiers.shift);
+                    window.focus(&self.modal_field_focus[self.explorer_modal_field as usize]);
+                    cx.notify();
+                    cx.stop_propagation();
+                    window.prevent_default();
+                }
                 _ if self.modal_key_edit(&key, event.keystroke.modifiers, cx) => {
                     cx.stop_propagation();
                     window.prevent_default();
@@ -4164,6 +4279,7 @@ impl WorkspaceView {
             range: 0..self.explorer_input.encode_utf16().count(),
             reversed: false,
         };
+        self.explorer_modal_field = ModalField::Name;
         self.modal_focus_pending = true;
         self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::NewFile(directory));
@@ -4223,6 +4339,7 @@ impl WorkspaceView {
             range: 0..self.explorer_input.encode_utf16().count(),
             reversed: false,
         };
+        self.explorer_modal_field = ModalField::Name;
         self.modal_focus_pending = true;
         self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::NewPhpFile(directory));
@@ -4246,6 +4363,7 @@ impl WorkspaceView {
             range: 0..self.explorer_input.encode_utf16().count(),
             reversed: false,
         };
+        self.explorer_modal_field = ModalField::Name;
         self.modal_focus_pending = true;
         self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::NewDirectory(directory));
@@ -4253,6 +4371,7 @@ impl WorkspaceView {
     }
 
     fn new_php_item(&mut self, directory: PathBuf, keyword: &'static str, cx: &mut Context<Self>) {
+        self.modal_type_items.clear();
         if self.explorer_fs_busy {
             self.status = "Another file operation is in progress".into();
             cx.notify();
@@ -4265,21 +4384,190 @@ impl WorkspaceView {
         self.explorer_new_menu_open = false;
         self.explorer_undo.clear();
         self.explorer_input = "NewItem".into();
+        self.explorer_file = "NewItem.php".into();
+        self.explorer_file_auto = true;
         self.explorer_selection = UTF16Selection {
             range: 0..self.explorer_input.encode_utf16().count(),
             reversed: false,
         };
+        self.explorer_modal_field = ModalField::Name;
         self.modal_focus_pending = true;
         self.explorer_namespace = self
             .project
             .as_ref()
-            .and_then(|project| project.path_to_namespace(directory.join("NewItem.php")))
-            .and_then(|value| value.rsplit_once('\\').map(|(prefix, _)| prefix.to_owned()))
+            .and_then(|project| project.path_to_namespace(&directory))
             .unwrap_or_default();
         self.explorer_extends.clear();
         self.explorer_implements.clear();
         self.explorer_operation = Some(ExplorerOperation::NewPhp { directory, keyword });
         cx.notify();
+    }
+
+    fn select_php_type(&mut self, keyword: &'static str, cx: &mut Context<Self>) {
+        self.modal_type_items.clear();
+        if let Some(ExplorerOperation::NewPhp {
+            keyword: current, ..
+        }) = self.explorer_operation.as_mut()
+        {
+            *current = keyword;
+            if !matches!(keyword, "class" | "interface") {
+                self.explorer_extends.clear();
+                self.explorer_implements.clear();
+            }
+            if (self.explorer_modal_field == ModalField::Implements && keyword != "class")
+                || (self.explorer_modal_field == ModalField::Extends
+                    && !matches!(keyword, "class" | "interface"))
+            {
+                self.set_modal_field(ModalField::Name);
+            }
+            cx.notify();
+        }
+    }
+
+    fn modal_type_context(&self) -> Option<crate::editor_view::TypeCompletionContext> {
+        use crate::editor_view::TypeCompletionContext::*;
+        match (&self.explorer_operation, self.explorer_modal_field) {
+            (
+                Some(ExplorerOperation::NewPhp {
+                    keyword: "class", ..
+                }),
+                ModalField::Extends,
+            ) => Some(ClassExtends),
+            (
+                Some(ExplorerOperation::NewPhp {
+                    keyword: "class", ..
+                }),
+                ModalField::Implements,
+            ) => Some(ClassImplements),
+            (
+                Some(ExplorerOperation::NewPhp {
+                    keyword: "interface",
+                    ..
+                }),
+                ModalField::Extends,
+            ) => Some(InterfaceExtends),
+            _ => None,
+        }
+    }
+
+    fn refresh_modal_types(&mut self) {
+        self.modal_type_items.clear();
+        let Some(context) = self.modal_type_context() else {
+            return;
+        };
+        let field = self.explorer_modal_field;
+        let text = self.modal_field_text(field);
+        let caret = utf16_to_byte_offset(text, self.modal_field_selection(field).range.end);
+        let (range, prefix) = crate::modal_type_completion::active_token(text, caret);
+        // A busy index is skipped; never wait on the UI thread.
+        let project = self
+            .project_index
+            .as_ref()
+            .and_then(|index| index.try_read().ok());
+        let vendor = self
+            .vendor_index
+            .as_ref()
+            .and_then(|index| index.try_read().ok());
+        let items = crate::modal_type_completion::lookup(
+            context,
+            prefix,
+            project.as_deref(),
+            vendor.as_deref(),
+            self._runtime_symbols.as_deref(),
+        );
+        self.modal_type_items = items;
+        self.modal_type_range = range;
+        self.modal_type_selected = 0;
+        self.modal_type_scroll
+            .set_offset(gpui::point(px(0.), px(0.)));
+    }
+
+    fn accept_modal_type(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.modal_type_context().is_none() {
+            return;
+        }
+        let Some(fqn) = self
+            .modal_type_items
+            .get(index)
+            .and_then(|item| item.insert_text.clone())
+        else {
+            return;
+        };
+        let field = self.explorer_modal_field;
+        let text = self.modal_field_text(field);
+        let range = byte_to_utf16_offset(text, self.modal_type_range.start)
+            ..byte_to_utf16_offset(text, self.modal_type_range.end);
+        self.modal_replace_field_range(field, range, &fqn, cx);
+        self.modal_type_items.clear();
+        cx.notify();
+    }
+
+    fn modal_completion_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        if self.modal_type_items.is_empty() {
+            return false;
+        }
+        match key {
+            "up" => {
+                self.modal_type_selected = (self.modal_type_selected + self.modal_type_items.len()
+                    - 1)
+                    % self.modal_type_items.len()
+            }
+            "down" => {
+                self.modal_type_selected =
+                    (self.modal_type_selected + 1) % self.modal_type_items.len()
+            }
+            "enter" => {
+                self.accept_modal_type(self.modal_type_selected, cx);
+                return true;
+            }
+            "escape" => self.modal_type_items.clear(),
+            "tab" => {
+                self.modal_type_items.clear();
+                return false;
+            }
+            _ => return false,
+        }
+        self.modal_type_scroll
+            .scroll_to_item(self.modal_type_selected);
+        cx.notify();
+        true
+    }
+
+    fn cycle_modal_field(&mut self, backwards: bool) {
+        let fields = match self.explorer_operation {
+            Some(ExplorerOperation::NewPhp {
+                keyword: "class", ..
+            }) => vec![
+                ModalField::Name,
+                ModalField::Namespace,
+                ModalField::File,
+                ModalField::Extends,
+                ModalField::Implements,
+            ],
+            Some(ExplorerOperation::NewPhp {
+                keyword: "interface",
+                ..
+            }) => vec![
+                ModalField::Name,
+                ModalField::Namespace,
+                ModalField::File,
+                ModalField::Extends,
+            ],
+            Some(ExplorerOperation::NewPhp { .. }) => {
+                vec![ModalField::Name, ModalField::Namespace, ModalField::File]
+            }
+            _ => vec![ModalField::Name],
+        };
+        let index = fields
+            .iter()
+            .position(|field| *field == self.explorer_modal_field)
+            .unwrap_or(0);
+        let next = if backwards {
+            index.checked_sub(1).unwrap_or(fields.len() - 1)
+        } else {
+            (index + 1) % fields.len()
+        };
+        self.set_modal_field(fields[next]);
     }
 
     fn rename_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -4312,6 +4600,7 @@ impl WorkspaceView {
             range: 0..basename_len,
             reversed: false,
         };
+        self.explorer_modal_field = ModalField::Name;
         self.modal_focus_pending = true;
         self.explorer_namespace.clear();
         self.explorer_operation = Some(ExplorerOperation::Rename(path));
@@ -4319,10 +4608,13 @@ impl WorkspaceView {
     }
 
     fn cancel_explorer_operation(&mut self, cx: &mut Context<Self>) {
+        self.modal_type_items.clear();
         self.explorer_operation = None;
         self.explorer_new_menu_open = false;
         self.modal_focus_pending = false;
         self.explorer_input.clear();
+        self.explorer_file.clear();
+        self.explorer_file_auto = true;
         self.explorer_undo.clear();
         self.explorer_namespace.clear();
         self.explorer_extends.clear();
@@ -4330,12 +4622,158 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn modal_field_text(&self, field: ModalField) -> &str {
+        match field {
+            ModalField::Name => &self.explorer_input,
+            ModalField::Namespace => &self.explorer_namespace,
+            ModalField::File => &self.explorer_file,
+            ModalField::Extends => &self.explorer_extends,
+            ModalField::Implements => &self.explorer_implements,
+        }
+    }
+
+    fn modal_field_text_mut(&mut self, field: ModalField) -> &mut String {
+        match field {
+            ModalField::Name => &mut self.explorer_input,
+            ModalField::Namespace => &mut self.explorer_namespace,
+            ModalField::File => &mut self.explorer_file,
+            ModalField::Extends => &mut self.explorer_extends,
+            ModalField::Implements => &mut self.explorer_implements,
+        }
+    }
+
+    fn modal_field_selection(&self, field: ModalField) -> &UTF16Selection {
+        match field {
+            ModalField::Name => &self.explorer_selection,
+            ModalField::Namespace => &self.explorer_namespace_selection,
+            ModalField::File => &self.explorer_file_selection,
+            ModalField::Extends => &self.explorer_extends_selection,
+            ModalField::Implements => &self.explorer_implements_selection,
+        }
+    }
+
+    fn modal_field_selection_mut(&mut self, field: ModalField) -> &mut UTF16Selection {
+        match field {
+            ModalField::Name => &mut self.explorer_selection,
+            ModalField::Namespace => &mut self.explorer_namespace_selection,
+            ModalField::File => &mut self.explorer_file_selection,
+            ModalField::Extends => &mut self.explorer_extends_selection,
+            ModalField::Implements => &mut self.explorer_implements_selection,
+        }
+    }
+
+    fn set_modal_field(&mut self, field: ModalField) {
+        self.modal_type_items.clear();
+        self.explorer_modal_field = field;
+        self.reset_modal_caret();
+    }
+
+    fn modal_caret_for(&self, field: ModalField, window: &Window) -> bool {
+        self.modal_caret_visible
+            && self.explorer_modal_field == field
+            && self.modal_field_focus[field as usize].is_focused(window)
+    }
+
+    fn set_modal_field_at(&mut self, field: ModalField, byte: usize) {
+        self.set_modal_field(field);
+        let caret = byte_to_utf16_offset(
+            self.modal_field_text(field),
+            byte.min(self.modal_field_text(field).len()),
+        );
+        *self.modal_field_selection_mut(field) = UTF16Selection {
+            range: caret..caret,
+            reversed: false,
+        };
+    }
+
+    fn modal_pointer_down(
+        &mut self,
+        field: ModalField,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let byte = self.modal_field_geometry[field as usize].hit_test(event.position.x);
+        self.set_modal_field_at(field, byte);
+        if event.click_count == 2 {
+            let text = self.modal_field_text(field);
+            let range = axiom_app::interaction::word_range_at(text, byte);
+            let range =
+                byte_to_utf16_offset(text, range.start)..byte_to_utf16_offset(text, range.end);
+            self.modal_field_selection_mut(field).range = range;
+        }
+        window.focus(&self.modal_field_focus[field as usize]);
+        cx.notify();
+    }
+
+    fn modal_pointer_move(
+        &mut self,
+        field: ModalField,
+        event: &gpui::MouseMoveEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging()
+            || self.explorer_modal_field != field
+            || !self.modal_field_focus[field as usize].is_focused(window)
+        {
+            return;
+        }
+        let byte = self.modal_field_geometry[field as usize].hit_test(event.position.x);
+        let caret = byte_to_utf16_offset(self.modal_field_text(field), byte);
+        let selection = self.modal_field_selection_mut(field);
+        let anchor = if selection.reversed {
+            selection.range.end
+        } else {
+            selection.range.start
+        };
+        *selection = UTF16Selection {
+            range: anchor.min(caret)..anchor.max(caret),
+            reversed: caret < anchor,
+        };
+        self.reset_modal_caret();
+        cx.notify();
+    }
     fn modal_replace_range(
         &mut self,
         range: std::ops::Range<usize>,
         text: &str,
         cx: &mut Context<Self>,
     ) {
+        let field = self.explorer_modal_field;
+        self.modal_replace_field_range(field, range, text, cx);
+    }
+
+    fn modal_replace_field_range(
+        &mut self,
+        field: ModalField,
+        range: std::ops::Range<usize>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if field != ModalField::Name {
+            let current = self.modal_field_text(field).to_owned();
+            let start = range.start.min(current.encode_utf16().count());
+            let end = range.end.min(current.encode_utf16().count());
+            let (updated, caret) = replace_utf16_range(&current, start..end, text);
+            *self.modal_field_text_mut(field) = updated;
+            *self.modal_field_selection_mut(field) = UTF16Selection {
+                range: caret..caret,
+                reversed: false,
+            };
+
+            if field == ModalField::File {
+                self.explorer_file_auto = false;
+            }
+            if matches!(field, ModalField::Extends | ModalField::Implements)
+                && field == self.explorer_modal_field
+            {
+                self.refresh_modal_types();
+            }
+            self.reset_modal_caret();
+            cx.notify();
+            return;
+        }
         self.reset_modal_caret();
         if self
             .explorer_operation
@@ -4353,6 +4791,14 @@ impl WorkspaceView {
         let before = self.explorer_input.encode_utf16().count();
         let (updated, caret) = replace_utf16_range(&self.explorer_input, range.clone(), text);
         self.explorer_input = updated;
+        if self.explorer_file_auto
+            && self
+                .explorer_operation
+                .as_ref()
+                .is_some_and(|op| matches!(op, ExplorerOperation::NewPhp { .. }))
+        {
+            self.explorer_file = format!("{}.php", self.explorer_input.trim_end_matches(".php"));
+        }
         self.explorer_selection = UTF16Selection {
             range: caret..caret,
             reversed: false,
@@ -4398,18 +4844,22 @@ impl WorkspaceView {
     }
 
     fn modal_key_edit(&mut self, key: &str, modifiers: Modifiers, cx: &mut Context<Self>) -> bool {
+        if matches!(key, "left" | "right" | "home" | "end") || (modifiers.control && key == "a") {
+            self.modal_type_items.clear();
+        }
+        let field = self.explorer_modal_field;
         self.reset_modal_caret();
-        let length = self.explorer_input.encode_utf16().count();
+        let length = self.modal_field_text(field).encode_utf16().count();
         let start = self
-            .explorer_selection
+            .modal_field_selection(field)
             .range
             .start
-            .min(self.explorer_selection.range.end);
+            .min(self.modal_field_selection(field).range.end);
         let end = self
-            .explorer_selection
+            .modal_field_selection(field)
             .range
             .start
-            .max(self.explorer_selection.range.end);
+            .max(self.modal_field_selection(field).range.end);
         if modifiers.control
             && key == "z"
             && self
@@ -4419,10 +4869,10 @@ impl WorkspaceView {
         {
             if let Some((value, selection)) = self.explorer_undo.pop() {
                 self.explorer_input = value;
-                self.explorer_selection = selection;
+                *self.modal_field_selection_mut(field) = selection;
                 if debug_input_enabled() {
                     tracing::info!(
-                        selection = ?self.explorer_selection.range,
+                        selection = ?self.modal_field_selection(field).range,
                         "[RENAME UNDO]"
                     );
                 }
@@ -4431,7 +4881,7 @@ impl WorkspaceView {
             return true;
         }
         if modifiers.control && key == "a" {
-            self.explorer_selection = UTF16Selection {
+            *self.modal_field_selection_mut(field) = UTF16Selection {
                 range: 0..length,
                 reversed: false,
             };
@@ -4444,19 +4894,16 @@ impl WorkspaceView {
             }
             return true;
         }
-        if modifiers.control && key == "x" {
-            let range = utf16_to_byte_offset(&self.explorer_input, start)
-                ..utf16_to_byte_offset(&self.explorer_input, end);
-            if let Some((text, caret)) =
-                crate::ui::input_line::cut_selection(&mut self.explorer_input, range)
-            {
+        if modifiers.control && matches!(key, "c" | "x") {
+            if start != end {
+                let query = self.modal_field_text(field);
+                let text = query
+                    [utf16_to_byte_offset(query, start)..utf16_to_byte_offset(query, end)]
+                    .to_owned();
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
-                let caret = byte_to_utf16_offset(&self.explorer_input, caret);
-                self.explorer_selection = UTF16Selection {
-                    range: caret..caret,
-                    reversed: false,
-                };
-                cx.notify();
+                if key == "x" {
+                    self.modal_replace_range(start..end, "", cx);
+                }
             }
             return true;
         }
@@ -4464,8 +4911,11 @@ impl WorkspaceView {
             if start != end {
                 self.modal_replace_range(start..end, "", cx);
             } else if start > 0 {
-                let previous =
-                    crate::ui::input_line::adjacent_utf16(&self.explorer_input, start, false);
+                let previous = crate::ui::input_line::adjacent_utf16(
+                    self.modal_field_text(field),
+                    start,
+                    false,
+                );
                 self.modal_replace_range(previous..start, "", cx);
             }
             return true;
@@ -4474,7 +4924,8 @@ impl WorkspaceView {
             if start != end {
                 self.modal_replace_range(start..end, "", cx);
             } else if end < length {
-                let next = crate::ui::input_line::adjacent_utf16(&self.explorer_input, end, true);
+                let next =
+                    crate::ui::input_line::adjacent_utf16(self.modal_field_text(field), end, true);
                 self.modal_replace_range(end..next, "", cx);
             }
             return true;
@@ -4484,16 +4935,20 @@ impl WorkspaceView {
                 if start != end {
                     start
                 } else {
-                    crate::ui::input_line::adjacent_utf16(&self.explorer_input, start, false)
+                    crate::ui::input_line::adjacent_utf16(
+                        self.modal_field_text(field),
+                        start,
+                        false,
+                    )
                 }
             } else {
                 if start != end {
                     end
                 } else {
-                    crate::ui::input_line::adjacent_utf16(&self.explorer_input, end, true)
+                    crate::ui::input_line::adjacent_utf16(self.modal_field_text(field), end, true)
                 }
             };
-            self.explorer_selection = UTF16Selection {
+            *self.modal_field_selection_mut(field) = UTF16Selection {
                 range: next..next,
                 reversed: false,
             };
@@ -4509,28 +4964,43 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
+        let Some(operation) = self.explorer_operation.as_ref() else {
+            return;
+        };
+        let name = self.explorer_input.trim().to_owned();
+        let is_php = matches!(
+            operation,
+            ExplorerOperation::NewPhp { .. } | ExplorerOperation::NewPhpFile(_)
+        );
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+            self.status = "Name must be a valid PHP identifier".into();
+            cx.notify();
+            return;
+        }
+        if is_php
+            && (!valid_php_identifier(name.trim_end_matches(".php"))
+                || !valid_php_namespace(&self.explorer_namespace))
+        {
+            self.status = "Invalid PHP name or namespace".into();
+            cx.notify();
+            return;
+        }
         let Some(operation) = self.explorer_operation.take() else {
             return;
         };
         self.modal_focus_pending = false;
-        let name = self.explorer_input.trim().to_owned();
         self.explorer_input.clear();
         self.explorer_undo.clear();
-        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
-            self.status = "Invalid name".into();
-            cx.notify();
-            return;
-        }
         let Some(project) = self.project.clone() else {
             return;
         };
         let operation = match operation {
             ExplorerOperation::NewFile(directory) => (directory, name, None),
             ExplorerOperation::NewPhpFile(directory) => {
-                let name = if name.ends_with(".php") {
-                    name
+                let name = if self.explorer_file.ends_with(".php") {
+                    self.explorer_file.trim().to_owned()
                 } else {
-                    format!("{name}.php")
+                    format!("{}.php", self.explorer_file.trim())
                 };
                 (directory, name, None)
             }
@@ -6355,6 +6825,178 @@ impl WorkspaceView {
             })
     }
 
+    fn modal_text_field(
+        &self,
+        workspace: Entity<WorkspaceView>,
+        label: &'static str,
+        field: ModalField,
+        value: String,
+        window: &Window,
+    ) -> impl IntoElement {
+        let t = theme();
+        let selected = self.modal_field_selection(field).range.clone();
+        let focused = self.explorer_modal_field == field
+            && self.modal_field_focus[field as usize].is_focused(window);
+        let caret = if self.modal_field_selection(field).reversed {
+            selected.start
+        } else {
+            selected.end
+        }
+        .min(value.encode_utf16().count());
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(t.text_secondary)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .id(if field == ModalField::Name {
+                        SharedString::from("explorer-operation-input")
+                    } else {
+                        SharedString::from(format!("php-input-{field:?}"))
+                    })
+                    .track_focus(&self.modal_field_focus[field as usize])
+                    .debug_selector(move || format!("modal-field-{field:?}"))
+                    .h(px(34.))
+                    .w_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .bg(t.panel_background)
+                    .border_1()
+                    .border_color(if focused { t.accent } else { t.border_subtle })
+                    .cursor(CursorStyle::IBeam)
+                    .on_mouse_down(MouseButton::Left, {
+                        let workspace = workspace.clone();
+                        move |event, window, cx| {
+                            cx.stop_propagation();
+                            workspace.update(cx, |this, cx| {
+                                this.modal_pointer_down(field, event, window, cx);
+                            });
+                        }
+                    })
+                    .on_mouse_move({
+                        let workspace = workspace.clone();
+                        move |event, window, cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.modal_pointer_move(field, event, window, cx)
+                            });
+                        }
+                    })
+                    .overflow_hidden()
+                    .child(crate::ui::input_line::render(
+                        self.modal_inputs[field as usize].clone(),
+                        self.modal_field_focus[field as usize].clone(),
+                        value,
+                        if focused {
+                            utf16_to_byte_offset(self.modal_field_text(field), selected.start)
+                                ..utf16_to_byte_offset(self.modal_field_text(field), selected.end)
+                        } else {
+                            0..0
+                        },
+                        utf16_to_byte_offset(self.modal_field_text(field), caret),
+                        self.modal_caret_for(field, window),
+                        self.modal_field_geometry[field as usize].clone(),
+                    )),
+            )
+            .when(focused && !self.modal_type_items.is_empty(), |this| {
+                this.child(
+                    gpui::deferred(
+                        gpui::anchored()
+                            .position_mode(gpui::AnchoredPositionMode::Local)
+                            .position(gpui::point(px(0.), px(56.)))
+                            .snap_to_window_with_margin(px(8.))
+                            .child(self.modal_type_popup(workspace.clone())),
+                    )
+                    .with_priority(2),
+                )
+            })
+            .when(
+                field == ModalField::Name
+                    && matches!(
+                        self.explorer_operation,
+                        Some(ExplorerOperation::NewPhp { .. })
+                    )
+                    && !valid_php_identifier(self.explorer_input.trim_end_matches(".php")),
+                |this| {
+                    this.child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(t.error)
+                            .child("Invalid PHP identifier"),
+                    )
+                },
+            )
+    }
+
+    fn modal_type_popup(&self, workspace: Entity<Self>) -> impl IntoElement {
+        let t = theme();
+        div()
+            .id("modal-type-completion")
+            .debug_selector(|| "modal-type-completion".into())
+            .w(px(486.))
+            .max_h(px(216.))
+            .overflow_y_scroll()
+            .track_scroll(&self.modal_type_scroll)
+            .bg(t.popup_background)
+            .border_1()
+            .border_color(t.border)
+            .shadow_lg()
+            .occlude()
+            .children(
+                self.modal_type_items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let workspace = workspace.clone();
+                        div()
+                            .id(("modal-type-candidate", index))
+                            .debug_selector(move || format!("modal-type-candidate-{index}"))
+                            .h(px(42.))
+                            .px_2()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .bg(if index == self.modal_type_selected {
+                                t.hover
+                            } else {
+                                t.popup_background
+                            })
+                            .hover(move |style| style.bg(t.hover))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                cx.stop_propagation();
+                                workspace.update(cx, |this, cx| {
+                                    this.accept_modal_type(index, cx);
+                                    window.focus(
+                                        &this.modal_field_focus[this.explorer_modal_field as usize],
+                                    );
+                                });
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(t.text_primary)
+                                    .overflow_hidden()
+                                    .child(item.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(t.text_secondary)
+                                    .overflow_hidden()
+                                    .child(item.detail.clone().unwrap_or_default()),
+                            )
+                    }),
+            )
+    }
+
     fn render_explorer_operation(
         &self,
         _window: &mut Window,
@@ -6363,43 +7005,39 @@ impl WorkspaceView {
         let t = theme();
         let m = metrics();
         let workspace = cx.entity();
-        let selection_start = self
-            .explorer_selection
-            .range
-            .start
-            .min(self.explorer_selection.range.end);
-        let selection_end = self
-            .explorer_selection
-            .range
-            .start
-            .max(self.explorer_selection.range.end);
-        let caret = self
-            .explorer_selection
-            .range
-            .end
-            .min(self.explorer_input.encode_utf16().count());
-        let input_width =
-            ((self.explorer_input.encode_utf16().count() as f32) * 8.0 + 24.0).clamp(140.0, 300.0);
         let title = match self.explorer_operation {
             Some(ExplorerOperation::Rename(_)) => "Rename",
             Some(ExplorerOperation::NewDirectory(_)) => "New Directory",
             Some(ExplorerOperation::NewFile(_)) => "File",
             Some(ExplorerOperation::NewPhpFile(_)) => "PHP File",
             Some(ExplorerOperation::NewPhp { keyword, .. }) => match keyword {
-                "class" => "Create New PHP Class",
-                "interface" => "Create New PHP Interface",
-                "trait" => "Create New PHP Trait",
-                "enum" => "Create New PHP Enum",
-                _ => "Create New PHP Item",
+                "class" => "Create PHP Class",
+                "interface" => "Create PHP Interface",
+                "trait" => "Create PHP Trait",
+                "enum" => "Create PHP Enum",
+                _ => "Create PHP Type",
             },
             None => "",
         };
+        let php_valid = self
+            .explorer_operation
+            .as_ref()
+            .is_some_and(|operation| match operation {
+                ExplorerOperation::NewPhp { .. } => {
+                    valid_php_identifier(self.explorer_input.trim_end_matches(".php"))
+                        && valid_php_namespace(&self.explorer_namespace)
+                }
+                ExplorerOperation::NewPhpFile(_) => !self.explorer_input.trim().is_empty(),
+                _ => true,
+            });
         div()
             .absolute()
             .top(px(110.))
+            .debug_selector(|| "php-type-modal".into())
             .left(px(320.))
-            .w(px(320.))
-            .p_3()
+            .w(px(520.))
+            .max_h(px(680.))
+            .p_4()
             .flex()
             .flex_col()
             .gap_2()
@@ -6410,69 +7048,79 @@ impl WorkspaceView {
             .cursor(CursorStyle::Arrow)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .shadow_lg()
-            .child(title)
-            .when(self.explorer_operation.as_ref().is_some_and(|operation| matches!(operation, ExplorerOperation::NewPhp { .. })), |this| {
-                this.child(format!("Directory: {}", self.operation_directory().display()))
-                    .child(format!("Namespace: {}", if self.explorer_namespace.is_empty() { "(none)" } else { &self.explorer_namespace }))
-                    .child("Extends / Implements: optional text fields supported by the generated template")
-            })
             .child(
                 div()
-                    .h(px(34.))
-                    .w(px(input_width))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .bg(t.panel_background)
-                    .cursor(CursorStyle::IBeam)
-                    .track_focus(&self.modal_input_focus)
-                    .id("explorer-operation-input")
-                    .on_mouse_down(MouseButton::Left, {
-                        let workspace = workspace.clone();
-                        move |event, window, cx| {
-                            cx.stop_propagation();
-                            workspace.update(cx, |this, cx| {
-                                window.focus(&this.modal_input_focus);
-                                this.reset_modal_caret();
-                                let byte = this.modal_input_geometry.hit_test(event.position.x);
-                                let range = if event.click_count == 2 {
-                                    axiom_app::interaction::word_range_at(&this.explorer_input, byte)
-                                } else { byte..byte };
-                                this.explorer_selection = UTF16Selection {
-                                    range: byte_to_utf16_offset(&this.explorer_input, range.start)
-                                        ..byte_to_utf16_offset(&this.explorer_input, range.end),
-                                    reversed: false,
-                                };
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .on_click({
-                        let workspace = workspace.clone();
-                        move |_, window, cx| {
-                            workspace.update(cx, |this, cx| {
-                                window.focus(&this.modal_input_focus);
-                                if debug_input_enabled() {
-                                    tracing::info!("[MODAL INPUT MOUSE DOWN]");
-                                }
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .overflow_hidden()
-                    .child(crate::ui::input_line::render(
-                        workspace.clone(), self.modal_input_focus.clone(), self.explorer_input.clone(),
-                        utf16_to_byte_offset(&self.explorer_input, selection_start)
-                            ..utf16_to_byte_offset(&self.explorer_input, selection_end),
-                        utf16_to_byte_offset(&self.explorer_input, caret), self.modal_caret_visible,
-                        self.modal_input_geometry.clone(),
-                    )),
+                    .text_size(px(15.))
+                    .text_color(t.text_primary)
+                    .child(title),
             )
+            .when(
+                self.explorer_operation
+                    .as_ref()
+                    .is_some_and(|operation| matches!(operation, ExplorerOperation::NewPhp { .. })),
+                |this| {
+                    let directory = self.operation_directory();
+                    let root = self.project.as_ref().map(|p| p.root_path());
+                    this.child(
+                        div()
+                            .text_color(t.text_muted)
+                            .text_size(px(11.))
+                            .child("TYPE"),
+                    )
+                    .child(
+                        div()
+                            .id("php-type-segmented")
+                            .w_full()
+                            .h(px(34.))
+                            .flex()
+                            .items_center()
+                            .rounded(m.border_radius_small)
+                            .bg(t.panel_background)
+                            .children([("class", "Class"), ("interface", "Interface"), ("trait", "Trait"), ("enum", "Enum")].into_iter().map(|(keyword, label)| {
+                                let active = matches!(self.explorer_operation, Some(ExplorerOperation::NewPhp { keyword: current, .. }) if current == keyword);
+                                let workspace = workspace.clone();
+                                div().id(SharedString::from(format!("php-type-{keyword}"))).flex_1().h_full().flex().items_center().justify_center().px_2().rounded(m.border_radius_small)
+                                    .bg(if active { t.inactive_selection } else { t.panel_background })
+                                    .border_1().border_color(if active { t.accent } else { t.panel_background })
+                                    .text_color(if active { t.text_primary } else { t.text_secondary })
+                                    .cursor(CursorStyle::PointingHand).hover(move |style| if active { style } else { style.bg(t.hover) })
+                                    .on_click(move |_, window, cx| workspace.update(cx, |this, cx| { this.select_php_type(keyword, cx); window.focus(&this.modal_field_focus[this.explorer_modal_field as usize]); }))
+                                    .child(label)
+                            }))
+                    )
+                    .child(
+                        div()
+                            .text_color(t.text_muted)
+                            .text_size(px(11.))
+                            .child("DIRECTORY"),
+                    )
+                    .child(
+                        div()
+                            .text_color(t.text_secondary)
+                            .child(relative_directory_label(root.as_deref(), &directory)),
+                    )
+                },
+            )
+            .child(self.modal_text_field(workspace.clone(), "Name", ModalField::Name, self.explorer_input.clone(), _window))            .when(self.explorer_operation.as_ref().is_some_and(|op| matches!(op, ExplorerOperation::NewPhp { .. })), |this| {
+                let workspace = workspace.clone();
+                this.child(self.modal_text_field(workspace.clone(), "Namespace", ModalField::Namespace, self.explorer_namespace.clone(), _window))
+                    .child(self.modal_text_field(workspace.clone(), "File", ModalField::File, self.explorer_file.clone(), _window))
+                    .when(self.explorer_operation.as_ref().is_some_and(|op| matches!(op, ExplorerOperation::NewPhp { keyword: "class" | "interface", .. })), |form| {
+                        form.child(self.modal_text_field(workspace.clone(), "Extends", ModalField::Extends, self.explorer_extends.clone(), _window))
+                    })
+                    .when(self.explorer_operation.as_ref().is_some_and(|op| matches!(op, ExplorerOperation::NewPhp { keyword: "class", .. })), |form| {
+                        form.child(self.modal_text_field(workspace.clone(), "Implements", ModalField::Implements, self.explorer_implements.clone(), _window))
+                    })
+            })
             .child(
                 div()
                     .flex()
                     .justify_end()
                     .gap_2()
+                    .border_t_1()
+                    .border_color(t.border_subtle)
+                    .pt_3()
+                    .mt_2()
                     .child(
                         div()
                             .id("explorer-operation-cancel")
@@ -6493,14 +7141,24 @@ impl WorkspaceView {
                             .id("explorer-operation-confirm")
                             .px_2()
                             .py_1()
-                            .bg(t.accent)
-                            .cursor(CursorStyle::PointingHand)
-                            .text_color(t.window_background)
-                            .on_click(move |_, _, cx| {
-                                workspace
-                                    .update(cx, |this, cx| this.confirm_explorer_operation(cx));
+                            .bg(if php_valid { t.accent } else { t.border_subtle })
+                            .cursor(if php_valid {
+                                CursorStyle::PointingHand
+                            } else {
+                                CursorStyle::Arrow
                             })
-                            .child("Confirm"),
+                            .text_color(if php_valid {
+                                t.window_background
+                            } else {
+                                t.text_muted
+                            })
+                            .when(php_valid, |this| {
+                                this.on_click(move |_, _, cx| {
+                                    workspace
+                                        .update(cx, |this, cx| this.confirm_explorer_operation(cx));
+                                })
+                            })
+                            .child("Create"),
                     ),
             )
     }
@@ -7808,6 +8466,104 @@ impl Render for WorkspaceView {
     }
 }
 
+/// Each mounted input has an immutable field identity. Text and selection live
+/// only in that field's persistent workspace slots; focus never copies them.
+struct ModalInput {
+    owner: gpui::WeakEntity<WorkspaceView>,
+    field: ModalField,
+}
+
+impl EntityInputHandler for ModalInput {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        actual: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        actual.replace(range.clone());
+        self.owner
+            .update(cx, |owner, _| {
+                let text = owner.modal_field_text(self.field);
+                text[utf16_to_byte_offset(text, range.start)..utf16_to_byte_offset(text, range.end)]
+                    .to_owned()
+            })
+            .ok()
+    }
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        self.owner
+            .update(cx, |owner, _| {
+                let selection = owner.modal_field_selection(self.field);
+                UTF16Selection {
+                    range: selection.range.clone(),
+                    reversed: selection.reversed,
+                }
+            })
+            .ok()
+    }
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.owner.update(cx, |owner, cx| {
+            if owner.explorer_operation.is_none() {
+                return;
+            }
+            let range =
+                range.unwrap_or_else(|| owner.modal_field_selection(self.field).range.clone());
+            owner.modal_replace_field_range(self.field, range, text, cx);
+        });
+    }
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_text_in_range(range, text, window, cx);
+    }
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        bounds: gpui::Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<Pixels>> {
+        Some(bounds)
+    }
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        self.owner
+            .update(cx, |owner, _| {
+                let byte = owner.modal_field_geometry[self.field as usize].hit_test(point.x);
+                byte_to_utf16_offset(owner.modal_field_text(self.field), byte)
+            })
+            .ok()
+    }
+}
+
 impl EntityInputHandler for WorkspaceView {
     fn text_for_range(
         &mut self,
@@ -7818,7 +8574,7 @@ impl EntityInputHandler for WorkspaceView {
     ) -> Option<String> {
         actual.replace(range.clone());
         let query = if self.explorer_operation.is_some() {
-            &self.explorer_input
+            self.modal_field_text(self.explorer_modal_field)
         } else if self.settings_visible && !self.command_palette_visible {
             &self.settings_query
         } else {
@@ -7835,9 +8591,10 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         if self.explorer_operation.is_some() {
+            let selection = self.modal_field_selection(self.explorer_modal_field);
             return Some(UTF16Selection {
-                range: self.explorer_selection.range.clone(),
-                reversed: self.explorer_selection.reversed,
+                range: selection.range.clone(),
+                reversed: selection.reversed,
             });
         }
         Some(UTF16Selection {
@@ -7866,99 +8623,28 @@ impl EntityInputHandler for WorkspaceView {
         &mut self,
         range: Option<std::ops::Range<usize>>,
         text: &str,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let editing_explorer = self.explorer_operation.is_some();
-        let editing_rename = self
-            .explorer_operation
-            .as_ref()
-            .is_some_and(|operation| matches!(operation, ExplorerOperation::Rename(_)));
-        let editing_settings =
-            self.settings_visible && !self.command_palette_visible && !editing_explorer;
-        let query = if editing_explorer {
-            self.explorer_input.clone()
-        } else if editing_settings {
-            self.settings_query.clone()
+        if self.explorer_operation.is_some() {
+            let range = range.unwrap_or_else(|| {
+                self.modal_field_selection(self.explorer_modal_field)
+                    .range
+                    .clone()
+            });
+            self.modal_replace_range(range, text, cx);
+            return;
+        }
+        let query = if self.settings_visible && !self.command_palette_visible {
+            &mut self.settings_query
         } else {
-            self.command_palette_query.clone()
+            &mut self.command_palette_query
         };
         let range = range.unwrap_or_else(|| {
-            if editing_explorer {
-                let start = self
-                    .explorer_selection
-                    .range
-                    .start
-                    .min(self.explorer_selection.range.end);
-                let end = self
-                    .explorer_selection
-                    .range
-                    .start
-                    .max(self.explorer_selection.range.end);
-                start..end
-            } else {
-                let end = query.encode_utf16().count();
-                end..end
-            }
+            let end = query.encode_utf16().count();
+            end..end
         });
-        let before_len = query.encode_utf16().count();
-        if editing_rename {
-            self.explorer_undo.push((
-                self.explorer_input.clone(),
-                UTF16Selection {
-                    range: self.explorer_selection.range.clone(),
-                    reversed: self.explorer_selection.reversed,
-                },
-            ));
-        }
-        let (query, caret) = replace_utf16_range(&query, range.clone(), text);
-        if editing_explorer {
-            self.explorer_input = query;
-            self.reset_modal_caret();
-            let length = self.explorer_input.encode_utf16().count();
-            self.explorer_selection = UTF16Selection {
-                range: caret..caret,
-                reversed: false,
-            };
-            if debug_input_enabled() {
-                tracing::info!(
-                    active = self.modal_input_focus.is_focused(window),
-                    "[MODAL INPUT HANDLER]"
-                );
-                tracing::info!(
-                    kind = if editing_rename { "rename" } else { "explorer" },
-                    range_start = range.start,
-                    range_end = range.end,
-                    inserted_len = text.encode_utf16().count(),
-                    "[MODAL REPLACE TEXT]"
-                );
-                tracing::info!(
-                    value_len_before = before_len,
-                    value_len_after = length,
-                    changed = true,
-                    "[MODAL STATE]"
-                );
-                tracing::info!(
-                    selection_after = ?self.explorer_selection.range,
-                    "[RENAME SELECTION AFTER EDIT]"
-                );
-                if editing_rename {
-                    tracing::info!(old_len = before_len, new_len = length, "[RENAME STATE]");
-                }
-                tracing::info!(notify = true, "[MODAL NOTIFY]");
-                if text.is_empty() {
-                    tracing::info!(
-                        range_start = range.start,
-                        range_end = range.end,
-                        "[MODAL DELETE]"
-                    );
-                }
-            }
-        } else if editing_settings {
-            self.settings_query = query;
-        } else {
-            self.command_palette_query = query;
-        }
+        *query = replace_utf16_range(query, range, text).0;
         self.command_palette_selected = 0;
         cx.notify();
     }
@@ -7988,8 +8674,9 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         Some(if self.explorer_operation.is_some() {
-            let byte = self.modal_input_geometry.hit_test(point.x);
-            byte_to_utf16_offset(&self.explorer_input, byte)
+            let byte =
+                self.modal_field_geometry[self.explorer_modal_field as usize].hit_test(point.x);
+            byte_to_utf16_offset(self.modal_field_text(self.explorer_modal_field), byte)
         } else if self.settings_visible && !self.command_palette_visible {
             self.settings_query.encode_utf16().count()
         } else {
@@ -8563,6 +9250,283 @@ mod modifier_tests {
             assert!(workspace.explorer_context.is_none());
             assert!(!workspace.explorer_new_menu_open);
             assert!(workspace.explorer_operation.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn modal_types_keyboard_mouse_and_field_isolation(cx: &mut gpui::TestAppContext) {
+        use super::ModalField::*;
+        let (view, cx) =
+            cx.add_window_view(move |_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        cx.update(|window, cx| view.update(cx, |w, cx| {
+            let mut project = axiom_index::ProjectSymbolIndex::new();
+            let root = tempfile::tempdir().unwrap();
+            project.index_project(root.path()).unwrap();
+            project.index_file_text("modal.php", "<?php namespace Psr\\Log; interface LoggerInterface {} interface LoggerOther {} class LoggerBase {}").unwrap();
+            w.project_index = Some(std::sync::Arc::new(std::sync::RwLock::new(project)));
+            w.explorer_operation = Some(super::ExplorerOperation::NewPhp { directory: "App".into(), keyword: "class" });
+            w.explorer_input = "FileStone".into();
+            w.explorer_namespace = "App".into();
+            w.explorer_file = "Custom.php".into();
+            w.explorer_file_auto = false;
+            w.set_modal_field(Implements);
+            window.focus(&w.modal_field_focus[Implements as usize]);
+            w.modal_replace_field_range(Implements, 0..0, "CacheInterface, Log", cx);
+            assert_eq!(w.modal_type_items.len(), 2);
+            assert!(w.modal_completion_key("down", cx));
+            assert_eq!(w.modal_type_selected, 1);
+            assert!(w.modal_completion_key("up", cx));
+            assert_eq!(w.modal_type_selected, 0);
+            assert!(w.modal_completion_key("enter", cx));
+            assert_eq!(w.explorer_implements, "CacheInterface, Psr\\Log\\LoggerInterface");
+            assert!(w.modal_type_items.is_empty());
+            w.modal_replace_field_range(Implements, 0..200, "Log", cx);
+            assert!(w.modal_completion_key("escape", cx));
+            assert!(w.explorer_operation.is_some());
+            assert_eq!(w.explorer_implements, "Log");
+            w.refresh_modal_types();
+            assert!(!w.modal_completion_key("tab", cx));
+            w.cycle_modal_field(false);
+            assert_eq!(w.explorer_modal_field, Name);
+            assert!(w.modal_type_items.is_empty());
+            w.set_modal_field(Extends);
+            w.modal_replace_field_range(Extends, 0..200, "Log", cx);
+            assert_eq!(w.modal_type_items[0].label, "LoggerBase");
+            w.select_php_type("interface", cx);
+            assert!(w.modal_type_items.is_empty());
+            w.refresh_modal_types();
+            assert_eq!(w.modal_type_items.len(), 2);
+            w.select_php_type("trait", cx);
+            assert!(w.modal_type_context().is_none());
+            assert!(w.modal_type_items.is_empty());
+            w.select_php_type("enum", cx);
+            assert!(w.modal_type_context().is_none());
+            w.select_php_type("class", cx);
+            w.set_modal_field(Implements);
+            window.focus(&w.modal_field_focus[Implements as usize]);
+            w.modal_replace_field_range(Implements, 0..200, "Log", cx);
+            cx.notify();
+        }));
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds("modal-type-candidate-0")
+            .expect("popup row is rendered");
+        let open_bounds = cx.debug_bounds("php-type-modal").unwrap();
+        let input_bounds = cx.debug_bounds("modal-field-Implements").unwrap();
+        let popup_bounds = cx.debug_bounds("modal-type-completion").unwrap();
+        assert_eq!(popup_bounds.size.width, input_bounds.size.width);
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(cx.debug_bounds("php-type-modal").unwrap(), open_bounds);
+        cx.update(|window, cx| {
+            view.update(cx, |w, _| {
+                assert_eq!(w.explorer_implements, "Psr\\Log\\LoggerInterface");
+                assert!(w.modal_type_items.is_empty());
+                assert!(w.modal_field_focus[Implements as usize].is_focused(window));
+                assert_eq!(w.explorer_input, "FileStone");
+                assert_eq!(w.explorer_namespace, "App");
+                assert_eq!(w.explorer_file, "Custom.php");
+                let caret = w.explorer_implements.encode_utf16().count();
+                assert_eq!(w.modal_field_selection(Implements).range, caret..caret);
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn php_inputs_independent_handlers_mouse_tab_and_auto_link(cx: &mut gpui::TestAppContext) {
+        use super::ModalField::*;
+        use gpui::EntityInputHandler;
+        let (view, cx) =
+            cx.add_window_view(move |_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        let inputs = view.update(cx, |w, _| {
+            w.explorer_operation = Some(super::ExplorerOperation::NewPhp {
+                directory: "App".into(),
+                keyword: "class",
+            });
+            w.explorer_namespace = "App".into();
+            w.modal_inputs.clone()
+        });
+        let ids: std::collections::HashSet<_> =
+            inputs.iter().map(|input| input.entity_id()).collect();
+        assert_eq!(ids.len(), 5);
+        cx.update(|window, cx| {
+            inputs[0].update(cx, |input, cx| {
+                input.replace_text_in_range(None, "FileStone", window, cx)
+            });
+            view.update(cx, |w, _| {
+                assert_eq!(w.explorer_input, "FileStone");
+                assert_eq!(w.explorer_namespace, "App");
+                assert_eq!(w.explorer_file, "FileStone.php");
+            });
+            for (index, text) in [
+                (1, "App\\Service"),
+                (3, "BaseService"),
+                (4, "CacheInterface"),
+            ] {
+                inputs[index].update(cx, |input, cx| {
+                    input.replace_text_in_range(Some(0..100), text, window, cx)
+                });
+            }
+            let expected = [
+                "FileStone",
+                "App\\Service",
+                "FileStone.php",
+                "BaseService",
+                "CacheInterface",
+            ];
+            view.update(cx, |w, cx| {
+                for field in [Name, Namespace, File, Extends, Implements] {
+                    let event = gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Left,
+                        position: gpui::point(gpui::px(0.), gpui::px(0.)),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    };
+                    w.modal_pointer_down(field, &event, window, cx);
+                    for (i, other) in [Name, Namespace, File, Extends, Implements]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        assert_eq!(w.modal_field_text(other), expected[i]);
+                        assert_eq!(w.modal_field_focus[i].is_focused(window), other == field);
+                        for blink in [false, true] {
+                            w.modal_caret_visible = blink;
+                            assert_eq!(w.modal_caret_for(other, window), blink && other == field);
+                        }
+                    }
+                }
+                for backwards in [false, true] {
+                    for _ in 0..5 {
+                        let event = gpui::KeyDownEvent {
+                            keystroke: gpui::Keystroke {
+                                key: "tab".into(),
+                                key_char: None,
+                                modifiers: gpui::Modifiers {
+                                    shift: backwards,
+                                    ..Default::default()
+                                },
+                            },
+                            is_held: false,
+                        };
+                        w.handle_workspace_keydown(&event, window, cx);
+                        for (i, field) in [Name, Namespace, File, Extends, Implements]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            assert_eq!(w.modal_field_text(field), expected[i]);
+                        }
+                    }
+                }
+                window.focus(&w.focus);
+                for field in [Name, Namespace, File, Extends, Implements] {
+                    assert!(!w.modal_caret_for(field, window));
+                }
+            });
+            inputs[2].update(cx, |input, cx| {
+                input.replace_text_in_range(Some(0..100), "Custom.php", window, cx)
+            });
+            inputs[0].update(cx, |input, cx| {
+                input.replace_text_in_range(Some(0..100), "Other", window, cx)
+            });
+            view.update(cx, |w, cx| {
+                assert!(!w.explorer_file_auto);
+                assert_eq!(w.explorer_file, "Custom.php");
+                for keyword in ["interface", "trait", "enum"] {
+                    w.select_php_type(keyword, cx);
+                    assert_eq!(w.explorer_input, "Other");
+                    assert_eq!(w.explorer_namespace, "App\\Service");
+                    assert_eq!(w.explorer_file, "Custom.php");
+                    if keyword == "interface" {
+                        assert_eq!(w.explorer_extends, "BaseService");
+                    }
+                }
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn php_inputs_psr4_initializes_only_namespace(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("App")).unwrap();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{"autoload":{"psr-4":{"App\\":"App/"}}}"#,
+        )
+        .unwrap();
+        let project = axiom_project::Project::open(dir.path()).unwrap();
+        let selected_directory = project.root_path().join("App");
+        let (view, cx) =
+            cx.add_window_view(move |_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        view.update(cx, |w, cx| {
+            w.project = Some(project);
+            w.new_php_item(selected_directory, "class", cx);
+            assert_eq!(w.explorer_namespace, "App");
+            assert_eq!(w.explorer_input, "NewItem");
+            assert_eq!(w.explorer_file, "NewItem.php");
+            assert!(w.explorer_extends.is_empty());
+            assert!(w.explorer_implements.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn php_inputs_shortcuts_and_selection_are_field_local(cx: &mut gpui::TestAppContext) {
+        use super::ModalField::*;
+        let (view, cx) =
+            cx.add_window_view(move |_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        view.update(cx, |w, cx| {
+            w.explorer_operation = Some(super::ExplorerOperation::NewPhp {
+                directory: "App".into(),
+                keyword: "class",
+            });
+            w.explorer_input = "FileStone".into();
+            w.explorer_file = "FileStone.php".into();
+            let control = gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            };
+            for field in [Namespace, File, Extends, Implements] {
+                w.set_modal_field(field);
+                w.modal_key_edit("a", control, cx);
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("a🙂b".into()));
+                w.modal_key_edit("v", control, cx);
+                w.modal_key_edit("left", Default::default(), cx);
+                assert_eq!(w.modal_field_selection(field).range, 3..3);
+                w.modal_key_edit("backspace", Default::default(), cx);
+                assert_eq!(w.modal_field_text(field), "ab");
+                w.modal_key_edit("delete", Default::default(), cx);
+                assert_eq!(w.modal_field_text(field), "a");
+                w.modal_key_edit("a", control, cx);
+                w.modal_key_edit("c", control, cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "a");
+                w.modal_key_edit("x", control, cx);
+                assert_eq!(w.modal_field_text(field), "");
+                w.modal_key_edit("v", control, cx);
+                w.set_modal_field(Name);
+                assert_eq!(w.modal_field_text(field), "a");
+                assert_eq!(w.modal_field_selection(field).range, 1..1);
+                assert_eq!(w.explorer_input, "FileStone");
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn php_inputs_focus_preserves_filestone_and_namespace(cx: &mut gpui::TestAppContext) {
+        let (view, cx) =
+            cx.add_window_view(move |_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        view.update(cx, |workspace, cx| {
+            workspace.explorer_operation = Some(super::ExplorerOperation::NewPhp {
+                directory: "App".into(),
+                keyword: "class",
+            });
+            workspace.explorer_namespace = "App".into();
+            workspace.modal_replace_range(0..0, "FileStone", cx);
+            workspace.cycle_modal_field(false);
+            assert_eq!(workspace.explorer_input, "FileStone");
+            assert_eq!(workspace.explorer_namespace, "App");
+            assert_eq!(workspace.explorer_file, "FileStone.php");
+            workspace.set_modal_field_at(super::ModalField::File, 0);
+            assert_eq!(workspace.explorer_input, "FileStone");
         });
     }
 
