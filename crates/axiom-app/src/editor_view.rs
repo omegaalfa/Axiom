@@ -2726,6 +2726,7 @@ impl EditorView {
             .map_or(cursor, |(i, _)| i);
         let prefix = &text[start..cursor];
         let preceded_by_new = before[..start].trim_end().ends_with("new");
+        let type_context = type_completion_context(before, start, preceded_by_new);
         if prefix.starts_with('$') {
             return NativeCompletionBatch {
                 items: self.local_variable_completions(&text[..cursor], prefix),
@@ -2978,6 +2979,7 @@ impl EditorView {
                 index
                     .search_prefix(prefix)
                     .into_iter()
+                    .filter(|symbol| runtime_type_kind_allowed(type_context, symbol.kind))
                     .take(40)
                     .map(|symbol| {
                         let import = matches!(
@@ -3003,10 +3005,10 @@ impl EditorView {
                             ),
                             kind: Some(match symbol.kind {
                                 RuntimeKind::Function => CompletionItemKind::FUNCTION,
-                                RuntimeKind::Class
-                                | RuntimeKind::Interface
-                                | RuntimeKind::Trait
-                                | RuntimeKind::Enum => CompletionItemKind::CLASS,
+                                RuntimeKind::Class => CompletionItemKind::CLASS,
+                                RuntimeKind::Interface => CompletionItemKind::INTERFACE,
+                                RuntimeKind::Trait => CompletionItemKind::CLASS,
+                                RuntimeKind::Enum => CompletionItemKind::ENUM,
                                 _ => CompletionItemKind::VALUE,
                             }),
                             insert_text: runtime_call_insert_text(symbol),
@@ -3030,34 +3032,39 @@ impl EditorView {
                 let project_matches = index.search_prefix(prefix);
                 completion_search_us = search_started.elapsed().as_micros();
                 completion_matches = project_matches.len();
-                items.extend(project_matches.into_iter().map(|symbol| {
-                    let import_started = Instant::now();
-                    let import = matches!(
-                        symbol.kind,
-                        ProjectSymbolKind::Class
-                            | ProjectSymbolKind::Interface
-                            | ProjectSymbolKind::Trait
-                            | ProjectSymbolKind::Enum
-                    )
-                    .then(|| self.composer_import_edit(&symbol.fully_qualified_name))
-                    .flatten();
-                    completion_import_us += import_started.elapsed().as_micros();
-                    CompletionItem {
-                        label: symbol.name.clone(),
-                        detail: Some(format!("{} • Project", symbol.fully_qualified_name)),
-                        kind: Some(match symbol.kind {
-                            ProjectSymbolKind::Function => CompletionItemKind::FUNCTION,
-                            ProjectSymbolKind::Method => CompletionItemKind::METHOD,
-                            ProjectSymbolKind::Class
-                            | ProjectSymbolKind::Interface
-                            | ProjectSymbolKind::Trait
-                            | ProjectSymbolKind::Enum => CompletionItemKind::CLASS,
-                            _ => CompletionItemKind::VALUE,
+                items.extend(
+                    project_matches
+                        .into_iter()
+                        .filter(|symbol| type_kind_allowed(type_context, symbol.kind))
+                        .map(|symbol| {
+                            let import_started = Instant::now();
+                            let import = matches!(
+                                symbol.kind,
+                                ProjectSymbolKind::Class
+                                    | ProjectSymbolKind::Interface
+                                    | ProjectSymbolKind::Trait
+                                    | ProjectSymbolKind::Enum
+                            )
+                            .then(|| self.composer_import_edit(&symbol.fully_qualified_name))
+                            .flatten();
+                            completion_import_us += import_started.elapsed().as_micros();
+                            CompletionItem {
+                                label: symbol.name.clone(),
+                                detail: Some(format!("{} • Project", symbol.fully_qualified_name)),
+                                kind: Some(match symbol.kind {
+                                    ProjectSymbolKind::Function => CompletionItemKind::FUNCTION,
+                                    ProjectSymbolKind::Method => CompletionItemKind::METHOD,
+                                    ProjectSymbolKind::Class => CompletionItemKind::CLASS,
+                                    ProjectSymbolKind::Interface => CompletionItemKind::INTERFACE,
+                                    ProjectSymbolKind::Trait => CompletionItemKind::CLASS,
+                                    ProjectSymbolKind::Enum => CompletionItemKind::ENUM,
+                                    _ => CompletionItemKind::VALUE,
+                                }),
+                                additional_text_edits: import.map(|edit| vec![edit]),
+                                ..Default::default()
+                            }
                         }),
-                        additional_text_edits: import.map(|edit| vec![edit]),
-                        ..Default::default()
-                    }
-                }));
+                );
             } else {
                 completion_index_unavailable = true;
             }
@@ -3079,17 +3086,42 @@ impl EditorView {
         if let Some(index) = &self.vendor_symbols
             && let Ok(index) = index.try_read()
         {
-            items.extend(index.classes_matching(prefix).into_iter().map(|fqn| {
-                let label = fqn.rsplit('\\').next().unwrap_or(&fqn).to_owned();
-                let import = self.composer_import_edit(&fqn);
-                CompletionItem {
-                    label,
-                    detail: Some(format!("{fqn} • Vendor")),
-                    kind: Some(CompletionItemKind::CLASS),
-                    additional_text_edits: import.map(|edit| vec![edit]),
-                    ..Default::default()
-                }
-            }));
+            if matches!(
+                type_context,
+                TypeCompletionContext::ClassExtends
+                    | TypeCompletionContext::ClassImplements
+                    | TypeCompletionContext::InterfaceExtends
+            ) {
+                items.extend(
+                    index
+                        .types_matching(prefix)
+                        .into_iter()
+                        .filter(|item| vendor_type_kind_allowed(type_context, item.kind))
+                        .map(|item| {
+                            let label = item.short_name;
+                            let import = self.composer_import_edit(&item.fqn);
+                            CompletionItem {
+                                label,
+                                detail: Some(format!("{} - Vendor", item.fqn)),
+                                kind: Some(vendor_completion_kind(item.kind)),
+                                additional_text_edits: import.map(|edit| vec![edit]),
+                                ..Default::default()
+                            }
+                        }),
+                );
+            } else {
+                items.extend(index.classes_matching(prefix).into_iter().map(|fqn| {
+                    let label = fqn.rsplit('\\').next().unwrap_or(&fqn).to_owned();
+                    let import = self.composer_import_edit(&fqn);
+                    CompletionItem {
+                        label,
+                        detail: Some(format!("{fqn} • Vendor")),
+                        kind: Some(CompletionItemKind::CLASS),
+                        additional_text_edits: import.map(|edit| vec![edit]),
+                        ..Default::default()
+                    }
+                }));
+            }
         }
         if preceded_by_new {
             rank_new_completion_items(&mut items, prefix);
@@ -4625,6 +4657,75 @@ impl EditorView {
                     .text_size(px(11.))
                     .child(shortcut),
             )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypeCompletionContext {
+    New,
+    ClassExtends,
+    ClassImplements,
+    InterfaceExtends,
+    GenericType,
+}
+
+fn type_completion_context(
+    before: &str,
+    start: usize,
+    preceded_by_new: bool,
+) -> TypeCompletionContext {
+    let head = before[..start].trim_end();
+    if preceded_by_new {
+        return TypeCompletionContext::New;
+    }
+    if head.ends_with("implements") {
+        return TypeCompletionContext::ClassImplements;
+    }
+    if head.ends_with("extends") {
+        let class_pos = head.rfind("class ");
+        let interface_pos = head.rfind("interface ");
+        return if interface_pos > class_pos {
+            TypeCompletionContext::InterfaceExtends
+        } else {
+            TypeCompletionContext::ClassExtends
+        };
+    }
+    TypeCompletionContext::GenericType
+}
+
+fn type_kind_allowed(context: TypeCompletionContext, kind: ProjectSymbolKind) -> bool {
+    match context {
+        TypeCompletionContext::New | TypeCompletionContext::ClassExtends => {
+            kind == ProjectSymbolKind::Class
+        }
+        TypeCompletionContext::ClassImplements | TypeCompletionContext::InterfaceExtends => {
+            kind == ProjectSymbolKind::Interface
+        }
+        TypeCompletionContext::GenericType => true,
+    }
+}
+
+fn runtime_type_kind_allowed(context: TypeCompletionContext, kind: RuntimeKind) -> bool {
+    match context {
+        TypeCompletionContext::New | TypeCompletionContext::ClassExtends => {
+            kind == RuntimeKind::Class
+        }
+        TypeCompletionContext::ClassImplements | TypeCompletionContext::InterfaceExtends => {
+            kind == RuntimeKind::Interface
+        }
+        TypeCompletionContext::GenericType => true,
+    }
+}
+
+fn vendor_type_kind_allowed(context: TypeCompletionContext, kind: ProjectSymbolKind) -> bool {
+    type_kind_allowed(context, kind)
+}
+
+fn vendor_completion_kind(kind: ProjectSymbolKind) -> CompletionItemKind {
+    match kind {
+        ProjectSymbolKind::Interface => CompletionItemKind::INTERFACE,
+        ProjectSymbolKind::Enum => CompletionItemKind::ENUM,
+        _ => CompletionItemKind::CLASS,
     }
 }
 
@@ -6590,7 +6691,10 @@ fn shape(window: &mut Window, text: &str) -> gpui::ShapedLine {
 
 #[cfg(test)]
 mod completion_ranking_tests {
-    use super::{filter_new_completion_items, rank_new_completion_items};
+    use super::{
+        TypeCompletionContext, filter_new_completion_items, rank_new_completion_items,
+        type_completion_context, type_kind_allowed,
+    };
     use lsp_types::{CompletionItem, CompletionItemKind};
 
     fn item(label: &str, detail: &str, kind: CompletionItemKind) -> CompletionItem {
@@ -6600,6 +6704,52 @@ mod completion_ranking_tests {
             kind: Some(kind),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn inheritance_contexts_filter_only_semantically_allowed_kinds() {
+        use axiom_index::ProjectSymbolKind::*;
+        let extends = "class Foo extends Bas";
+        let implements = "class Foo implements Log";
+        let interface_extends = "interface Foo extends Cach";
+        assert_eq!(
+            type_completion_context(extends, extends.len() - 3, false),
+            TypeCompletionContext::ClassExtends
+        );
+        assert_eq!(
+            type_completion_context(implements, implements.len() - 3, false),
+            TypeCompletionContext::ClassImplements
+        );
+        assert_eq!(
+            type_completion_context(interface_extends, interface_extends.len() - 4, false),
+            TypeCompletionContext::InterfaceExtends
+        );
+        assert!(type_kind_allowed(
+            TypeCompletionContext::ClassExtends,
+            Class
+        ));
+        assert!(!type_kind_allowed(
+            TypeCompletionContext::ClassExtends,
+            Interface
+        ));
+        assert!(type_kind_allowed(
+            TypeCompletionContext::ClassImplements,
+            Interface
+        ));
+        assert!(!type_kind_allowed(
+            TypeCompletionContext::ClassImplements,
+            Class
+        ));
+        assert!(type_kind_allowed(
+            TypeCompletionContext::InterfaceExtends,
+            Interface
+        ));
+        assert!(!type_kind_allowed(
+            TypeCompletionContext::InterfaceExtends,
+            Trait
+        ));
+        assert!(type_kind_allowed(TypeCompletionContext::New, Class));
+        assert!(!type_kind_allowed(TypeCompletionContext::New, Enum));
     }
 
     #[test]
