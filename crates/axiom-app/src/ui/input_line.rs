@@ -40,6 +40,10 @@ pub fn replace_all_text(text: &str, ranges: &[Range<usize>], replacement: &str) 
 pub struct InputGeometry(Rc<RefCell<Option<(ShapedLine, Point<Pixels>)>>>);
 
 impl InputGeometry {
+    pub fn anchor(&self) -> Option<Point<Pixels>> {
+        self.0.borrow().as_ref().map(|(_, origin)| *origin)
+    }
+
     pub fn hit_test(&self, x: Pixels) -> usize {
         self.0.borrow().as_ref().map_or(0, |(line, origin)| {
             let local_x = (x - origin.x).max(px(0.));

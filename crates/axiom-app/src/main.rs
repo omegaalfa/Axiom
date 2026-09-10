@@ -3,6 +3,7 @@
 mod editor_view;
 mod lsp_bridge;
 mod modal_type_completion;
+mod php_type_template;
 mod syntax_theme;
 mod terminal_view;
 mod ui;

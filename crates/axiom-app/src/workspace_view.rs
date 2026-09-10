@@ -211,9 +211,56 @@ fn semantic_popup_geometry(
     )
 }
 
+fn modal_type_popup_geometry(
+    anchor: Point<Pixels>,
+    viewport: gpui::Size<Pixels>,
+    count: usize,
+    footer_top: Option<Pixels>,
+) -> gpui::Bounds<Pixels> {
+    let margin = metrics().spacing_sm;
+    let width = px(486.).min((viewport.width - margin * 2.).max(px(0.)));
+    let height =
+        (px(42.) * count.clamp(1, 5) as f32).min((viewport.height - margin * 2.).max(px(0.)));
+    let below = anchor.y + px(22.) + margin;
+    let below_limit = footer_top
+        .unwrap_or(viewport.height - margin)
+        .min(viewport.height - margin);
+    let above = anchor.y - margin;
+    let y = if below + height <= below_limit {
+        below
+    } else if above - height >= margin {
+        above - height
+    } else {
+        below.min((viewport.height - margin - height).max(margin))
+    };
+    let x = anchor
+        .x
+        .max(margin)
+        .min((viewport.width - width - margin).max(margin));
+    gpui::Bounds::new(gpui::point(x, y), gpui::size(width, height))
+}
+
 #[cfg(test)]
 mod semantic_popup_visual_tests {
     use super::*;
+
+    #[test]
+    fn modal_type_popup_flips_and_limits_without_modal_resize() {
+        let viewport = gpui::size(px(800.), px(600.));
+        let below = modal_type_popup_geometry(gpui::point(px(100.), px(100.)), viewport, 4, None);
+        assert!(below.origin.y > px(100.));
+        let above = modal_type_popup_geometry(gpui::point(px(100.), px(560.)), viewport, 4, None);
+        assert!(above.bottom() <= viewport.height);
+        assert!(above.origin.y < px(560.));
+        let limited =
+            modal_type_popup_geometry(gpui::point(px(100.), px(300.)), viewport, 100, None);
+        assert!(limited.size.height <= px(210.));
+        assert!(limited.bottom() <= viewport.height - metrics().spacing_sm);
+        assert_eq!(below.size.width, above.size.width);
+        let footer_safe =
+            modal_type_popup_geometry(gpui::point(px(100.), px(500.)), viewport, 4, Some(px(530.)));
+        assert!(footer_safe.origin.y < px(500.));
+    }
 
     #[test]
     fn hover_preserves_selection_background_and_accent() {
@@ -5011,28 +5058,13 @@ impl WorkspaceView {
                     format!("{name}.php")
                 };
                 let symbol = name.trim_end_matches(".php");
-                let namespace_line = if self.explorer_namespace.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("\nnamespace {};\n", self.explorer_namespace.trim())
-                };
-                let extends = if self.explorer_extends.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" extends {}", self.explorer_extends.trim())
-                };
-                let implements = if self.explorer_implements.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" implements {}", self.explorer_implements.trim())
-                };
-                let inheritance = if keyword == "class" {
-                    format!("{extends}{implements}")
-                } else {
-                    String::new()
-                };
-                let declaration = format!("{keyword} {symbol}{inheritance}");
-                let body = format!("<?php\n{namespace_line}\n{declaration}\n{{\n}}\n");
+                let body = crate::php_type_template::render(
+                    keyword,
+                    symbol,
+                    &self.explorer_namespace,
+                    &self.explorer_extends,
+                    &self.explorer_implements,
+                );
                 (directory, name, Some(body))
             }
             ExplorerOperation::NewDirectory(directory) => {
@@ -6906,13 +6938,22 @@ impl WorkspaceView {
                     )),
             )
             .when(focused && !self.modal_type_items.is_empty(), |this| {
+                let anchor = self.modal_field_geometry[field as usize]
+                    .anchor()
+                    .unwrap_or_default();
+                let geometry = modal_type_popup_geometry(
+                    anchor,
+                    window.viewport_size(),
+                    self.modal_type_items.len(),
+                    Some(px(630.)),
+                );
                 this.child(
                     gpui::deferred(
                         gpui::anchored()
-                            .position_mode(gpui::AnchoredPositionMode::Local)
-                            .position(gpui::point(px(0.), px(56.)))
+                            .position_mode(gpui::AnchoredPositionMode::Window)
+                            .position(geometry.origin)
                             .snap_to_window_with_margin(px(8.))
-                            .child(self.modal_type_popup(workspace.clone())),
+                            .child(self.modal_type_popup(workspace.clone(), geometry.size)),
                     )
                     .with_priority(2),
                 )
@@ -6935,13 +6976,17 @@ impl WorkspaceView {
             )
     }
 
-    fn modal_type_popup(&self, workspace: Entity<Self>) -> impl IntoElement {
+    fn modal_type_popup(
+        &self,
+        workspace: Entity<Self>,
+        size: gpui::Size<Pixels>,
+    ) -> impl IntoElement {
         let t = theme();
         div()
             .id("modal-type-completion")
             .debug_selector(|| "modal-type-completion".into())
-            .w(px(486.))
-            .max_h(px(216.))
+            .w(size.width)
+            .h(size.height)
             .overflow_y_scroll()
             .track_scroll(&self.modal_type_scroll)
             .bg(t.popup_background)
