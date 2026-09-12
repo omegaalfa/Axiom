@@ -22,12 +22,12 @@ pub use semantic::{
     DefinitionQueryContext, DefinitionResult, DefinitionSyntaxContext, Expression,
     ExpressionResolver, FileId, FileRecord, FindUsagesOptions, FindUsagesResult, FindUsagesStatus,
     ImportBinding, ImportKind, ImportTable, InaccessibilityInfo, InaccessibilityReason,
-    InterfaceRelationIndexes, MemberAccess, MemberKind, MemberResolution, MemberResolver,
-    PersistentFileKey, PersistentSymbolKey, ReferenceConfidence, ReferenceId, ReferenceLocation,
-    ReferenceProvider, ReferenceRole, ReferenceTarget, Scope, ScopeId, ScopeKind, ScopeStore,
-    SemanticDefinitionOutcome, SemanticDefinitionResult, SemanticEngine, SemanticParameter,
-    SemanticReference, SemanticRevision, SemanticSnapshot, SemanticSymbol, SnapshotBuilder,
-    SourceOrigin, SymbolId, TypeCompatibility, UsageLocation, VariableBinding,
+    InterfaceRelationIndexes, LocalBindingId, MemberAccess, MemberKind, MemberResolution,
+    MemberResolver, PersistentFileKey, PersistentSymbolKey, ReferenceConfidence, ReferenceId,
+    ReferenceLocation, ReferenceProvider, ReferenceRole, ReferenceTarget, Scope, ScopeId,
+    ScopeKind, ScopeStore, SemanticDefinitionOutcome, SemanticDefinitionResult, SemanticEngine,
+    SemanticParameter, SemanticReference, SemanticRevision, SemanticSnapshot, SemanticSymbol,
+    SnapshotBuilder, SourceOrigin, SymbolId, TypeCompatibility, UsageLocation, VariableBinding,
     declared_type_compatibility, declared_type_label,
 };
 pub use source::{

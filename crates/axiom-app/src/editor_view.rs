@@ -1,3 +1,13 @@
+use crate::{
+    lsp_bridge::LspBridge,
+    syntax_theme::styled_segment,
+    ui::{
+        components::separator,
+        metrics,
+        metrics::{CODE_FONT_FAMILY, code_font},
+        theme,
+    },
+};
 use axiom_editor::{Document, DocumentEdit};
 use axiom_index::{
     DeclaredType, DefinitionSyntaxContext, MemberAccess, MemberResolution, PersistentFileKey,
@@ -33,18 +43,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-use crate::{
-    lsp_bridge::LspBridge,
-    syntax_theme::styled_segment,
-    ui::{
-        components::separator,
-        metrics,
-        metrics::{CODE_FONT_FAMILY, code_font},
-        theme,
-    },
-};
-
 actions!(
     editor,
     [
@@ -1273,6 +1271,10 @@ impl EditorView {
 
     pub fn current_cursor_offset(&self) -> usize {
         self.document.cursor_offset()
+    }
+
+    pub fn set_cursor_offset(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.move_to(offset.min(self.document.len()), cx);
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -2729,7 +2731,11 @@ impl EditorView {
         let type_context = type_completion_context(before, start, preceded_by_new);
         if prefix.starts_with('$') {
             return NativeCompletionBatch {
-                items: self.local_variable_completions(&text[..cursor], prefix),
+                items: if before[..start].ends_with("::") || before[..start].ends_with("->") {
+                    Vec::new()
+                } else {
+                    self.local_variable_completions(&text[..cursor], prefix)
+                },
                 new_prefix: None,
             };
         }
@@ -3141,34 +3147,47 @@ impl EditorView {
     }
 
     fn local_variable_completions(&self, context: &str, prefix: &str) -> Vec<CompletionItem> {
-        let mut names = std::collections::BTreeSet::new();
-        for (offset, _) in context.match_indices('$') {
-            let tail = &context[offset..];
-            let name = tail
-                .chars()
-                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
-                .collect::<String>();
-            if !name.is_empty() {
-                names.insert(format!("${name}"));
+        let Some(snapshot) = self
+            .semantic_engine
+            .as_ref()
+            .and_then(|engine| engine.try_snapshot())
+        else {
+            return Vec::new();
+        };
+        let key = PersistentFileKey::workspace_lexical(&self.file_path);
+        let Some(scope) = snapshot.completion_scope(&key, context.len().saturating_sub(1)) else {
+            return Vec::new();
+        };
+        let mut names = std::collections::HashSet::new();
+        let mut items: Vec<CompletionItem> = Vec::new();
+        for binding in scope
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.declaration_span.end <= context.len().saturating_sub(prefix.len())
+            })
+            .filter(|binding| {
+                binding.name.starts_with(prefix) && names.insert(binding.name.as_str())
+            })
+        {
+            let position = items.partition_point(|item| {
+                (item.label.len(), item.label.as_str())
+                    < (binding.name.len(), binding.name.as_str())
+            });
+            if position >= 40 {
+                continue;
             }
-        }
-        let mut items = names
-            .into_iter()
-            .filter(|name| name.starts_with(prefix))
-            .map(|name| {
-                let detail = self
-                    .resolve_native_type(&name, context)
-                    .map(|ty| ty.to_owned());
+            items.insert(
+                position,
                 CompletionItem {
-                    label: name,
-                    detail,
+                    label: binding.name.clone(),
                     kind: Some(CompletionItemKind::VARIABLE),
                     ..Default::default()
-                }
-            })
-            .collect::<Vec<_>>();
-        items.sort_by_key(|item| (!item.label.starts_with(prefix), item.label.clone()));
-        items.into_iter().take(40).collect()
+                },
+            );
+            items.truncate(40);
+        }
+        items
     }
 
     /// Builds a single additional edit for a Composer/project class. The edit
@@ -6851,6 +6870,130 @@ mod completion_ranking_tests {
 
 #[cfg(test)]
 mod formatter_tests {
+    #[gpui::test]
+    fn local_bindings_completion_and_accept(cx: &mut gpui::TestAppContext) {
+        for (source, expected) in [
+            (
+                "<?php $service = new Service(); $serviceFactory = new Factory(); $ser",
+                vec!["$service", "$serviceFactory"],
+            ),
+            (
+                "<?php function handle(Service $service) { $ser; }",
+                vec!["$service"],
+            ),
+            (
+                "<?php function a(Service $service) {} function b() { $ser; }",
+                vec![],
+            ),
+            (
+                "<?php function a() { $ser; $service = new Service(); }",
+                vec![],
+            ),
+            (
+                "<?php $f = function(Service $service) { $ser; };",
+                vec!["$service"],
+            ),
+            ("<?php $service = 1; $ser", vec!["$service"]),
+            ("<?php $service = new Service(); Service::$ser", vec![]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("locals.php");
+            std::fs::write(&path, source).unwrap();
+            let mut index = axiom_index::ProjectSymbolIndex::new();
+            index.index_project(dir.path()).unwrap();
+            let snapshot = axiom_index::SemanticSnapshot::from_project_index(
+                &index,
+                axiom_index::SemanticRevision(1),
+            );
+            let engine = std::sync::Arc::new(axiom_index::SemanticEngine::from_snapshot(snapshot));
+            let cursor = source.rfind("$ser").unwrap() + 4;
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                let mut editor = EditorView::from_document(
+                    path,
+                    axiom_editor::Document::from_content(source),
+                    None,
+                    cx,
+                );
+                editor.semantic_engine = Some(engine);
+                editor.document.move_cursor(cursor);
+                editor
+            });
+            view.update(cx, |editor, cx| {
+                let batch = editor.native_completions_impl(source);
+                assert_eq!(
+                    batch
+                        .items
+                        .iter()
+                        .map(|item| item.label.as_str())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "{source}"
+                );
+                if !expected.is_empty() {
+                    assert_eq!(editor.completion_replacement_range(), cursor - 4..cursor);
+                    editor.set_completions(batch.items, cx);
+                    editor.accept_completion(cx);
+                    let mut result = source.to_owned();
+                    result.replace_range(cursor - 4..cursor, expected[0]);
+                    assert_eq!(editor.document.content(), result);
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn local_bindings_preserve_member_new_static_inheritance(cx: &mut gpui::TestAppContext) {
+        for (suffix, expected) in [
+            ("$service->", "run"),
+            ("new Serv", "Service"),
+            ("Service::", "make"),
+            ("class Child extends Serv", "Service"),
+            ("class Child implements Log", "Logger"),
+            ("interface Child extends Log", "Logger"),
+        ] {
+            let source = format!(
+                "<?php class Service {{ public function run() {{}} public static function make() {{}} }} interface Logger {{}} $service = new Service(); {suffix}"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("contexts.php");
+            std::fs::write(&path, &source).unwrap();
+            let mut index = axiom_index::ProjectSymbolIndex::new();
+            index.index_project(dir.path()).unwrap();
+            let snapshot = axiom_index::SemanticSnapshot::from_project_index(
+                &index,
+                axiom_index::SemanticRevision(1),
+            );
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                let mut editor = EditorView::from_document(
+                    path,
+                    axiom_editor::Document::from_content(&source),
+                    None,
+                    cx,
+                );
+                editor.semantic_engine = Some(std::sync::Arc::new(
+                    axiom_index::SemanticEngine::from_snapshot(snapshot),
+                ));
+                editor.project_symbols = Some(std::sync::Arc::new(std::sync::RwLock::new(index)));
+                editor.document.move_cursor(source.len());
+                editor
+            });
+            view.update(cx, |editor, _| {
+                let batch = editor.native_completions_impl(&source);
+                assert!(
+                    batch.items.iter().any(|item| item.label == expected),
+                    "{suffix}: {:?}",
+                    batch.items
+                );
+                assert!(
+                    batch
+                        .items
+                        .iter()
+                        .all(|item| item.kind != Some(lsp_types::CompletionItemKind::VARIABLE))
+                );
+            });
+        }
+    }
+
     #[gpui::test]
     fn replace_all_rendered_button_replaces_every_match(cx: &mut gpui::TestAppContext) {
         for (source, query, replacement, expected) in [

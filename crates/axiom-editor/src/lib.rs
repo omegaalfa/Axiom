@@ -175,6 +175,7 @@ impl Document {
         self.edit_batch_invalid = false;
         self.last_edit.take()
     }
+
     pub fn line_count(&self) -> usize {
         self.buffer.num_lines()
     }

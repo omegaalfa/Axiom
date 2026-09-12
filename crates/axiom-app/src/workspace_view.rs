@@ -383,15 +383,22 @@ fn prepare_find_usages(
     {
         return Err("Find Usages: current buffer is not indexed yet; retry after indexing");
     }
+    let local = snapshot.find_local_usages_at(&source_key, offset);
+    // Local results concern only the source buffer; unrelated dirty tabs do
+    // not participate in the query or its freshness validation.
     // Do not silently omit dirty references that have not reached the snapshot yet.
     for (key, text) in &texts {
+        if local.is_some() {
+            break;
+        }
         if (snapshot.file_id(key).is_some() || axiom_project::is_php_file(&key.normalized_path))
             && !snapshot.matches_file_text(key, text)
         {
             return Err("Find Usages: an open buffer is not indexed yet; retry after indexing");
         }
     }
-    let mut result = snapshot.find_usages_at(path, offset, FindUsagesOptions::default());
+    let mut result = local
+        .unwrap_or_else(|| snapshot.find_usages_at(path, offset, FindUsagesOptions::default()));
     if result.usages.is_empty() && result.status != axiom_index::FindUsagesStatus::Complete {
         return Err("Find Usages: unresolved, ambiguous or unsupported symbol");
     }
@@ -661,6 +668,7 @@ pub struct WorkspaceView {
     project: Option<Project>,
     explorer: Vec<ExplorerItem>,
     expanded: HashSet<PathBuf>,
+    explorer_refresh_generation: u64,
     tabs: Vec<OpenTab>,
     active: Option<usize>,
     focus: FocusHandle,
@@ -764,6 +772,7 @@ pub struct WorkspaceView {
     shortcut_conflict: Option<String>,
     debug_overlay_visible: bool,
     focus_active_editor: bool,
+    pending_created_caret: Option<usize>,
     project_dialog_open: bool,
     project_load_generation: u64,
     project_load_results: Option<Receiver<(u64, Result<ProjectLoadPayload, String>)>>,
@@ -1256,6 +1265,7 @@ impl WorkspaceView {
             project: None,
             explorer: Vec::new(),
             expanded: HashSet::new(),
+            explorer_refresh_generation: 0,
             tabs: Vec::new(),
             active: None,
             focus: cx.focus_handle(),
@@ -1373,6 +1383,7 @@ impl WorkspaceView {
             shortcut_conflict: None,
             debug_overlay_visible: false,
             focus_active_editor: false,
+            pending_created_caret: None,
             project_dialog_open: false,
             project_load_generation: 0,
             project_load_results: None,
@@ -2260,6 +2271,7 @@ impl WorkspaceView {
     }
 
     fn clear_project(&mut self, cx: &mut Context<Self>) {
+        self.explorer_refresh_generation = self.explorer_refresh_generation.wrapping_add(1);
         self.project_load_generation = self.project_load_generation.wrapping_add(1);
         self.project_load_results = None;
         self.project_semantic_generation = self.project_semantic_generation.wrapping_add(1);
@@ -3214,17 +3226,22 @@ impl WorkspaceView {
             return;
         };
         // Rope clones retain resident text without materializing buffers on the UI.
-        let buffers = self
-            .tabs
-            .iter()
-            .map(|tab| {
-                let editor = tab.editor.read(cx);
-                (
-                    axiom_index::PersistentFileKey::workspace_lexical(&tab.path),
-                    editor.references_text_snapshot(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let source_key = axiom_index::PersistentFileKey::workspace_lexical(&path);
+        let local = snapshot.local_binding_at(&source_key, offset).is_some();
+        let buffers = if local {
+            vec![(source_key, editor.references_text_snapshot())]
+        } else {
+            self.tabs
+                .iter()
+                .map(|tab| {
+                    let editor = tab.editor.read(cx);
+                    (
+                        axiom_index::PersistentFileKey::workspace_lexical(&tab.path),
+                        editor.references_text_snapshot(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let context = Arc::new(FindUsagesContext {
             kind: NavigationQueryKind::References,
             project_generation: self.project_semantic_generation,
@@ -4156,20 +4173,40 @@ impl WorkspaceView {
             });
         } else if let Some(project) = self.project.clone() {
             let directory = item.path.clone();
-            let depth = item.depth + 1;
             let workspace = cx.entity().downgrade();
             cx.spawn(async move |_, cx| {
                 let result = project.read_directory(&directory);
                 let _ = workspace.update(cx, |this, cx| {
                     match result {
                         Ok(entries) => {
+                            let Some(current_index) = this
+                                .explorer
+                                .iter()
+                                .position(|candidate| candidate.path == directory)
+                            else {
+                                return;
+                            };
+                            if this.expanded.contains(&directory) {
+                                return;
+                            }
+                            let insert_at = current_index + 1;
+                            if this
+                                .explorer
+                                .iter()
+                                .skip(insert_at)
+                                .any(|candidate| candidate.path.starts_with(&directory))
+                            {
+                                this.expanded.insert(directory.clone());
+                                return;
+                            }
+                            let depth = this.explorer[current_index].depth + 1;
                             let children = entries.into_iter().map(|entry| ExplorerItem {
                                 path: entry.path,
                                 name: entry.name,
                                 kind: entry.kind,
                                 depth,
                             });
-                            this.explorer.splice(index + 1..index + 1, children);
+                            this.explorer.splice(insert_at..insert_at, children);
                             this.expanded.insert(directory.clone());
                         }
                         Err(error) => this.status = format!("Falha ao abrir pasta: {error}").into(),
@@ -4187,25 +4224,62 @@ impl WorkspaceView {
             return;
         };
         let root = project.root_path().to_path_buf();
+        let expanded = self.expanded.clone();
+        self.explorer_refresh_generation = self.explorer_refresh_generation.wrapping_add(1);
+        let refresh_generation = self.explorer_refresh_generation;
         let workspace = cx.entity().downgrade();
         self.status = "Refreshing Project Explorer...".into();
         self.explorer_context = None;
         cx.notify();
         cx.spawn(async move |_, cx| {
-            let result = project.read_directory(&root);
+            let result = (|| {
+                let entries = project
+                    .read_directory(&root)
+                    .map_err(|error| error.to_string())?;
+                let mut visible: Vec<ExplorerItem> = entries
+                    .into_iter()
+                    .map(|entry| ExplorerItem {
+                        path: entry.path,
+                        name: entry.name,
+                        kind: entry.kind,
+                        depth: 0,
+                    })
+                    .collect();
+                let mut expanded_paths: Vec<_> = expanded.into_iter().collect();
+                expanded_paths.sort_by_key(|path| path.components().count());
+                let mut valid_expanded = HashSet::new();
+                for directory in expanded_paths {
+                    let Some(index) = visible.iter().position(|item| item.path == directory) else {
+                        continue;
+                    };
+                    if visible[index].kind != EntryKind::Directory {
+                        continue;
+                    }
+                    let children = match project.read_directory(&directory) {
+                        Ok(children) => children,
+                        Err(_) => continue,
+                    };
+                    let depth = visible[index].depth + 1;
+                    let child_items = children.into_iter().map(|entry| ExplorerItem {
+                        path: entry.path,
+                        name: entry.name,
+                        kind: entry.kind,
+                        depth,
+                    });
+                    let insert_at = index + 1;
+                    visible.splice(insert_at..insert_at, child_items);
+                    valid_expanded.insert(directory);
+                }
+                Ok::<_, String>((visible, valid_expanded))
+            })();
             let _ = workspace.update(cx, |this, cx| {
+                if this.explorer_refresh_generation != refresh_generation {
+                    return;
+                }
                 match result {
-                    Ok(entries) => {
-                        this.explorer = entries
-                            .into_iter()
-                            .map(|entry| ExplorerItem {
-                                path: entry.path,
-                                name: entry.name,
-                                kind: entry.kind,
-                                depth: 0,
-                            })
-                            .collect();
-                        this.expanded.clear();
+                    Ok((items, expanded)) => {
+                        this.explorer = items;
+                        this.expanded = expanded;
                         this.status = "Project Explorer refreshed".into();
                     }
                     Err(error) => {
@@ -5026,7 +5100,9 @@ impl WorkspaceView {
         }
         if is_php
             && (!valid_php_identifier(name.trim_end_matches(".php"))
-                || !valid_php_namespace(&self.explorer_namespace))
+                || !valid_php_namespace(&self.explorer_namespace)
+                || self.explorer_file.trim().is_empty()
+                || self.explorer_file.contains(['/', '\\']))
         {
             self.status = "Invalid PHP name or namespace".into();
             cx.notify();
@@ -5035,6 +5111,7 @@ impl WorkspaceView {
         let Some(operation) = self.explorer_operation.take() else {
             return;
         };
+        self.pending_created_caret = None;
         self.modal_focus_pending = false;
         self.explorer_input.clear();
         self.explorer_undo.clear();
@@ -5052,20 +5129,22 @@ impl WorkspaceView {
                 (directory, name, None)
             }
             ExplorerOperation::NewPhp { directory, keyword } => {
-                let name = if name.ends_with(".php") {
-                    name
+                let file = self.explorer_file.trim();
+                let name = if file.ends_with(".php") {
+                    file.to_owned()
                 } else {
-                    format!("{name}.php")
+                    format!("{file}.php")
                 };
                 let symbol = name.trim_end_matches(".php");
-                let body = crate::php_type_template::render(
+                let generated = crate::php_type_template::render_with_caret(
                     keyword,
                     symbol,
                     &self.explorer_namespace,
                     &self.explorer_extends,
                     &self.explorer_implements,
                 );
-                (directory, name, Some(body))
+                self.pending_created_caret = Some(generated.caret_offset);
+                (directory, name, Some(generated.contents))
             }
             ExplorerOperation::NewDirectory(directory) => {
                 self.explorer_fs_busy = true;
@@ -5195,7 +5274,8 @@ impl WorkspaceView {
                 match result {
                     Ok(ExplorerFsResult::Create(Some(path))) => {
                         this.refresh_explorer(cx);
-                        this.open_file_background(path, cx);
+                        let caret = this.pending_created_caret.take();
+                        this.open_file_background_at(path, caret, cx);
                     }
                     Ok(_) => this.refresh_explorer(cx),
                     Err(error) => this.status = format!("Operation failed: {error}").into(),
@@ -5325,6 +5405,15 @@ impl WorkspaceView {
     }
 
     fn open_file_background(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.open_file_background_at(path, None, cx);
+    }
+
+    fn open_file_background_at(
+        &mut self,
+        path: PathBuf,
+        caret_offset: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
         let path = match fs::canonicalize(path) {
             Ok(path) => path,
             Err(error) => {
@@ -5350,6 +5439,9 @@ impl WorkspaceView {
         };
         let lsp = self.lsp.clone();
         let editor = cx.new(|cx| EditorView::from_document(path.clone(), document, lsp, cx));
+        if let Some(offset) = caret_offset {
+            editor.update(cx, |editor, cx| editor.set_cursor_offset(offset, cx));
+        }
         if let Some(symbols) = &self._runtime_symbols {
             editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
         }
@@ -9034,6 +9126,96 @@ fn tab_display_path(path: &Path, project_root: Option<&Path>, runtime_root: &Pat
 #[cfg(test)]
 mod modifier_tests {
     #[gpui::test]
+    fn local_references_action_reuses_popup_and_navigation(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unsaved_local.php");
+        let text = "<?php function first($service) { foo($service); } function second($service) { foo($service); }";
+        let mut builder = axiom_index::SnapshotBuilder::empty(axiom_index::SemanticRevision(1));
+        builder.replace_workspace_file(&path, text);
+        let engine =
+            std::sync::Arc::new(axiom_index::SemanticEngine::from_snapshot(builder.finish()));
+        let (workspace, cx) =
+            cx.add_window_view(|_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        let editor = cx.new(|cx| {
+            let mut editor = EditorView::from_document(
+                path.clone(),
+                axiom_editor::Document::from_content(text),
+                None,
+                cx,
+            );
+            editor.reveal_lsp_position(
+                axiom_lsp::PositionCodec::offset_to_position(
+                    text,
+                    text.find("$service").unwrap(),
+                    Default::default(),
+                ),
+                cx,
+            );
+            editor
+        });
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.semantic_engine = Some(engine);
+                workspace.tabs.push(OpenTab {
+                    path: path.clone(),
+                    editor: editor.clone(),
+                });
+                workspace.active = Some(0);
+                workspace.find_usages_action(&crate::editor_view::References, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert!(workspace.find_usages_visible, "{}", workspace.status);
+            assert_eq!(workspace.find_usages.len(), 2);
+        });
+        cx.simulate_keystrokes("down enter");
+        workspace.update(cx, |workspace, cx| {
+            assert!(!workspace.find_usages_visible);
+            assert_eq!(
+                editor.read(cx).current_cursor_offset(),
+                text.match_indices("$service").nth(1).unwrap().0
+            );
+            assert_eq!(editor.read(cx).document_content(), text);
+            assert!(!path.exists());
+        });
+    }
+
+    #[test]
+    fn local_references_preparation_uses_only_matching_dirty_buffer() {
+        use axiom_index::{PersistentFileKey, SemanticRevision, SnapshotBuilder};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never_saved.php");
+        let text = "<?php function first($service) { $service->run(); $service->log(); } function second($service) { $service->run(); }";
+        let mut builder = SnapshotBuilder::empty(SemanticRevision(1));
+        builder.replace_workspace_file(&path, text);
+        let snapshot = builder.finish();
+        let key = PersistentFileKey::workspace_lexical(&path);
+        let unrelated = PersistentFileKey::workspace_lexical(&dir.path().join("unindexed.php"));
+        let buffers = std::collections::HashMap::from([
+            (key.clone(), text.to_owned()),
+            (unrelated, "<?php unindexed();".into()),
+        ]);
+        let (targets, status) =
+            super::prepare_find_usages(&snapshot, &path, text.find("$service").unwrap(), buffers)
+                .unwrap();
+        assert_eq!(status, axiom_index::FindUsagesStatus::Complete);
+        assert_eq!(targets.len(), 3);
+        assert!(
+            targets
+                .iter()
+                .all(|target| &text[target.span.clone()] == "$service"
+                    && target.span.start < text.find("function second").unwrap())
+        );
+        assert!(!path.exists());
+        let buffers = std::collections::HashMap::from([(key, format!(" {text}"))]);
+        assert!(
+            super::prepare_find_usages(&snapshot, &path, text.find("$service").unwrap(), buffers)
+                .is_err()
+        );
+    }
+
+    #[gpui::test]
     fn references_action_and_enter_use_indexed_unsaved_buffer(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("unsaved.php");
@@ -9511,6 +9693,46 @@ mod modifier_tests {
             assert_eq!(w.explorer_file, "NewItem.php");
             assert!(w.explorer_extends.is_empty());
             assert!(w.explorer_implements.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn explorer_refresh_preserves_expanded_paths_after_child_delete(cx: &mut gpui::TestAppContext) {
+        use super::ExplorerItem;
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("App");
+        std::fs::create_dir(&app).unwrap();
+        std::fs::write(app.join("A.php"), "<?php").unwrap();
+        std::fs::write(app.join("B.php"), "<?php").unwrap();
+        let project = axiom_project::Project::open(dir.path()).unwrap();
+        let app = project.root_path().join("App");
+        let app_for_view = app.clone();
+        let (view, cx) =
+            cx.add_window_view(move |_, cx| WorkspaceView::new(StartupTarget::Welcome, cx));
+        view.update(cx, |w, cx| {
+            w.project = Some(project);
+            w.explorer = vec![ExplorerItem {
+                path: app_for_view.clone(),
+                name: "App".into(),
+                kind: EntryKind::Directory,
+                depth: 0,
+            }];
+            w.expanded.insert(app_for_view.clone());
+            w.refresh_explorer(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |w, _| {
+            assert!(w.expanded.contains(&app));
+            assert!(w.explorer.iter().any(|item| item.name == "A.php"));
+            assert!(w.explorer.iter().any(|item| item.name == "B.php"));
+        });
+        std::fs::remove_file(app.join("B.php")).unwrap();
+        view.update(cx, |w, cx| w.refresh_explorer(cx));
+        cx.run_until_parked();
+        view.update(cx, |w, _| {
+            assert!(w.expanded.contains(&app));
+            assert!(w.explorer.iter().any(|item| item.name == "A.php"));
+            assert!(!w.explorer.iter().any(|item| item.name == "B.php"));
         });
     }
 

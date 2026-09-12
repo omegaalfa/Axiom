@@ -46,3 +46,6 @@ Cada fase precisa de reprodução focada, teste determinístico quando possível
 ## Evidências
 
 O estado descrito é baseado nos fluxos em `workspace_view.rs`, `editor_view.rs`, `ui/input_line.rs`, `axiom-index/src/semantic.rs` e `axiom-project/src/lib.rs`, além dos testes de diagnostics, formatting, Find/Replace, referências, implementação e modal presentes no binário `axiom`.
+## Atualização de fase
+
+Safe Rename local foi removido. LocalBindingId e Find Usages local permanecem preservados. Próxima etapa recomendada: File Structure baseada no snapshot atual; reavaliar Safe Rename após estabilizar identidade e escopo.

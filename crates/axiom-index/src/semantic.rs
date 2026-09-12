@@ -272,8 +272,29 @@ pub struct SymbolId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct ReferenceId(pub u32);
 
+/// Snapshot-local identity. A declaration byte offset is unique within a file;
+/// callers must retain the snapshot that produced this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LocalBindingId {
+    pub file: FileId,
+    pub declaration_start: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct LocalFileReferences {
+    #[serde(default)]
+    scope_by_declaration: HashMap<usize, usize>,
+    #[serde(default)]
+    names_by_scope: HashMap<usize, HashSet<String>>,
+    // Sorted, nonoverlapping variable-token ranges for binary cursor lookup.
+    occurrences: Vec<(std::ops::Range<usize>, Option<usize>)>,
+    by_declaration: HashMap<usize, Vec<std::ops::Range<usize>>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ReferenceRole {
+    LocalDeclaration,
+    LocalUse,
     Type,
     Instantiation,
     FunctionCall,
@@ -316,6 +337,8 @@ pub struct SemanticReference {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ReferenceStore {
+    #[serde(default)]
+    locals: HashMap<FileId, LocalFileReferences>,
     pub records: Vec<SemanticReference>,
     pub references_by_target: HashMap<SymbolId, Vec<ReferenceId>>,
     pub references_by_file: HashMap<FileId, Vec<ReferenceId>>,
@@ -1342,6 +1365,8 @@ pub struct SemanticSnapshot {
     pub scopes: ScopeStore,
     pub file_fingerprints: HashMap<FileId, u64>,
     pub interface_relations: InterfaceRelationIndexes,
+    #[serde(default)]
+    completion_scopes: HashMap<FileId, Vec<(usize, Option<ScopeId>)>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1374,6 +1399,7 @@ impl SemanticSnapshot {
             scopes: ScopeStore::default(),
             file_fingerprints: HashMap::new(),
             interface_relations: InterfaceRelationIndexes::default(),
+            completion_scopes: HashMap::new(),
         }
     }
 
@@ -1403,6 +1429,48 @@ impl SemanticSnapshot {
     /// Variant for callers that already hold the resident compact `FileId`.
     pub fn scope_id_at_file(&self, file: FileId, offset: usize) -> Option<ScopeId> {
         self.scope_at(file, offset).map(|scope| scope.id)
+    }
+
+    /// Binary lookup of one lexical scope; no scan of other scopes at query time.
+    pub fn completion_scope(&self, key: &PersistentFileKey, offset: usize) -> Option<&Scope> {
+        let entries = self.completion_scopes.get(&self.file_id(key)?)?;
+        let index = entries.partition_point(|(start, _)| *start <= offset);
+        self.scope(entries.get(index.checked_sub(1)?)?.1?)
+    }
+
+    fn rebuild_completion_scopes(&mut self) {
+        let mut events: HashMap<FileId, Vec<(usize, bool, usize, u32)>> = HashMap::new();
+        for scope in &self.scopes.records {
+            if let Some(file) = scope.file {
+                if scope.span.is_empty() {
+                    continue;
+                }
+                let entries = events.entry(file).or_default();
+                entries.push((scope.span.start, true, scope.span.start, scope.id.0));
+                entries.push((scope.span.end, false, scope.span.start, scope.id.0));
+            }
+        }
+        for (file, mut events) in events {
+            events.sort_unstable();
+            let mut active = std::collections::BTreeSet::new();
+            let mut entries = Vec::new();
+            for (offset, enter, start, id) in events {
+                if enter {
+                    active.insert((start, id));
+                } else {
+                    active.remove(&(start, id));
+                }
+                let scope = active.last().map(|(_, id)| ScopeId(*id));
+                if entries
+                    .last()
+                    .is_some_and(|(previous, _)| *previous == offset)
+                {
+                    entries.pop();
+                }
+                entries.push((offset, scope));
+            }
+            self.completion_scopes.insert(file, entries);
+        }
     }
 
     pub fn symbol_id(&self, key: &PersistentSymbolKey) -> Option<SymbolId> {
@@ -2457,6 +2525,10 @@ impl SemanticSnapshot {
         offset: usize,
         options: FindUsagesOptions,
     ) -> FindUsagesResult {
+        let lexical = PersistentFileKey::workspace_lexical(file.as_ref());
+        if let Some(result) = self.find_local_usages_at(&lexical, offset) {
+            return result;
+        }
         let key = PersistentFileKey::workspace(file.as_ref());
         let Some(file_id) = self.file_id(&key) else {
             return FindUsagesResult {
@@ -2506,6 +2578,89 @@ impl SemanticSnapshot {
             usages: Vec::new(),
             status: FindUsagesStatus::Ambiguous,
         }
+    }
+
+    pub fn local_binding_at(
+        &self,
+        key: &PersistentFileKey,
+        offset: usize,
+    ) -> Option<LocalBindingId> {
+        let file = self.file_id(key)?;
+        let entries = &self.references.locals.get(&file)?.occurrences;
+        let index = entries
+            .partition_point(|(span, _)| span.start <= offset)
+            .checked_sub(1)?;
+        let (span, declaration) = &entries[index];
+        span.contains(&offset).then_some(LocalBindingId {
+            file,
+            declaration_start: (*declaration)?,
+        })
+    }
+
+    pub fn find_local_usages(&self, binding: LocalBindingId) -> FindUsagesResult {
+        let Some(ranges) = self
+            .references
+            .locals
+            .get(&binding.file)
+            .and_then(|file| file.by_declaration.get(&binding.declaration_start))
+        else {
+            return FindUsagesResult {
+                usages: Vec::new(),
+                status: FindUsagesStatus::Stale,
+            };
+        };
+        let Some(file) = self.file(binding.file) else {
+            return FindUsagesResult {
+                usages: Vec::new(),
+                status: FindUsagesStatus::Stale,
+            };
+        };
+        FindUsagesResult {
+            usages: ranges
+                .iter()
+                .map(|span| UsageLocation {
+                    file: file.key.clone(),
+                    span: span.clone(),
+                    role: if span.start == binding.declaration_start {
+                        ReferenceRole::LocalDeclaration
+                    } else {
+                        ReferenceRole::LocalUse
+                    },
+                    confidence: ReferenceConfidence::Exact,
+                    source_symbol: None,
+                    provider: ReferenceProvider::Semantic,
+                })
+                .collect(),
+            status: FindUsagesStatus::Complete,
+        }
+    }
+
+    /// None means the cursor does not hit a local variable token. Unresolved
+    /// local tokens return a partial result instead of falling through to a class.
+    pub fn find_local_usages_at(
+        &self,
+        key: &PersistentFileKey,
+        offset: usize,
+    ) -> Option<FindUsagesResult> {
+        let file = self.file_id(key)?;
+        let entries = &self.references.locals.get(&file)?.occurrences;
+        let index = entries
+            .partition_point(|(span, _)| span.start <= offset)
+            .checked_sub(1)?;
+        let (span, declaration) = &entries[index];
+        if !span.contains(&offset) {
+            return None;
+        }
+        Some(match declaration {
+            Some(start) => self.find_local_usages(LocalBindingId {
+                file,
+                declaration_start: *start,
+            }),
+            None => FindUsagesResult {
+                usages: Vec::new(),
+                status: FindUsagesStatus::Partial,
+            },
+        })
     }
 
     fn usage_location(
@@ -2604,8 +2759,10 @@ impl SemanticSnapshot {
             scopes: persisted.scopes,
             file_fingerprints: persisted.file_fingerprints,
             interface_relations: InterfaceRelationIndexes::default(),
+            completion_scopes: HashMap::new(),
         };
         snapshot.rebuild_interface_relations();
+        snapshot.rebuild_completion_scopes();
         let active_symbols: HashSet<SymbolId> = snapshot
             .files
             .records
@@ -3005,6 +3162,7 @@ impl SnapshotBuilder {
             scopes: self.scopes.clone(),
             file_fingerprints: self.file_fingerprints.clone(),
             interface_relations: InterfaceRelationIndexes::default(),
+            completion_scopes: HashMap::new(),
         }
     }
 
@@ -3041,8 +3199,10 @@ impl SnapshotBuilder {
             scopes: self.scopes,
             file_fingerprints: self.file_fingerprints,
             interface_relations: InterfaceRelationIndexes::default(),
+            completion_scopes: HashMap::new(),
         };
         snapshot.rebuild_interface_relations();
+        snapshot.rebuild_completion_scopes();
         snapshot
     }
 
@@ -3161,7 +3321,10 @@ impl SnapshotBuilder {
         // file's records. This removes stale reverse-index entries and keeps
         // ReferenceId deliberately local to the new snapshot.
         let old_records = std::mem::take(&mut self.references.records);
+        let mut locals = std::mem::take(&mut self.references.locals);
+        locals.retain(|file, _| !changed_ids.contains(file));
         self.references = ReferenceStore::default();
+        self.references.locals = locals;
         for reference in old_records {
             if changed_ids.contains(&reference.file) {
                 continue;
@@ -3797,7 +3960,7 @@ fn extract_assignments(
                 continue;
             };
             let name = node_text(left, text).trim();
-            if name.starts_with('$') {
+            if left.kind() == "variable_name" {
                 if let Some(scope) = assignment_scope(builder, file, node.start_byte()) {
                     let right_text = node_text(right, text).trim();
                     let raw_type = if right.kind() == "object_creation_expression" {
@@ -3829,11 +3992,16 @@ fn extract_assignments(
                     } else {
                         None
                     };
-                    if let Some(raw_type) = raw_type {
+                    if raw_type.is_some()
+                        || !builder.scopes.records[scope.0 as usize]
+                            .bindings
+                            .iter()
+                            .any(|binding| binding.name == name)
+                    {
                         let binding = VariableBinding {
                             name: name.to_owned(),
                             declaration_span: left.byte_range(),
-                            declared_type: Some(declared_type(&raw_type, builder, scope)),
+                            declared_type: raw_type.map(|raw| declared_type(&raw, builder, scope)),
                         };
                         let bindings = &mut builder.scopes.records[scope.0 as usize].bindings;
                         if let Some(existing) =
@@ -3864,6 +4032,8 @@ fn extract_references(
     root: tree_sitter::Node<'_>,
     text: &str,
 ) {
+    let mut local_nodes: HashMap<(ScopeId, String), Vec<(std::ops::Range<usize>, bool)>> =
+        HashMap::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         let Some(scope) = snapshot.scope_at(file, node.start_byte()) else {
@@ -3872,6 +4042,34 @@ fn extract_references(
         };
         let source_scope = scope.id;
         let source_symbol = source_symbol_for_scope(snapshot, file, scope);
+
+        if node.kind() == "variable_name" {
+            let parent = node.parent();
+            let is_property = parent.is_some_and(|parent| {
+                parent.kind() == "property_element"
+                    || (parent.kind() == "scoped_property_access_expression"
+                        && parent.child_by_field_name("name") == Some(node))
+            });
+            if !is_property {
+                let name = node_text(node, text);
+                let known = scope.bindings.iter().any(|binding| binding.name == name);
+                let declaration = known
+                    && parent.is_some_and(|parent| {
+                        (parent.kind() == "assignment_expression"
+                            && parent.child_by_field_name("left") == Some(node))
+                            || matches!(
+                                parent.kind(),
+                                "simple_parameter"
+                                    | "variadic_parameter"
+                                    | "property_promotion_parameter"
+                            )
+                    });
+                local_nodes
+                    .entry((source_scope, name.to_owned()))
+                    .or_default()
+                    .push((node.byte_range(), declaration));
+            }
+        }
 
         // These nodes are intentionally handled before the generic traversal:
         // their names are references to types, but not ordinary `Type` uses.
@@ -4200,6 +4398,34 @@ fn extract_references(
         }
         stack.extend(node.named_children(&mut node.walk()));
     }
+    let mut locals = LocalFileReferences::default();
+    for ((scope, name), mut occurrences) in local_nodes {
+        let scope_start = snapshot.scope(scope).expect("resident scope").span.start;
+        locals
+            .names_by_scope
+            .entry(scope_start)
+            .or_default()
+            .insert(name);
+        occurrences.sort_by_key(|(span, _)| span.start);
+        let declaration = occurrences
+            .iter()
+            .find(|(_, declaration)| *declaration)
+            .map(|(span, _)| span.start);
+        for (span, _) in occurrences {
+            let binding = declaration.filter(|start| *start <= span.start);
+            if let Some(start) = binding {
+                locals.scope_by_declaration.insert(start, scope_start);
+                locals
+                    .by_declaration
+                    .entry(start)
+                    .or_default()
+                    .push(span.clone());
+            }
+            locals.occurrences.push((span, binding));
+        }
+    }
+    locals.occurrences.sort_by_key(|(span, _)| span.start);
+    builder.references.locals.insert(file, locals);
 }
 
 fn source_symbol_for_scope(
@@ -4929,6 +5155,191 @@ fn normalize_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_usages_have_scope_identity_exact_ranges_and_declaration_order() {
+        use super::*;
+        for source in [
+            "<?php function a() { $service = new Service(); $service->run(); $service->log(); } function b() { $service = new OtherService(); $service->run(); }",
+            "<?php function a(Service $service) { $service->run(); foo($service); } function b(Service $service) { foo($service); }",
+            "<?php function a() { $service = 1; echo $service; $service = 2; echo $service; } function b() { $service = 3; echo $service; }",
+            "<?php function a($service) { foo($service); $f = function($service) { foo($service); }; foo($service); }",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("unsaved.php");
+            let key = PersistentFileKey::workspace_lexical(&path);
+            let mut builder = SnapshotBuilder::empty(SemanticRevision(1));
+            builder.replace_workspace_file(&path, source);
+            let snapshot = builder.finish();
+            let mut groups: HashMap<LocalBindingId, Vec<std::ops::Range<usize>>> = HashMap::new();
+            for (offset, _) in source.match_indices("$service") {
+                let id = snapshot.local_binding_at(&key, offset).expect(source);
+                groups.entry(id).or_default().push(offset..offset + 8);
+            }
+            assert_eq!(groups.len(), 2, "{source}");
+            for (id, expected) in groups {
+                assert!(expected.len() >= 2);
+                for range in &expected {
+                    for cursor in range.clone() {
+                        let result =
+                            snapshot.find_usages_at(&path, cursor, FindUsagesOptions::default());
+                        assert_eq!(result.status, FindUsagesStatus::Complete);
+                        assert_eq!(
+                            result
+                                .usages
+                                .iter()
+                                .map(|usage| usage.span.clone())
+                                .collect::<Vec<_>>(),
+                            expected
+                        );
+                        assert_eq!(snapshot.local_binding_at(&key, cursor), Some(id));
+                    }
+                }
+            }
+            assert!(
+                !path.exists(),
+                "queries must work without an on-disk buffer"
+            );
+        }
+        let path = std::path::PathBuf::from("before.php");
+        let source = "<?php echo $item; $item = 1; echo $item;";
+        let mut builder = SnapshotBuilder::empty(SemanticRevision(2));
+        builder.replace_workspace_file(&path, source);
+        let snapshot = builder.finish();
+        let key = PersistentFileKey::workspace_lexical(&path);
+        let first = source.find("$item").unwrap();
+        assert!(snapshot.local_binding_at(&key, first).is_none());
+        assert!(
+            snapshot
+                .find_local_usages_at(&key, first)
+                .unwrap()
+                .usages
+                .is_empty()
+        );
+        let last = source.rfind("$item").unwrap();
+        assert_eq!(
+            snapshot
+                .find_local_usages_at(&key, last)
+                .unwrap()
+                .usages
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn local_usages_follow_dirty_replacement_and_keep_unrelated_files() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dirty.php");
+        let other = dir.path().join("other.php");
+        let original = "<?php function a($item) { echo $item; }";
+        let mut builder = SnapshotBuilder::empty(SemanticRevision(1));
+        builder.replace_workspace_file(&path, original);
+        builder.replace_workspace_file(&other, original);
+        let base = builder.finish();
+        let replacement = "<?php function b($changed) { echo $changed; echo $changed; }";
+        let mut builder = SnapshotBuilder::from_snapshot(&base);
+        builder.replace_workspace_file(&path, replacement);
+        builder.compact_scopes();
+        let next = builder.finish();
+        let query = |snapshot: &SemanticSnapshot, path: &Path, text: &str| {
+            snapshot.find_usages_at(path, text.find('$').unwrap(), FindUsagesOptions::default())
+        };
+        assert_eq!(query(&base, &path, original).usages.len(), 2);
+        assert_eq!(query(&next, &path, replacement).usages.len(), 3);
+        assert_eq!(query(&next, &other, original).usages.len(), 2);
+        let mut builder = SnapshotBuilder::from_snapshot(&next);
+        builder.remove_file(&path);
+        let removed = builder.finish();
+        assert!(
+            removed
+                .find_local_usages_at(
+                    &PersistentFileKey::workspace_lexical(&path),
+                    replacement.find('$').unwrap()
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn local_dispatch_does_not_capture_property_declarations() {
+        use super::*;
+        let path = std::path::PathBuf::from("properties.php");
+        let text = "<?php class Item { public $value; public static $shared; } $item = new Item(); echo $item->value; echo Item::$shared;";
+        let mut builder = SnapshotBuilder::empty(SemanticRevision(1));
+        builder.replace_workspace_file(&path, text);
+        let snapshot = builder.finish();
+        let key = PersistentFileKey::workspace_lexical(&path);
+        for token in ["$value", "$shared"] {
+            let offset = text.find(token).unwrap();
+            assert!(snapshot.find_local_usages_at(&key, offset).is_none());
+            let result = snapshot.find_usages_at(&path, offset + 1, FindUsagesOptions::default());
+            let symbol = snapshot.symbols_for_fqn(&format!("Item::{token}"))[0];
+            assert_eq!(
+                result,
+                snapshot.find_usages(symbol, FindUsagesOptions::default()),
+                "property dispatch must preserve the existing symbol query: {token}"
+            );
+        }
+        assert!(
+            snapshot
+                .find_local_usages_at(&key, text.rfind("$shared").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn completion_scope_positions_follow_snapshot_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locals.php");
+        let source =
+            "<?php function first($alpha) { $local = 1; } function second($beta) { $other = 2; }";
+        std::fs::write(&path, source).unwrap();
+        let mut index = crate::ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot =
+            super::SemanticSnapshot::from_project_index(&index, super::SemanticRevision(1));
+        let key = super::PersistentFileKey::workspace(&path);
+        for offset in 0..source.len() {
+            assert_eq!(
+                snapshot
+                    .completion_scope(&key, offset)
+                    .map(|scope| scope.id),
+                snapshot.scope_id_at(&key, offset)
+            );
+        }
+        let replacement = "<?php function only($changed) { $local = 3; }";
+        let mut builder = super::SnapshotBuilder::from_snapshot(&snapshot);
+        builder.replace_workspace_file(&path, replacement);
+        let next = builder.finish();
+        let scope = next
+            .completion_scope(&key, replacement.find("$local").unwrap())
+            .unwrap();
+        assert!(
+            scope
+                .bindings
+                .iter()
+                .any(|binding| binding.name == "$changed")
+        );
+        assert!(
+            !scope
+                .bindings
+                .iter()
+                .any(|binding| binding.name == "$alpha" || binding.name == "$beta")
+        );
+        assert!(
+            next.completion_scope(&key, replacement.len() + 100)
+                .is_none()
+        );
+        assert!(
+            next.completion_scope(
+                &super::PersistentFileKey::workspace_lexical(&dir.path().join("absent.php")),
+                0
+            )
+            .is_none()
+        );
+    }
+
     use super::*;
     use std::{sync::Arc, time::Instant};
 
@@ -7565,9 +7976,13 @@ function useB() { same(); $local = 1; $fn = function($local) { return $local; };
             text.rfind("$local").unwrap() + 1,
             FindUsagesOptions::default(),
         );
+        assert_eq!(result.usages.len(), 2);
+        let closure_start = text.find("function($local)").unwrap();
         assert!(
-            result.usages.is_empty(),
-            "local binding must not resolve to the enclosing function"
+            result.usages.iter().all(|usage| {
+                usage.span.start > closure_start && &text[usage.span.clone()] == "$local"
+            }),
+            "local binding must resolve only inside its closure, not to the enclosing function"
         );
     }
 

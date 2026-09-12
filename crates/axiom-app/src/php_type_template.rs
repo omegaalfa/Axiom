@@ -1,6 +1,11 @@
 //! Pure preparation of a new PHP declaration; no symbol resolution or UI state.
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) struct GeneratedPhpType {
+    pub contents: String,
+    pub caret_offset: usize,
+}
+
 fn normalize(value: &str) -> String {
     value
         .trim()
@@ -23,13 +28,20 @@ fn types(value: &str) -> Vec<(String, bool)> {
         .collect()
 }
 
-pub(crate) fn render(
+#[cfg(test)]
+fn render(keyword: &str, name: &str, namespace: &str, extends: &str, implements: &str) -> String {
+    render_with_caret(keyword, name, namespace, extends, implements)
+        .contents
+        .replace("{\n    \n}", "{\n}")
+}
+
+pub(crate) fn render_with_caret(
     keyword: &str,
     name: &str,
     namespace: &str,
     extends: &str,
     implements: &str,
-) -> String {
+) -> GeneratedPhpType {
     let namespace = normalize(namespace);
     let parents = if matches!(keyword, "class" | "interface") {
         types(extends)
@@ -97,13 +109,32 @@ pub(crate) fn render(
     if !interfaces.is_empty() {
         output.push_str(&format!(" implements {}", interfaces.join(", ")));
     }
-    output.push_str("\n{\n}\n");
-    output
+    output.push_str("\n{\n    \n}\n");
+    let caret_offset = output.len() - 3;
+    GeneratedPhpType {
+        contents: output,
+        caret_offset,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_caret_is_after_indented_body_line() {
+        for keyword in ["class", "interface", "trait", "enum"] {
+            let generated = render_with_caret(keyword, "Item", "App", "App\\Base", "App\\Contract");
+            assert_eq!(
+                &generated.contents[generated.caret_offset - 4..generated.caret_offset],
+                "    "
+            );
+            assert_eq!(generated.contents.as_bytes()[generated.caret_offset], b'\n');
+            assert!(generated.caret_offset < generated.contents.rfind('}').unwrap());
+        }
+        let generated = render_with_caret("class", "Item", "", "", "");
+        assert!(generated.contents.starts_with("<?php\n\nclass Item"));
+    }
 
     #[test]
     fn external_class_template_and_sorted_imports() {

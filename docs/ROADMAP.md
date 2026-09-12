@@ -50,3 +50,6 @@ Cada fase deve compilar e executar no Windows, ser modular, incremental e valida
 ## Evidências principais
 
 As capacidades acima são implementadas em `crates/axiom-app/src/workspace_view.rs`, `editor_view.rs`, `ui/input_line.rs`, `crates/axiom-index/src/semantic.rs` e `crates/axiom-project/src/lib.rs`, com testes unitários nos próprios módulos. O estado permanece experimental.
+## Atualização de fase
+
+Safe Rename local foi removido. LocalBindingId, Find Usages local e completion de variáveis permanecem preservados. Próxima etapa recomendada: File Structure baseada em snapshots e índices residentes; reavaliar Safe Rename somente após estabilizar identidade e escopo.
