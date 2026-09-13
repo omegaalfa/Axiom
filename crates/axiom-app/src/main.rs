@@ -3,6 +3,8 @@
 mod editor_view;
 mod lsp_bridge;
 mod modal_type_completion;
+mod outline;
+mod outline_popup;
 mod php_type_template;
 mod syntax_theme;
 mod terminal_view;
@@ -34,6 +36,7 @@ fn main() -> anyhow::Result<()> {
         .with_assets(AxiomAssets)
         .run(move |cx: &mut App| {
             cx.bind_keys(editor_view::key_bindings());
+            cx.bind_keys(outline_popup::key_bindings());
             cx.bind_keys(workspace_view::key_bindings());
             cx.bind_keys(terminal_view::key_bindings());
 

@@ -2660,6 +2660,9 @@ impl WorkspaceView {
                 self.dispatch_editor_action(crate::editor_view::Reformat, window, cx)
             }
             "editor.undo" => self.dispatch_editor_action(crate::editor_view::Undo, window, cx),
+            "editor.file_structure" => {
+                self.dispatch_editor_action(crate::editor_view::FileStructure, window, cx)
+            }
             "editor.redo" => self.dispatch_editor_action(crate::editor_view::Redo, window, cx),
             "editor.select_all" => {
                 self.dispatch_editor_action(crate::editor_view::SelectAll, window, cx)

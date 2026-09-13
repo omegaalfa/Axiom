@@ -14,6 +14,13 @@ pub struct CommandDescriptor {
 pub fn registry() -> Vec<CommandDescriptor> {
     vec![
         command(
+            "editor.file_structure",
+            "File Structure",
+            "Shows declarations in the current PHP file.",
+            "Editor",
+            "ctrl-f12",
+        ),
+        command(
             "editor.undo",
             "Undo",
             "Undoes the last editor change.",

@@ -73,6 +73,7 @@ actions!(
         HoverInfo,
         Definition,
         References,
+        FileStructure,
         NativeDefinition,
         Reformat,
         SignatureHelp,
@@ -133,6 +134,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-k", HoverInfo, Some("Editor")),
         KeyBinding::new("secondary-b", Definition, Some("Editor")),
         KeyBinding::new("shift-f12", References, Some("Editor")),
+        KeyBinding::new("ctrl-f12", FileStructure, Some("Editor")),
         KeyBinding::new("ctrl-alt-l", Reformat, Some("Editor")),
         KeyBinding::new("secondary-alt-l", Reformat, Some("Editor")),
         KeyBinding::new("ctrl-shift-space", SignatureHelp, Some("Editor")),
@@ -239,6 +241,7 @@ impl Drop for UiStageGuard {
 }
 
 pub struct EditorView {
+    outline_popup: Option<Entity<crate::outline_popup::OutlinePopup>>,
     document: Document,
     syntax: Option<PhpSyntax>,
     focus: FocusHandle,
@@ -1163,6 +1166,7 @@ impl EditorView {
             completions: Vec::new(),
             completion_selected: 0,
             hover_popup: None,
+            outline_popup: None,
             hover_anchor: None,
             diagnostics: DiagnosticStore::default(),
             context_menu: None,
@@ -1297,6 +1301,91 @@ impl EditorView {
         self.move_to(range.start.min(self.document.len()), cx);
         self.marked_range = Some(range);
         self.ensure_cursor_visible();
+        cx.notify();
+    }
+
+    fn file_structure(&mut self, _: &FileStructure, window: &mut Window, cx: &mut Context<Self>) {
+        if !is_php_file(&self.file_path) {
+            return;
+        }
+        let Some(snapshot) = self
+            .semantic_engine
+            .as_ref()
+            .and_then(|engine| engine.try_snapshot())
+        else {
+            self.status = Some("File Structure: indexing unavailable".into());
+            cx.notify();
+            return;
+        };
+        let key = PersistentFileKey::workspace_lexical(&self.file_path);
+        // Explicit action only: verify dirty-buffer identity before trusting ranges.
+        let text = self.document.text_snapshot().to_string();
+        if !snapshot.matches_file_text(&key, &text) {
+            self.status = Some("File Structure: waiting for indexing; retry shortly".into());
+            cx.notify();
+            return;
+        }
+        let Some(file) = snapshot.file_id(&key) else {
+            return;
+        };
+        let symbols: Vec<_> = snapshot
+            .symbols_for_file(file)
+            .iter()
+            .filter_map(|id| snapshot.symbol(*id))
+            .map(|s| axiom_index::ProjectSymbol {
+                name: s.name.clone(),
+                fully_qualified_name: s.fully_qualified_name.clone(),
+                kind: s.kind,
+                file: self.file_path.clone(),
+                range: s.range.clone(),
+                namespace: s.namespace.clone(),
+                visibility: s.visibility,
+                modifiers: s.modifiers.clone(),
+                parameters: s.parameters.clone(),
+                return_type: s.return_type.clone(),
+            })
+            .collect();
+        let items = crate::outline::build_file_outline(&symbols, &self.file_path);
+        let guard = crate::outline_popup::Guard {
+            session: self.document_session,
+            revision: self.document.buffer_revision(),
+            path: self.file_path.clone(),
+        };
+        let owner = cx.entity().downgrade();
+        let popup = cx.new(|cx| crate::outline_popup::OutlinePopup::new(owner, guard, items, cx));
+        popup.update(cx, |popup, cx| popup.watch(window, cx));
+        window.focus(&popup.read(cx).focus);
+        self.outline_popup = Some(popup);
+        cx.notify();
+    }
+
+    pub(crate) fn outline_is_current(&self, guard: &crate::outline_popup::Guard) -> bool {
+        guard.session == self.document_session
+            && guard.revision == self.document.buffer_revision()
+            && guard.path == self.file_path
+    }
+    pub(crate) fn dismiss_outline(&mut self, cx: &mut Context<Self>) {
+        self.outline_popup = None;
+        cx.notify();
+    }
+
+    pub(crate) fn finish_outline(
+        &mut self,
+        guard: &crate::outline_popup::Guard,
+        range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.outline_is_current(guard) {
+            if let Some(range) = range.filter(|r| r.start < r.end && r.end <= self.document.len()) {
+                // Navigation is a collapsed caret, not an IME composition.
+                // Windows suppresses action dispatch while marked text exists.
+                self.marked_range = None;
+                self.move_to(range.start, cx);
+            }
+        }
+        self.outline_popup = None;
+        window.focus(&self.focus_handle(cx));
         cx.notify();
     }
 
@@ -5579,6 +5668,7 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::hover_info))
             .on_action(cx.listener(Self::definition))
             .on_action(cx.listener(Self::reformat))
+            .on_action(cx.listener(Self::file_structure))
             .on_action(cx.listener(Self::signature_help))
             .on_action(cx.listener(Self::complete_statement))
             .on_action(cx.listener(Self::find))
@@ -6152,6 +6242,7 @@ impl Render for EditorView {
                         .child(Self::find_button("Replace All", FindReplaceAll)),
                 )
             })
+            .when_some(self.outline_popup.clone(), |this, popup| this.child(popup))
             .when_some(status, |this, status| {
                 this.child(
                     div()
@@ -6870,6 +6961,207 @@ mod completion_ranking_tests {
 
 #[cfg(test)]
 mod formatter_tests {
+    #[gpui::test]
+    fn outline_accept_has_no_ime_composition_and_typing_preserves_name(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "<?php\n// ç😀\nclass Service {\n public function saveAll() {}\n}\n";
+        let path = std::path::PathBuf::from("outline-ime.php");
+        let mut builder = axiom_index::SnapshotBuilder::empty(axiom_index::SemanticRevision(1));
+        builder.replace_workspace_file(&path, source);
+        let snapshot = builder.finish();
+        let key = axiom_index::PersistentFileKey::workspace_lexical(&path);
+        let target = snapshot
+            .symbols_for_file(snapshot.file_id(&key).unwrap())
+            .iter()
+            .filter_map(|id| snapshot.symbol(*id))
+            .find(|s| s.name == "saveAll")
+            .unwrap()
+            .range
+            .clone();
+        let engine = std::sync::Arc::new(axiom_index::SemanticEngine::from_snapshot(snapshot));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut editor = EditorView::from_document(
+                path,
+                axiom_editor::Document::from_content(source),
+                None,
+                cx,
+            );
+            editor.semantic_engine = Some(engine);
+            window.focus(&editor.focus);
+            editor
+        });
+        cx.update(|_, cx| {
+            cx.bind_keys(super::key_bindings());
+            cx.bind_keys(crate::outline_popup::key_bindings());
+        });
+        for mouse in [false, true] {
+            cx.simulate_keystrokes("ctrl-f12 s a v");
+            if mouse {
+                let bounds = cx.debug_bounds("outline-row-1").unwrap();
+                cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            } else {
+                cx.simulate_keystrokes("enter");
+            }
+            cx.update(|window, cx| {
+                view.update(cx, |editor, cx| {
+                    assert_eq!(editor.document.cursor_offset(), target.start);
+                    assert_eq!(editor.selected_range(), target.start..target.start);
+                    assert_eq!(editor.selection_anchor, None);
+                    assert_eq!(
+                        gpui::EntityInputHandler::marked_text_range(editor, window, cx),
+                        None,
+                        "Windows skips action dispatch while marked text exists"
+                    );
+                    assert!(editor.focus.is_focused(window));
+                    assert!(editor.outline_popup.is_none());
+                })
+            });
+            cx.simulate_keystrokes("down");
+            view.update(cx, |editor, _| {
+                assert_ne!(editor.document.cursor_offset(), target.start)
+            });
+            cx.simulate_keystrokes("up ctrl-f12 escape ctrl-f12 s a v enter");
+        }
+        cx.simulate_input("x");
+        let mut expected = source.to_string();
+        expected.insert(target.start, 'x');
+        view.update(cx, |editor, _| {
+            assert_eq!(editor.document.content(), expected)
+        });
+        cx.simulate_keystrokes("ctrl-z");
+        view.update(cx, |editor, _| {
+            assert_eq!(editor.document.content(), source)
+        });
+        cx.simulate_keystrokes("ctrl-f12 s a v enter enter");
+        view.update(cx, |editor, _| {
+            let edited = editor.document.content();
+            assert!(edited.contains("saveAll"));
+            assert_eq!(edited.lines().count(), source.lines().count() + 1);
+        });
+    }
+    #[gpui::test]
+    fn outline_mouse_focus_loss_empty_and_identity_guards(cx: &mut gpui::TestAppContext) {
+        let text = "<?php class A {}";
+        let path = std::path::PathBuf::from("outline-mouse.php");
+        let mut builder = axiom_index::SnapshotBuilder::empty(axiom_index::SemanticRevision(1));
+        builder.replace_workspace_file(&path, text);
+        let snapshot = builder.finish();
+        let key = axiom_index::PersistentFileKey::workspace_lexical(&path);
+        let expected = snapshot
+            .symbol(snapshot.symbols_for_file(snapshot.file_id(&key).unwrap())[0])
+            .unwrap()
+            .range
+            .start;
+        let engine = std::sync::Arc::new(axiom_index::SemanticEngine::from_snapshot(snapshot));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut editor = EditorView::from_document(
+                path,
+                axiom_editor::Document::from_content(text),
+                None,
+                cx,
+            );
+            editor.semantic_engine = Some(engine);
+            window.focus(&editor.focus);
+            editor
+        });
+        cx.update(|_, cx| {
+            cx.bind_keys(super::key_bindings());
+            cx.bind_keys(crate::outline_popup::key_bindings());
+        });
+        cx.simulate_keystrokes("ctrl-f12");
+        let bounds = cx.debug_bounds("outline-row-0").expect("rendered row");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        view.update(cx, |editor, _| {
+            assert_eq!(editor.document.cursor_offset(), expected);
+            assert!(editor.outline_popup.is_none());
+        });
+        cx.simulate_keystrokes("ctrl-f12 escape ctrl-f12 escape");
+        view.update(cx, |editor, _| assert!(editor.outline_popup.is_none()));
+        cx.simulate_keystrokes("ctrl-f12 z z z up down enter");
+        view.update(cx, |editor, _| {
+            assert_eq!(editor.document.cursor_offset(), expected);
+            assert!(editor.outline_popup.is_none());
+        });
+        cx.simulate_keystrokes("ctrl-f12");
+        let _other_focus = cx.update(|window, cx| {
+            let other = cx.focus_handle();
+            window.focus(&other);
+            other
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        view.update(cx, |editor, _| assert!(editor.outline_popup.is_some()));
+        cx.update(|window, cx| {
+            view.update(cx, |editor, cx| {
+                let guard = crate::outline_popup::Guard {
+                    session: editor.document_session,
+                    revision: editor.document.buffer_revision(),
+                    path: editor.file_path.clone(),
+                };
+                editor.document_session += 1;
+                editor.finish_outline(&guard, Some(0..1), window, cx);
+                assert_eq!(editor.document.cursor_offset(), expected);
+                editor.document_session = guard.session;
+                editor.file_path = "different.php".into();
+                editor.finish_outline(&guard, Some(0..1), window, cx);
+                assert_eq!(editor.document.cursor_offset(), expected);
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn outline_shortcut_filter_keyboard_and_stale_navigation(cx: &mut gpui::TestAppContext) {
+        let text = "<?php class A { public function first() {} public function save() {} } class B { public function save() {} }";
+        let path = std::path::PathBuf::from("outline-dirty.php");
+        let mut builder = axiom_index::SnapshotBuilder::empty(axiom_index::SemanticRevision(1));
+        builder.replace_workspace_file(&path, text);
+        let snapshot = builder.finish();
+        let key = axiom_index::PersistentFileKey::workspace_lexical(&path);
+        let save = snapshot
+            .symbols_for_file(snapshot.file_id(&key).unwrap())
+            .iter()
+            .filter_map(|id| snapshot.symbol(*id))
+            .find(|s| s.fully_qualified_name == "A::save")
+            .unwrap()
+            .range
+            .start;
+        let engine = std::sync::Arc::new(axiom_index::SemanticEngine::from_snapshot(snapshot));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut editor = EditorView::from_document(
+                path,
+                axiom_editor::Document::from_content(text),
+                None,
+                cx,
+            );
+            editor.semantic_engine = Some(engine);
+            window.focus(&editor.focus);
+            editor
+        });
+        cx.update(|_, cx| {
+            cx.bind_keys(super::key_bindings());
+            cx.bind_keys(crate::outline_popup::key_bindings());
+        });
+        cx.simulate_keystrokes("ctrl-f12");
+        view.update(cx, |editor, _| assert!(editor.outline_popup.is_some()));
+        cx.simulate_keystrokes("s a v");
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |editor, _| {
+            assert!(editor.outline_popup.is_none());
+            assert_eq!(editor.document.cursor_offset(), save);
+            assert_eq!(editor.document.content(), text);
+        });
+        cx.simulate_keystrokes("ctrl-f12 escape");
+        view.update(cx, |editor, _| assert!(editor.outline_popup.is_none()));
+        cx.simulate_keystrokes("ctrl-f12");
+        view.update(cx, |editor, cx| {
+            editor.document.insert_text(" ");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update(cx, |editor, _| assert!(editor.outline_popup.is_none()));
+    }
+
     #[gpui::test]
     fn local_bindings_completion_and_accept(cx: &mut gpui::TestAppContext) {
         for (source, expected) in [
