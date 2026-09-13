@@ -494,6 +494,15 @@ fn prepare_implementations(
             .file(symbol.file)
             .ok_or("Implementation file unavailable")?;
         let text = fs::read_to_string(&file.path).map_err(|_| "Implementation file unavailable")?;
+        let key = axiom_index::PersistentFileKey::workspace_lexical(&file.path);
+        if !snapshot.matches_file_text(&key, &text)
+            || symbol.range.start > text.len()
+            || symbol.range.end > text.len()
+            || !text.is_char_boundary(symbol.range.start)
+            || !text.is_char_boundary(symbol.range.end)
+        {
+            return Err("Implementation target is stale; retry after indexing");
+        }
         let position =
             PositionCodec::offset_to_position(&text, symbol.range.start, Default::default());
         let display = file
@@ -9333,6 +9342,26 @@ mod modifier_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn implementation_preparation_discards_target_with_stale_filesystem_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let interface = dir.path().join("Cache.php");
+        let redis = dir.path().join("Redis.php");
+        std::fs::write(&interface, "<?php interface Cache {} ").unwrap();
+        std::fs::write(&redis, "<?php class RedisCache implements Cache {} ").unwrap();
+        let mut index = axiom_index::ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = axiom_index::SemanticSnapshot::from_project_index(
+            &index,
+            axiom_index::SemanticRevision(1),
+        );
+        let interface_id = snapshot.symbols_for_fqn("Cache")[0];
+        let offset = snapshot.symbol(interface_id).unwrap().range.start + 1;
+        std::fs::write(&redis, "<?php class RedisCache {} ").unwrap();
+        let result = super::prepare_implementations(&snapshot, &interface, offset);
+        assert!(result.is_err(), "stale target text must be discarded");
     }
     #[gpui::test]
     fn references_popup_keyboard_and_empty_results(cx: &mut gpui::TestAppContext) {
