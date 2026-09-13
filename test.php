@@ -2,75 +2,65 @@
 
 declare(strict_types=1);
 
-namespace Probe\TraitsA {
+namespace Probe\BaseA {
 
-    trait ConflictA
+    class Service
     {
-        public function label(): string
-        {
-            return 'A';
-        }
     }
 }
 
-namespace Probe\TraitsB {
+namespace Probe\BaseB {
 
-    trait ConflictB
+    class Service
     {
-        public function label(): string
-        {
-            return 'B';
-        }
     }
 }
 
-namespace Probe\Models {
+namespace Probe\ModelsA {
 
-    use Probe\TraitsA\ConflictA as TraitA;
-    use Probe\TraitsB\ConflictB as TraitB;
+    use Probe\BaseA\Service;
 
-    class Consumer
+    class UserService extends Service
     {
-        use TraitA, TraitB {
-            TraitA::label insteadof TraitB;
-            TraitB::label as labelFromB;
-        }
     }
 
-    class OverrideConsumer
+    class AdminService extends Service
     {
-        use TraitA, TraitB {
-            TraitA::label insteadof TraitB;
-            TraitB::label as labelFromB;
-        }
+    }
 
-        public function label(): string
-        {
-            return 'local';
-        }
+    class SpecialUserService extends UserService
+    {
+    }
+}
 
-        public function labelFromB(): string
-        {
-            return 'local-b';
-        }
+namespace Probe\ModelsB {
+
+    use Probe\BaseB\Service;
+
+    class OrderService extends Service
+    {
+    }
+}
+
+namespace Probe\AliasModels {
+
+    use Probe\BaseA\Service as BaseService;
+
+    class AliasedService extends BaseService
+    {
     }
 }
 
 namespace Probe\Usage {
 
-    use Probe\Models\Consumer;
-    use Probe\Models\OverrideConsumer;
+    use Probe\BaseA\Service as ServiceA;
+    use Probe\BaseB\Service as ServiceB;
+    use Probe\ModelsA\UserService;
 
-    function exercise(): void
-    {
-        $consumer = new Consumer();
-
-        $consumer->label();
-        $consumer->labelFromB();
-
-        $override = new OverrideConsumer();
-
-        $override->label();
-        $override->labelFromB();
+    function exercise(
+        ServiceA $serviceA,
+        ServiceB $serviceB,
+        UserService $userService,
+    ): void {
     }
 }

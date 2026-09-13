@@ -1442,6 +1442,7 @@ pub struct InterfaceRelationIndexes {
     implementers_by_interface: HashMap<SymbolId, Vec<SymbolId>>,
     method_implementations_by_interface_method: HashMap<SymbolId, Vec<SymbolId>>,
     trait_consumers_by_trait: HashMap<SymbolId, Vec<SymbolId>>,
+    subclasses_by_parent: HashMap<SymbolId, Vec<SymbolId>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1757,6 +1758,7 @@ impl SemanticSnapshot {
         };
         let declaration = self.symbol(symbol)?;
         let candidates = match declaration.kind {
+            ProjectSymbolKind::Class => self.subclasses_of(symbol),
             ProjectSymbolKind::Interface => self.implementers_of(symbol),
             ProjectSymbolKind::Trait => self
                 .interface_relations
@@ -1791,22 +1793,38 @@ impl SemanticSnapshot {
             }
             _ => return None,
         };
-        Some(
-            candidates
-                .iter()
-                .copied()
-                .filter(|id| {
-                    self.symbol(*id).is_some_and(|target| {
-                        !target
-                            .modifiers
-                            .iter()
-                            .any(|modifier| modifier == "abstract")
-                            && (target.kind != ProjectSymbolKind::Method
-                                || target.visibility == Visibility::Public)
-                    })
+        let filtered = candidates
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.symbol(*id).is_some_and(|target| {
+                    !target
+                        .modifiers
+                        .iter()
+                        .any(|modifier| modifier == "abstract")
+                        && (target.kind != ProjectSymbolKind::Method
+                            || target.visibility == Visibility::Public)
                 })
-                .collect(),
-        )
+            })
+            .collect::<Vec<_>>();
+        if declaration.kind == ProjectSymbolKind::Class && filtered.is_empty() {
+            let is_final = declaration
+                .modifiers
+                .iter()
+                .any(|modifier| modifier == "final");
+            if !is_final {
+                return None;
+            }
+        }
+        Some(filtered)
+    }
+
+    fn subclasses_of(&self, parent: SymbolId) -> &[SymbolId] {
+        self.interface_relations
+            .subclasses_by_parent
+            .get(&parent)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     fn rebuild_interface_relations(&mut self) {
@@ -1816,6 +1834,31 @@ impl SemanticSnapshot {
             .iter()
             .flat_map(|file| file.symbols.iter().copied())
             .collect();
+        self.interface_relations.subclasses_by_parent.clear();
+        for child in &self.symbols.records {
+            if child.kind != ProjectSymbolKind::Class {
+                continue;
+            }
+            let Some(scope) = self
+                .scopes
+                .records
+                .iter()
+                .find(|s| s.class_name.as_deref() == Some(child.name.as_str()))
+            else {
+                continue;
+            };
+            let Some(parent_name) = &scope.parent_class else {
+                continue;
+            };
+            let parents = self.symbols_for_fqn(parent_name).to_vec();
+            for parent in parents {
+                self.interface_relations
+                    .subclasses_by_parent
+                    .entry(parent)
+                    .or_default()
+                    .push(child.id);
+            }
+        }
         let mut extends: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
         let mut implements: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
         for reference in &self.references.records {
@@ -1838,6 +1881,19 @@ impl SemanticSnapshot {
         }
 
         let mut relations = InterfaceRelationIndexes::default();
+        for (child, parents) in &extends {
+            for parent in parents {
+                relations
+                    .subclasses_by_parent
+                    .entry(*parent)
+                    .or_default()
+                    .push(*child);
+            }
+        }
+        for values in relations.subclasses_by_parent.values_mut() {
+            values.sort_by_key(|id| id.0);
+            values.dedup();
+        }
         for scope in &self.scopes.records {
             let Some(owner_name) = scope.class_name.as_deref() else {
                 continue;
@@ -6127,6 +6183,19 @@ mod tests {
     fn snapshot_imports_project_declarations_and_owner_members() {
         let (_dir, index) = fixture_index();
         let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        eprintln!(
+            "SCOPES {:?}",
+            snapshot
+                .scopes
+                .records
+                .iter()
+                .map(|s| (&s.class_name, &s.parent_class))
+                .collect::<Vec<_>>()
+        );
+        eprintln!("SYMS {:?}", snapshot.symbols_for_fqn("Base"));
+        for s in &snapshot.scopes.records {
+            eprintln!("S {:?} P {:?}", s.class_name, s.parent_class);
+        }
         let classes = snapshot.symbols_for_fqn("App\\Services\\UserService");
         assert_eq!(classes.len(), 1);
         let owner = snapshot.symbol(classes[0]).unwrap();
@@ -7675,6 +7744,25 @@ class ParentChild extends ParentBase {
     }
 
     #[test]
+    fn class_implementation_targets_include_subclass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("classes.php");
+        let text = "<?php class Base {} class Child extends Base {}";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let targets = snapshot
+            .implementation_targets_at(&path, text.find("class Base").unwrap() + 6)
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            snapshot.symbol(targets[0]).unwrap().fully_qualified_name,
+            "Child"
+        );
+    }
+
+    #[test]
     fn trait_adaptations_do_not_override_local_methods() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("override.php");
@@ -7714,6 +7802,33 @@ class ParentChild extends ParentBase {
                 MemberAccess::Instance
             ),
             MemberResolution::Resolved(alias)
+        );
+    }
+
+    #[test]
+    fn class_implementation_targets_are_direct_only_and_final_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hierarchy.php");
+        let text = "<?php abstract class Base {} class Child extends Base {} class GrandChild extends Child {} final class Done {}";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let base = snapshot
+            .implementation_targets_at(&path, text.find("Base").unwrap())
+            .unwrap();
+        assert_eq!(base.len(), 1);
+        assert_eq!(snapshot.symbol(base[0]).unwrap().name, "Child");
+        let child = snapshot
+            .implementation_targets_at(&path, text.find("Child").unwrap())
+            .unwrap();
+        assert_eq!(child.len(), 1);
+        assert_eq!(snapshot.symbol(child[0]).unwrap().name, "GrandChild");
+        assert!(
+            snapshot
+                .implementation_targets_at(&path, text.find("Done").unwrap())
+                .unwrap()
+                .is_empty()
         );
     }
 
