@@ -251,11 +251,20 @@ pub struct Scope {
     pub interfaces_extended: Vec<String>,
     /// Traits composed directly by this declaration.
     pub traits_used: Vec<String>,
+    #[serde(default)]
+    pub trait_method_aliases: Vec<TraitMethodAlias>,
     pub is_static_method: bool,
     pub imports: ImportTable,
     pub bindings: Vec<VariableBinding>,
     pub file: Option<FileId>,
     pub span: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraitMethodAlias {
+    pub trait_name: String,
+    pub method_name: String,
+    pub alias_name: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1034,6 +1043,31 @@ impl<'a> MemberResolver<'a> {
             MemberKind::Property => ProjectSymbolKind::Property,
             MemberKind::ClassConstant => ProjectSymbolKind::ClassConstant,
         };
+        if project_kind == ProjectSymbolKind::Method {
+            if let DeclaredType::Named { resolved, .. } = receiver {
+                if let Some(alias) = self
+                    .snapshot
+                    .trait_aliases_by_class
+                    .get(resolved)
+                    .and_then(|aliases| aliases.iter().find(|alias| alias.alias_name == name))
+                {
+                    let trait_ids = self.snapshot.symbols_for_fqn(&alias.trait_name);
+                    let methods = trait_ids.iter().flat_map(|id| {
+                        self.snapshot.members_named(
+                            *id,
+                            &alias.method_name,
+                            ProjectSymbolKind::Method,
+                        )
+                    });
+                    let ids: Vec<_> = methods.copied().collect();
+                    return match ids.as_slice() {
+                        [id] => MemberResolution::Resolved(*id),
+                        [] => MemberResolution::Unresolved,
+                        _ => MemberResolution::Candidates(ids),
+                    };
+                }
+            }
+        }
         let owners = self.inheritance_chain_with_depth(resolved);
         if owners.is_empty() {
             // The nominal type can be known before a lazy Composer/vendor file
@@ -1368,6 +1402,8 @@ pub struct SemanticSnapshot {
     pub interface_relations: InterfaceRelationIndexes,
     #[serde(default)]
     completion_scopes: HashMap<FileId, Vec<(usize, Option<ScopeId>)>>,
+    #[serde(default)]
+    trait_aliases_by_class: HashMap<String, Vec<TraitMethodAlias>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1401,6 +1437,7 @@ impl SemanticSnapshot {
             file_fingerprints: HashMap::new(),
             interface_relations: InterfaceRelationIndexes::default(),
             completion_scopes: HashMap::new(),
+            trait_aliases_by_class: HashMap::new(),
         }
     }
 
@@ -2828,7 +2865,17 @@ impl SemanticSnapshot {
             file_fingerprints: persisted.file_fingerprints,
             interface_relations: InterfaceRelationIndexes::default(),
             completion_scopes: HashMap::new(),
+            trait_aliases_by_class: HashMap::new(),
         };
+        for scope in &snapshot.scopes.records {
+            if let Some(class) = &scope.class_name {
+                if !scope.trait_method_aliases.is_empty() {
+                    snapshot
+                        .trait_aliases_by_class
+                        .insert(class.clone(), scope.trait_method_aliases.clone());
+                }
+            }
+        }
         snapshot.rebuild_interface_relations();
         snapshot.rebuild_completion_scopes();
         let active_symbols: HashSet<SymbolId> = snapshot
@@ -3157,6 +3204,7 @@ impl SnapshotBuilder {
             parent_class,
             interfaces_extended: Vec::new(),
             traits_used: Vec::new(),
+            trait_method_aliases: Vec::new(),
             is_static_method,
             imports: ImportTable::default(),
             bindings: Vec::new(),
@@ -3221,7 +3269,7 @@ impl SnapshotBuilder {
     }
 
     fn snapshot_view(&self) -> SemanticSnapshot {
-        SemanticSnapshot {
+        let mut snapshot = SemanticSnapshot {
             revision: self.revision,
             files: self.files.clone(),
             symbols: self.symbols.clone(),
@@ -3231,7 +3279,18 @@ impl SnapshotBuilder {
             file_fingerprints: self.file_fingerprints.clone(),
             interface_relations: InterfaceRelationIndexes::default(),
             completion_scopes: HashMap::new(),
+            trait_aliases_by_class: HashMap::new(),
+        };
+        for scope in &snapshot.scopes.records {
+            if let Some(class) = &scope.class_name {
+                if !scope.trait_method_aliases.is_empty() {
+                    snapshot
+                        .trait_aliases_by_class
+                        .insert(class.clone(), scope.trait_method_aliases.clone());
+                }
+            }
         }
+        snapshot
     }
 
     pub fn build(mut self) -> SemanticSnapshot {
@@ -3268,7 +3327,17 @@ impl SnapshotBuilder {
             file_fingerprints: self.file_fingerprints,
             interface_relations: InterfaceRelationIndexes::default(),
             completion_scopes: HashMap::new(),
+            trait_aliases_by_class: HashMap::new(),
         };
+        for scope in &snapshot.scopes.records {
+            if let Some(class) = &scope.class_name {
+                if !scope.trait_method_aliases.is_empty() {
+                    snapshot
+                        .trait_aliases_by_class
+                        .insert(class.clone(), scope.trait_method_aliases.clone());
+                }
+            }
+        }
         snapshot.rebuild_interface_relations();
         snapshot.rebuild_completion_scopes();
         snapshot
@@ -3774,6 +3843,7 @@ fn collect_trait_names(
             .unwrap_or_default()
             .split(',')
             .map(str::trim)
+            .map(|name| name.split('{').next().unwrap_or(name).trim())
             .filter(|name| !name.is_empty())
         {
             output.push(resolve_builder_name(
@@ -3793,6 +3863,52 @@ fn collect_trait_names(
     }
     for child in node.named_children(&mut node.walk()) {
         collect_trait_names(builder, child, scope, text, output);
+    }
+}
+
+fn collect_trait_method_aliases(
+    builder: &SnapshotBuilder,
+    node: tree_sitter::Node<'_>,
+    scope: ScopeId,
+    text: &str,
+    output: &mut Vec<TraitMethodAlias>,
+) {
+    if node.kind() == "use_as_clause" {
+        let Some(access) = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "class_constant_access_expression")
+        else {
+            return;
+        };
+        let mut access_cursor = access.walk();
+        let mut parts = access.named_children(&mut access_cursor);
+        let Some(trait_node) = parts.next() else {
+            return;
+        };
+        let Some(method_node) = parts.next() else {
+            return;
+        };
+        let alias = node
+            .named_children(&mut node.walk())
+            .filter(|child| child.kind() == "name")
+            .filter(|child| child.start_byte() > access.end_byte())
+            .last();
+        if let Some(alias) = alias {
+            output.push(TraitMethodAlias {
+                trait_name: resolve_builder_name(
+                    builder,
+                    scope,
+                    node_text(trait_node, text),
+                    ImportKind::Class,
+                ),
+                method_name: node_text(method_node, text).to_owned(),
+                alias_name: node_text(alias, text).to_owned(),
+            });
+        }
+        return;
+    }
+    for child in node.named_children(&mut node.walk()) {
+        collect_trait_method_aliases(builder, child, scope, text, output);
     }
 }
 
@@ -3906,6 +4022,9 @@ fn extract_scopes(
                     );
                 }
                 builder.scopes.records[child.0 as usize].traits_used = traits;
+                let mut aliases = Vec::new();
+                collect_trait_method_aliases(builder, node, scope, text, &mut aliases);
+                builder.scopes.records[child.0 as usize].trait_method_aliases = aliases;
             }
             mark_scope(builder, child, node);
             for child_node in node.named_children(&mut node.walk()) {
@@ -7327,6 +7446,54 @@ class ParentChild extends ParentBase {
         assert_eq!(
             snapshot.symbol(targets[0]).unwrap().fully_qualified_name,
             "User"
+        );
+    }
+
+    #[test]
+    fn trait_method_alias_resolves_to_source_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alias.php");
+        let text = "<?php trait HasUuid { public function uuid(): string {} } class User { use HasUuid { HasUuid::uuid as uuidAlias; } } function run(User $user): void { $user->uuidAlias(); }";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let method = snapshot.members_named(
+            snapshot.symbols_for_fqn("HasUuid")[0],
+            "uuid",
+            ProjectSymbolKind::Method,
+        )[0];
+        let user_scope = snapshot
+            .scopes
+            .records
+            .iter()
+            .find(|scope| scope.class_name.as_deref() == Some("User"))
+            .unwrap()
+            .id;
+        assert_eq!(
+            snapshot.member_resolver().resolve_method(
+                user_scope,
+                &DeclaredType::Named {
+                    written: "User".into(),
+                    resolved: "User".into()
+                },
+                "uuidAlias",
+                MemberAccess::Instance
+            ),
+            MemberResolution::Resolved(method)
+        );
+        let file_id = snapshot
+            .file_id(&PersistentFileKey::workspace(&path))
+            .unwrap();
+        assert!(
+            snapshot
+                .references_for_file(file_id)
+                .iter()
+                .filter_map(|id| snapshot.reference(*id))
+                .any(
+                    |reference| reference.target == ReferenceTarget::Resolved(method)
+                        && reference.role == ReferenceRole::MethodCall
+                )
         );
     }
 
