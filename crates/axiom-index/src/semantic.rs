@@ -1353,6 +1353,7 @@ pub struct InterfaceRelationIndexes {
     direct_implementers_by_interface: HashMap<SymbolId, Vec<SymbolId>>,
     implementers_by_interface: HashMap<SymbolId, Vec<SymbolId>>,
     method_implementations_by_interface_method: HashMap<SymbolId, Vec<SymbolId>>,
+    trait_consumers_by_trait: HashMap<SymbolId, Vec<SymbolId>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1647,6 +1648,12 @@ impl SemanticSnapshot {
         let declaration = self.symbol(symbol)?;
         let candidates = match declaration.kind {
             ProjectSymbolKind::Interface => self.implementers_of(symbol),
+            ProjectSymbolKind::Trait => self
+                .interface_relations
+                .trait_consumers_by_trait
+                .get(&symbol)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
             ProjectSymbolKind::Method
                 if declaration
                     .owner
@@ -1704,6 +1711,41 @@ impl SemanticSnapshot {
         }
 
         let mut relations = InterfaceRelationIndexes::default();
+        for scope in &self.scopes.records {
+            let Some(owner_name) = scope.class_name.as_deref() else {
+                continue;
+            };
+            if !matches!(scope.kind, ScopeKind::Class | ScopeKind::Enum) {
+                continue;
+            }
+            let Some(owner) = self.symbols_for_fqn(owner_name).iter().copied().find(|id| {
+                self.symbol(*id).is_some_and(|s| {
+                    matches!(s.kind, ProjectSymbolKind::Class | ProjectSymbolKind::Enum)
+                        && scope.file.is_some_and(|file| {
+                            self.files
+                                .records
+                                .get(file.0 as usize)
+                                .is_some_and(|record| record.symbols.contains(id))
+                        })
+                })
+            }) else {
+                continue;
+            };
+            for trait_name in &scope.traits_used {
+                if let Some(trait_id) =
+                    self.symbols_for_fqn(trait_name).iter().copied().find(|id| {
+                        self.symbol(*id)
+                            .is_some_and(|s| s.kind == ProjectSymbolKind::Trait)
+                    })
+                {
+                    relations
+                        .trait_consumers_by_trait
+                        .entry(trait_id)
+                        .or_default()
+                        .push(owner);
+                }
+            }
+        }
         for (&class, interfaces) in &implements {
             if self.symbol(class).is_none_or(|symbol| {
                 !matches!(
@@ -1778,6 +1820,10 @@ impl SemanticSnapshot {
                     .cmp(&self.symbol(*right).map(|s| s.fully_qualified_name.as_str()))
                     .then(left.0.cmp(&right.0))
             });
+            values.dedup();
+        }
+        for values in relations.trait_consumers_by_trait.values_mut() {
+            values.sort_by_key(|id| id.0);
             values.dedup();
         }
 
@@ -7221,6 +7267,47 @@ class ParentChild extends ParentBase {
             candidate.location.file,
             fs::canonicalize(dir.path().join("A.php")).unwrap()
         );
+    }
+
+    #[test]
+    fn trait_consumers_are_resident_and_incremental() {
+        let dir = tempfile::tempdir().unwrap();
+        let trait_file = dir.path().join("Trait.php");
+        let user_file = dir.path().join("User.php");
+        fs::write(&trait_file, "<?php namespace App\\Traits; trait HasUuid {}").unwrap();
+        fs::write(&user_file, "<?php namespace App\\Models; use App\\Traits\\HasUuid as UuidTrait; class User { use UuidTrait; } class Child extends User {}").unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let trait_id = snapshot.symbols_for_fqn("App\\Traits\\HasUuid")[0];
+        let targets = snapshot
+            .implementation_targets_at(
+                &trait_file,
+                "<?php namespace App\\Traits; trait HasUuid"
+                    .find("HasUuid")
+                    .unwrap()
+                    + 1,
+            )
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            snapshot.symbol(targets[0]).unwrap().fully_qualified_name,
+            "App\\Models\\User"
+        );
+        let mut builder = SnapshotBuilder::from_snapshot(&snapshot);
+        builder.replace_workspace_file(
+            &user_file,
+            "<?php namespace App\\Models; class User {} class Child extends User {}".to_owned(),
+        );
+        let changed = builder.finish();
+        let remaining: Vec<_> = changed
+            .implementation_targets_at(&trait_file, 40)
+            .unwrap()
+            .iter()
+            .filter_map(|id| changed.symbol(*id).map(|s| s.fully_qualified_name.clone()))
+            .collect();
+        assert!(remaining.is_empty(), "stale trait consumers: {remaining:?}");
+        assert!(changed.symbol(trait_id).is_some());
     }
 
     #[test]

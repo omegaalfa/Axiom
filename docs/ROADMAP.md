@@ -53,3 +53,6 @@ As capacidades acima são implementadas em `crates/axiom-app/src/workspace_view.
 ## Atualização de fase
 
 Safe Rename local foi removido. LocalBindingId, Find Usages local e completion de variáveis permanecem preservados. Próxima etapa recomendada: File Structure baseada em snapshots e índices residentes; reavaliar Safe Rename somente após estabilizar identidade e escopo.
+## AtualizaÃ§Ã£o 2026-09-13
+
+File Structure / Outline estÃ¡ concluÃ­do com snapshot semÃ¢ntico, navegaÃ§Ã£o por teclado/mouse, caret colapsado, reveal centralizado e destaque transitÃ³rio. PrÃ³xima etapa: ampliar References/Find Usages e Go to Implementation em casos ambÃ­guos.

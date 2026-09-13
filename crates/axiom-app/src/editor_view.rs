@@ -1383,8 +1383,7 @@ impl EditorView {
                 // Navigation is a collapsed caret, not an IME composition.
                 // Windows suppresses action dispatch while marked text exists.
                 self.marked_range = None;
-                self.move_to(range.start, cx);
-                self.navigation_highlight_line = Some(self.document.line_of_offset(range.start));
+                self.navigate_to_offset(range.start, cx);
             }
         }
         self.outline_popup = None;
@@ -1801,6 +1800,16 @@ impl EditorView {
         self.selection_anchor = None;
         self.preferred_x = None;
         self.ensure_cursor_visible();
+        cx.notify();
+    }
+
+    /// Applies the common visual state for an explicit semantic navigation.
+    /// Resolution and stale guards remain owned by the caller.
+    fn navigate_to_offset(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.marked_range = None;
+        let offset = offset.min(self.document.len());
+        self.move_to(offset, cx);
+        self.navigation_highlight_line = Some(self.document.line_of_offset(offset));
         cx.notify();
     }
 
@@ -4114,7 +4123,7 @@ impl EditorView {
             .map(|lsp| lsp.encoding())
             .unwrap_or_default();
         let offset = PositionCodec::position_to_offset(&text, position, encoding);
-        self.move_to(offset, cx);
+        self.navigate_to_offset(offset, cx);
     }
 
     fn mouse_offset(&self, line: usize, x: Pixels, window: &mut Window) -> usize {

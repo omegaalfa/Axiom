@@ -49,3 +49,6 @@ O estado descrito é baseado nos fluxos em `workspace_view.rs`, `editor_view.rs`
 ## Atualização de fase
 
 Safe Rename local foi removido. LocalBindingId e Find Usages local permanecem preservados. Próxima etapa recomendada: File Structure baseada no snapshot atual; reavaliar Safe Rename após estabilizar identidade e escopo.
+## AtualizaÃ§Ã£o 2026-09-13
+
+File Structure / Outline estÃ¡ concluÃ­do com snapshot semÃ¢ntico, caret colapsado, reveal centralizado e destaque transitÃ³rio. PrÃ³xima etapa: ampliar References/Find Usages e Go to Implementation em casos ambÃ­guos.
