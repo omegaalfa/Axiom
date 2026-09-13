@@ -253,6 +253,8 @@ pub struct Scope {
     pub traits_used: Vec<String>,
     #[serde(default)]
     pub trait_method_aliases: Vec<TraitMethodAlias>,
+    #[serde(default)]
+    pub trait_method_precedence: Vec<TraitMethodPrecedence>,
     pub is_static_method: bool,
     pub imports: ImportTable,
     pub bindings: Vec<VariableBinding>,
@@ -265,6 +267,13 @@ pub struct TraitMethodAlias {
     pub trait_name: String,
     pub method_name: String,
     pub alias_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraitMethodPrecedence {
+    pub method_name: String,
+    pub preferred_trait: String,
+    pub excluded_traits: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1044,6 +1053,51 @@ impl<'a> MemberResolver<'a> {
             MemberKind::ClassConstant => ProjectSymbolKind::ClassConstant,
         };
         if project_kind == ProjectSymbolKind::Method {
+            // A method declared directly on the receiver class shadows every
+            // trait adaptation, alias, and inherited declaration.
+            let direct: Vec<_> = self
+                .snapshot
+                .symbols_for_fqn(resolved)
+                .iter()
+                .flat_map(|id| self.snapshot.members_named(*id, name, project_kind))
+                .copied()
+                .collect();
+            if let [id] = direct.as_slice() {
+                if let Some(symbol) = self.snapshot.symbol(*id) {
+                    let is_static = symbol.modifiers.iter().any(|modifier| modifier == "static");
+                    if matches!(
+                        (access, is_static),
+                        (MemberAccess::Instance, true) | (MemberAccess::Static, false)
+                    ) {
+                        return MemberResolution::Incompatible(*id);
+                    }
+                    return if self.is_accessible(scope, symbol) {
+                        MemberResolution::Resolved(*id)
+                    } else {
+                        MemberResolution::ResolvedButInaccessible(*id)
+                    };
+                }
+            }
+            if let Some(rule) = self
+                .snapshot
+                .trait_precedence_by_class
+                .get(resolved)
+                .and_then(|rules| rules.iter().find(|r| r.method_name == name))
+            {
+                let ids = self
+                    .snapshot
+                    .symbols_for_fqn(&rule.preferred_trait)
+                    .iter()
+                    .flat_map(|id| {
+                        self.snapshot
+                            .members_named(*id, name, ProjectSymbolKind::Method)
+                    })
+                    .copied()
+                    .collect::<Vec<_>>();
+                if let [id] = ids.as_slice() {
+                    return MemberResolution::Resolved(*id);
+                }
+            }
             if let DeclaredType::Named { resolved, .. } = receiver {
                 if let Some(alias) = self
                     .snapshot
@@ -1404,6 +1458,8 @@ pub struct SemanticSnapshot {
     completion_scopes: HashMap<FileId, Vec<(usize, Option<ScopeId>)>>,
     #[serde(default)]
     trait_aliases_by_class: HashMap<String, Vec<TraitMethodAlias>>,
+    #[serde(default)]
+    trait_precedence_by_class: HashMap<String, Vec<TraitMethodPrecedence>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1426,6 +1482,22 @@ impl Default for SemanticSnapshot {
 }
 
 impl SemanticSnapshot {
+    fn rebuild_trait_adaptations(&mut self) {
+        self.trait_aliases_by_class.clear();
+        self.trait_precedence_by_class.clear();
+        for scope in &self.scopes.records {
+            if let Some(class) = &scope.class_name {
+                if !scope.trait_method_aliases.is_empty() {
+                    self.trait_aliases_by_class
+                        .insert(class.clone(), scope.trait_method_aliases.clone());
+                }
+                if !scope.trait_method_precedence.is_empty() {
+                    self.trait_precedence_by_class
+                        .insert(class.clone(), scope.trait_method_precedence.clone());
+                }
+            }
+        }
+    }
     pub fn empty(revision: SemanticRevision) -> Self {
         Self {
             revision,
@@ -1438,6 +1510,7 @@ impl SemanticSnapshot {
             interface_relations: InterfaceRelationIndexes::default(),
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
+            trait_precedence_by_class: HashMap::new(),
         }
     }
 
@@ -2866,6 +2939,7 @@ impl SemanticSnapshot {
             interface_relations: InterfaceRelationIndexes::default(),
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
+            trait_precedence_by_class: HashMap::new(),
         };
         for scope in &snapshot.scopes.records {
             if let Some(class) = &scope.class_name {
@@ -2874,8 +2948,14 @@ impl SemanticSnapshot {
                         .trait_aliases_by_class
                         .insert(class.clone(), scope.trait_method_aliases.clone());
                 }
+                if !scope.trait_method_precedence.is_empty() {
+                    snapshot
+                        .trait_precedence_by_class
+                        .insert(class.clone(), scope.trait_method_precedence.clone());
+                }
             }
         }
+        snapshot.rebuild_trait_adaptations();
         snapshot.rebuild_interface_relations();
         snapshot.rebuild_completion_scopes();
         let active_symbols: HashSet<SymbolId> = snapshot
@@ -3205,6 +3285,7 @@ impl SnapshotBuilder {
             interfaces_extended: Vec::new(),
             traits_used: Vec::new(),
             trait_method_aliases: Vec::new(),
+            trait_method_precedence: Vec::new(),
             is_static_method,
             imports: ImportTable::default(),
             bindings: Vec::new(),
@@ -3280,6 +3361,7 @@ impl SnapshotBuilder {
             interface_relations: InterfaceRelationIndexes::default(),
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
+            trait_precedence_by_class: HashMap::new(),
         };
         for scope in &snapshot.scopes.records {
             if let Some(class) = &scope.class_name {
@@ -3328,6 +3410,7 @@ impl SnapshotBuilder {
             interface_relations: InterfaceRelationIndexes::default(),
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
+            trait_precedence_by_class: HashMap::new(),
         };
         for scope in &snapshot.scopes.records {
             if let Some(class) = &scope.class_name {
@@ -3338,6 +3421,7 @@ impl SnapshotBuilder {
                 }
             }
         }
+        snapshot.rebuild_trait_adaptations();
         snapshot.rebuild_interface_relations();
         snapshot.rebuild_completion_scopes();
         snapshot
@@ -3912,6 +3996,56 @@ fn collect_trait_method_aliases(
     }
 }
 
+fn collect_trait_method_precedence(
+    builder: &SnapshotBuilder,
+    node: tree_sitter::Node<'_>,
+    scope: ScopeId,
+    text: &str,
+    output: &mut Vec<TraitMethodPrecedence>,
+) {
+    if node.kind() == "use_instead_of_clause" {
+        let mut access = None;
+        let mut names = Vec::new();
+        for child in node.named_children(&mut node.walk()) {
+            if child.kind() == "class_constant_access_expression" {
+                access = Some(child);
+            } else if child.kind() == "name" {
+                names.push(child);
+            }
+        }
+        if let Some(access) = access {
+            let mut cursor = access.walk();
+            let mut parts = access.named_children(&mut cursor);
+            if let (Some(trait_node), Some(method_node)) = (parts.next(), parts.next()) {
+                output.push(TraitMethodPrecedence {
+                    preferred_trait: resolve_builder_name(
+                        builder,
+                        scope,
+                        node_text(trait_node, text),
+                        ImportKind::Class,
+                    ),
+                    method_name: node_text(method_node, text).to_owned(),
+                    excluded_traits: names
+                        .into_iter()
+                        .map(|n| {
+                            resolve_builder_name(
+                                builder,
+                                scope,
+                                node_text(n, text),
+                                ImportKind::Class,
+                            )
+                        })
+                        .collect(),
+                });
+            }
+        }
+        return;
+    }
+    for child in node.named_children(&mut node.walk()) {
+        collect_trait_method_precedence(builder, child, scope, text, output);
+    }
+}
+
 fn extract_scopes(
     builder: &mut SnapshotBuilder,
     node: tree_sitter::Node<'_>,
@@ -4025,6 +4159,9 @@ fn extract_scopes(
                 let mut aliases = Vec::new();
                 collect_trait_method_aliases(builder, node, scope, text, &mut aliases);
                 builder.scopes.records[child.0 as usize].trait_method_aliases = aliases;
+                let mut precedence = Vec::new();
+                collect_trait_method_precedence(builder, node, scope, text, &mut precedence);
+                builder.scopes.records[child.0 as usize].trait_method_precedence = precedence;
             }
             mark_scope(builder, child, node);
             for child_node in node.named_children(&mut node.walk()) {
@@ -7494,6 +7631,84 @@ class ParentChild extends ParentBase {
                     |reference| reference.target == ReferenceTarget::Resolved(method)
                         && reference.role == ReferenceRole::MethodCall
                 )
+        );
+    }
+
+    #[test]
+    fn trait_method_insteadof_prefers_declared_trait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("precedence.php");
+        let text = "<?php trait A { function foo() {} } trait B { function foo() {} } class C { use A, B { A::foo insteadof B; } } function run(C $c) { $c->foo(); }";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let c_scope = snapshot
+            .scopes
+            .records
+            .iter()
+            .find(|s| s.class_name.as_deref() == Some("C"))
+            .unwrap()
+            .id;
+        let aid = snapshot.members_named(
+            snapshot.symbols_for_fqn("A")[0],
+            "foo",
+            ProjectSymbolKind::Method,
+        )[0];
+        assert_eq!(
+            snapshot.member_resolver().resolve_method(
+                c_scope,
+                &DeclaredType::Named {
+                    written: "C".into(),
+                    resolved: "C".into()
+                },
+                "foo",
+                MemberAccess::Instance
+            ),
+            MemberResolution::Resolved(aid)
+        );
+    }
+
+    #[test]
+    fn trait_adaptations_do_not_override_local_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("override.php");
+        let text = "<?php trait A { function foo() {} } trait B { function foo() {} } class C { use A, B { A::foo insteadof B; B::foo as fooFromB; } function foo() {} function fooFromB() {} } function run(C $c) { $c->foo(); $c->fooFromB(); }";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let scope = snapshot
+            .scopes
+            .records
+            .iter()
+            .find(|s| s.class_name.as_deref() == Some("C"))
+            .unwrap()
+            .id;
+        let cid = snapshot.symbols_for_fqn("C")[0];
+        let foo = snapshot.members_named(cid, "foo", ProjectSymbolKind::Method)[0];
+        let alias = snapshot.members_named(cid, "fooFromB", ProjectSymbolKind::Method)[0];
+        let receiver = DeclaredType::Named {
+            written: "C".into(),
+            resolved: "C".into(),
+        };
+        assert_eq!(
+            snapshot.member_resolver().resolve_method(
+                scope,
+                &receiver,
+                "foo",
+                MemberAccess::Instance
+            ),
+            MemberResolution::Resolved(foo)
+        );
+        assert_eq!(
+            snapshot.member_resolver().resolve_method(
+                scope,
+                &receiver,
+                "fooFromB",
+                MemberAccess::Instance
+            ),
+            MemberResolution::Resolved(alias)
         );
     }
 

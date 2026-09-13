@@ -1,16 +1,76 @@
 <?php
-use Fiber;
-use ArrayIterator;
-use AxiomTest\CustomRuntime;
-use AxiomSPLTeste\ArrayIterator;
 
+declare(strict_types=1);
 
-$service = new UserService();
-$service->findByEmail('a@test.com');
+namespace Probe\TraitsA {
 
-$array = CustomRuntime::hello($name, $age);
+    trait ConflictA
+    {
+        public function label(): string
+        {
+            return 'A';
+        }
+    }
+}
 
-$teste = CustomRuntime::hello($name, $age);
-$teste = new CustomRuntime();
+namespace Probe\TraitsB {
 
-$teste = ArrayIterator::current();
+    trait ConflictB
+    {
+        public function label(): string
+        {
+            return 'B';
+        }
+    }
+}
+
+namespace Probe\Models {
+
+    use Probe\TraitsA\ConflictA as TraitA;
+    use Probe\TraitsB\ConflictB as TraitB;
+
+    class Consumer
+    {
+        use TraitA, TraitB {
+            TraitA::label insteadof TraitB;
+            TraitB::label as labelFromB;
+        }
+    }
+
+    class OverrideConsumer
+    {
+        use TraitA, TraitB {
+            TraitA::label insteadof TraitB;
+            TraitB::label as labelFromB;
+        }
+
+        public function label(): string
+        {
+            return 'local';
+        }
+
+        public function labelFromB(): string
+        {
+            return 'local-b';
+        }
+    }
+}
+
+namespace Probe\Usage {
+
+    use Probe\Models\Consumer;
+    use Probe\Models\OverrideConsumer;
+
+    function exercise(): void
+    {
+        $consumer = new Consumer();
+
+        $consumer->label();
+        $consumer->labelFromB();
+
+        $override = new OverrideConsumer();
+
+        $override->label();
+        $override->labelFromB();
+    }
+}
