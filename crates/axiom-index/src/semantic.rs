@@ -1658,9 +1658,26 @@ impl SemanticSnapshot {
                 if declaration
                     .owner
                     .and_then(|owner| self.symbol(owner))
-                    .is_some_and(|owner| owner.kind == ProjectSymbolKind::Interface) =>
+                    .is_some_and(|owner| {
+                        matches!(
+                            owner.kind,
+                            ProjectSymbolKind::Interface | ProjectSymbolKind::Trait
+                        )
+                    }) =>
             {
-                self.implementations_of(symbol)
+                let owner = declaration.owner.unwrap();
+                if self
+                    .symbol(owner)
+                    .is_some_and(|owner| owner.kind == ProjectSymbolKind::Trait)
+                {
+                    self.interface_relations
+                        .trait_consumers_by_trait
+                        .get(&owner)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[])
+                } else {
+                    self.implementations_of(symbol)
+                }
             }
             _ => return None,
         };
@@ -7271,6 +7288,45 @@ class ParentChild extends ParentBase {
         assert_eq!(
             candidate.location.file,
             fs::canonicalize(dir.path().join("A.php")).unwrap()
+        );
+    }
+
+    #[test]
+    fn trait_method_calls_resolve_to_original_trait_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trait_method.php");
+        let text = "<?php trait HasUuid { public function uuid(): string { return 'x'; } } class User { use HasUuid; } function run(User $user): void { $user->uuid(); }";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let method = snapshot.members_named(
+            snapshot.symbols_for_fqn("HasUuid")[0],
+            "uuid",
+            ProjectSymbolKind::Method,
+        )[0];
+        let call = text.rfind("uuid").unwrap() + 1;
+        let result = snapshot.find_usages_at(&path, call, FindUsagesOptions::default());
+        assert!(result.usages.iter().any(|usage| usage.span.contains(&call)));
+        assert!(
+            snapshot
+                .references_for_file(
+                    snapshot
+                        .file_id(&PersistentFileKey::workspace(&path))
+                        .unwrap()
+                )
+                .iter()
+                .filter_map(|id| snapshot.reference(*id))
+                .any(|reference| reference.target == ReferenceTarget::Resolved(method))
+        );
+        let method_offset = text.find("function uuid").unwrap() + 10;
+        let targets = snapshot
+            .implementation_targets_at(&path, method_offset)
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            snapshot.symbol(targets[0]).unwrap().fully_qualified_name,
+            "User"
         );
     }
 
