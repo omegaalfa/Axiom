@@ -257,6 +257,7 @@ pub struct EditorView {
     selection_anchor: Option<usize>,
     preferred_x: Option<Pixels>,
     marked_range: Option<Range<usize>>,
+    navigation_highlight_line: Option<usize>,
     selecting: bool,
     file_path: PathBuf,
     status: Option<SharedString>,
@@ -1155,6 +1156,7 @@ impl EditorView {
             selection_anchor: None,
             preferred_x: None,
             marked_range: None,
+            navigation_highlight_line: None,
             selecting: false,
             file_path: path.clone(),
             status: None,
@@ -1382,6 +1384,7 @@ impl EditorView {
                 // Windows suppresses action dispatch while marked text exists.
                 self.marked_range = None;
                 self.move_to(range.start, cx);
+                self.navigation_highlight_line = Some(self.document.line_of_offset(range.start));
             }
         }
         self.outline_popup = None;
@@ -1792,6 +1795,7 @@ impl EditorView {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.navigation_highlight_line = None;
         self.reset_caret_blink(cx);
         self.document.move_cursor(offset);
         self.selection_anchor = None;
@@ -4595,7 +4599,9 @@ impl EditorView {
             .text_size(px(FONT_SIZE))
             .font_family(CODE_FONT_FAMILY)
             .text_color(t.text_primary)
-            .bg(if cursor_here {
+            .bg(if self.navigation_highlight_line == Some(line) {
+                t.inactive_selection
+            } else if cursor_here {
                 t.active_line
             } else {
                 t.editor_background
@@ -7015,6 +7021,10 @@ mod formatter_tests {
                     );
                     assert!(editor.focus.is_focused(window));
                     assert!(editor.outline_popup.is_none());
+                    assert_eq!(
+                        editor.navigation_highlight_line,
+                        Some(editor.document.line_of_offset(target.start))
+                    );
                 })
             });
             cx.simulate_keystrokes("down");
