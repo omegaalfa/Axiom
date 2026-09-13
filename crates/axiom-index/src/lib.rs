@@ -1441,12 +1441,19 @@ fn walk(
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() == "namespace_definition" {
-                current_namespace = child
-                    .child_by_field_name("name")
-                    .and_then(|name| name.utf8_text(text.as_bytes()).ok())
-                    .unwrap_or("")
-                    .trim_matches('\\')
-                    .to_owned();
+                if child.child_by_field_name("body").is_some() {
+                    // Bracketed namespaces own their declarations in a body.
+                    walk(child, text, file, namespace, class, out, source);
+                } else {
+                    // Unbracketed namespaces keep the program-level lexical
+                    // traversal used by the existing indexer.
+                    current_namespace = child
+                        .child_by_field_name("name")
+                        .and_then(|name| name.utf8_text(text.as_bytes()).ok())
+                        .unwrap_or("")
+                        .trim_matches('\\')
+                        .to_owned();
+                }
             } else {
                 walk(child, text, file, &current_namespace, class, out, source);
             }

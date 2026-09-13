@@ -1823,7 +1823,12 @@ impl SemanticSnapshot {
             values.dedup();
         }
         for values in relations.trait_consumers_by_trait.values_mut() {
-            values.sort_by_key(|id| id.0);
+            values.sort_by(|left, right| {
+                self.symbol(*left)
+                    .map(|s| s.fully_qualified_name.as_str())
+                    .cmp(&self.symbol(*right).map(|s| s.fully_qualified_name.as_str()))
+                    .then(left.0.cmp(&right.0))
+            });
             values.dedup();
         }
 
@@ -7266,6 +7271,93 @@ class ParentChild extends ParentBase {
         assert_eq!(
             candidate.location.file,
             fs::canonicalize(dir.path().join("A.php")).unwrap()
+        );
+    }
+
+    #[test]
+    fn trait_consumers_keep_distinct_symbols_and_name_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("traits.php");
+        let text = "<?php namespace App; trait HasUuid {} trait Auditable {} class User { use HasUuid; } class Order { use HasUuid, Auditable; }";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let uuid = snapshot.symbols_for_fqn("App\\HasUuid")[0];
+        let audit = snapshot.symbols_for_fqn("App\\Auditable")[0];
+        let uuid_targets = snapshot
+            .implementation_targets_at(&path, text.find("trait HasUuid").unwrap() + 7)
+            .unwrap();
+        let audit_targets = snapshot
+            .implementation_targets_at(&path, text.find("trait Auditable").unwrap() + 7)
+            .unwrap();
+        let names = |ids: &[SymbolId]| {
+            ids.iter()
+                .map(|id| snapshot.symbol(*id).unwrap().fully_qualified_name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&uuid_targets), vec!["App\\Order", "App\\User"]);
+        assert_eq!(names(&audit_targets), vec!["App\\Order"]);
+        assert_eq!(
+            snapshot.symbol(uuid).unwrap().range,
+            text.find("HasUuid").unwrap()..text.find("HasUuid").unwrap() + 7
+        );
+        assert_eq!(
+            snapshot.symbol(audit).unwrap().range,
+            text.find("Auditable").unwrap()..text.find("Auditable").unwrap() + 9
+        );
+        assert_ne!(
+            snapshot.symbol(uuid_targets[0]).unwrap().range,
+            snapshot.symbol(uuid_targets[1]).unwrap().range
+        );
+    }
+
+    #[test]
+    fn bracketed_namespace_trait_import_and_use_resolve_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("probe.php");
+        let text = r#"<?php
+namespace Probe\TraitsA { trait HasUuid {} }
+namespace Probe\Models { use Probe\TraitsA\HasUuid; class User { use HasUuid; } }
+"#;
+        fs::write(&file, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let trait_id = snapshot.symbols_for_fqn("Probe\\TraitsA\\HasUuid")[0];
+        let use_offset = text.rfind("use HasUuid").unwrap() + 4;
+        let usages = snapshot.find_usages_at(&file, use_offset, FindUsagesOptions::default());
+        assert!(
+            usages
+                .usages
+                .iter()
+                .any(|usage| usage.span.contains(&use_offset))
+        );
+        let declaration_offset = text.find("trait HasUuid").unwrap() + 7;
+        let targets = snapshot
+            .implementation_targets_at(&file, declaration_offset)
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            snapshot.symbol(targets[0]).unwrap().fully_qualified_name,
+            "Probe\\Models\\User"
+        );
+        assert!(
+            usages
+                .usages
+                .iter()
+                .any(|usage| usage.role == ReferenceRole::TraitUse)
+        );
+        assert!(
+            snapshot
+                .references_for_file(
+                    snapshot
+                        .file_id(&PersistentFileKey::workspace(&file))
+                        .unwrap()
+                )
+                .iter()
+                .filter_map(|id| snapshot.reference(*id))
+                .any(|reference| reference.target == ReferenceTarget::Resolved(trait_id))
         );
     }
 
