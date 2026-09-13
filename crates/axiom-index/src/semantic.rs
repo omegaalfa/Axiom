@@ -3370,6 +3370,11 @@ impl SnapshotBuilder {
                         .trait_aliases_by_class
                         .insert(class.clone(), scope.trait_method_aliases.clone());
                 }
+                if !scope.trait_method_precedence.is_empty() {
+                    snapshot
+                        .trait_precedence_by_class
+                        .insert(class.clone(), scope.trait_method_precedence.clone());
+                }
             }
         }
         snapshot
