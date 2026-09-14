@@ -991,15 +991,26 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
                 continue;
             }
             let method_name = name.utf8_text(input.text.as_bytes()).unwrap_or("");
-            if !matches!(
+            let resolved = snapshot.member_resolver().resolve_method(
+                scope,
+                &receiver,
+                method_name,
+                MemberAccess::Instance,
+            );
+            let dynamic = matches!(
                 snapshot.member_resolver().resolve_method(
                     scope,
                     &receiver,
-                    method_name,
+                    "__call",
                     MemberAccess::Instance
                 ),
-                MemberResolution::Resolved(_)
-            ) {
+                MemberResolution::Resolved(_) | MemberResolution::ResolvedButInaccessible(_)
+            );
+            if !matches!(
+                resolved,
+                MemberResolution::Resolved(_) | MemberResolution::ResolvedButInaccessible(_)
+            ) && !dynamic
+            {
                 out.push(ByteDiagnostic {
                     range: name.start_byte()..name.end_byte(),
                     severity: Some(DiagnosticSeverity::ERROR),
@@ -8498,6 +8509,89 @@ mod diagnostic_store_tests {
             "<?php namespace Probe; class Service { public function run(): void {} } $service = new \\Probe\\Service(); $service->run();",
         );
         assert!(!diagnostics.iter().any(|d| d.message.contains("run")));
+    }
+
+    #[test]
+    fn trait_method_suppresses_unknown_method() {
+        assert!(method_fixture("<?php trait Runnable { function run() {} } class Service { use Runnable; } $service = new Service(); $service->run();").iter().all(|d| !d.message.contains("run")));
+    }
+    #[test]
+    fn trait_alias_suppresses_unknown_method() {
+        assert!(method_fixture("<?php trait RunnerTrait { function execute() {} } class Service { use RunnerTrait { RunnerTrait::execute as run; } } $service = new Service(); $service->run();").iter().all(|d| !d.message.contains("run")));
+    }
+    #[test]
+    fn trait_insteadof_suppresses_unknown_method() {
+        assert!(method_fixture("<?php trait A { function run() {} } trait B { function run() {} } class Service { use A, B { A::run insteadof B; } } $service = new Service(); $service->run();").iter().all(|d| !d.message.contains("run")));
+    }
+    #[test]
+    fn unknown_receiver_does_not_report_unknown_method() {
+        assert!(
+            method_fixture("<?php function test($value): void { $value->run(); }")
+                .iter()
+                .all(|d| !d.message.contains("run"))
+        );
+    }
+    #[test]
+    fn mixed_receiver_does_not_report_unknown_method() {
+        assert!(
+            method_fixture("<?php function test(mixed $value): void { $value->run(); }")
+                .iter()
+                .all(|d| !d.message.contains("run"))
+        );
+    }
+    #[test]
+    fn nullable_receiver_does_not_report_unknown_method() {
+        assert!(
+            method_fixture(
+                "<?php class Service {} function test(?Service $value): void { $value->run(); }"
+            )
+            .iter()
+            .all(|d| !d.message.contains("run"))
+        );
+    }
+    #[test]
+    fn magic_call_suppresses_unknown_method() {
+        assert!(method_fixture("<?php class DynamicService { function __call(string $name, array $arguments): mixed {} } $service = new DynamicService(); $service->anything();").iter().all(|d| !d.message.contains("anything")));
+    }
+    #[test]
+    fn inherited_magic_call_suppresses_unknown_method() {
+        assert!(method_fixture("<?php class DynamicBase { function __call(string $name, array $arguments): mixed {} } class Service extends DynamicBase {} $service = new Service(); $service->anything();").iter().all(|d| !d.message.contains("anything")));
+    }
+    #[test]
+    fn local_override_precedes_inherited_method_for_unknown_method() {
+        assert!(method_fixture("<?php class BaseService { function run() {} } class Service extends BaseService { function run() {} } $service = new Service(); $service->run();").iter().all(|d| !d.message.contains("run")));
+    }
+    #[test]
+    fn multi_level_inherited_method_suppresses_unknown_method() {
+        assert!(method_fixture("<?php class GrandParentService { function run() {} } class BaseService extends GrandParentService {} class Service extends BaseService {} $service = new Service(); $service->run();").iter().all(|d| !d.message.contains("run")));
+    }
+    #[test]
+    fn fully_qualified_receiver_unknown_method() {
+        let d = method_fixture(
+            "<?php namespace Probe\\Models; class Service {} $service = new \\Probe\\Models\\Service(); $service->run();",
+        );
+        assert!(d.iter().any(|x| x.message.contains("run")));
+    }
+    #[test]
+    fn imported_receiver_unknown_method() {
+        let d = method_fixture(
+            "<?php namespace Probe\\Models; class Service {} namespace App; use Probe\\Models\\Service; $service = new Service(); $service->run();",
+        );
+        assert!(d.iter().any(|x| x.message.contains("run")));
+    }
+    #[test]
+    fn bracketed_namespace_receiver_resolution_for_unknown_method() {
+        let d = method_fixture(
+            "<?php namespace Probe\\Models { class Service {} $service = new Service(); $service->run(); }",
+        );
+        assert!(d.iter().any(|x| x.message.contains("run")));
+    }
+    #[test]
+    fn same_short_name_receiver_isolation_for_unknown_method() {
+        let d = method_fixture(
+            "<?php namespace A { class Service { function run() {} } } namespace B { class Service {} $service = new Service(); $service->run(); }",
+        );
+        assert!(d.iter().any(|x| x.message.contains("run")));
     }
 
     #[test]
