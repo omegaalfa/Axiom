@@ -1415,16 +1415,27 @@ impl<'a> MemberResolver<'a> {
 
     fn parent_class_of(&self, class_name: &str) -> Option<String> {
         self.snapshot
-            .scopes
-            .records
+            .symbols_for_fqn(class_name)
             .iter()
-            .find(|scope| {
-                matches!(
-                    scope.kind,
-                    ScopeKind::Class | ScopeKind::Interface | ScopeKind::Enum
-                ) && scope.class_name.as_deref() == Some(class_name)
+            .find_map(|id| self.snapshot.parent_class_of(*id))
+            .and_then(|id| {
+                self.snapshot
+                    .symbol(id)
+                    .map(|s| s.fully_qualified_name.clone())
             })
-            .and_then(|scope| scope.parent_class.clone())
+            .or_else(|| {
+                self.snapshot
+                    .scopes
+                    .records
+                    .iter()
+                    .find(|scope| {
+                        matches!(
+                            scope.kind,
+                            ScopeKind::Class | ScopeKind::Interface | ScopeKind::Enum
+                        ) && scope.class_name.as_deref() == Some(class_name)
+                    })
+                    .and_then(|scope| scope.parent_class.clone())
+            })
     }
 
     fn is_same_or_subclass(&self, candidate: &str, ancestor: &str) -> bool {

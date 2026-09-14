@@ -1740,6 +1740,10 @@ impl EditorView {
         self.maybe_schedule_initial_native_inspections(cx);
     }
 
+    pub fn refresh_native_inspections(&mut self, cx: &mut Context<Self>) {
+        self.schedule_native_inspections("semantic snapshot published", cx);
+    }
+
     fn maybe_schedule_initial_native_inspections(&mut self, cx: &mut Context<Self>) {
         if self.initial_native_inspection_scheduled || self.project_symbols.is_none() {
             return;

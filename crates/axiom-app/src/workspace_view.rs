@@ -2158,6 +2158,7 @@ impl WorkspaceView {
                     for tab in &self.tabs {
                         tab.editor.update(cx, |editor, editor_cx| {
                             editor.set_semantic_engine(engine.clone(), editor_cx);
+                            editor.refresh_native_inspections(editor_cx);
                         });
                     }
                     tabs_update_us = tabs_started.elapsed().as_micros();
