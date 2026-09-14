@@ -693,7 +693,7 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
     calls.sort_by_key(|node| node.start_byte());
 
     let mut out = Vec::new();
-    for call in calls {
+    for call in calls.iter() {
         let arguments_node = call.child_by_field_name("arguments").or_else(|| {
             call.named_children(&mut call.walk())
                 .find(|node| node.kind() == "arguments")
@@ -961,9 +961,55 @@ fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiag
             }
         }
     }
+    if let Some(snapshot) = input.semantic_snapshot.as_ref() {
+        for call in calls.iter().filter(|call| {
+            matches!(
+                call.kind(),
+                "member_call_expression" | "nullsafe_member_call_expression"
+            )
+        }) {
+            let (Some(object), Some(name)) = (
+                call.child_by_field_name("object"),
+                call.child_by_field_name("name"),
+            ) else {
+                continue;
+            };
+            let Some(scope) = snapshot.scope_id_at(&input.file_key, call.start_byte()) else {
+                continue;
+            };
+            let resolver = axiom_index::ExpressionResolver::new(snapshot, scope);
+            let Some(receiver) = resolver.infer_ast_expression_type(object, input.text.as_ref())
+            else {
+                continue;
+            };
+            if matches!(
+                receiver,
+                DeclaredType::Unknown(_)
+                    | DeclaredType::Builtin(axiom_index::BuiltinType::Mixed)
+                    | DeclaredType::Nullable(_)
+            ) {
+                continue;
+            }
+            let method_name = name.utf8_text(input.text.as_bytes()).unwrap_or("");
+            if !matches!(
+                snapshot.member_resolver().resolve_method(
+                    scope,
+                    &receiver,
+                    method_name,
+                    MemberAccess::Instance
+                ),
+                MemberResolution::Resolved(_)
+            ) {
+                out.push(ByteDiagnostic {
+                    range: name.start_byte()..name.end_byte(),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: format!("Method `{method_name}` not found"),
+                });
+            }
+        }
+    }
     out
 }
-
 #[derive(Default)]
 struct DiagnosticStore {
     native_syntax: Vec<ByteDiagnostic>,
