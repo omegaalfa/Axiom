@@ -70,6 +70,18 @@ pub struct ProjectSymbol {
     pub modifiers: Vec<String>,
     pub parameters: Option<String>,
     pub return_type: Option<String>,
+    #[serde(default)]
+    pub structured_parameters: Vec<IndexedParameter>,
+    #[serde(default)]
+    pub structured_return_type: Option<DeclaredType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IndexedParameter {
+    pub name: Option<String>,
+    pub declared_type: Option<DeclaredType>,
+    pub optional: bool,
+    pub variadic: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -494,6 +506,8 @@ impl VendorSymbolIndex {
                             modifiers: vec!["composer".into()],
                             parameters: None,
                             return_type: None,
+                            structured_parameters: Vec::new(),
+                            structured_return_type: None,
                         });
                     }
                     break;
@@ -535,7 +549,9 @@ impl VendorSymbolIndex {
                                         .to_owned()
                                 })
                         }),
-                        return_type,
+                        return_type: return_type.clone(),
+                        structured_parameters: Vec::new(),
+                        structured_return_type: return_type.as_deref().map(indexed_declared_type),
                     });
                 }
             }
@@ -569,6 +585,8 @@ impl VendorSymbolIndex {
                             modifiers: vec!["composer".into()],
                             parameters: None,
                             return_type: None,
+                            structured_parameters: Vec::new(),
+                            structured_return_type: None,
                         });
                     }
                 }
@@ -1527,7 +1545,15 @@ fn walk(
                 visibility,
                 modifiers,
                 parameters,
-                return_type,
+                return_type: return_type.clone(),
+                structured_parameters: (kind == ProjectSymbolKind::Method)
+                    .then(|| {
+                        node.child_by_field_name("parameters")
+                            .map(|p| indexed_parameters(p, text))
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default(),
+                structured_return_type: return_type.as_deref().map(indexed_declared_type),
             };
             trace_symbol_insert(&symbol, source);
             out.push(symbol);
@@ -1557,6 +1583,56 @@ fn walk(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk(child, text, file, namespace, class, out, source);
+    }
+}
+
+fn indexed_parameters(node: Node<'_>, text: &str) -> Vec<IndexedParameter> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if !matches!(
+            child.kind(),
+            "simple_parameter" | "variadic_parameter" | "property_promotion_parameter"
+        ) {
+            continue;
+        }
+        let name = child
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(text.as_bytes()).ok())
+            .map(str::to_owned);
+        let declared_type = child
+            .child_by_field_name("type")
+            .and_then(|n| n.utf8_text(text.as_bytes()).ok())
+            .map(indexed_declared_type);
+        out.push(IndexedParameter {
+            name,
+            declared_type,
+            optional: child.child_by_field_name("default_value").is_some(),
+            variadic: child.kind() == "variadic_parameter",
+        });
+    }
+    out
+}
+
+fn indexed_declared_type(raw: &str) -> DeclaredType {
+    let raw = raw.trim();
+    if let Some(inner) = raw.strip_prefix('?') {
+        return DeclaredType::Nullable(Box::new(indexed_declared_type(inner)));
+    }
+    if raw.contains('|') {
+        return DeclaredType::Union(raw.split('|').map(indexed_declared_type).collect());
+    }
+    match raw.to_ascii_lowercase().as_str() {
+        "int" => DeclaredType::Builtin(BuiltinType::Int),
+        "string" => DeclaredType::Builtin(BuiltinType::String),
+        "bool" => DeclaredType::Builtin(BuiltinType::Bool),
+        "float" => DeclaredType::Builtin(BuiltinType::Float),
+        "mixed" => DeclaredType::Builtin(BuiltinType::Mixed),
+        "void" => DeclaredType::Builtin(BuiltinType::Void),
+        "never" => DeclaredType::Builtin(BuiltinType::Never),
+        "null" => DeclaredType::Builtin(BuiltinType::Null),
+        "self" | "parent" | "static" => DeclaredType::Unknown(raw.to_owned()),
+        _ => DeclaredType::Unknown(raw.to_owned()),
     }
 }
 

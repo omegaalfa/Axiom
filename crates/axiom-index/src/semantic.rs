@@ -276,6 +276,12 @@ pub struct TraitMethodPrecedence {
     pub excluded_traits: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredMethod {
+    pub source_method: SymbolId,
+    pub declaring_owner: SymbolId,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScopeStore {
     pub records: Vec<Scope>,
@@ -519,6 +525,8 @@ pub struct SemanticSymbol {
     pub parameters: Option<String>,
     #[serde(default)]
     pub structured_parameters: Vec<SemanticParameter>,
+    #[serde(default)]
+    pub structured_return_type: Option<DeclaredType>,
     pub return_type: Option<String>,
     pub owner: Option<SymbolId>,
     pub owner_key: Option<PersistentSymbolKey>,
@@ -1442,6 +1450,8 @@ pub struct InterfaceRelationIndexes {
     implementers_by_interface: HashMap<SymbolId, Vec<SymbolId>>,
     method_implementations_by_interface_method: HashMap<SymbolId, Vec<SymbolId>>,
     trait_consumers_by_trait: HashMap<SymbolId, Vec<SymbolId>>,
+    interfaces_by_class: HashMap<SymbolId, Vec<SymbolId>>,
+    parent_class_by_child: HashMap<SymbolId, SymbolId>,
     subclasses_by_parent: HashMap<SymbolId, Vec<SymbolId>>,
 }
 
@@ -1461,6 +1471,8 @@ pub struct SemanticSnapshot {
     trait_aliases_by_class: HashMap<String, Vec<TraitMethodAlias>>,
     #[serde(default)]
     trait_precedence_by_class: HashMap<String, Vec<TraitMethodPrecedence>>,
+    #[serde(default)]
+    active_scope_by_owner: HashMap<SymbolId, ScopeId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1483,6 +1495,239 @@ impl Default for SemanticSnapshot {
 }
 
 impl SemanticSnapshot {
+    pub fn parent_class_of(&self, child: SymbolId) -> Option<SymbolId> {
+        self.interface_relations
+            .parent_class_by_child
+            .get(&child)
+            .copied()
+    }
+    pub fn required_abstract_methods_for_class(&self, class: SymbolId) -> Vec<RequiredMethod> {
+        let Some(class_symbol) = self.symbol(class) else {
+            return Vec::new();
+        };
+        if class_symbol.kind != ProjectSymbolKind::Class {
+            return Vec::new();
+        }
+        let mut chain = Vec::new();
+        let mut current = Some(class);
+        let mut visited = HashSet::new();
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                break;
+            }
+            chain.push(id);
+            let Some(sym) = self.symbol(id) else {
+                break;
+            };
+            current = self.parent_class_of(id);
+            if sym.kind != ProjectSymbolKind::Class {
+                break;
+            }
+        }
+        chain.reverse();
+        let mut pending: HashMap<String, RequiredMethod> = HashMap::new();
+        for owner in chain {
+            for method in self.members_of(owner) {
+                let Some(symbol) = self.symbol(*method) else {
+                    continue;
+                };
+                if symbol.kind != ProjectSymbolKind::Method {
+                    continue;
+                }
+                if symbol.modifiers.iter().any(|m| m == "abstract") {
+                    pending.insert(
+                        symbol.name.clone(),
+                        RequiredMethod {
+                            source_method: *method,
+                            declaring_owner: owner,
+                        },
+                    );
+                } else {
+                    pending.remove(&symbol.name);
+                }
+            }
+        }
+        let mut result: Vec<_> = pending.into_values().collect();
+        result.sort_by_key(|r| r.source_method.0);
+        result
+    }
+
+    pub fn required_interface_methods_for_class(&self, class: SymbolId) -> Vec<RequiredMethod> {
+        let mut queue = self.interfaces_implemented_by_class(class);
+        let mut visited = HashSet::new();
+        let mut result = Vec::new();
+        while let Some(interface) = queue.pop() {
+            if !visited.insert(interface) {
+                continue;
+            }
+            for method in self.members_of(interface) {
+                if let Some(symbol) = self.symbol(*method) {
+                    if symbol.kind == ProjectSymbolKind::Method {
+                        result.push(RequiredMethod {
+                            source_method: *method,
+                            declaring_owner: interface,
+                        });
+                    }
+                }
+            }
+            if let Some(interface_symbol) = self.symbol(interface) {
+                let mut scopes = self.scopes.records.iter().filter(|s| {
+                    let active_scope = s.file.is_some_and(|file| {
+                        self.files
+                            .records
+                            .get(file.0 as usize)
+                            .is_some_and(|record| record.symbols.contains(&interface))
+                    });
+                    if !active_scope {
+                        return false;
+                    }
+                    s.owner == Some(interface)
+                        || s.class_name.as_deref()
+                            == Some(interface_symbol.fully_qualified_name.as_str())
+                });
+                let scope = scopes.next().or_else(|| {
+                    let mut short = self.scopes.records.iter().filter(|s| {
+                        s.class_name.as_deref() == Some(interface_symbol.name.as_str())
+                            && s.file.is_some_and(|file| {
+                                self.files
+                                    .records
+                                    .get(file.0 as usize)
+                                    .is_some_and(|record| record.symbols.contains(&interface))
+                            })
+                    });
+                    let candidate = short.next();
+                    (candidate.is_some() && short.next().is_none()).then_some(candidate.unwrap())
+                });
+                if let Some(scope) = scope {
+                    for parent in &scope.interfaces_extended {
+                        if let Some(id) = self.symbols_for_fqn(parent).first() {
+                            queue.push(*id);
+                        }
+                    }
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        result.retain(|required| seen.insert(required.source_method));
+        result.sort_by_key(|required| required.source_method.0);
+        result
+    }
+
+    pub fn interfaces_implemented_by_class(&self, class: SymbolId) -> Vec<SymbolId> {
+        self.interface_relations
+            .interfaces_by_class
+            .get(&class)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Returns the active declaration scope for a symbol owner. Detached
+    /// scopes from previous incremental revisions are excluded.
+    pub fn active_declaration_scope(&self, symbol: SymbolId) -> Option<ScopeId> {
+        let owner = self.symbol(symbol)?.owner.unwrap_or(symbol);
+        self.active_scope_by_owner.get(&owner).copied()
+    }
+
+    pub fn missing_required_methods_for_class(&self, class: SymbolId) -> Vec<RequiredMethod> {
+        let Some(cs) = self.symbol(class) else {
+            return Vec::new();
+        };
+        if cs.kind != ProjectSymbolKind::Class {
+            return Vec::new();
+        }
+        let Some(scope) = self.scopes.records.iter().find(|s| {
+            s.owner == Some(class)
+                && s.file.is_some_and(|f| {
+                    self.files
+                        .records
+                        .get(f.0 as usize)
+                        .is_some_and(|r| r.symbols.contains(&class))
+                })
+        }) else {
+            return Vec::new();
+        };
+        let mut reqs = self.required_interface_methods_for_class(class);
+        reqs.extend(self.required_abstract_methods_for_class(class));
+        let mut seen = HashSet::new();
+        reqs.retain(|req| seen.insert(req.source_method));
+        let receiver = DeclaredType::Named {
+            written: cs.name.clone(),
+            resolved: cs.fully_qualified_name.clone(),
+        };
+        let mut out: Vec<_> = reqs
+            .into_iter()
+            .filter(|req| {
+                let Some(r) = self.symbol(req.source_method) else {
+                    return false;
+                };
+                let access = if r.modifiers.iter().any(|m| m == "static") {
+                    MemberAccess::Static
+                } else {
+                    MemberAccess::Instance
+                };
+                let MemberResolution::Resolved(id) = self
+                    .member_resolver()
+                    .resolve_method(scope.id, &receiver, &r.name, access)
+                else {
+                    return true;
+                };
+                let Some(e) = self.symbol(id) else {
+                    return true;
+                };
+                e.modifiers.iter().any(|m| m == "abstract")
+                    || (r.modifiers.iter().any(|m| m == "public")
+                        && !e.modifiers.iter().any(|m| m == "public"))
+                    || !self.method_signature_compatible(r, e)
+            })
+            .collect();
+        out.sort_by_key(|r| r.source_method.0);
+        out
+    }
+
+    fn method_signature_compatible(
+        &self,
+        required: &SemanticSymbol,
+        implementation: &SemanticSymbol,
+    ) -> bool {
+        if required.structured_parameters.is_empty()
+            || implementation.structured_parameters.is_empty()
+        {
+            return true;
+        }
+        let required_required = required
+            .structured_parameters
+            .iter()
+            .filter(|p| !p.optional && !p.variadic)
+            .count();
+        if implementation.structured_parameters.len() < required_required {
+            return false;
+        }
+        for (i, expected) in required.structured_parameters.iter().enumerate() {
+            let Some(actual) = implementation.structured_parameters.get(i).or_else(|| {
+                implementation
+                    .structured_parameters
+                    .last()
+                    .filter(|p| p.variadic)
+            }) else {
+                return false;
+            };
+            if expected.variadic != actual.variadic {
+                return false;
+            }
+            if let (Some(req), Some(imp)) = (&expected.declared_type, &actual.declared_type) {
+                if declared_type_compatibility(self, req, imp) == TypeCompatibility::Incompatible {
+                    return false;
+                }
+            }
+        }
+        match (&required.return_type, &implementation.return_type) {
+            (Some(req), Some(imp)) => {
+                req.trim().eq_ignore_ascii_case(imp.trim())
+                    || req.trim().eq_ignore_ascii_case("mixed")
+            }
+            _ => true,
+        }
+    }
     fn rebuild_trait_adaptations(&mut self) {
         self.trait_aliases_by_class.clear();
         self.trait_precedence_by_class.clear();
@@ -1512,6 +1757,7 @@ impl SemanticSnapshot {
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
             trait_precedence_by_class: HashMap::new(),
+            active_scope_by_owner: HashMap::new(),
         }
     }
 
@@ -1882,6 +2128,16 @@ impl SemanticSnapshot {
 
         let mut relations = InterfaceRelationIndexes::default();
         for (child, parents) in &extends {
+            if let [parent] = parents.as_slice() {
+                relations.parent_class_by_child.insert(*child, *parent);
+                relations
+                    .subclasses_by_parent
+                    .entry(*parent)
+                    .or_default()
+                    .push(*child);
+            }
+        }
+        for (child, parents) in &extends {
             for parent in parents {
                 relations
                     .subclasses_by_parent
@@ -2077,6 +2333,16 @@ impl SemanticSnapshot {
                         .method_implementations_by_interface_method
                         .insert(method, matches);
                 }
+            }
+        }
+        let direct = relations.direct_implementers_by_interface.clone();
+        for (interface, classes) in direct {
+            for class in classes {
+                relations
+                    .interfaces_by_class
+                    .entry(class)
+                    .or_default()
+                    .push(interface);
             }
         }
         self.interface_relations = relations;
@@ -2996,6 +3262,7 @@ impl SemanticSnapshot {
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
             trait_precedence_by_class: HashMap::new(),
+            active_scope_by_owner: HashMap::new(),
         };
         for scope in &snapshot.scopes.records {
             if let Some(class) = &scope.class_name {
@@ -3012,6 +3279,36 @@ impl SemanticSnapshot {
             }
         }
         snapshot.rebuild_trait_adaptations();
+        for scope in &snapshot.scopes.records {
+            let Some(file) = scope.file else { continue };
+            let owner = scope.owner.or_else(|| {
+                scope.class_name.as_deref().and_then(|name| {
+                    snapshot
+                        .symbols
+                        .records
+                        .iter()
+                        .find(|symbol| {
+                            symbol.file == file
+                                && (symbol.fully_qualified_name == name || symbol.name == name)
+                                && snapshot
+                                    .files
+                                    .records
+                                    .get(file.0 as usize)
+                                    .is_some_and(|record| record.symbols.contains(&symbol.id))
+                        })
+                        .map(|symbol| symbol.id)
+                })
+            });
+            let Some(owner) = owner else { continue };
+            if snapshot
+                .files
+                .records
+                .get(file.0 as usize)
+                .is_some_and(|record| record.symbols.contains(&owner))
+            {
+                snapshot.active_scope_by_owner.insert(owner, scope.id);
+            }
+        }
         snapshot.rebuild_interface_relations();
         snapshot.rebuild_completion_scopes();
         let active_symbols: HashSet<SymbolId> = snapshot
@@ -3185,8 +3482,18 @@ impl SnapshotBuilder {
                 visibility: source.visibility,
                 modifiers: source.modifiers,
                 parameters: source.parameters,
-                structured_parameters: Vec::new(),
+                structured_parameters: source
+                    .structured_parameters
+                    .iter()
+                    .map(|parameter| SemanticParameter {
+                        name: parameter.name.clone(),
+                        declared_type: parameter.declared_type.clone(),
+                        optional: parameter.optional,
+                        variadic: parameter.variadic,
+                    })
+                    .collect(),
                 return_type: source.return_type,
+                structured_return_type: source.structured_return_type.clone(),
                 owner: None,
                 owner_key: None,
             });
@@ -3259,7 +3566,61 @@ impl SnapshotBuilder {
                 .push(symbol.id);
         }
         builder.populate_scopes_from_files();
+        builder.resolve_indexed_signature_types();
         builder
+    }
+
+    fn resolve_indexed_signature_types(&mut self) {
+        let symbols: Vec<(SymbolId, FileId, String)> = self
+            .symbols
+            .records
+            .iter()
+            .filter(|s| s.kind == ProjectSymbolKind::Method)
+            .map(|s| (s.id, s.file, s.fully_qualified_name.clone()))
+            .collect();
+        for (id, file, fqn) in symbols {
+            let owner_name = fqn.rsplit_once("::").map(|(o, _)| o);
+            let Some(scope_id) = self
+                .scopes
+                .records
+                .iter()
+                .find(|scope| {
+                    scope.file == Some(file)
+                        && scope.class_name.as_deref().is_some_and(|name| {
+                            Some(name) == owner_name
+                                || owner_name.is_some_and(|owner| {
+                                    owner.rsplit_once('\\').map(|(_, short)| short) == Some(name)
+                                })
+                        })
+                })
+                .map(|s| s.id)
+            else {
+                continue;
+            };
+            let params = self.symbols.records[id.0 as usize]
+                .structured_parameters
+                .clone();
+            self.symbols.records[id.0 as usize].structured_parameters = params
+                .into_iter()
+                .map(|mut p| {
+                    let declared = p.declared_type.take();
+                    p.declared_type = match declared {
+                        Some(DeclaredType::Unknown(raw)) => {
+                            Some(declared_type(&raw, self, scope_id))
+                        }
+                        other => other,
+                    };
+                    p
+                })
+                .collect();
+            if let Some(DeclaredType::Unknown(raw)) = self.symbols.records[id.0 as usize]
+                .structured_return_type
+                .take()
+            {
+                self.symbols.records[id.0 as usize].structured_return_type =
+                    Some(declared_type(&raw, self, scope_id));
+            }
+        }
     }
 
     /// Starts a new revision from an immutable snapshot. File replacements
@@ -3418,6 +3779,7 @@ impl SnapshotBuilder {
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
             trait_precedence_by_class: HashMap::new(),
+            active_scope_by_owner: HashMap::new(),
         };
         for scope in &snapshot.scopes.records {
             if let Some(class) = &scope.class_name {
@@ -3472,6 +3834,7 @@ impl SnapshotBuilder {
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
             trait_precedence_by_class: HashMap::new(),
+            active_scope_by_owner: HashMap::new(),
         };
         for scope in &snapshot.scopes.records {
             if let Some(class) = &scope.class_name {
@@ -3483,6 +3846,36 @@ impl SnapshotBuilder {
             }
         }
         snapshot.rebuild_trait_adaptations();
+        for scope in &snapshot.scopes.records {
+            let Some(file) = scope.file else { continue };
+            let owner = scope.owner.or_else(|| {
+                scope.class_name.as_deref().and_then(|name| {
+                    snapshot
+                        .symbols
+                        .records
+                        .iter()
+                        .find(|symbol| {
+                            symbol.file == file
+                                && symbol.fully_qualified_name == name
+                                && snapshot
+                                    .files
+                                    .records
+                                    .get(file.0 as usize)
+                                    .is_some_and(|record| record.symbols.contains(&symbol.id))
+                        })
+                        .map(|symbol| symbol.id)
+                })
+            });
+            let Some(owner) = owner else { continue };
+            if snapshot
+                .files
+                .records
+                .get(file.0 as usize)
+                .is_some_and(|record| record.symbols.contains(&owner))
+            {
+                snapshot.active_scope_by_owner.insert(owner, scope.id);
+            }
+        }
         snapshot.rebuild_interface_relations();
         snapshot.rebuild_completion_scopes();
         snapshot
@@ -3805,6 +4198,7 @@ impl SnapshotBuilder {
                 parameters: source.parameters,
                 structured_parameters: Vec::new(),
                 return_type: source.return_type,
+                structured_return_type: source.structured_return_type.clone(),
                 owner: None,
                 owner_key: None,
             };
@@ -7833,6 +8227,198 @@ class ParentChild extends ParentBase {
     }
 
     #[test]
+    fn parent_class_of_returns_direct_resident_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parents.php");
+        let text = "<?php class Base {} class Child extends Base {} class Grand extends Child {}";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let base = snapshot.symbols_for_fqn("Base")[0];
+        let child = snapshot.symbols_for_fqn("Child")[0];
+        let grand = snapshot.symbols_for_fqn("Grand")[0];
+        assert_eq!(snapshot.parent_class_of(child), Some(base));
+        assert_eq!(snapshot.parent_class_of(grand), Some(child));
+    }
+
+    #[test]
+    fn required_abstract_methods_use_parent_relation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abstract.php");
+        let text =
+            "<?php abstract class Base { abstract function run(); } class Child extends Base {}";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let child = snapshot.symbols_for_fqn("Child")[0];
+        let req = snapshot.required_abstract_methods_for_class(child);
+        assert_eq!(req.len(), 1);
+    }
+
+    #[test]
+    fn interfaces_implemented_by_class_are_resident_and_owner_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contracts.php");
+        let text = "<?php interface Runner {} interface Logger {} class Service implements Runner, Logger {}";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let service = snapshot.symbols_for_fqn("Service")[0];
+        let ids = snapshot
+            .interface_relations
+            .interfaces_by_class
+            .get(&service)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&snapshot.symbols_for_fqn("Runner")[0]));
+        assert!(ids.contains(&snapshot.symbols_for_fqn("Logger")[0]));
+        let required = snapshot.required_interface_methods_for_class(service);
+        assert!(required.is_empty());
+    }
+
+    #[test]
+    fn required_interface_methods_include_inherited_contracts_and_deduplicate_diamond() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interfaces.php");
+        let text = "<?php interface Root { function run(); } interface Left extends Root {} interface Right extends Root {} interface Combined extends Left, Right { function finish(); } class Service implements Combined {}";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let service = snapshot.symbols_for_fqn("Service")[0];
+        let req = snapshot.required_interface_methods_for_class(service);
+        assert_eq!(req.len(), 2);
+        assert_eq!(
+            req.iter()
+                .filter(|r| snapshot.symbol(r.source_method).unwrap().name == "run")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn required_interface_methods_keep_same_name_contract_symbols_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contracts.php");
+        let text = "<?php interface A { function run(int $id); } interface B { function run(string $id); } class Service implements A, B {}";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let service = snapshot.symbols_for_fqn("Service")[0];
+        let req = snapshot.required_interface_methods_for_class(service);
+        assert_eq!(req.len(), 2);
+        assert_ne!(req[0].source_method, req[1].source_method);
+    }
+
+    #[test]
+    fn interface_short_name_fallback_is_conservative_when_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contracts.php");
+        fs::write(&path, "<?php namespace A; interface Root { function a(); } namespace B; interface Root { function b(); } namespace C; interface Child extends Root {} class Service implements Child {}").unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let service = snapshot.symbols_for_fqn("C\\Service")[0];
+        assert!(
+            snapshot
+                .required_interface_methods_for_class(service)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn incremental_same_fqn_interface_rejects_tombstone_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contracts.php");
+        fs::write(&path, "<?php namespace Probe\\Contracts; interface ParentA { function a(); } interface ParentB { function b(); } interface Contract extends ParentA {} namespace Probe\\Models; use Probe\\Contracts\\Contract; class Service implements Contract {}").unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let first = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let service = first.symbols_for_fqn("Probe\\Models\\Service")[0];
+        let req = first.required_interface_methods_for_class(service);
+        assert_eq!(
+            first
+                .symbol(req[0].source_method)
+                .unwrap()
+                .fully_qualified_name,
+            "Probe\\Contracts\\ParentA::a"
+        );
+        let mut builder = SnapshotBuilder::from_snapshot(&first);
+        builder.replace_workspace_file(&path, "<?php namespace Probe\\Contracts; interface ParentA { function a(); } interface ParentB { function b(); } interface Contract extends ParentB {} namespace Probe\\Models; use Probe\\Contracts\\Contract; class Service implements Contract {}");
+        let second = builder.finish();
+        let service = second.symbols_for_fqn("Probe\\Models\\Service")[0];
+        let req = second.required_interface_methods_for_class(service);
+        assert_eq!(req.len(), 1);
+        assert_eq!(
+            second
+                .symbol(req[0].source_method)
+                .unwrap()
+                .fully_qualified_name,
+            "Probe\\Contracts\\ParentB::b"
+        );
+    }
+
+    #[test]
+    fn multiple_interface_parents_are_collected_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contracts.php");
+        fs::write(&path, "<?php interface A { function a(); } interface B { function b(); } interface Combined extends A, B { function c(); } class Service implements Combined {}").unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let service = snapshot.symbols_for_fqn("Service")[0];
+        let req = snapshot.required_interface_methods_for_class(service);
+        assert_eq!(
+            req.iter()
+                .map(|r| snapshot.symbol(r.source_method).unwrap().name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn abstract_redeclaration_and_concrete_satisfaction_are_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abstract.php");
+        fs::write(&path, "<?php abstract class A { abstract function run(); } abstract class B extends A { abstract function run(); } class C extends B {} class D extends B { function run() {} }").unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let c = snapshot.symbols_for_fqn("C")[0];
+        let d = snapshot.symbols_for_fqn("D")[0];
+        let req = snapshot.required_abstract_methods_for_class(c);
+        assert_eq!(req.len(), 1);
+        assert_eq!(
+            snapshot
+                .symbol(req[0].source_method)
+                .unwrap()
+                .fully_qualified_name,
+            "B::run"
+        );
+        assert!(snapshot.required_abstract_methods_for_class(d).is_empty());
+    }
+
+    #[test]
+    fn required_abstract_methods_support_multi_level_and_concrete_elimination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abstracts.php");
+        let text = "<?php abstract class A { abstract function run(); abstract function stop(); } abstract class B extends A {} class C extends B { function run() {} function stop() {} }";
+        fs::write(&path, text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let b = snapshot.symbols_for_fqn("B")[0];
+        let c = snapshot.symbols_for_fqn("C")[0];
+        assert_eq!(snapshot.required_abstract_methods_for_class(b).len(), 2);
+        assert!(snapshot.required_abstract_methods_for_class(c).is_empty());
+    }
+
+    #[test]
     fn trait_consumers_keep_distinct_symbols_and_name_ranges() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("traits.php");
@@ -8416,6 +9002,45 @@ namespace Probe\Models { use Probe\TraitsA\HasUuid; class User { use HasUuid; } 
         assert!(
             matches!(context.structured_parameters[2].declared_type, Some(DeclaredType::Named { ref resolved, .. }) if resolved == "App\\Base")
         );
+    }
+
+    #[test]
+    fn project_index_snapshot_preserves_structured_method_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runner.php");
+        fs::write(
+            &path,
+            "<?php interface Runner { public function run(int $id, string $name = ''): string; }",
+        )
+        .unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let run = snapshot.symbols_for_fqn("Runner::run")[0];
+        let method = snapshot.symbol(run).unwrap();
+        assert_eq!(method.structured_parameters.len(), 2);
+        assert_eq!(
+            method.structured_parameters[0].declared_type,
+            Some(DeclaredType::Builtin(BuiltinType::Int))
+        );
+        assert!(!method.structured_parameters[0].optional);
+        assert!(method.structured_parameters[1].optional);
+    }
+
+    #[test]
+    fn active_declaration_scope_rejects_detached_method_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handler.php");
+        fs::write(
+            &path,
+            "<?php namespace Contracts; interface Handler { public function run(): void; }",
+        )
+        .unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let method = snapshot.symbols_for_fqn("Contracts\\Handler::run")[0];
+        assert!(snapshot.active_declaration_scope(method).is_some());
     }
 
     #[test]
@@ -9191,6 +9816,7 @@ function run(User $user): void { foo(); echo $user->name; $user->name = 'A'; ech
             parameters: None,
             structured_parameters: Vec::new(),
             return_type: None,
+            structured_return_type: None,
             owner: None,
             owner_key: None,
         });

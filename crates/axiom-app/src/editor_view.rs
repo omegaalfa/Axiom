@@ -502,7 +502,7 @@ fn compute_unknown_class_inspections(input: &UnknownClassInspectionInput) -> Vec
         if end > start {
             let written = &input.text[start..end];
             let name = written.trim_start_matches('\\');
-            let resolved = resolve_php_class_name(written, input.text.as_ref());
+            let resolved = resolve_php_class_name_at(written, input.text.as_ref(), start);
             let known_project =
                 input.project_classes.contains(&resolved) || input.project_classes.contains(name);
             let known_runtime = input.runtime_symbols.as_ref().is_some_and(|index| {
@@ -1345,6 +1345,8 @@ impl EditorView {
                 modifiers: s.modifiers.clone(),
                 parameters: s.parameters.clone(),
                 return_type: s.return_type.clone(),
+                structured_parameters: Vec::new(),
+                structured_return_type: s.structured_return_type.clone(),
             })
             .collect();
         let items = crate::outline::build_file_outline(&symbols, &self.file_path);
@@ -3097,7 +3099,9 @@ impl EditorView {
                                 | RuntimeKind::Trait
                                 | RuntimeKind::Enum
                         )
-                        .then(|| self.composer_import_edit(&symbol.fqn))
+                        .then(|| {
+                            self.composer_import_edit(&symbol.fqn, self.document.cursor_offset())
+                        })
                         .flatten();
                         CompletionItem {
                             label: symbol.name.clone(),
@@ -3153,7 +3157,12 @@ impl EditorView {
                                     | ProjectSymbolKind::Trait
                                     | ProjectSymbolKind::Enum
                             )
-                            .then(|| self.composer_import_edit(&symbol.fully_qualified_name))
+                            .then(|| {
+                                self.composer_import_edit(
+                                    &symbol.fully_qualified_name,
+                                    self.document.cursor_offset(),
+                                )
+                            })
                             .flatten();
                             completion_import_us += import_started.elapsed().as_micros();
                             CompletionItem {
@@ -3168,6 +3177,16 @@ impl EditorView {
                                     ProjectSymbolKind::Enum => CompletionItemKind::ENUM,
                                     _ => CompletionItemKind::VALUE,
                                 }),
+                                insert_text: (current_namespace(&self.document.content())
+                                    .is_empty()
+                                    && matches!(
+                                        symbol.kind,
+                                        ProjectSymbolKind::Class
+                                            | ProjectSymbolKind::Interface
+                                            | ProjectSymbolKind::Trait
+                                            | ProjectSymbolKind::Enum
+                                    ))
+                                .then(|| format!("\\{}", symbol.fully_qualified_name)),
                                 additional_text_edits: import.map(|edit| vec![edit]),
                                 ..Default::default()
                             }
@@ -3207,7 +3226,8 @@ impl EditorView {
                         .filter(|item| vendor_type_kind_allowed(type_context, item.kind))
                         .map(|item| {
                             let label = item.short_name;
-                            let import = self.composer_import_edit(&item.fqn);
+                            let import =
+                                self.composer_import_edit(&item.fqn, self.document.cursor_offset());
                             CompletionItem {
                                 label,
                                 detail: Some(format!("{} - Vendor", item.fqn)),
@@ -3220,7 +3240,7 @@ impl EditorView {
             } else {
                 items.extend(index.classes_matching(prefix).into_iter().map(|fqn| {
                     let label = fqn.rsplit('\\').next().unwrap_or(&fqn).to_owned();
-                    let import = self.composer_import_edit(&fqn);
+                    let import = self.composer_import_edit(&fqn, self.document.cursor_offset());
                     CompletionItem {
                         label,
                         detail: Some(format!("{fqn} • Vendor")),
@@ -3295,70 +3315,85 @@ impl EditorView {
     /// Builds a single additional edit for a Composer/project class. The edit
     /// is deliberately narrow: it only inserts a missing `use` statement and
     /// never rewrites or reformats the document.
-    fn composer_import_edit(&self, fqn: &str) -> Option<lsp_types::TextEdit> {
+    fn composer_import_edit(&self, fqn: &str, caret: usize) -> Option<lsp_types::TextEdit> {
         let fqn = fqn.trim_start_matches('\\');
         let text = self.document.content();
-        let current_namespace = text.lines().find_map(|line| {
-            let line = line.trim();
-            line.strip_prefix("namespace ")
-                .and_then(|value| value.trim_end_matches(';').split_whitespace().next())
-                .map(|value| value.trim_matches('\\').to_owned())
-        });
-        let short = fqn.rsplit('\\').next().unwrap_or(fqn);
-        if current_namespace
-            .as_deref()
-            .is_some_and(|namespace| fqn.strip_suffix(&format!("\\{short}")) == Some(namespace))
+        let caret = caret.min(text.len());
+        let mut ns_start = 0usize;
+        let mut current_namespace = String::new();
+        let mut current_bracketed = false;
+        for (offset, line) in text.split_inclusive('\n').scan(0usize, |o, line| {
+            let s = *o;
+            *o += line.len();
+            Some((s, line))
+        }) {
+            if offset > caret {
+                break;
+            }
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("namespace ") {
+                let rest = rest.trim();
+                current_namespace = rest
+                    .trim_end_matches([';', '{'])
+                    .trim()
+                    .trim_matches('\\')
+                    .to_owned();
+                current_bracketed = rest.contains('{');
+                ns_start = offset + line.len();
+            }
+        }
+        let target_ns = fqn.rsplit_once('\\').map(|(ns, _)| ns).unwrap_or("");
+        if current_namespace.is_empty()
+            || current_namespace == target_ns
+            || has_import_in_region(&text, fqn, ns_start, caret)
         {
             return None;
         }
-        if has_import(&text, fqn) {
-            return None;
-        }
-        let mut last_use_end = None;
-        let mut namespace_end = None;
-        for (offset, line) in text.split_inclusive('\n').scan(0usize, |offset, line| {
-            let start = *offset;
-            *offset += line.len();
-            Some((start, line))
-        }) {
-            let trimmed = line.trim();
-            if trimmed.starts_with("use ") && trimmed.ends_with(';') {
-                last_use_end = Some(offset + line.len());
+        let (region_start, region_end) = if current_bracketed {
+            let mut depth = 0i32;
+            let mut end = text.len();
+            for (i, ch) in text[ns_start..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    if depth == 0 {
+                        end = ns_start + i;
+                        break;
+                    }
+                    depth -= 1;
+                }
             }
-            if trimmed.starts_with("namespace ") && trimmed.ends_with(';') {
-                namespace_end = Some(offset + line.len());
-            }
-        }
-        let insertion = last_use_end.or(namespace_end).unwrap_or_else(|| {
-            text.find("<?php")
-                .map(|pos| {
-                    text[pos..]
-                        .find('\n')
-                        .map(|n| pos + n + 1)
-                        .unwrap_or(text.len())
-                })
-                .unwrap_or(0)
-        });
+            (ns_start, end.min(caret.max(ns_start)))
+        } else {
+            (0, text.len())
+        };
+        let region = &text[region_start..region_end];
+        let insertion = region
+            .split_inclusive('\n')
+            .scan(region_start, |o, line| {
+                let s = *o;
+                *o += line.len();
+                Some((s, line))
+            })
+            .filter(|(_, line)| line.trim().starts_with("use ") && line.trim_end().ends_with(';'))
+            .map(|(o, line)| o + line.len())
+            .last()
+            .unwrap_or(ns_start);
         let prefix = if insertion > 0 && !text[..insertion].ends_with('\n') {
             "\n"
         } else {
             ""
         };
-        let new_text = format!("{prefix}use {fqn};\n");
         let position = PositionCodec::offset_to_position(
             &text,
             insertion,
-            self.lsp
-                .as_ref()
-                .map(|lsp| lsp.encoding())
-                .unwrap_or_default(),
+            self.lsp.as_ref().map(|l| l.encoding()).unwrap_or_default(),
         );
         Some(lsp_types::TextEdit {
             range: lsp_types::Range::new(position, position),
-            new_text,
+            new_text: format!("{prefix}use {fqn};\n"),
         })
     }
-
     fn resolve_native_type(&self, owner: &str, context: &str) -> Option<String> {
         let owner = owner.trim();
         if owner == "$this" {
@@ -4912,6 +4947,31 @@ fn resolve_php_class_name(written: &str, context: &str) -> String {
         .unwrap_or_else(|| written.to_owned())
 }
 
+fn resolve_php_class_name_at(written: &str, context: &str, offset: usize) -> String {
+    let written = written.trim().trim_start_matches('\\');
+    if written.contains('\\') {
+        return written.to_owned();
+    }
+    let prefix = &context[..offset.min(context.len())];
+    for (fqn, alias) in prefix.lines().flat_map(parse_use_imports) {
+        if alias == written {
+            return fqn;
+        }
+    }
+    let namespace = prefix
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("namespace "))
+        .last()
+        .map(|value| value.trim_end_matches([';', '{']).trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    if namespace.is_empty() {
+        written.to_owned()
+    } else {
+        format!("{namespace}\\{written}")
+    }
+}
+
 fn split_method_chain(owner: &str) -> Option<(&str, Vec<String>)> {
     let mut parts = owner.split("->");
     let base = parts.next()?.trim();
@@ -4959,6 +5019,7 @@ fn parse_use_imports(line: &str) -> Vec<(String, String)> {
     vec![(fqn.trim_matches('\\').to_owned(), alias)]
 }
 
+#[cfg(test)]
 fn has_import(context: &str, fqn: &str) -> bool {
     context
         .lines()
@@ -4977,6 +5038,16 @@ fn extract_owner_expression(text: &str, owner_end: usize) -> (usize, String) {
         }
     }
     (start, prefix[start..].trim().to_owned())
+}
+
+fn has_import_in_region(text: &str, fqn: &str, start: usize, end: usize) -> bool {
+    text.get(start.min(text.len())..end.min(text.len()))
+        .is_some_and(|region| {
+            region.lines().any(|line| {
+                line.trim() == format!("use {fqn};")
+                    || line.trim_start().starts_with(&format!("use {fqn} as "))
+            })
+        })
 }
 
 fn current_namespace(context: &str) -> String {
@@ -5083,7 +5154,7 @@ fn native_format_php(text: &str) -> String {
             result.push_str(raw_line);
         } else {
             result.push_str(&"    ".repeat(indent));
-            result.push_str(trimmed);
+            result.push_str(&normalize_php_line(trimmed));
         }
         if let Some(delimiter) = heredoc_start.filter(|delimiter| !delimiter.is_empty()) {
             heredoc = Some(delimiter);
@@ -5138,6 +5209,69 @@ fn native_format_php(text: &str) -> String {
 
 fn supports_native_format(path: &Path) -> bool {
     is_php_file(path)
+}
+
+fn normalize_php_line(line: &str) -> String {
+    if line.contains(['\'', '"', '`']) || line.contains("//") || line.contains("/*") {
+        return line.to_owned();
+    }
+    let mut out = String::new();
+    let mut code = String::new();
+    let mut quote = None;
+    let flush = |out: &mut String, code: &mut String| {
+        if !code.is_empty() {
+            let mut s = code.split_whitespace().collect::<Vec<_>>().join(" ");
+            for op in ["===", "??", "=", "+"] {
+                let spaced = format!(" {op} ");
+                s = s
+                    .replace(op, &spaced)
+                    .replace(&format!("  {op}  "), &spaced);
+            }
+            s = s
+                .replace(" ? - > ", "?->")
+                .replace(" ?-> ", "?->")
+                .replace(" -> ", "->")
+                .replace(" :: ", "::")
+                .replace(" - > ", "->")
+                .replace(" : : ", "::")
+                .replace(" ( ", "(")
+                .replace(" )", ")")
+                .replace(" ,", ",")
+                .replace(",  ", ", ");
+            out.push_str(&s);
+            code.clear();
+        }
+    };
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            out.push(ch);
+            if ch == '\\' {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            flush(&mut out, &mut code);
+            quote = Some(ch);
+            out.push(ch);
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'/') {
+            flush(&mut out, &mut code);
+            out.push(ch);
+            out.push(chars.next().unwrap());
+            out.extend(chars);
+            break;
+        }
+        code.push(ch);
+    }
+    flush(&mut out, &mut code);
+    out
 }
 
 fn php_heredoc_delimiter(line: &str) -> Option<String> {
@@ -7446,9 +7580,9 @@ mod formatter_tests {
     use super::{
         Arc, DefinitionQuery, EditorView, FindReplace, FindReplaceAll, FindState,
         ProjectSymbolIndex, VendorSymbolIndex, completion_presentation, declared_class_fqn,
-        declared_parent_fqn, extract_owner_expression, native_format_php, property_type_in_context,
-        resolve_php_class_name, resolve_vendor_definition_target, supports_native_format,
-        vendor_lookup_needed,
+        declared_parent_fqn, extract_owner_expression, native_format_php, normalize_php_line,
+        property_type_in_context, resolve_php_class_name, resolve_vendor_definition_target,
+        supports_native_format, vendor_lookup_needed,
     };
     use lsp_types::CompletionItem;
     use std::time::Duration;
@@ -7607,7 +7741,7 @@ mod formatter_tests {
     fn indents_nested_php_blocks() {
         let input = "<?php\nclass Test{\npublic function foo(){\n$value=1;\nif($value){\necho \"ok\";\n}\n}\n}\n";
         let output = native_format_php(input);
-        assert!(output.contains("class Test{\n    public function foo(){\n        $value=1;"));
+        assert!(output.contains("class Test{\n    public function foo(){\n        $value = 1;"));
         assert!(output.contains("        if($value){\n            echo \"ok\";"));
     }
 
@@ -7639,6 +7773,52 @@ mod formatter_tests {
     fn native_formatter_provider_is_restricted_to_php_paths() {
         assert!(supports_native_format(std::path::Path::new("example.php")));
         assert!(!supports_native_format(std::path::Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn formatter_keeps_semicolon_after_fully_qualified_constructor() {
+        let input = "<?php\n$service = new \\Probe\\Models\\Service();\n";
+        let output = native_format_php(input);
+        assert!(output.contains("new \\Probe\\Models\\Service();"));
+        assert!(!output.contains("Service()\n;"));
+    }
+
+    #[test]
+    fn formatter_keeps_semicolon_after_fqn_static_call() {
+        let input = "<?php\n$result = \\Vendor\\Package\\Service::create();\n";
+        let output = native_format_php(input);
+        assert!(output.contains("Service::create();"));
+    }
+
+    #[test]
+    fn formatter_fqn_is_idempotent() {
+        let input = "<?php\n$service = new \\Probe\\Models\\Service();\n";
+        let once = native_format_php(input);
+        assert_eq!(native_format_php(&once), once);
+    }
+
+    #[test]
+    fn formatter_normalizes_object_operator_spacing() {
+        assert_eq!(
+            normalize_php_line("$service   ->   local ( );"),
+            "$service->local();"
+        );
+    }
+
+    #[test]
+    fn formatter_normalizes_static_operator_spacing() {
+        assert_eq!(
+            normalize_php_line("Service   ::   create ( );"),
+            "Service::create();"
+        );
+    }
+
+    #[test]
+    fn formatter_normalizes_nullsafe_operator_spacing() {
+        assert_eq!(
+            normalize_php_line("$service  ?->  local ( );"),
+            "$service?->local();"
+        );
     }
 
     #[test]
@@ -8250,6 +8430,8 @@ mod diagnostic_store_tests {
                 modifiers: Vec::new(),
                 parameters: Some("(int $value)".into()),
                 return_type: None,
+                structured_parameters: Vec::new(),
+                structured_return_type: None,
             }],
             runtime_symbols: None,
             semantic_snapshot: None,
@@ -8276,6 +8458,8 @@ mod diagnostic_store_tests {
                     modifiers: Vec::new(),
                     parameters: Some("(int $value)".into()),
                     return_type: None,
+                    structured_parameters: Vec::new(),
+                    structured_return_type: None,
                 },
                 axiom_index::ProjectSymbol {
                     name: "pair".into(),
@@ -8288,6 +8472,8 @@ mod diagnostic_store_tests {
                     modifiers: Vec::new(),
                     parameters: Some("(int $a, int $b)".into()),
                     return_type: None,
+                    structured_parameters: Vec::new(),
+                    structured_return_type: None,
                 },
             ],
             runtime_symbols: None,

@@ -244,6 +244,8 @@ mod tests {
                 modifiers: vec![],
                 parameters: None,
                 return_type: None,
+                structured_parameters: Vec::new(),
+                structured_return_type: None,
             },
             ProjectSymbol {
                 name: "A".into(),
@@ -256,6 +258,8 @@ mod tests {
                 modifiers: vec![],
                 parameters: None,
                 return_type: None,
+                structured_parameters: Vec::new(),
+                structured_return_type: None,
             },
         ];
         let outline = build_file_outline(symbols.iter(), &file);

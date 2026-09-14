@@ -413,6 +413,9 @@ impl Document {
     fn previous_codepoint_boundary(&self, offset: usize) -> usize {
         let content = self.content();
         let offset = self.normalize_offset(offset);
+        if offset >= 2 && &content.as_bytes()[offset - 2..offset] == b"\r\n" {
+            return offset - 2;
+        }
         content[..offset]
             .char_indices()
             .next_back()
@@ -422,6 +425,9 @@ impl Document {
     fn next_codepoint_boundary(&self, offset: usize) -> usize {
         let content = self.content();
         let offset = self.normalize_offset(offset);
+        if content.as_bytes().get(offset..offset + 2) == Some(b"\r\n") {
+            return offset + 2;
+        }
         content[offset..]
             .chars()
             .next()
@@ -670,6 +676,66 @@ mod tests {
         document.move_cursor(document.len());
         document.insert_newline();
         assert!(document.content().ends_with("\r\n"));
+    }
+
+    #[test]
+    fn first_backspace_deletes_immediately() {
+        let mut document = Document::from_content("123456");
+        document.move_cursor(document.len());
+        document.delete_backward();
+        assert_eq!(document.content(), "12345");
+        assert_eq!(document.cursor_offset(), 5);
+    }
+
+    #[test]
+    fn backspace_at_line_start_merges_once() {
+        let mut document = Document::from_content("abc\ndef");
+        document.move_cursor(4);
+        document.delete_backward();
+        assert_eq!(document.content(), "abcdef");
+        assert_eq!(document.cursor_offset(), 3);
+    }
+
+    #[test]
+    fn enter_backspace_round_trip_and_repeated_cycles() {
+        let mut document = Document::from_content("abc");
+        for _ in 0..100 {
+            document.move_cursor(3);
+            document.insert_newline();
+            document.delete_backward();
+        }
+        assert_eq!(document.content(), "abc");
+        assert_eq!(document.cursor_offset(), 3);
+        assert_eq!(document.line_count(), 1);
+        assert!(document.selection().is_empty());
+    }
+
+    #[test]
+    fn crlf_backspace_is_atomic_and_caret_never_splits_pair() {
+        let mut document = Document::from_content("abc\r\ndef");
+        assert_eq!(document.line_ending(), LineEnding::CrLf);
+        document.move_cursor(5);
+        document.delete_backward();
+        assert_eq!(document.content(), "abcdef");
+        assert_eq!(document.cursor_offset(), 3);
+        document.move_cursor(4);
+        assert_ne!(
+            &document.content()[document.cursor_offset() - 1..document.cursor_offset() + 1],
+            "\r\n"
+        );
+    }
+
+    #[test]
+    fn move_left_moves_on_first_press_and_unicode_backspace_is_boundary_safe() {
+        let mut document = Document::from_content("123456");
+        document.move_cursor(document.len());
+        document.move_cursor(document.previous_codepoint_offset(document.cursor_offset()));
+        assert_eq!(document.cursor_offset(), 5);
+        let mut unicode = Document::from_content("ação🔥");
+        unicode.move_cursor(unicode.len());
+        unicode.delete_backward();
+        assert_eq!(unicode.content(), "ação");
+        assert!(unicode.content().is_char_boundary(unicode.cursor_offset()));
     }
 
     #[test]
