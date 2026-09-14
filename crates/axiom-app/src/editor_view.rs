@@ -8442,6 +8442,64 @@ mod diagnostic_store_tests {
 
     fn assert_send_sync<T: Send + Sync>() {}
 
+    fn method_fixture(source: &str) -> Vec<ByteDiagnostic> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.php");
+        fs::write(&path, source).unwrap();
+        let mut index = axiom_index::ProjectSymbolIndex::new();
+        index.index_project(dir.path()).unwrap();
+        let snapshot = Arc::new(axiom_index::SemanticSnapshot::from_project_index(
+            &index,
+            axiom_index::SemanticRevision(1),
+        ));
+        let text: Arc<str> = Arc::from(source);
+        compute_argument_inspections(&ArgumentInspectionInput {
+            text,
+            project_symbols: index.symbols().to_vec(),
+            runtime_symbols: None,
+            semantic_snapshot: Some(snapshot),
+            file_key: PersistentFileKey::workspace_lexical(&path),
+        })
+    }
+
+    #[test]
+    fn unknown_instance_method_reports_diagnostic() {
+        let diagnostics =
+            method_fixture("<?php class Service {} $service = new Service(); $service->run();");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Method `run` not found"))
+        );
+    }
+
+    #[test]
+    fn unknown_method_range_is_method_name() {
+        let source = "<?php class Service {} $service = new Service(); $service->run();";
+        let diagnostics = method_fixture(source);
+        let d = diagnostics
+            .iter()
+            .find(|d| d.message.contains("run"))
+            .unwrap();
+        assert_eq!(&source[d.range.clone()], "run");
+    }
+
+    #[test]
+    fn inherited_method_suppresses_unknown_method() {
+        let diagnostics = method_fixture(
+            "<?php namespace Probe\\UnknownMethod; class BaseService { public function inherited(): void {} } class Service extends BaseService {} $service = new Service(); $service->inherited();",
+        );
+        assert!(!diagnostics.iter().any(|d| d.message.contains("inherited")));
+    }
+
+    #[test]
+    fn cross_file_method_add_clears_unknown_method() {
+        let diagnostics = method_fixture(
+            "<?php namespace Probe; class Service { public function run(): void {} } $service = new \\Probe\\Service(); $service->run();",
+        );
+        assert!(!diagnostics.iter().any(|d| d.message.contains("run")));
+    }
+
     #[test]
     fn stale_native_inspection_stops_before_subsequent_rules() {
         let latest_generation = AtomicU64::new(1);
