@@ -15,6 +15,13 @@ Estado real: **pre-alpha experimental**. O workspace compila no Windows com Rust
 
 ## Parcial
 
+- 🟡 **Axiom AI / Chat:** provider Ollama local, seleção e cache de modelos,
+  Thinking por modelo persistido, respostas Markdown, Thinking retornado pelo
+  provider, streaming NDJSON com fila/stale guard, cópia de respostas/blocos de
+  código e scroll nativo do chat já estão implementados. Permanecem cancelamento,
+  retry, histórico persistente, metadados de uso e validação manual contínua do
+  streaming.
+
 - 🟡 Completion: lookup e ranking existem, mas faltam inferência de intenção, expected type e edição semântica.
 - 🟡 References/Find Usages: classes, métodos, propriedades, funções e constantes indexadas; variáveis locais/parâmetros e casos ambíguos permanecem limitados.
 - 🟡 Go to Implementation: interfaces e métodos indexados funcionam; subclasses genéricas, overrides abstratos e consumidores de traits ainda não são completos.

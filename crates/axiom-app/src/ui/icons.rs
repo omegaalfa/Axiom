@@ -8,6 +8,7 @@ const PROJECT_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 const SEARCH_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 4.5 4.5"/></svg>"#;
 const PROBLEMS_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 21 20H3z"/><path d="M12 9v5"/><path d="M12 17.2v.1"/></svg>"#;
 const TERMINAL_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6 6 6-6 6"/><path d="M13 18h7"/></svg>"#;
+const ARROW_DOWN_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v16"/><path d="m6 14 6 6 6-6"/></svg>"#;
 
 pub struct AxiomAssets;
 
@@ -18,6 +19,7 @@ impl AssetSource for AxiomAssets {
             "icons/activity-search.svg" => SEARCH_ICON,
             "icons/activity-problems.svg" => PROBLEMS_ICON,
             "icons/activity-terminal.svg" => TERMINAL_ICON,
+            "icons/arrow-down.svg" => ARROW_DOWN_ICON,
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(source.as_bytes())))
@@ -30,11 +32,19 @@ impl AssetSource for AxiomAssets {
                 "activity-search.svg".into(),
                 "activity-problems.svg".into(),
                 "activity-terminal.svg".into(),
+                "arrow-down.svg".into(),
             ]
         } else {
             Vec::new()
         })
     }
+}
+
+pub fn arrow_down_icon(color: Rgba) -> Svg {
+    svg()
+        .path("icons/arrow-down.svg")
+        .size(metrics().icon_size)
+        .text_color(color)
 }
 
 #[derive(Clone, Copy)]

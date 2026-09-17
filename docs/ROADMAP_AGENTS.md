@@ -298,6 +298,20 @@ e use armazenamento seguro do SO quando possível.
 
 # M.2 — AI Chat
 
+## Estado atual (2026-09-17)
+
+O núcleo de Chat já está funcional com Ollama local: seleção de provider/modelo,
+capability e preferência de Thinking por modelo persistida, requests non-streaming
+e streaming NDJSON com `ThinkingDelta`/`ContentDelta`, fila thread-safe e stale
+guard. A UI renderiza Markdown nativo, blocos de código com cópia, Thinking
+colapsável, cópia da última resposta e scroll nativo com ação one-shot para o fim.
+
+Ainda pendentes neste marco: cancelamento de generation, retry, histórico
+persistente, metadados de uso e validação manual contínua do streaming em desktop.
+
+O transporte permanece fora da UI thread e as atualizações são drenadas em lote
+no ciclo compartilhado do `WorkspaceView`.
+
 Somente agora aparece a primeira UI.
 
 ## Objetivo

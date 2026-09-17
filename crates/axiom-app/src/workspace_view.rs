@@ -44,7 +44,7 @@ use crate::{
     terminal_view::TerminalView,
     ui::{
         components::tooltip,
-        icons::{ActivityIcon, activity_icon, file_icon},
+        icons::{ActivityIcon, activity_icon, arrow_down_icon, file_icon},
         metrics, theme,
     },
 };
@@ -904,6 +904,7 @@ pub struct WorkspaceView {
     thinking_preferences: HashMap<(String, String), bool>,
     thinking_expanded: HashSet<u64>,
     chat_stream_events: Arc<Mutex<Vec<ChatStreamEvent>>>,
+    chat_scroll_handle: ScrollHandle,
     model_picker_open: bool,
     model_label: String,
     providers_modal_visible: bool,
@@ -1717,6 +1718,7 @@ impl WorkspaceView {
                 .collect(),
             thinking_expanded: HashSet::new(),
             chat_stream_events: Arc::new(Mutex::new(Vec::new())),
+            chat_scroll_handle: ScrollHandle::new(),
             model_picker_open: false,
             model_label: if ui_settings
                 .configured_providers
@@ -4587,6 +4589,21 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn jump_chat_to_latest(&mut self, cx: &mut Context<Self>) {
+        self.chat_scroll_handle.scroll_to_bottom();
+        cx.notify();
+    }
+
+    fn chat_is_near_bottom(&self) -> bool {
+        let max_offset = self.chat_scroll_handle.max_offset().height;
+        if max_offset <= px(0.) {
+            return true;
+        }
+        let offset = self.chat_scroll_handle.offset().y;
+        let distance_to_bottom = (-offset - max_offset).abs();
+        distance_to_bottom <= px(6.)
+    }
+
     fn poll_chat_stream(&mut self, cx: &mut Context<Self>) {
         let events = std::mem::take(
             &mut *self
@@ -6130,6 +6147,7 @@ impl WorkspaceView {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.chat_scroll_handle)
             .flex()
             .flex_col()
             .gap_2()
@@ -6305,6 +6323,32 @@ impl WorkspaceView {
                     ),
             )
             .child(self.render_ai_chat_conversation(cx))
+            .when(
+                !self.chat_messages.is_empty() && !self.chat_is_near_bottom(),
+                |this| {
+                    this.child(
+                        div()
+                            .id("ai-scroll-to-latest")
+                            .absolute()
+                            .bottom(px(92.))
+                            .right_3()
+                            .w(m.icon_size + px(12.))
+                            .h(m.icon_size + px(12.))
+                            .rounded(px(999.))
+                            .bg(t.elevated_surface)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(move |s| s.bg(t.hover))
+                            .tooltip(|_, cx| tooltip("Scroll to latest", cx))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.jump_chat_to_latest(cx);
+                            }))
+                            .child(arrow_down_icon(t.text_primary)),
+                    )
+                },
+            )
             .child(
                 div()
                     .m_3()
