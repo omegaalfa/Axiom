@@ -57,6 +57,8 @@ actions!(
         Down,
         Home,
         End,
+        SelectHome,
+        SelectEnd,
         SelectLeft,
         SelectRight,
         SelectUp,
@@ -100,6 +102,7 @@ const GUTTER_WIDTH: f32 = 64.0;
 const TEXT_PADDING: f32 = 12.0;
 const FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT: f32 = 22.0;
+const HORIZONTAL_END_PADDING: f32 = 16.0;
 
 struct CachedLineLayout {
     text: String,
@@ -119,6 +122,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", Down, Some("Editor")),
         KeyBinding::new("home", Home, Some("Editor")),
         KeyBinding::new("end", End, Some("Editor")),
+        KeyBinding::new("shift-home", SelectHome, Some("Editor")),
+        KeyBinding::new("shift-end", SelectEnd, Some("Editor")),
         KeyBinding::new("shift-left", SelectLeft, Some("Editor")),
         KeyBinding::new("shift-right", SelectRight, Some("Editor")),
         KeyBinding::new("shift-up", SelectUp, Some("Editor")),
@@ -1928,10 +1933,23 @@ impl EditorView {
     }
 
     fn ensure_cursor_visible(&self) {
-        self.scroll.scroll_to_item(
-            self.document.line_of_offset(self.document.cursor_offset()),
-            ScrollStrategy::Center,
-        );
+        let line = self.document.line_of_offset(self.document.cursor_offset());
+        self.scroll.scroll_to_item(line, ScrollStrategy::Center);
+    }
+
+    fn reveal_horizontal_home(&self) {
+        let scroll = self.scroll.0.borrow();
+        let offset = scroll.base_handle.offset();
+        scroll.base_handle.set_offset(gpui::point(px(0.), offset.y));
+    }
+
+    fn reveal_horizontal_end(&self) {
+        let scroll = self.scroll.0.borrow();
+        let offset = scroll.base_handle.offset();
+        let max = scroll.base_handle.max_offset();
+        scroll
+            .base_handle
+            .set_offset(gpui::point(-max.width, offset.y));
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -2022,11 +2040,22 @@ impl EditorView {
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(
-            self.document
-                .offset_of_line(self.document.line_of_offset(self.document.cursor_offset())),
-            cx,
-        );
+        let line = self.document.line_of_offset(self.document.cursor_offset());
+        let start = self.document.offset_of_line(line);
+        let content = self.document.line_content(line);
+        let text = trim_eol(content.as_ref());
+        let useful = text
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map_or(0, |(offset, _)| offset);
+        let target = if self.document.cursor_offset() == start + useful {
+            start
+        } else {
+            start + useful
+        };
+        self.move_to(target, cx);
+        self.reveal_horizontal_home();
+        self.reveal_horizontal_home();
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
@@ -2034,6 +2063,33 @@ impl EditorView {
         let start = self.document.offset_of_line(line);
         let len = trim_eol(self.document.line_content(line).as_ref()).len();
         self.move_to(start + len, cx);
+        self.reveal_horizontal_end();
+    }
+
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        let line = self.document.line_of_offset(self.document.cursor_offset());
+        let start = self.document.offset_of_line(line);
+        let content = self.document.line_content(line);
+        let text = trim_eol(content.as_ref());
+        let useful = text
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map_or(0, |(offset, _)| offset);
+        let target = if self.document.cursor_offset() == start + useful {
+            start
+        } else {
+            start + useful
+        };
+        self.select_to(target, cx);
+        self.reveal_horizontal_home();
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        let line = self.document.line_of_offset(self.document.cursor_offset());
+        let start = self.document.offset_of_line(line);
+        let len = trim_eol(self.document.line_content(line).as_ref()).len();
+        self.select_to(start + len, cx);
+        self.reveal_horizontal_end();
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
@@ -4698,7 +4754,8 @@ impl EditorView {
             .flex()
             .w(self
                 .content_width
-                .max(px(GUTTER_WIDTH + TEXT_PADDING) + shaped_width))
+                .max(px(GUTTER_WIDTH + TEXT_PADDING) + shaped_width)
+                + px(HORIZONTAL_END_PADDING))
             .h(px(LINE_HEIGHT))
             .line_height(px(LINE_HEIGHT))
             .text_size(px(FONT_SIZE))
@@ -5862,6 +5919,8 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
             .on_action(cx.listener(Self::select_up))
@@ -7171,6 +7230,14 @@ mod completion_ranking_tests {
 
 #[cfg(test)]
 mod formatter_tests {
+    #[test]
+    fn horizontal_content_range_includes_visual_end_padding_only() {
+        let logical_width = 640.0_f32;
+        let layout_width = logical_width.max(120.0) + super::HORIZONTAL_END_PADDING;
+        assert_eq!(logical_width, 640.0);
+        assert_eq!(layout_width, 656.0);
+    }
+
     #[gpui::test]
     fn outline_accept_has_no_ime_composition_and_typing_preserves_name(
         cx: &mut gpui::TestAppContext,

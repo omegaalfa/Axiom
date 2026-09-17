@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
@@ -11,10 +11,15 @@ use std::{
     time::Instant,
 };
 
+use axiom_ai_provider::{
+    ChatRole, OllamaProvider, ProviderChatMessage, ProviderChatRequest, ProviderChatStreamEvent,
+    ProviderConnectionRequest, ProviderConnectivity, ProviderKind, ProviderUiState, RequestTracker,
+};
 use axiom_app::commands::Keymap;
 use axiom_app::shell_state::{
-    RecentProjects, StartupTarget, composer_vendor_cache_path, project_symbol_cache_path,
-    recent_projects_path, runtime_stubs_cache_path, runtime_stubs_default_path, unix_timestamp_now,
+    ProviderPersisted, RecentProjects, StartupTarget, UiSettings, composer_vendor_cache_path,
+    project_symbol_cache_path, recent_projects_path, runtime_stubs_cache_path,
+    runtime_stubs_default_path, ui_settings_path, unix_timestamp_now,
 };
 use axiom_editor::Document;
 use axiom_index::{
@@ -27,10 +32,10 @@ use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_con
 use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSession};
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
-    LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollHandle, SharedString, Style, Timer, UTF16Selection, Window, actions, div, prelude::*, px,
-    relative,
+    Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight, GlobalElementId, KeyBinding,
+    KeyDownEvent, LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, ScrollHandle, SharedString, Style, Timer, UTF16Selection, Window, actions, div,
+    prelude::*, px, relative,
 };
 
 use crate::{
@@ -57,6 +62,7 @@ actions!(
         ShowFeatures,
         Find,
         ToggleProject,
+        ToggleAiPanel,
         ToggleTerminal,
         OpenInTerminal,
         ImportRuntimeStubs,
@@ -74,6 +80,21 @@ actions!(
         DebugInput,
         GoToImplementation,
         CloseFindUsages,
+        InputBackspace,
+        InputDelete,
+        InputLeft,
+        InputRight,
+        InputHome,
+        InputEnd,
+        InputSelectAll,
+        InputSelectLeft,
+        InputSelectRight,
+        InputSelectHome,
+        InputSelectEnd,
+        InputCopy,
+        InputCut,
+        InputPaste,
+        InputEnter,
     ]
 );
 
@@ -82,6 +103,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-shift-o", OpenProject, None),
         KeyBinding::new("secondary-o", OpenFile, None),
         KeyBinding::new("secondary-f", Find, None),
+        KeyBinding::new("ctrl-alt-a", ToggleAiPanel, None),
         KeyBinding::new("secondary-`", ToggleTerminal, None),
         KeyBinding::new("ctrl-shift-p", CommandPalette, None),
         KeyBinding::new("up", PaletteUp, Some("CommandPalette")),
@@ -93,12 +115,36 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("f12", DebugInput, None),
         KeyBinding::new("ctrl-alt-b", GoToImplementation, None),
         KeyBinding::new("alt-f7", crate::editor_view::References, None),
+        KeyBinding::new("backspace", InputBackspace, Some("SingleLineInput")),
+        KeyBinding::new("delete", InputDelete, Some("SingleLineInput")),
+        KeyBinding::new("left", InputLeft, Some("SingleLineInput")),
+        KeyBinding::new("right", InputRight, Some("SingleLineInput")),
+        KeyBinding::new("home", InputHome, Some("SingleLineInput")),
+        KeyBinding::new("end", InputEnd, Some("SingleLineInput")),
+        KeyBinding::new("secondary-a", InputSelectAll, Some("SingleLineInput")),
+        KeyBinding::new("shift-left", InputSelectLeft, Some("SingleLineInput")),
+        KeyBinding::new("shift-right", InputSelectRight, Some("SingleLineInput")),
+        KeyBinding::new("shift-home", InputSelectHome, Some("SingleLineInput")),
+        KeyBinding::new("shift-end", InputSelectEnd, Some("SingleLineInput")),
+        KeyBinding::new("secondary-c", InputCopy, Some("SingleLineInput")),
+        KeyBinding::new("secondary-x", InputCut, Some("SingleLineInput")),
+        KeyBinding::new("secondary-v", InputPaste, Some("SingleLineInput")),
+        KeyBinding::new("enter", InputEnter, Some("SingleLineInput")),
+        KeyBinding::new("shift-enter", InputEnter, Some("SingleLineInput")),
     ]
 }
 
 struct OpenTab {
     path: PathBuf,
     editor: Entity<EditorView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderModalView {
+    ProvidersList,
+    AddProvider,
+    ConfigureOpenAI,
+    ConfigureAnthropic,
 }
 
 #[derive(Clone)]
@@ -240,6 +286,15 @@ fn modal_type_popup_geometry(
     gpui::Bounds::new(gpui::point(x, y), gpui::size(width, height))
 }
 
+fn ai_panel_width_for_viewport(
+    requested: Pixels,
+    viewport: gpui::Size<Pixels>,
+    fixed_left: Pixels,
+) -> Pixels {
+    let available = (viewport.width - fixed_left - px(160.)).max(px(0.));
+    requested.min(px(520.)).min(available).max(px(0.))
+}
+
 #[cfg(test)]
 mod semantic_popup_visual_tests {
     use super::*;
@@ -260,6 +315,14 @@ mod semantic_popup_visual_tests {
         let footer_safe =
             modal_type_popup_geometry(gpui::point(px(100.), px(500.)), viewport, 4, Some(px(530.)));
         assert!(footer_safe.origin.y < px(500.));
+    }
+
+    #[test]
+    fn ai_panel_width_never_exceeds_small_viewport_space() {
+        let width = ai_panel_width_for_viewport(px(340.), gpui::size(px(420.), px(300.)), px(260.));
+        assert_eq!(width, px(0.));
+        let width = ai_panel_width_for_viewport(px(340.), gpui::size(px(900.), px(300.)), px(260.));
+        assert_eq!(width, px(340.));
     }
 
     #[test]
@@ -608,6 +671,79 @@ enum ModalField {
     Implements,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveTextInput {
+    None,
+    AiComposer,
+    ProviderBaseUrl,
+    ProviderApiKey,
+    ProviderCatalogSearch,
+    ModalInput,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatUiMessage {
+    id: u64,
+    role: ChatRole,
+    content: String,
+    thinking: Option<String>,
+}
+
+struct ChatStreamEvent {
+    request_id: axiom_ai_provider::ProviderRequestId,
+    event: ProviderChatStreamEvent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ChatRequestState {
+    Idle,
+    Sending,
+    Error(String),
+}
+
+fn should_send_ai_on_enter(active: ActiveTextInput, text: &str, state: &ChatRequestState) -> bool {
+    active == ActiveTextInput::AiComposer
+        && !text.trim().is_empty()
+        && !matches!(state, ChatRequestState::Sending)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderModel {
+    id: String,
+    label: String,
+}
+
+fn provider_models(provider: &str) -> Vec<ProviderModel> {
+    match provider {
+        "Ollama" => Vec::new(),
+        "Anthropic" => vec![
+            ProviderModel {
+                id: "claude-sonnet".into(),
+                label: "Claude Sonnet".into(),
+            },
+            ProviderModel {
+                id: "claude-opus".into(),
+                label: "Claude Opus".into(),
+            },
+        ],
+        _ => vec![
+            ProviderModel {
+                id: "gpt-5.6-sol".into(),
+                label: "GPT-5.6 Sol".into(),
+            },
+            ProviderModel {
+                id: "gpt-5.6".into(),
+                label: "GPT-5.6".into(),
+            },
+            ProviderModel {
+                id: "gpt-5.6-pro".into(),
+                label: "GPT-5.6 Pro".into(),
+            },
+        ],
+    }
+}
+
 enum ExplorerFsResult {
     Create(Option<PathBuf>),
     Rename { old: PathBuf, new: PathBuf },
@@ -746,6 +882,47 @@ pub struct WorkspaceView {
     pending_delete: Option<PathBuf>,
     pending_delete_is_directory: bool,
     project_panel_visible: bool,
+    ai_panel_visible: bool,
+    ai_panel_width: Pixels,
+    ai_panel_resizing: bool,
+    ai_panel_resize_start_x: f32,
+    ai_panel_resize_start_width: f32,
+    ui_settings_path: Option<PathBuf>,
+    ai_composer_text: String,
+    ai_composer_selection: UTF16Selection,
+    ai_composer_focus: FocusHandle,
+    ai_composer_geometry: crate::ui::input_line::InputGeometry,
+    ai_composer_active: bool,
+    ai_composer_dragging: bool,
+    ai_composer_marked_range: Option<std::ops::Range<usize>>,
+    chat_messages: Vec<ChatUiMessage>,
+    chat_request_state: ChatRequestState,
+    chat_next_message_id: u64,
+    chat_generating_phase: u8,
+    chat_current_request_id: Option<axiom_ai_provider::ProviderRequestId>,
+    chat_thinking_enabled: bool,
+    thinking_preferences: HashMap<(String, String), bool>,
+    thinking_expanded: HashSet<u64>,
+    chat_stream_events: Arc<Mutex<Vec<ChatStreamEvent>>>,
+    model_picker_open: bool,
+    model_label: String,
+    providers_modal_visible: bool,
+    provider_modal_view: ProviderModalView,
+    provider_config_target: String,
+    provider_api_key: crate::ui::input_line::SingleLineInputState,
+    provider_base_url: crate::ui::input_line::SingleLineInputState,
+    provider_base_url_active: bool,
+    active_text_input: ActiveTextInput,
+    configured_providers: Vec<(String, String)>,
+    provider_configs: Vec<ProviderPersisted>,
+    provider_catalog_input: crate::ui::input_line::SingleLineInputState,
+    provider_model_picker_open: bool,
+    provider_default_model: Option<String>,
+    provider_connection_state: ProviderUiState,
+    provider_request_tracker: RequestTracker,
+    ollama_models: Vec<axiom_ai_provider::ProviderModel>,
+    default_provider: Option<String>,
+    active_provider: Option<String>,
     terminal_session: Option<std::sync::Arc<TerminalSession>>,
     terminal_view: Option<Entity<TerminalView>>,
     terminal_visible: bool,
@@ -808,7 +985,159 @@ pub struct WorkspaceView {
     last_key_event_at: Option<Instant>,
 }
 
+fn render_assistant_markdown(content: &str, cx: &mut Context<WorkspaceView>) -> gpui::Div {
+    let t = theme();
+    let mut blocks = Vec::new();
+    let mut in_code = false;
+    let mut code = String::new();
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_code {
+                let code_content = code.trim_end_matches('\n').to_owned();
+                let copy_content = code_content.clone();
+                blocks.push(
+                    div()
+                        .relative()
+                        .px_2()
+                        .py_1()
+                        .bg(t.elevated_surface)
+                        .font_family(crate::ui::metrics::CODE_FONT_FAMILY)
+                        .text_color(t.text_primary)
+                        .child(
+                            div()
+                                .id("ai-copy-code-block")
+                                .absolute()
+                                .top_1()
+                                .right_1()
+                                .px_1()
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(move |s| s.bg(t.hover))
+                                .tooltip(|_, cx| tooltip("Copy code", cx))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.copy_code_block(&copy_content, cx);
+                                }))
+                                .child("⧉"),
+                        )
+                        .child(code_content),
+                );
+                code.clear();
+            }
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            code.push_str(line);
+            code.push('\n');
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            blocks.push(div().h_2());
+        } else if trimmed == "---" || trimmed == "***" {
+            blocks.push(div().h_px().w_full().bg(t.border_subtle));
+        } else if let Some(heading) = trimmed.strip_prefix("### ") {
+            blocks.push(
+                div()
+                    .text_color(t.text_primary)
+                    .text_size(px(15.))
+                    .child(heading.to_string()),
+            );
+        } else if let Some(heading) = trimmed.strip_prefix("## ") {
+            blocks.push(
+                div()
+                    .text_color(t.text_primary)
+                    .text_size(px(16.))
+                    .child(heading.to_string()),
+            );
+        } else if let Some(heading) = trimmed.strip_prefix("# ") {
+            blocks.push(
+                div()
+                    .text_color(t.text_primary)
+                    .text_size(px(18.))
+                    .child(heading.to_string()),
+            );
+        } else if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            blocks.push(div().child(format!("• {}", item.trim_matches('*'))));
+        } else if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && trimmed.contains(". ")
+        {
+            blocks.push(div().child(trimmed.to_string()));
+        } else if let Some(quote) = trimmed.strip_prefix("> ") {
+            blocks.push(
+                div()
+                    .pl_2()
+                    .border_l_1()
+                    .border_color(t.accent)
+                    .text_color(t.text_secondary)
+                    .child(quote.to_string()),
+            );
+        } else {
+            let visible = trimmed.replace("__", "").replace('`', "");
+            blocks.push(render_markdown_inline(&visible, t.text_secondary));
+        }
+    }
+    if in_code && !code.is_empty() {
+        let code_content = code.trim_end_matches('\n').to_owned();
+        let copy_content = code_content.clone();
+        blocks.push(
+            div()
+                .relative()
+                .px_2()
+                .py_1()
+                .bg(t.elevated_surface)
+                .font_family(crate::ui::metrics::CODE_FONT_FAMILY)
+                .child(
+                    div()
+                        .id("ai-copy-code-block")
+                        .absolute()
+                        .top_1()
+                        .right_1()
+                        .px_1()
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |s| s.bg(t.hover))
+                        .tooltip(|_, cx| tooltip("Copy code", cx))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_code_block(&copy_content, cx);
+                        }))
+                        .child("⧉"),
+                )
+                .child(code_content),
+        );
+    }
+    div().flex().flex_col().gap_1().children(blocks)
+}
+
+fn render_thinking_text(text: &str, color: gpui::Rgba) -> gpui::Div {
+    div().flex().flex_col().gap_1().children(
+        text.lines()
+            .map(|line| div().text_color(color).child(line.to_owned())),
+    )
+}
+
+fn render_markdown_inline(text: &str, color: gpui::Rgba) -> gpui::Div {
+    let parts: Vec<_> = text.split("**").collect();
+    div()
+        .flex()
+        .flex_wrap()
+        .children(parts.into_iter().enumerate().map(|(index, part)| {
+            if index % 2 == 1 {
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(color)
+                    .child(part.to_owned())
+            } else {
+                div().text_color(color).child(part.to_owned())
+            }
+        }))
+}
+
 impl WorkspaceView {
+    fn copy_code_block(&mut self, code: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(code.to_owned()));
+    }
     fn current_text_for_path(&self, path: &Path, cx: &App) -> Option<(String, TargetTextSource)> {
         let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if let Some(tab) = self.tabs.iter().find(|tab| {
@@ -826,10 +1155,10 @@ impl WorkspaceView {
     }
 
     fn render_command_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let workspace = cx.entity();
         let t = theme();
         let m = metrics();
         let commands = self.palette_commands();
-        let workspace = cx.entity();
         div()
             .absolute()
             .top(px(70.))
@@ -1261,6 +1590,8 @@ impl WorkspaceView {
             .as_deref()
             .map(RecentProjects::load)
             .unwrap_or_default();
+        let ui_path = ui_settings_path();
+        let ui_settings = ui_path.as_deref().map(UiSettings::load).unwrap_or_default();
         let keymap = Keymap::load_user();
         let (semantic_update_sender, semantic_update_receiver) = mpsc::channel();
         if debug_input_enabled() {
@@ -1357,6 +1688,90 @@ impl WorkspaceView {
             pending_delete: None,
             pending_delete_is_directory: false,
             project_panel_visible: true,
+            ai_panel_visible: ui_settings.ai_panel_visible,
+            ai_panel_width: px(ui_settings.ai_panel_width.clamp(280.0, 520.0)),
+            ai_panel_resizing: false,
+            ai_panel_resize_start_x: 0.0,
+            ai_panel_resize_start_width: ui_settings.ai_panel_width,
+            ui_settings_path: ui_path,
+            ai_composer_text: String::new(),
+            ai_composer_selection: UTF16Selection {
+                range: 0..0,
+                reversed: false,
+            },
+            ai_composer_focus: cx.focus_handle(),
+            ai_composer_geometry: Default::default(),
+            ai_composer_active: false,
+            ai_composer_dragging: false,
+            ai_composer_marked_range: None,
+            chat_messages: Vec::new(),
+            chat_request_state: ChatRequestState::Idle,
+            chat_next_message_id: 1,
+            chat_generating_phase: 0,
+            chat_current_request_id: None,
+            chat_thinking_enabled: false,
+            thinking_preferences: ui_settings
+                .thinking_preferences
+                .iter()
+                .map(|(provider, model, enabled)| ((provider.clone(), model.clone()), *enabled))
+                .collect(),
+            thinking_expanded: HashSet::new(),
+            chat_stream_events: Arc::new(Mutex::new(Vec::new())),
+            model_picker_open: false,
+            model_label: if ui_settings
+                .configured_providers
+                .iter()
+                .any(|(_, model)| model == &ui_settings.model_label)
+            {
+                ui_settings.model_label.clone()
+            } else {
+                "Model".into()
+            },
+            providers_modal_visible: false,
+            provider_modal_view: ProviderModalView::ProvidersList,
+            provider_config_target: String::new(),
+            provider_api_key: crate::ui::input_line::SingleLineInputState {
+                focus: Some(cx.focus_handle()),
+                ..Default::default()
+            },
+            provider_base_url: crate::ui::input_line::SingleLineInputState {
+                focus: Some(cx.focus_handle()),
+                ..Default::default()
+            },
+            provider_base_url_active: false,
+            active_text_input: ActiveTextInput::None,
+            configured_providers: ui_settings.configured_providers.clone(),
+            provider_configs: ui_settings.provider_configs.clone(),
+            provider_catalog_input: crate::ui::input_line::SingleLineInputState {
+                focus: Some(cx.focus_handle()),
+                ..Default::default()
+            },
+            provider_model_picker_open: false,
+            provider_default_model: None,
+            provider_connection_state: ProviderUiState::Idle,
+            provider_request_tracker: RequestTracker::default(),
+            ollama_models: ui_settings
+                .provider_configs
+                .iter()
+                .find(|config| config.provider == "Ollama")
+                .map(|config| config.cached_models.clone())
+                .unwrap_or_default(),
+            default_provider: ui_settings.default_provider.clone().filter(|p| {
+                ui_settings
+                    .configured_providers
+                    .iter()
+                    .any(|(name, _)| name == p)
+            }),
+            active_provider: ui_settings
+                .active_provider
+                .clone()
+                .filter(|p| {
+                    ui_settings
+                        .configured_providers
+                        .iter()
+                        .any(|(name, _)| name == p)
+                })
+                .or_else(|| ui_settings.default_provider.clone()),
             terminal_session: None,
             terminal_view: None,
             terminal_visible: false,
@@ -1418,6 +1833,27 @@ impl WorkspaceView {
             key_event_id: 0,
             last_key_event_at: None,
         };
+        workspace.chat_thinking_enabled = workspace
+            .active_provider
+            .as_ref()
+            .and_then(|provider| {
+                workspace
+                    .thinking_preferences
+                    .get(&(provider.clone(), workspace.model_label.clone()))
+            })
+            .copied()
+            .unwrap_or(false);
+        if workspace.active_provider.as_deref() == Some("Ollama") {
+            workspace.provider_config_target = "Ollama".into();
+            if let Some(config) = workspace
+                .provider_configs
+                .iter()
+                .find(|c| c.provider == "Ollama")
+            {
+                workspace.provider_base_url.text = config.base_url.clone();
+            }
+            workspace.test_ollama_connection(cx);
+        }
         workspace.begin_runtime_stub_load(cx, false);
         workspace.start_runtime_watcher(cx);
         if let StartupTarget::Project { root, initial_file } = startup {
@@ -1433,7 +1869,13 @@ impl WorkspaceView {
                             crate::editor_view::UI_STAGE_POLL_CYCLE,
                         );
                         let cycle_started = Instant::now();
-                        if this.explorer_operation.is_some()
+                        if (this.explorer_operation.is_some()
+                            || matches!(
+                                this.active_text_input,
+                                ActiveTextInput::AiComposer
+                                    | ActiveTextInput::ProviderBaseUrl
+                                    | ActiveTextInput::ProviderApiKey
+                            ))
                             && crate::ui::input_line::blink_due(
                                 cycle_started,
                                 this.modal_caret_activity,
@@ -1441,11 +1883,23 @@ impl WorkspaceView {
                             )
                         {
                             this.modal_caret_visible = !this.modal_caret_visible;
+                            if this.active_text_input == ActiveTextInput::ProviderBaseUrl {
+                                this.provider_base_url.active = this.modal_caret_visible;
+                            }
+                            if this.active_text_input == ActiveTextInput::ProviderApiKey {
+                                this.provider_api_key.active = this.modal_caret_visible;
+                            }
                             this.modal_caret_toggle = cycle_started;
+                            cx.notify();
+                        }
+                        if matches!(this.chat_request_state, ChatRequestState::Sending) {
+                            this.chat_generating_phase =
+                                this.chat_generating_phase.wrapping_add(1) % 4;
                             cx.notify();
                         }
                         let poll_started = Instant::now();
                         this.poll_lsp(cx);
+                        this.poll_chat_stream(cx);
                         let lsp_us = poll_started.elapsed().as_micros();
                         if this.index_results.is_some() {
                             this.indexing_phase = this.indexing_phase.wrapping_add(6) % 100;
@@ -2815,7 +3269,10 @@ impl WorkspaceView {
                 token_text = ?token.as_ref().map(|token| token.text.as_str()),
                 token_kind = ?token.as_ref().map(|token| token.kind.as_str()),
                 token_range = ?token.as_ref().map(|token| token.range.clone()),
-                "\n\n\n[DEFINITION INPUT]"
+                "
+
+
+[DEFINITION INPUT]"
             );
         }
         let snapshot = engine.snapshot();
@@ -2833,7 +3290,10 @@ impl WorkspaceView {
         );
         let semantic_us = semantic_started.elapsed().as_micros();
         if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
-            tracing::info!(outcome = ?detailed.outcome, result = ?detailed.result, "\n\n\n[DEFINITION RESULT]");
+            tracing::info!(outcome = ?detailed.outcome, result = ?detailed.result, "
+
+
+[DEFINITION RESULT]");
         }
         let axiom_index::DefinitionResult::Resolved(candidate) = &detailed.result else {
             if debug_input_enabled() {
@@ -4059,6 +4519,2018 @@ impl WorkspaceView {
             );
         }
         cx.notify();
+    }
+
+    fn persist_ui_settings(&self) {
+        if let Some(path) = &self.ui_settings_path {
+            let _ = UiSettings {
+                ai_panel_visible: self.ai_panel_visible,
+                ai_panel_width: self.ai_panel_width.into(),
+                configured_providers: self.configured_providers.clone(),
+                default_provider: self.default_provider.clone(),
+                active_provider: self.active_provider.clone(),
+                model_label: self.model_label.clone(),
+                provider_configs: self.provider_configs.clone(),
+                thinking_preferences: self
+                    .thinking_preferences
+                    .iter()
+                    .map(|((provider, model), enabled)| (provider.clone(), model.clone(), *enabled))
+                    .collect(),
+            }
+            .save(path);
+        }
+    }
+
+    fn toggle_ai_panel(&mut self, _: &ToggleAiPanel, _: &mut Window, cx: &mut Context<Self>) {
+        self.ai_panel_visible = !self.ai_panel_visible;
+        self.persist_ui_settings();
+        cx.notify();
+    }
+
+    fn ai_panel_resize_start(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_panel_resizing = true;
+        self.ai_panel_resize_start_x = event.position.x.into();
+        self.ai_panel_resize_start_width = self.ai_panel_width.into();
+        cx.notify();
+    }
+
+    fn ai_panel_resize_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ai_panel_resizing {
+            let x: f32 = event.position.x.into();
+            self.ai_panel_width = px((self.ai_panel_resize_start_width - x
+                + self.ai_panel_resize_start_x)
+                .clamp(280.0, 520.0));
+            cx.notify();
+        }
+    }
+
+    fn ai_panel_resize_end(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.ai_panel_resizing {
+            self.ai_panel_resizing = false;
+            self.persist_ui_settings();
+            cx.notify();
+        }
+    }
+
+    fn toggle_model_picker(&mut self, cx: &mut Context<Self>) {
+        self.model_picker_open = !self.model_picker_open;
+        cx.notify();
+    }
+
+    fn poll_chat_stream(&mut self, cx: &mut Context<Self>) {
+        let events = std::mem::take(
+            &mut *self
+                .chat_stream_events
+                .lock()
+                .expect("chat stream queue poisoned"),
+        );
+        if events.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for event in events {
+            if Some(event.request_id) != self.chat_current_request_id {
+                continue;
+            }
+            let assistant_id = self
+                .chat_messages
+                .iter()
+                .rev()
+                .find(|m| m.role == ChatRole::Assistant)
+                .map(|m| m.id);
+            match event.event {
+                ProviderChatStreamEvent::ThinkingDelta(delta) => {
+                    if let Some(id) = assistant_id
+                        .and_then(|id| self.chat_messages.iter().position(|m| m.id == id))
+                    {
+                        self.chat_messages[id]
+                            .thinking
+                            .get_or_insert_with(String::new)
+                            .push_str(&delta);
+                        changed = true;
+                    }
+                }
+                ProviderChatStreamEvent::ContentDelta(delta) => {
+                    if let Some(id) = assistant_id
+                        .and_then(|id| self.chat_messages.iter().position(|m| m.id == id))
+                    {
+                        self.chat_messages[id].content.push_str(&delta);
+                        changed = true;
+                    }
+                }
+                ProviderChatStreamEvent::Done => {
+                    self.chat_request_state = ChatRequestState::Idle;
+                    self.chat_current_request_id = None;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn send_ai_chat_message(&mut self, cx: &mut Context<Self>) {
+        let content = self.ai_composer_text.clone();
+        if content.trim().is_empty() || matches!(self.chat_request_state, ChatRequestState::Sending)
+        {
+            return;
+        }
+        if self.provider_config_target != "Ollama"
+            || self.model_label.trim().is_empty()
+            || self.model_label == "Model"
+            || self.provider_base_url.text.trim().is_empty()
+        {
+            self.chat_request_state =
+                ChatRequestState::Error("Ollama provider/model unavailable".into());
+            cx.notify();
+            return;
+        }
+        self.chat_messages.push(ChatUiMessage {
+            id: self.chat_next_message_id,
+            role: ChatRole::User,
+            content,
+            thinking: None,
+        });
+        self.chat_next_message_id += 1;
+        self.ai_composer_text.clear();
+        self.ai_composer_selection = UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        };
+        self.chat_request_state = ChatRequestState::Sending;
+        let id = self.provider_request_tracker.begin();
+        self.chat_current_request_id = Some(id);
+        let assistant_id = self.chat_next_message_id;
+        self.chat_next_message_id += 1;
+        self.chat_messages.push(ChatUiMessage {
+            id: assistant_id,
+            role: ChatRole::Assistant,
+            content: String::new(),
+            thinking: Some(String::new()),
+        });
+        let base_url = self.provider_base_url.text.clone();
+        let model = self.model_label.clone();
+        let think = self
+            .selected_model_supports_thinking()
+            .then_some(self.chat_thinking_enabled);
+        let messages = self
+            .chat_messages
+            .iter()
+            .filter(|message| {
+                !(message.role == ChatRole::Assistant
+                    && message.content.is_empty()
+                    && message.thinking.as_deref() == Some(""))
+            })
+            .map(|message| ProviderChatMessage {
+                role: message.role.clone(),
+                content: message.content.clone(),
+            })
+            .collect();
+        let entity = cx.entity();
+        let chat_events = self.chat_stream_events.clone();
+        cx.spawn(async move |_, cx| {
+            let result = gpui::background_executor()
+                .spawn(async move {
+                    let result = OllamaProvider::default().chat_stream(
+                        &base_url,
+                        &ProviderChatRequest {
+                            model,
+                            messages,
+                            think,
+                        },
+                        |event| {
+                            let mut queue = chat_events.lock().expect("chat stream queue poisoned");
+                            queue.push(ChatStreamEvent {
+                                request_id: id,
+                                event,
+                            });
+                            Ok(())
+                        },
+                    );
+                    result
+                })
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.chat_current_request_id != Some(id) {
+                    return;
+                }
+                match result {
+                    Ok(_response) => this.chat_request_state = ChatRequestState::Idle,
+                    Err(error) => {
+                        this.chat_request_state =
+                            ChatRequestState::Error(error.user_message().into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn test_ollama_connection(&mut self, cx: &mut Context<Self>) {
+        if self.provider_config_target != "Ollama"
+            || matches!(self.provider_connection_state, ProviderUiState::Testing)
+        {
+            return;
+        }
+        let id = self.provider_request_tracker.begin();
+        let base_url = self.provider_base_url.text.clone();
+        self.provider_connection_state = ProviderUiState::Testing;
+        let entity = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = gpui::background_executor()
+                .spawn(async move {
+                    let provider = OllamaProvider::default();
+                    let request = ProviderConnectionRequest {
+                        kind: ProviderKind::Ollama,
+                        base_url,
+                    };
+                    match provider.test_connection(&request) {
+                        axiom_ai_provider::ProviderConnectionStatus::Connected => {
+                            provider.list_models(&request)
+                        }
+                        axiom_ai_provider::ProviderConnectionStatus::Failed(e) => Err(e),
+                    }
+                })
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.provider_request_tracker.current() != Some(id) {
+                    return;
+                }
+                this.provider_connection_state = match result {
+                    Ok(models) => ProviderUiState::Connected { models },
+                    Err(e) => ProviderUiState::Error(e),
+                };
+                if let ProviderUiState::Connected { models } = &this.provider_connection_state {
+                    this.ollama_models = models.clone();
+                    let selected = if models.iter().any(|m| m.label == this.model_label) {
+                        this.model_label.clone()
+                    } else {
+                        models.first().map(|m| m.label.clone()).unwrap_or_default()
+                    };
+                    this.provider_default_model =
+                        (!selected.is_empty()).then_some(selected.clone());
+                    if let Some(config) = this
+                        .provider_configs
+                        .iter_mut()
+                        .find(|c| c.provider == "Ollama")
+                    {
+                        config.cached_models = models.clone();
+                    }
+                    this.persist_ui_settings();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn active_provider_input(
+        &mut self,
+    ) -> Option<&mut crate::ui::input_line::SingleLineInputState> {
+        match self.active_text_input {
+            ActiveTextInput::ProviderBaseUrl => Some(&mut self.provider_base_url),
+            ActiveTextInput::ProviderApiKey => Some(&mut self.provider_api_key),
+            ActiveTextInput::ProviderCatalogSearch => Some(&mut self.provider_catalog_input),
+            _ => None,
+        }
+    }
+
+    fn with_composer_state(
+        &mut self,
+        f: impl FnOnce(&mut crate::ui::input_line::SingleLineInputState),
+    ) {
+        let mut s = crate::ui::input_line::SingleLineInputState {
+            text: self.ai_composer_text.clone(),
+            selection_anchor: utf16_to_byte_offset(
+                &self.ai_composer_text,
+                self.ai_composer_selection.range.start,
+            ),
+            selection_active: utf16_to_byte_offset(
+                &self.ai_composer_text,
+                self.ai_composer_selection.range.end,
+            ),
+            ..Default::default()
+        };
+        f(&mut s);
+        self.ai_composer_text = s.text;
+        self.ai_composer_selection = UTF16Selection {
+            range: byte_to_utf16_offset(&self.ai_composer_text, s.selection_anchor)
+                ..byte_to_utf16_offset(&self.ai_composer_text, s.selection_active),
+            reversed: s.selection_anchor > s.selection_active,
+        };
+    }
+
+    fn input_backspace(&mut self, _: &InputBackspace, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.with_composer_state(|s| s.backspace());
+            cx.notify();
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            i.backspace();
+            cx.notify();
+        }
+    }
+    fn input_delete(&mut self, _: &InputDelete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.with_composer_state(|s| s.delete());
+            cx.notify();
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            i.delete();
+            cx.notify();
+        }
+    }
+    fn input_left(&mut self, _: &InputLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.with_composer_state(|s| s.move_left());
+            cx.notify();
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            i.move_left();
+            cx.notify();
+        }
+    }
+    fn input_right(&mut self, _: &InputRight, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.with_composer_state(|s| s.move_right());
+            cx.notify();
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            i.move_right();
+            cx.notify();
+        }
+    }
+    fn input_home(&mut self, _: &InputHome, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.with_composer_state(|s| s.move_home(false));
+            cx.notify();
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            i.move_home(false);
+            cx.notify();
+        }
+    }
+    fn input_end(&mut self, _: &InputEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.with_composer_state(|s| s.move_end(false));
+            cx.notify();
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            i.move_end(false);
+            cx.notify();
+        }
+    }
+    fn input_select_all(&mut self, _: &InputSelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.with_composer_state(|s| s.select_all());
+            cx.notify();
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            i.select_all();
+            cx.notify();
+        }
+    }
+    fn input_select_left(&mut self, _: &InputSelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.with_composer_state(|s| s.extend_left());
+            cx.notify();
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            i.extend_left();
+            cx.notify();
+        }
+    }
+    fn input_select_right(&mut self, _: &InputSelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.with_composer_state(|s| s.extend_right());
+            cx.notify();
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            i.extend_right();
+            cx.notify();
+        }
+    }
+    fn input_select_home(&mut self, _: &InputSelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.with_composer_state(|s| s.move_home(true));
+            cx.notify();
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            i.move_home(true);
+            cx.notify();
+        }
+    }
+    fn input_select_end(&mut self, _: &InputSelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.with_composer_state(|s| s.move_end(true));
+            cx.notify();
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            i.move_end(true);
+            cx.notify();
+        }
+    }
+    fn input_copy(&mut self, _: &InputCopy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            let r = self.ai_composer_selection.range.clone();
+            let a = utf16_to_byte_offset(&self.ai_composer_text, r.start);
+            let b = utf16_to_byte_offset(&self.ai_composer_text, r.end);
+            if let Some(s) = self.ai_composer_text.get(a..b) {
+                cx.write_to_clipboard(ClipboardItem::new_string(s.to_owned()));
+            }
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            let r = i.selection();
+            if let Some(s) = i.text.get(r) {
+                cx.write_to_clipboard(ClipboardItem::new_string(s.to_owned()));
+            }
+        }
+    }
+    fn input_cut(&mut self, _: &InputCut, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            let r = self.ai_composer_selection.range.clone();
+            let a = utf16_to_byte_offset(&self.ai_composer_text, r.start);
+            let b = utf16_to_byte_offset(&self.ai_composer_text, r.end);
+            if let Some(s) = self.ai_composer_text.get(a..b) {
+                cx.write_to_clipboard(ClipboardItem::new_string(s.to_owned()));
+                self.ai_composer_text.replace_range(a..b, "");
+                let e = self.ai_composer_text.encode_utf16().count();
+                self.ai_composer_selection = UTF16Selection {
+                    range: e..e,
+                    reversed: false,
+                };
+                cx.notify();
+            }
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            let r = i.selection();
+            if let Some(s) = i.text.get(r.clone()) {
+                cx.write_to_clipboard(ClipboardItem::new_string(s.to_owned()));
+                i.replace_selection("");
+                cx.notify();
+            }
+        }
+    }
+    fn input_paste(&mut self, _: &InputPaste, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            if let Some(s) = cx.read_from_clipboard().and_then(|x| x.text()) {
+                let r = self.ai_composer_selection.range.clone();
+                let s = crate::ui::input_line::SingleLineInputState::sanitize_single_line(&s);
+                self.ai_composer_text = replace_utf16_range(&self.ai_composer_text, r, &s).0;
+                let e = self.ai_composer_text.encode_utf16().count();
+                self.ai_composer_selection = UTF16Selection {
+                    range: e..e,
+                    reversed: false,
+                };
+                cx.notify();
+            }
+            return;
+        }
+        if let Some(i) = self.active_provider_input() {
+            if let Some(s) = cx.read_from_clipboard().and_then(|x| x.text()) {
+                i.replace_selection(&s);
+                cx.notify();
+            }
+        }
+    }
+
+    fn input_enter(&mut self, _: &InputEnter, _: &mut Window, cx: &mut Context<Self>) {
+        if should_send_ai_on_enter(
+            self.active_text_input,
+            &self.ai_composer_text,
+            &self.chat_request_state,
+        ) {
+            self.send_ai_chat_message(cx);
+        }
+    }
+    fn provider_base_url_drag_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(
+            self.active_text_input,
+            ActiveTextInput::ProviderBaseUrl | ActiveTextInput::ProviderApiKey
+        ) && event.dragging()
+        {
+            if self.active_text_input == ActiveTextInput::ProviderApiKey {
+                let byte = self.provider_api_key.geometry.hit_test(event.position.x);
+                self.provider_api_key.drag_to(byte);
+            } else {
+                let byte = self.provider_base_url.geometry.hit_test(event.position.x);
+                self.provider_base_url.drag_to(byte);
+            }
+            cx.notify();
+        }
+    }
+
+    fn provider_base_url_drag_end(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_text_input == ActiveTextInput::ProviderApiKey {
+            self.provider_api_key.end_drag();
+        } else {
+            self.provider_base_url.end_drag();
+        }
+        cx.notify();
+    }
+
+    fn choose_model(&mut self, label: &str, cx: &mut Context<Self>) {
+        self.model_label = label.to_owned();
+        self.active_provider = self
+            .configured_providers
+            .iter()
+            .find(|(_, model)| model == label)
+            .map(|(provider, _)| provider.clone());
+        self.model_picker_open = false;
+        self.chat_thinking_enabled = self
+            .active_provider
+            .as_ref()
+            .and_then(|provider| {
+                self.thinking_preferences
+                    .get(&(provider.clone(), self.model_label.clone()))
+            })
+            .copied()
+            .unwrap_or(false);
+        self.persist_ui_settings();
+        cx.notify();
+    }
+
+    fn selected_model_supports_thinking(&self) -> bool {
+        self.active_provider.as_deref() == Some("Ollama")
+            && self
+                .ollama_models
+                .iter()
+                .find(|model| model.label == self.model_label)
+                .and_then(|model| model.metadata.as_ref())
+                .is_some_and(axiom_ai_provider::ModelMetadata::supports_thinking)
+    }
+
+    fn close_providers_modal(&mut self, cx: &mut Context<Self>) {
+        self.providers_modal_visible = false;
+        self.active_text_input = ActiveTextInput::None;
+        self.provider_base_url_active = false;
+        self.provider_base_url.active = false;
+        self.provider_modal_view = ProviderModalView::ProvidersList;
+        cx.notify();
+    }
+
+    fn configure_provider(&mut self, provider: &str, cx: &mut Context<Self>) {
+        self.provider_config_target = provider.to_owned();
+        self.provider_api_key.text.clear();
+        self.provider_api_key.selection_anchor = 0;
+        self.provider_api_key.selection_active = 0;
+        self.provider_base_url.text = if provider == "Anthropic" {
+            "https://api.anthropic.com".to_owned()
+        } else if provider == "Ollama" {
+            "http://localhost:11434".to_owned()
+        } else {
+            "https://api.openai.com/v1".to_owned()
+        };
+        if let Some(saved) = self
+            .provider_configs
+            .iter()
+            .find(|c| c.provider == provider)
+        {
+            self.provider_api_key.text = saved.api_key.clone();
+            self.provider_base_url.text = saved.base_url.clone();
+        }
+        self.provider_base_url.selection_anchor = self.provider_base_url.text.len();
+        self.provider_base_url.selection_active = self.provider_base_url.text.len();
+        let models = provider_models(provider);
+        self.provider_default_model = self
+            .configured_providers
+            .iter()
+            .find(|(name, _)| name == provider)
+            .map(|(_, model)| model.clone())
+            .filter(|m| models.iter().any(|item| &item.label == m))
+            .or_else(|| models.first().map(|m| m.label.clone()));
+        self.provider_model_picker_open = false;
+        self.provider_modal_view = if provider == "Anthropic" {
+            ProviderModalView::ConfigureAnthropic
+        } else {
+            ProviderModalView::ConfigureOpenAI
+        };
+        cx.notify();
+    }
+
+    fn render_provider_config(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let workspace = cx.entity();
+        let models: Vec<ProviderModel> = if self.provider_config_target == "Ollama" {
+            self.ollama_models
+                .iter()
+                .map(|m| ProviderModel {
+                    id: m.id.clone(),
+                    label: m.label.clone(),
+                })
+                .collect()
+        } else {
+            provider_models(&self.provider_config_target)
+        };
+        let model = self
+            .provider_default_model
+            .clone()
+            .unwrap_or_else(|| models.first().map(|m| m.label.clone()).unwrap_or_default());
+        div()
+            .id("provider-config")
+            .w(px(520.))
+            .max_h(px(560.))
+            .overflow_y_scroll()
+            .relative()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .bg(t.panel_background)
+            .border_1()
+            .border_color(t.border)
+            .rounded(metrics().border_radius_medium)
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .child(self.provider_config_target.clone()),
+                    )
+                    .child(
+                        div()
+                            .id("provider-config-close")
+                            .px_2()
+                            .py_1()
+                            .rounded(metrics().border_radius_small)
+                            .text_color(t.text_muted)
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(t.hover).text_color(t.text_primary))
+                            .on_mouse_down(MouseButton::Left, {
+                                let w = workspace.clone();
+                                move |_, _, cx| {
+                                    w.update(cx, |this, cx| this.close_providers_modal(cx))
+                                }
+                            })
+                            .child("×"),
+                    ),
+            )
+            .child(div().text_color(t.text_secondary).child("API Key"))
+            .child(
+                div()
+                    .id("provider-api-key-input")
+                    .key_context("SingleLineInput")
+                    .cursor(CursorStyle::IBeam)
+                    .track_focus(
+                        self.provider_api_key
+                            .focus
+                            .as_ref()
+                            .expect("provider api key focus"),
+                    )
+                    .h(px(34.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .bg(t.editor_background)
+                    .border_1()
+                    .border_color(t.border_subtle)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.active_text_input = ActiveTextInput::ProviderApiKey;
+                            this.provider_api_key.active = true;
+                            this.modal_caret_visible = true;
+                            this.modal_caret_activity = Instant::now();
+                            this.modal_caret_toggle = this.modal_caret_activity;
+                            let byte = this.provider_api_key.geometry.hit_test(event.position.x);
+                            this.provider_api_key.mouse_down(byte, event.click_count);
+                            if let Some(focus) = this.provider_api_key.focus.clone() {
+                                window.focus(&focus);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(Self::provider_base_url_drag_end),
+                    )
+                    .child(crate::ui::input_line::render_state_with_mode(
+                        cx.entity(),
+                        &self.provider_api_key,
+                        crate::ui::input_line::InputVisualMode::Plain,
+                    )),
+            )
+            .child(div().text_color(t.text_secondary).child("Default model"))
+            .child(
+                div()
+                    .h(px(34.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .bg(t.editor_background)
+                    .border_1()
+                    .border_color(t.border_subtle)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.provider_model_picker_open = !this.provider_model_picker_open;
+                            cx.notify();
+                        }),
+                    )
+                    .child(model)
+                    .child("▾"),
+            )
+            .when(self.provider_model_picker_open, |d| {
+                let models = models.clone();
+                d.child(
+                    gpui::deferred(
+                        div()
+                            .id("provider-model-picker")
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .p_2()
+                            .absolute()
+                            .left(px(20.))
+                            .top(px(178.))
+                            .w_full()
+                            .max_w(px(480.))
+                            .max_h(px(220.))
+                            .overflow_y_scroll()
+                            .bg(t.window_background)
+                            .border_1()
+                            .border_color(t.border_subtle)
+                            .children(models.into_iter().map(|item| {
+                                let label = item.label.clone();
+                                let selected =
+                                    self.provider_default_model.as_deref() == Some(label.as_str());
+                                let row = div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(metrics().border_radius_small)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .when(selected, |row| {
+                                        row.bg(t.hover).text_color(t.text_primary)
+                                    })
+                                    .hover(|row| row.bg(t.hover).text_color(t.text_primary))
+                                    .child(div().flex_1().child(item.label))
+                                    .when(selected, |row| row.child("✓"));
+                                row.on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.provider_default_model = Some(label.clone());
+                                        this.provider_model_picker_open = false;
+                                        cx.notify();
+                                    }),
+                                )
+                            })),
+                    )
+                    .with_priority(2),
+                )
+            })
+            .child(div().text_color(t.text_secondary).child("Base URL"))
+            .child(
+                div()
+                    .id("provider-base-url-input")
+                    .key_context("SingleLineInput")
+                    .cursor(CursorStyle::IBeam)
+                    .on_action(cx.listener(Self::input_backspace))
+                    .on_action(cx.listener(Self::input_delete))
+                    .on_action(cx.listener(Self::input_left))
+                    .on_action(cx.listener(Self::input_right))
+                    .on_action(cx.listener(Self::input_home))
+                    .on_action(cx.listener(Self::input_end))
+                    .on_action(cx.listener(Self::input_select_all))
+                    .track_focus(
+                        self.provider_base_url
+                            .focus
+                            .as_ref()
+                            .expect("provider base URL focus"),
+                    )
+                    .h(px(34.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .bg(t.editor_background)
+                    .border_1()
+                    .border_color(t.border_subtle)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.provider_base_url_active = true;
+                            this.active_text_input = ActiveTextInput::ProviderBaseUrl;
+                            this.provider_base_url.active = true;
+                            this.modal_caret_visible = true;
+                            this.modal_caret_activity = Instant::now();
+                            this.modal_caret_toggle = this.modal_caret_activity;
+                            let byte = this.provider_base_url.geometry.hit_test(event.position.x);
+                            let caret = byte_to_utf16_offset(&this.provider_base_url.text, byte);
+                            this.provider_base_url.mouse_down(caret, event.click_count);
+                            this.ai_composer_active = false;
+                            if let Some(focus) = this.provider_base_url.focus.clone() {
+                                window.focus(&focus);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(Self::provider_base_url_drag_end),
+                    )
+                    .child(crate::ui::input_line::render_state(
+                        cx.entity(),
+                        &self.provider_base_url,
+                    )),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(t.accent)
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|s| s.bg(t.hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.test_ollama_connection(cx)),
+                    )
+                    .child(match &self.provider_connection_state {
+                        ProviderUiState::Idle => "Test Connection",
+                        ProviderUiState::Testing => "Testing...",
+                        ProviderUiState::Connected { .. } => "Connected",
+                        ProviderUiState::Error(_) => "Retry Connection",
+                    }),
+            )
+            .when(self.provider_config_target == "Ollama", |this| {
+                this.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_color(t.accent)
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.bg(t.hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.test_ollama_connection(cx);
+                            }),
+                        )
+                        .child("Reload models"),
+                )
+            })
+            .child(
+                div().flex().justify_end().child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .bg(t.accent)
+                        .text_color(t.text_primary)
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            workspace.update(cx, |this, cx| {
+                                let model =
+                                    this.provider_default_model.clone().unwrap_or_else(|| {
+                                        provider_models(&this.provider_config_target)
+                                            .first()
+                                            .map(|m| m.label.clone())
+                                            .unwrap_or_default()
+                                    });
+                                if let Some(entry) = this
+                                    .configured_providers
+                                    .iter_mut()
+                                    .find(|(provider, _)| provider == &this.provider_config_target)
+                                {
+                                    entry.1 = model.to_owned();
+                                } else {
+                                    this.configured_providers.push((
+                                        this.provider_config_target.clone(),
+                                        model.to_owned(),
+                                    ));
+                                    if this.default_provider.is_none() {
+                                        this.default_provider =
+                                            Some(this.provider_config_target.clone());
+                                        this.active_provider = this.default_provider.clone();
+                                        this.model_label = model.to_owned();
+                                    }
+                                }
+                                let config = ProviderPersisted {
+                                    provider: this.provider_config_target.clone(),
+                                    api_key: this.provider_api_key.text.clone(),
+                                    base_url: this.provider_base_url.text.clone(),
+                                    model: model.to_owned(),
+                                    cached_models: this.ollama_models.clone(),
+                                };
+                                if let Some(existing) = this
+                                    .provider_configs
+                                    .iter_mut()
+                                    .find(|c| c.provider == config.provider)
+                                {
+                                    *existing = config;
+                                } else {
+                                    this.provider_configs.push(config);
+                                }
+                                this.provider_modal_view = ProviderModalView::ProvidersList;
+                                this.persist_ui_settings();
+                                cx.notify();
+                            })
+                        })
+                        .child("Save"),
+                ),
+            )
+    }
+
+    fn render_providers_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        if self.provider_modal_view == ProviderModalView::ProvidersList {
+            return div()
+                .id("providers-modal-overlay")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(t.window_background)
+                .child(
+                    div()
+                        .id("provider-catalog")
+                        .w(px(520.))
+                        .p_5()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .bg(t.panel_background)
+                        .border_1()
+                        .border_color(t.border)
+                        .rounded(m.border_radius_medium)
+                        .child(div().text_size(px(16.)).child("AI Providers"))
+                        .when(self.configured_providers.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .text_color(t.text_muted)
+                                    .child("No providers configured yet."),
+                            )
+                            .child(
+                                div()
+                                    .text_color(t.text_secondary)
+                                    .child("Connect a provider to start using Axiom AI."),
+                            )
+                        })
+                        .children(self.configured_providers.iter().map(|(provider, model)| {
+                            let provider_name = provider.clone();
+                            let is_default = self.default_provider.as_deref() == Some(provider);
+                            let configure_name = provider.clone();
+                            let remove_name = provider.clone();
+                            div()
+                                .p_3()
+                                .flex()
+                                .justify_between()
+                                .border_1()
+                                .border_color(t.border_subtle)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(provider.clone())
+                                        .child(div().text_color(t.text_muted).child(model.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_end()
+                                        .gap_1()
+                                        .when(is_default, |d| {
+                                            d.child(div().text_color(t.accent).child("Default"))
+                                        })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .gap_2()
+                                                .when(!is_default, |d| {
+                                                    let default_name = provider_name.clone();
+                                                    d.child(
+                                                        div()
+                                                            .text_color(t.text_muted)
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.default_provider =
+                                                                            Some(default_name.clone());
+                                                                        this.persist_ui_settings();
+                                                                        cx.notify();
+                                                                    },
+                                                                ),
+                                                            )
+                                                            .child("Set default"),
+                                                    )
+                                                })
+                                                .child(
+                                                    div()
+                                                        .text_color(t.accent)
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |this, _, _, cx| {
+                                                                this.configure_provider(
+                                                                    &configure_name,
+                                                                    cx,
+                                                                )
+                                                            }),
+                                                        )
+                                                        .child("Configure"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_color(t.text_muted)
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |this, _, _, cx| {
+                                                                this.configured_providers.retain(
+                                                                    |(p, _)| p != &remove_name,
+                                                                );
+                                                                if this.default_provider.as_deref()
+                                                                    == Some(remove_name.as_str())
+                                                                {
+                                                                    this.default_provider = None;
+                                                                }
+                                                        if this.active_provider.as_deref()
+                                                                    == Some(remove_name.as_str())
+                                                                {
+                                                                    this.active_provider = this
+                                                                        .default_provider
+                                                                        .clone();
+                                                                    this.model_label = this
+                                                                        .active_provider
+                                                                        .as_ref()
+                                                                        .and_then(|name| {
+                                                                            this.configured_providers
+                                                                                .iter()
+                                                                                .find(|(p, _)| p == name)
+                                                                                .map(|(_, model)| model.clone())
+                                                                        })
+                                                                .unwrap_or_default();
+                                                        }
+                                                        if this.configured_providers.is_empty() {
+                                                            this.default_provider = None;
+                                                            this.active_provider = None;
+                                                            this.model_label = "Model".to_owned();
+                                                        }
+                                                        this.persist_ui_settings();
+                                                        cx.notify();
+                                                            }),
+                                                        )
+                                                        .child("Remove"),
+                                                ),
+                                        ),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.default_provider = Some(provider_name.clone());
+                                        this.active_provider = this.default_provider.clone();
+                                        cx.notify();
+                                    }),
+                                )
+                        }))
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .bg(t.accent)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.provider_modal_view = ProviderModalView::AddProvider;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("+ Add Provider"),
+                        )
+                        .child(
+                            div().flex().justify_end().child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.close_providers_modal(cx)
+                                        }),
+                                    )
+                                    .child("Done"),
+                            ),
+                        ),
+                );
+        }
+        if self.provider_modal_view == ProviderModalView::AddProvider {
+            let catalog = [
+                ("Cloud", "OpenAI", "GPT models", true),
+                ("Cloud", "Anthropic", "Claude models", true),
+                ("Cloud", "Google", "Gemini models", true),
+                ("Cloud", "OpenRouter", "Multi-provider models", true),
+                ("Local", "Ollama", "Local models", true),
+                ("Local", "LM Studio", "Local models", true),
+                ("Custom", "OpenAI Compatible", "Custom endpoint", true),
+            ];
+            let query = self.provider_catalog_input.text.to_lowercase();
+            return div()
+                .id("providers-modal-overlay")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(t.window_background)
+                .child(
+                    div()
+                        .id("provider-catalog")
+                        .w(px(520.))
+                        .max_h(px(560.))
+                        .overflow_y_scroll()
+                        .p_5()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .bg(t.panel_background)
+                        .border_1()
+                        .border_color(t.border)
+                        .rounded(m.border_radius_medium)
+                        .child(div().text_size(px(16.)).child("Add Provider"))
+                        .child(
+                            div()
+                                .id("provider-catalog-search")
+                                .key_context("SingleLineInput")
+                                .cursor(CursorStyle::IBeam)
+                                .track_focus(
+                                    self.provider_catalog_input
+                                        .focus
+                                        .as_ref()
+                                        .expect("catalog search focus"),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                        this.active_text_input =
+                                            ActiveTextInput::ProviderCatalogSearch;
+                                        this.provider_catalog_input.active = true;
+                                        let byte = this
+                                            .provider_catalog_input
+                                            .geometry
+                                            .hit_test(event.position.x);
+                                        this.provider_catalog_input
+                                            .mouse_down(byte, event.click_count);
+                                        if let Some(f) = this.provider_catalog_input.focus.clone() {
+                                            window.focus(&f);
+                                        }
+                                        cx.notify();
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::provider_base_url_drag_end),
+                                )
+                                .h(px(34.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .bg(t.editor_background)
+                                .border_1()
+                                .border_color(t.border_subtle)
+                                .text_color(t.text_muted)
+                                .child(crate::ui::input_line::render_state(
+                                    cx.entity(),
+                                    &self.provider_catalog_input,
+                                )),
+                        )
+                        .children(
+                            catalog
+                                .into_iter()
+                                .filter(move |(group, name, description, _)| {
+                                    query.is_empty()
+                                        || name.to_lowercase().contains(&query)
+                                        || group.to_lowercase().contains(&query)
+                                        || description.to_lowercase().contains(&query)
+                                })
+                                .map(|(group, name, description, enabled)| {
+                                    let name_owned = name.to_owned();
+                                    let row = div()
+                                        .p_3()
+                                        .flex()
+                                        .justify_between()
+                                        .border_b_1()
+                                        .border_color(t.border_subtle)
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .child(
+                                                    div().text_color(t.text_secondary).child(group),
+                                                )
+                                                .child(name)
+                                                .child(
+                                                    div()
+                                                        .text_color(t.text_muted)
+                                                        .child(description),
+                                                ),
+                                        );
+                                    if enabled {
+                                        row.child(
+                                            div()
+                                                .text_color(t.accent)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.configure_provider(&name_owned, cx)
+                                                    }),
+                                                )
+                                                .child("Configure"),
+                                        )
+                                    } else {
+                                        row.child(
+                                            div().text_color(t.text_muted).child("Coming soon"),
+                                        )
+                                    }
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_color(t.text_secondary)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.provider_modal_view = ProviderModalView::ProvidersList;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("Back"),
+                        ),
+                );
+        }
+        if false && self.provider_modal_view == ProviderModalView::AddProvider {
+            return div()
+                .id("providers-modal-overlay")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(t.window_background)
+                .child(
+                    div()
+                        .w(px(520.))
+                        .p_5()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .bg(t.panel_background)
+                        .border_1()
+                        .border_color(t.border)
+                        .rounded(m.border_radius_medium)
+                        .child(div().text_size(px(16.)).child("Add Provider"))
+                        .child(
+                            div()
+                                .p_3()
+                                .border_1()
+                                .border_color(t.border_subtle)
+                                .child("OpenAI")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.configure_provider("OpenAI", cx)
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .p_3()
+                                .border_1()
+                                .border_color(t.border_subtle)
+                                .child("Anthropic")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.configure_provider("Anthropic", cx)
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_color(t.text_secondary)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.provider_modal_view = ProviderModalView::ProvidersList;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("Back"),
+                        ),
+                );
+        }
+        if matches!(
+            self.provider_modal_view,
+            ProviderModalView::ConfigureOpenAI | ProviderModalView::ConfigureAnthropic
+        ) {
+            return div()
+                .id("providers-modal-overlay")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(t.window_background)
+                .child(self.render_provider_config(cx));
+        }
+        div()
+            .id("providers-modal-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(t.window_background)
+            .child(
+                div()
+                    .id("providers-modal")
+                    .w(px(520.))
+                    .max_w(px(560.))
+                    .max_h(px(560.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .bg(t.panel_background)
+                    .border_1()
+                    .border_color(t.border)
+                    .rounded(m.border_radius_medium)
+                    .child(
+                        div()
+                            .h(px(48.))
+                            .px_4()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(t.border_subtle)
+                            .child(div().text_size(px(16.)).child("AI Providers"))
+                            .child(
+                                div()
+                                    .id("providers-close")
+                                    .px_2()
+                                    .text_color(t.text_muted)
+                                    .hover(move |s| s.bg(t.hover).text_color(t.text_primary))
+                                    .on_click({
+                                        let w = workspace.clone();
+                                        move |_, _, cx| {
+                                            w.update(cx, |this, cx| this.close_providers_modal(cx))
+                                        }
+                                    })
+                                    .child("×"),
+                            ),
+                    )
+                    .children(
+                        [
+                            ("OpenAI", "Connected / Not configured", "GPT-5.6 Sol"),
+                            ("Anthropic", "Not configured", "Claude Sonnet"),
+                        ]
+                        .into_iter()
+                        .map(|(provider, status, model)| {
+                            div()
+                                .p_4()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .border_b_1()
+                                .border_color(t.border_subtle)
+                                .child(div().text_color(t.text_primary).child(provider))
+                                .child(div().text_color(t.text_muted).child(status))
+                                .child(div().text_color(t.text_secondary).child("Default model"))
+                                .child(
+                                    div()
+                                        .h(px(34.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .bg(t.editor_background)
+                                        .border_1()
+                                        .border_color(t.border_subtle)
+                                        .child(model)
+                                        .child("▾"),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(100.))
+                                        .px_2()
+                                        .py_1()
+                                        .text_color(t.accent)
+                                        .hover(move |s| s.bg(t.hover))
+                                        .on_mouse_down(MouseButton::Left, {
+                                            let w = workspace.clone();
+                                            move |_, _, cx| {
+                                                w.update(cx, |this, cx| {
+                                                    this.configure_provider(provider, cx)
+                                                })
+                                            }
+                                        })
+                                        .child("Configure"),
+                                )
+                        }),
+                    )
+                    .child(
+                        div()
+                            .p_4()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(t.text_primary)
+                                    .child("Local / Future providers"),
+                            )
+                            .child(div().text_color(t.text_muted).child("Coming later")),
+                    )
+                    .child(
+                        div().p_3().flex().justify_end().child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .bg(t.accent)
+                                .text_color(t.text_primary)
+                                .rounded(m.border_radius_small)
+                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                    workspace.update(cx, |this, cx| this.close_providers_modal(cx))
+                                })
+                                .child("Done"),
+                        ),
+                    ),
+            )
+    }
+
+    fn render_model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        let workspace_models = workspace.clone();
+        if self.configured_providers.is_empty() {
+            return div()
+                .id("ai-model-picker")
+                .absolute()
+                .bottom(px(92.))
+                .right(m.spacing_lg)
+                .w(px(220.))
+                .p_2()
+                .bg(t.popup_background)
+                .border_1()
+                .border_color(t.border)
+                .rounded(m.border_radius_medium)
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_color(t.text_muted)
+                        .child("No providers configured."),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_color(t.accent)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.model_picker_open = false;
+                                this.providers_modal_visible = true;
+                                this.provider_modal_view = ProviderModalView::ProvidersList;
+                                cx.notify();
+                            }),
+                        )
+                        .child("Manage Providers..."),
+                );
+        }
+        let configured = self.configured_providers.clone();
+        return div()
+            .id("ai-model-picker")
+            .absolute()
+            .bottom(px(92.))
+            .right(m.spacing_lg)
+            .w(px(220.))
+            .max_h(px(300.))
+            .overflow_y_scroll()
+            .p_2()
+            .bg(t.popup_background)
+            .border_1()
+            .border_color(t.border)
+            .rounded(m.border_radius_medium)
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(t.text_secondary)
+                    .child("Choose model"),
+            )
+            .children(configured.into_iter().map(move |(provider, label)| {
+                let selected = self.model_label == label;
+                let w = workspace_models.clone();
+                let click_label = label.clone();
+                div()
+                    .id(SharedString::from(format!("model-{label}")))
+                    .px_2()
+                    .py_1()
+                    .text_color(if selected {
+                        t.text_primary
+                    } else {
+                        t.text_secondary
+                    })
+                    .bg(if selected {
+                        t.inactive_selection
+                    } else {
+                        t.popup_background
+                    })
+                    .hover(move |s| s.bg(t.hover))
+                    .on_click(move |_, _, cx| {
+                        w.update(cx, |this, cx| this.choose_model(&click_label, cx))
+                    })
+                    .child(format!(
+                        "{provider}  ·  {}{}",
+                        label,
+                        if selected { "  ✓" } else { "" }
+                    ))
+            }))
+            .child(div().mx_2().my_1().h(px(1.)).bg(t.border_subtle))
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(t.accent)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.model_picker_open = false;
+                            this.providers_modal_visible = true;
+                            this.provider_modal_view = ProviderModalView::ProvidersList;
+                            cx.notify();
+                        }),
+                    )
+                    .child("Manage Providers..."),
+            );
+    }
+
+    fn copy_last_assistant(&mut self, cx: &mut Context<Self>) {
+        if let Some(message) = self
+            .chat_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == ChatRole::Assistant)
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(message.content.clone()));
+        }
+    }
+
+    fn render_ai_chat_conversation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        div()
+            .id("ai-chat-conversation")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .text_color(t.text_secondary)
+            .when(self.chat_messages.is_empty(), |this| {
+                this.items_center()
+                    .justify_center()
+                    .child(div().text_size(px(28.)).text_color(t.accent).child("✦"))
+                    .child(div().text_color(t.text_primary).child("Ask Axiom anything"))
+                    .child("Understand code, diagnose problems,")
+                    .child("or start an agent task.")
+            })
+            .children(
+                self.chat_messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, message)| {
+                        let is_last_assistant = message.role == ChatRole::Assistant
+                            && !self.chat_messages[index + 1..]
+                                .iter()
+                                .any(|candidate| candidate.role == ChatRole::Assistant);
+                        div()
+                            .id(SharedString::from(format!(
+                                "ai-chat-message-{}",
+                                message.id
+                            )))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_color(t.text_primary).child(match message.role {
+                                ChatRole::Assistant => "Assistant",
+                                _ => "User",
+                            }))
+                            .when_some(
+                                (message.role == ChatRole::Assistant
+                                    && message
+                                        .thinking
+                                        .as_ref()
+                                        .is_some_and(|thinking| !thinking.trim().is_empty()))
+                                .then(|| message.thinking.clone().unwrap()),
+                                |this, thinking| {
+                                    let expanded = self.thinking_expanded.contains(&message.id);
+                                    let message_id = message.id;
+                                    this.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "ai-thinking-{}",
+                                                message_id
+                                            )))
+                                            .px_2()
+                                            .py_1()
+                                            .rounded(metrics().border_radius_small)
+                                            .bg(t.elevated_surface)
+                                            .text_color(t.text_muted)
+                                            .cursor(CursorStyle::PointingHand)
+                                            .hover(move |s| s.bg(t.hover))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if !this.thinking_expanded.insert(message_id) {
+                                                    this.thinking_expanded.remove(&message_id);
+                                                }
+                                                cx.notify();
+                                            }))
+                                            .child(if expanded {
+                                                div().child("Thinking ▾").child(
+                                                    render_thinking_text(&thinking, t.text_muted),
+                                                )
+                                            } else {
+                                                div().child("Thinking ▸")
+                                            }),
+                                    )
+                                },
+                            )
+                            .child(match message.role {
+                                ChatRole::Assistant => {
+                                    render_assistant_markdown(&message.content, cx)
+                                }
+                                _ => div().child(message.content.clone()),
+                            })
+                            .when(is_last_assistant, |this| {
+                                this.child(
+                                    div()
+                                        .id("ai-copy-last-assistant")
+                                        .px_2()
+                                        .py_1()
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(move |s| s.bg(t.hover))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.copy_last_assistant(cx);
+                                        }))
+                                        .tooltip(|_, cx| tooltip("Copy response", cx))
+                                        .child("⧉"),
+                                )
+                            })
+                    }),
+            )
+            .when(
+                matches!(self.chat_request_state, ChatRequestState::Sending),
+                |this| {
+                    let dots = ".".repeat(self.chat_generating_phase as usize);
+                    this.child(
+                        div()
+                            .text_color(t.text_muted)
+                            .child(format!("Generating {:<3}", dots)),
+                    )
+                },
+            )
+            .when_some(
+                match &self.chat_request_state {
+                    ChatRequestState::Error(message) => Some(message.clone()),
+                    _ => None,
+                },
+                |this, message| this.child(div().text_color(t.error).child(message)),
+            )
+    }
+
+    fn render_ai_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        div()
+            .id("ai-panel")
+            .relative()
+            .w(ai_panel_width_for_viewport(
+                self.ai_panel_width,
+                window.viewport_size(),
+                if self.project_panel_visible {
+                    self.project_panel_width + metrics().activity_bar_width
+                } else {
+                    metrics().activity_bar_width
+                },
+            ))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(t.panel_background)
+            .border_l_1()
+            .child(
+                div()
+                    .h(m.panel_header_height)
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child("Axiom AI")
+                    .child("..."),
+            )
+            .child(
+                div()
+                    .h(px(36.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(t.border_subtle)
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .rounded(m.border_radius_small)
+                            .bg(t.inactive_selection)
+                            .text_color(t.text_primary)
+                            .child("Chat"),
+                    )
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .rounded(m.border_radius_small)
+                            .text_color(t.text_muted)
+                            .hover(move |s| s.bg(t.hover).text_color(t.text_primary))
+                            .child("Agent"),
+                    ),
+            )
+            .child(self.render_ai_chat_conversation(cx))
+            .child(
+                div()
+                    .m_3()
+                    .p_2()
+                    .h(px(82.))
+                    .flex()
+                    .flex_col()
+                    .justify_between()
+                    .rounded(m.border_radius_medium)
+                    .bg(t.editor_background)
+                    .border_1()
+                    .border_color(t.border_subtle)
+                    .child(
+                        div()
+                            .id("ai-composer-input")
+                            .key_context("SingleLineInput")
+                            .cursor(CursorStyle::IBeam)
+                            .on_action(cx.listener(Self::input_backspace))
+                            .on_action(cx.listener(Self::input_delete))
+                            .on_action(cx.listener(Self::input_left))
+                            .on_action(cx.listener(Self::input_right))
+                            .on_action(cx.listener(Self::input_home))
+                            .on_action(cx.listener(Self::input_end))
+                            .on_action(cx.listener(Self::input_select_all))
+                            .on_action(cx.listener(Self::input_select_left))
+                            .on_action(cx.listener(Self::input_select_right))
+                            .on_action(cx.listener(Self::input_select_home))
+                            .on_action(cx.listener(Self::input_select_end))
+                            .on_action(cx.listener(Self::input_copy))
+                            .on_action(cx.listener(Self::input_cut))
+                            .on_action(cx.listener(Self::input_paste))
+                            .on_action(cx.listener(Self::input_enter))
+                            .track_focus(&self.ai_composer_focus)
+                            .overflow_hidden()
+                            .h(px(34.))
+                            .w_full()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .bg(t.editor_background)
+                            .border_1()
+                            .border_color(if self.ai_composer_active {
+                                t.accent
+                            } else {
+                                t.border_subtle
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    this.ai_composer_active = true;
+                                    this.active_text_input = ActiveTextInput::AiComposer;
+                                    this.provider_base_url_active = false;
+                                    this.provider_base_url.active = false;
+                                    window.focus(&this.ai_composer_focus);
+                                    let byte = this.ai_composer_geometry.hit_test(event.position.x);
+                                    let caret = byte_to_utf16_offset(&this.ai_composer_text, byte);
+                                    if event.click_count >= 2 {
+                                        let end = this.ai_composer_text.encode_utf16().count();
+                                        this.ai_composer_selection = UTF16Selection {
+                                            range: 0..end,
+                                            reversed: false,
+                                        };
+                                        this.ai_composer_dragging = false;
+                                    } else {
+                                        this.ai_composer_selection = UTF16Selection {
+                                            range: caret..caret,
+                                            reversed: false,
+                                        };
+                                        this.ai_composer_dragging = true;
+                                    }
+                                    this.modal_caret_visible = true;
+                                    this.modal_caret_activity = Instant::now();
+                                    this.modal_caret_toggle = this.modal_caret_activity;
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                                if this.active_text_input == ActiveTextInput::AiComposer
+                                    && this.ai_composer_dragging
+                                    && event.dragging()
+                                {
+                                    let byte = this.ai_composer_geometry.hit_test(event.position.x);
+                                    let head = byte_to_utf16_offset(&this.ai_composer_text, byte);
+                                    this.ai_composer_selection.range.end = head;
+                                    this.ai_composer_selection.reversed =
+                                        this.ai_composer_selection.range.start > head;
+                                    cx.notify();
+                                }
+                            }))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.ai_composer_dragging = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(crate::ui::input_line::render(
+                                cx.entity(),
+                                self.ai_composer_focus.clone(),
+                                if self.ai_composer_text.is_empty() {
+                                    "Ask Axiom...".into()
+                                } else {
+                                    self.ai_composer_text.clone()
+                                },
+                                if self.ai_composer_active {
+                                    utf16_to_byte_offset(
+                                        &self.ai_composer_text,
+                                        self.ai_composer_selection
+                                            .range
+                                            .start
+                                            .min(self.ai_composer_selection.range.end),
+                                    )
+                                        ..utf16_to_byte_offset(
+                                            &self.ai_composer_text,
+                                            self.ai_composer_selection
+                                                .range
+                                                .start
+                                                .max(self.ai_composer_selection.range.end),
+                                        )
+                                } else {
+                                    0..0
+                                },
+                                utf16_to_byte_offset(
+                                    &self.ai_composer_text,
+                                    self.ai_composer_selection.range.end,
+                                ),
+                                self.modal_caret_visible,
+                                self.ai_composer_geometry.clone(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_color(t.text_muted)
+                            .child("+ Context")
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .when(self.selected_model_supports_thinking(), |this| {
+                                        this.child(
+                                            div()
+                                                .id("ai-thinking-toggle")
+                                                .px_1()
+                                                .cursor(CursorStyle::PointingHand)
+                                                .text_color(if self.chat_thinking_enabled {
+                                                    t.accent
+                                                } else {
+                                                    t.text_muted
+                                                })
+                                                .hover(move |s| s.bg(t.hover))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.chat_thinking_enabled =
+                                                        !this.chat_thinking_enabled;
+                                                    if let Some(provider) =
+                                                        this.active_provider.clone()
+                                                    {
+                                                        this.thinking_preferences.insert(
+                                                            (provider, this.model_label.clone()),
+                                                            this.chat_thinking_enabled,
+                                                        );
+                                                        this.persist_ui_settings();
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                                .child(if self.chat_thinking_enabled {
+                                                    "Thinking: On"
+                                                } else {
+                                                    "Thinking: Off"
+                                                }),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .id("ai-model-button")
+                                            .px_1()
+                                            .hover(move |s| s.bg(t.hover))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_model_picker(cx)
+                                            }))
+                                            .child(format!("{} ? ?", self.model_label)),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("ai-send-button")
+                                            .px_2()
+                                            .rounded(m.border_radius_small)
+                                            .when(
+                                                !self.ai_composer_text.trim().is_empty()
+                                                    && !matches!(
+                                                        self.chat_request_state,
+                                                        ChatRequestState::Sending
+                                                    ),
+                                                |this| {
+                                                    this.cursor(CursorStyle::PointingHand)
+                                                        .text_color(t.accent)
+                                                        .hover(move |s| s.bg(t.hover))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.send_ai_chat_message(cx)
+                                                        }))
+                                                },
+                                            )
+                                            .child("↑"),
+                                    ),
+                            ),
+                    ),
+            )
+            .when(self.model_picker_open, |this| {
+                this.child(self.render_model_picker(cx))
+            })
+            .child(
+                div()
+                    .id("ai-panel-resize-handle")
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .bottom(px(0.))
+                    .w(px(5.))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::ai_panel_resize_start))
+                    .on_mouse_move(cx.listener(Self::ai_panel_resize_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::ai_panel_resize_end))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::ai_panel_resize_end)),
+            )
     }
 
     fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
@@ -6097,6 +8569,40 @@ impl WorkspaceView {
                     .tooltip(|_, cx| tooltip("Search — not available yet", cx))
                     .child(activity_icon(ActivityIcon::Search, t.text_muted)),
             )
+            .child({
+                let workspace = workspace.clone();
+                let active = self.ai_panel_visible;
+                div()
+                    .id("activity-ai")
+                    .relative()
+                    .w(m.activity_bar_width)
+                    .h(px(36.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(|_, cx| tooltip("Axiom AI (Ctrl+Alt+A)", cx))
+                    .hover(move |style| style.bg(t.hover))
+                    .on_click(move |_, window, cx| {
+                        workspace.update(cx, |this, cx| {
+                            this.toggle_ai_panel(&ToggleAiPanel, window, cx)
+                        })
+                    })
+                    .when(active, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .left(px(0.))
+                                .h(px(20.))
+                                .w(px(2.))
+                                .bg(t.accent),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_color(if active { t.accent } else { t.text_muted })
+                            .child("✦"),
+                    )
+            })
             .child(
                 div()
                     .id("activity-problems-disabled")
@@ -6942,26 +9448,8 @@ impl WorkspaceView {
                     });
                 })
             })
-            .child({
-                let workspace = workspace.clone();
-                let directory = directory.clone();
-                Self::explorer_menu_item("PHP Trait", move |window, cx| {
-                    workspace.update(cx, |this, cx| {
-                        this.begin_new_item(NewItemKind::PhpTrait, directory.clone(), window, cx)
-                    });
-                })
-            })
-            .child({
-                let workspace = workspace.clone();
-                let directory = directory.clone();
-                Self::explorer_menu_item("PHP Enum", move |window, cx| {
-                    workspace.update(cx, |this, cx| {
-                        this.begin_new_item(NewItemKind::PhpEnum, directory.clone(), window, cx)
-                    });
-                })
-            })
+            .child(div())
     }
-
     fn modal_text_field(
         &self,
         workspace: Entity<WorkspaceView>,
@@ -7867,6 +10355,7 @@ impl WorkspaceView {
                     .to_owned();
                 this.child(
                     div()
+                        .id("ai-copy-code-block")
                         .absolute()
                         .top(px(0.))
                         .left(px(0.))
@@ -8330,6 +10819,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::show_features))
             .on_action(cx.listener(Self::find))
             .on_action(cx.listener(Self::toggle_project))
+            .on_action(cx.listener(Self::toggle_ai_panel))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::import_runtime_stubs_action))
             .on_action(cx.listener(Self::import_runtime_stub_files_action))
@@ -8340,6 +10830,20 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::native_definition_action))
             .on_action(cx.listener(Self::find_usages_action))
             .on_action(cx.listener(Self::go_to_implementation))
+            .on_action(cx.listener(Self::input_backspace))
+            .on_action(cx.listener(Self::input_delete))
+            .on_action(cx.listener(Self::input_left))
+            .on_action(cx.listener(Self::input_right))
+            .on_action(cx.listener(Self::input_home))
+            .on_action(cx.listener(Self::input_end))
+            .on_action(cx.listener(Self::input_select_all))
+            .on_action(cx.listener(Self::input_select_left))
+            .on_action(cx.listener(Self::input_select_right))
+            .on_action(cx.listener(Self::input_select_home))
+            .on_action(cx.listener(Self::input_select_end))
+            .on_action(cx.listener(Self::input_copy))
+            .on_action(cx.listener(Self::input_cut))
+            .on_action(cx.listener(Self::input_paste))
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::settings))
             .on_action(cx.listener(Self::debug_input))
@@ -8423,7 +10927,8 @@ impl Render for WorkspaceView {
                         .when(self.terminal_visible, |this| {
                             this.child(self.render_terminal_panel(cx))
                         }),
-                ),
+                )
+                .when(self.ai_panel_visible, |this| this.child(self.render_ai_panel(window, cx))),
             ))
             .when(self.project.is_some(), |this| this.child(
                 div()
@@ -8521,6 +11026,7 @@ impl Render for WorkspaceView {
             })
             .when(self.settings_visible, |this| this.child(self.render_settings(cx)))
             .when(self.features_visible, |this| this.child(self.render_features(cx)))
+            .when(self.providers_modal_visible, |this| this.child(self.render_providers_modal(cx)))
             .when(self.definition_loading, |this| {
                 this.child(
                     div()
@@ -8723,7 +11229,13 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Context<Self>,
     ) -> Option<String> {
         actual.replace(range.clone());
-        let query = if self.explorer_operation.is_some() {
+        let query = if self.active_text_input == ActiveTextInput::AiComposer {
+            &self.ai_composer_text
+        } else if self.active_text_input == ActiveTextInput::ProviderApiKey {
+            &self.provider_api_key.text
+        } else if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
+            &self.provider_base_url.text
+        } else if self.explorer_operation.is_some() {
             self.modal_field_text(self.explorer_modal_field)
         } else if self.settings_visible && !self.command_palette_visible {
             &self.settings_query
@@ -8740,6 +11252,34 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            return Some(UTF16Selection {
+                range: self.ai_composer_selection.range.clone(),
+                reversed: self.ai_composer_selection.reversed,
+            });
+        }
+        if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
+            return Some(UTF16Selection {
+                range: self.provider_base_url.selection_anchor
+                    ..self.provider_base_url.selection_active,
+                reversed: self.provider_base_url.selection_anchor
+                    > self.provider_base_url.selection_active,
+            });
+        }
+        if self.active_text_input == ActiveTextInput::ProviderApiKey {
+            return Some(UTF16Selection {
+                range: byte_to_utf16_offset(
+                    &self.provider_api_key.text,
+                    self.provider_api_key.selection_anchor,
+                )
+                    ..byte_to_utf16_offset(
+                        &self.provider_api_key.text,
+                        self.provider_api_key.selection_active,
+                    ),
+                reversed: self.provider_api_key.selection_anchor
+                    > self.provider_api_key.selection_active,
+            });
+        }
         if self.explorer_operation.is_some() {
             let selection = self.modal_field_selection(self.explorer_modal_field);
             return Some(UTF16Selection {
@@ -8766,9 +11306,15 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<std::ops::Range<usize>> {
-        None
+        (self.active_text_input == ActiveTextInput::AiComposer)
+            .then(|| self.ai_composer_marked_range.clone())
+            .flatten()
     }
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            self.ai_composer_marked_range = None;
+        }
+    }
     fn replace_text_in_range(
         &mut self,
         range: Option<std::ops::Range<usize>>,
@@ -8776,6 +11322,61 @@ impl EntityInputHandler for WorkspaceView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            let range = range
+                .or_else(|| self.ai_composer_marked_range.clone())
+                .unwrap_or_else(|| self.ai_composer_selection.range.clone());
+            let text = crate::ui::input_line::SingleLineInputState::sanitize_single_line(text);
+            self.ai_composer_text = replace_utf16_range(&self.ai_composer_text, range, &text).0;
+            let end = self.ai_composer_text.encode_utf16().count();
+            self.ai_composer_selection = UTF16Selection {
+                range: end..end,
+                reversed: false,
+            };
+            self.ai_composer_marked_range = None;
+            cx.notify();
+            return;
+        }
+        if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
+            let range = range.unwrap_or_else(|| {
+                self.provider_base_url
+                    .selection_anchor
+                    .min(self.provider_base_url.selection_active)
+                    ..self
+                        .provider_base_url
+                        .selection_anchor
+                        .max(self.provider_base_url.selection_active)
+            });
+            let sanitized = crate::ui::input_line::SingleLineInputState::sanitize_single_line(text);
+            let (text, _) = replace_utf16_range(&self.provider_base_url.text, range, &sanitized);
+            self.provider_base_url.text = text;
+            let end = self.provider_base_url.text.encode_utf16().count();
+            self.provider_base_url.selection_anchor = end;
+            self.provider_base_url.selection_active = end;
+            cx.notify();
+            return;
+        }
+        if self.active_text_input == ActiveTextInput::ProviderApiKey {
+            let range = range.unwrap_or_else(|| {
+                let a = byte_to_utf16_offset(
+                    &self.provider_api_key.text,
+                    self.provider_api_key.selection_anchor,
+                );
+                let b = byte_to_utf16_offset(
+                    &self.provider_api_key.text,
+                    self.provider_api_key.selection_active,
+                );
+                a.min(b)..a.max(b)
+            });
+            let sanitized = crate::ui::input_line::SingleLineInputState::sanitize_single_line(text);
+            let (text, _) = replace_utf16_range(&self.provider_api_key.text, range, &sanitized);
+            self.provider_api_key.text = text;
+            let end = self.provider_api_key.text.len();
+            self.provider_api_key.selection_anchor = end;
+            self.provider_api_key.selection_active = end;
+            cx.notify();
+            return;
+        }
         if self.explorer_operation.is_some() {
             let range = range.unwrap_or_else(|| {
                 self.modal_field_selection(self.explorer_modal_field)
@@ -8806,6 +11407,24 @@ impl EntityInputHandler for WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.active_text_input == ActiveTextInput::AiComposer {
+            let replacement = range
+                .or_else(|| self.ai_composer_marked_range.clone())
+                .unwrap_or_else(|| self.ai_composer_selection.range.clone());
+            self.ai_composer_text =
+                replace_utf16_range(&self.ai_composer_text, replacement.clone(), text).0;
+            let start = replacement
+                .start
+                .min(self.ai_composer_text.encode_utf16().count());
+            let end = start + text.encode_utf16().count();
+            self.ai_composer_selection = UTF16Selection {
+                range: end..end,
+                reversed: false,
+            };
+            self.ai_composer_marked_range = (!text.is_empty()).then_some(start..end);
+            cx.notify();
+            return;
+        }
         self.replace_text_in_range(range, text, window, cx);
     }
     fn bounds_for_range(
@@ -8823,7 +11442,16 @@ impl EntityInputHandler for WorkspaceView {
         _window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(if self.explorer_operation.is_some() {
+        Some(if self.active_text_input == ActiveTextInput::AiComposer {
+            let byte = self.ai_composer_geometry.hit_test(point.x);
+            byte_to_utf16_offset(&self.ai_composer_text, byte)
+        } else if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
+            let byte = self.provider_base_url.geometry.hit_test(point.x);
+            byte_to_utf16_offset(&self.provider_base_url.text, byte)
+        } else if self.active_text_input == ActiveTextInput::ProviderApiKey {
+            let byte = self.provider_api_key.geometry.hit_test(point.x);
+            byte_to_utf16_offset(&self.provider_api_key.text, byte)
+        } else if self.explorer_operation.is_some() {
             let byte =
                 self.modal_field_geometry[self.explorer_modal_field as usize].hit_test(point.x);
             byte_to_utf16_offset(self.modal_field_text(self.explorer_modal_field), byte)
@@ -9126,7 +11754,11 @@ fn normalize_modifiers(modifiers: Modifiers) -> (bool, bool, bool) {
 
 fn tab_display_path(path: &Path, project_root: Option<&Path>, runtime_root: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(runtime_root) {
-        return format!("Runtime Stub\n{}", relative.display());
+        return format!(
+            "Runtime Stub
+{}",
+            relative.display()
+        );
     }
     if let Some(root) = project_root
         && let Ok(relative) = path.strip_prefix(root)
@@ -9319,7 +11951,8 @@ mod modifier_tests {
         let interface_text = "<?php interface Cache { public function get(): void; }";
         let redis_text =
             "<?php class RedisCache implements \\Cache { public function get(): void {} }";
-        let main_text = "<?php class Unrelated {}\n";
+        let main_text = "<?php class Unrelated {}
+";
         std::fs::write(&interface, interface_text).unwrap();
         std::fs::write(&redis, redis_text).unwrap();
         std::fs::write(&file, main_text).unwrap();
@@ -9907,11 +12540,15 @@ mod modifier_tests {
         let path = dir.path().join("Service.php");
         std::fs::write(
             &path,
-            "<?php\nclass Service { public function old(): void {} }\n",
+            "<?php
+class Service { public function old(): void {} }
+",
         )
         .unwrap();
-        let dirty =
-            "<?php\n$label = \"ação ç ã 😀\";\nclass Service { public function run(): void {} }\n";
+        let dirty = "<?php
+$label = \"ação ç ã 😀\";
+class Service { public function run(): void {} }
+";
         let path_for_editor = path.clone();
         let dirty_for_editor = dirty.to_owned();
         let (workspace, cx) =
@@ -9938,7 +12575,12 @@ mod modifier_tests {
         let start = text.rfind("run").unwrap();
         assert_eq!(&text[start..start + 3], "run");
         let closed_path = dir.path().join("Closed.php");
-        std::fs::write(&closed_path, "<?php class Closed {}\n").unwrap();
+        std::fs::write(
+            &closed_path,
+            "<?php class Closed {}
+",
+        )
+        .unwrap();
         let (closed_text, closed_source) = cx.read(|app| {
             let workspace = workspace.read(app);
             workspace.current_text_for_path(&closed_path, app).unwrap()

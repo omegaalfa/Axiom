@@ -8,6 +8,7 @@ members = [
     "crates/axiom-php",
     "crates/axiom-syntax",
     "crates/axiom-terminal",
+    "crates/axiom-ai-provider",
     "crates/axiom-index",
 ]
 
@@ -42,3 +43,5 @@ strip = true
 [profile.dev]
 opt-level = 0
 debug = true
+
+

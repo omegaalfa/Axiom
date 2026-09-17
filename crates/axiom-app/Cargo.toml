@@ -23,6 +23,7 @@ axiom-project = { path = "../axiom-project" }
 axiom-index = { path = "../axiom-index" }
 axiom-syntax = { path = "../axiom-syntax" }
 axiom-terminal = { path = "../axiom-terminal" }
+axiom-ai-provider = { path = "../axiom-ai-provider" }
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

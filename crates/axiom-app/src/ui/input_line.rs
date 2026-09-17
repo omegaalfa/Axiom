@@ -37,7 +37,179 @@ pub fn replace_all_text(text: &str, ranges: &[Range<usize>], replacement: &str) 
 }
 
 #[derive(Clone, Default)]
-pub struct InputGeometry(Rc<RefCell<Option<(ShapedLine, Point<Pixels>)>>>);
+pub struct InputGeometry(
+    Rc<RefCell<Option<(ShapedLine, Point<Pixels>)>>>,
+    Rc<RefCell<Option<Vec<usize>>>>,
+);
+
+/// Domain-neutral state for one independent single-line input.
+/// Owners may attach their own FocusHandle; text and selection never share
+/// storage with another instance.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct SingleLineInputState {
+    pub text: String,
+    pub selection_anchor: usize,
+    pub selection_active: usize,
+    pub geometry: InputGeometry,
+    pub focus: Option<FocusHandle>,
+    pub active: bool,
+    pub dragging: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum InputVisualMode {
+    #[default]
+    Plain,
+    Masked,
+}
+
+/// Builds a display-only representation while preserving UTF-8 byte boundaries.
+/// Each scalar is replaced by the same number of one-byte mask glyphs, so the
+/// renderer's byte offsets remain valid for the real value.
+pub fn visual_text(text: &str, mode: InputVisualMode) -> String {
+    match mode {
+        InputVisualMode::Plain => text.to_owned(),
+        InputVisualMode::Masked => text
+            .chars()
+            .flat_map(|ch| std::iter::repeat_n('*', ch.len_utf8()))
+            .collect(),
+    }
+}
+
+impl Default for SingleLineInputState {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            selection_anchor: 0,
+            selection_active: 0,
+            geometry: InputGeometry::default(),
+            focus: None,
+            active: false,
+            dragging: false,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl SingleLineInputState {
+    pub fn sanitize_single_line(text: &str) -> String {
+        text.replace(&format!("{}{}", char::from(13), char::from(10)), " ")
+            .replace(char::from(10), " ")
+            .replace(char::from(13), " ")
+    }
+    pub fn selection(&self) -> Range<usize> {
+        self.selection_anchor.min(self.selection_active)
+            ..self.selection_anchor.max(self.selection_active)
+    }
+    pub fn replace_selection(&mut self, text: &str) {
+        let text = Self::sanitize_single_line(text);
+        let range = self.selection();
+        self.text.replace_range(range.clone(), &text);
+        let end = range.start + text.len();
+        self.selection_anchor = end;
+        self.selection_active = end;
+    }
+    pub fn move_left(&mut self) {
+        let pos = self.selection();
+        self.selection_active = if !pos.is_empty() {
+            pos.start
+        } else {
+            self.text[..self.selection_active]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(i, _)| i)
+        };
+        self.selection_anchor = self.selection_active;
+    }
+    pub fn move_right(&mut self) {
+        let pos = self.selection();
+        self.selection_active = if !pos.is_empty() {
+            pos.end
+        } else {
+            self.text[self.selection_active..]
+                .chars()
+                .next()
+                .map_or(self.text.len(), |c| self.selection_active + c.len_utf8())
+        };
+        self.selection_anchor = self.selection_active;
+    }
+    pub fn backspace(&mut self) {
+        let pos = self.selection();
+        if !pos.is_empty() {
+            self.replace_selection("");
+        } else if self.selection_active > 0 {
+            let end = self.selection_active;
+            self.selection_active = self.text[..end]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(i, _)| i);
+            self.replace_selection("");
+        }
+    }
+    pub fn delete(&mut self) {
+        let pos = self.selection();
+        if !pos.is_empty() {
+            self.replace_selection("");
+        } else if self.selection_active < self.text.len() {
+            let end = self.selection_active
+                + self.text[self.selection_active..]
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8);
+            self.text.replace_range(self.selection_active..end, "");
+        }
+    }
+    pub fn select_all(&mut self) {
+        self.selection_anchor = 0;
+        self.selection_active = self.text.len();
+    }
+    pub fn move_home(&mut self, extend: bool) {
+        if !extend {
+            self.selection_anchor = 0;
+        }
+        self.selection_active = 0;
+    }
+    pub fn move_end(&mut self, extend: bool) {
+        if !extend {
+            self.selection_anchor = self.text.len();
+        }
+        self.selection_active = self.text.len();
+    }
+    pub fn extend_left(&mut self) {
+        self.selection_active = self.text[..self.selection_active]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(i, _)| i);
+    }
+    pub fn extend_right(&mut self) {
+        if let Some(ch) = self.text[self.selection_active..].chars().next() {
+            self.selection_active += ch.len_utf8();
+        }
+    }
+    pub fn begin_drag(&mut self, offset: usize) {
+        self.selection_anchor = offset;
+        self.selection_active = offset;
+        self.dragging = true;
+    }
+    pub fn mouse_down(&mut self, offset: usize, click_count: usize) {
+        if click_count >= 2 {
+            self.select_all();
+            self.dragging = false;
+        } else {
+            self.begin_drag(offset);
+        }
+    }
+    pub fn drag_to(&mut self, offset: usize) {
+        if self.dragging {
+            self.selection_active = offset.min(self.text.len());
+        }
+    }
+    pub fn end_drag(&mut self) {
+        self.dragging = false;
+    }
+}
 
 impl InputGeometry {
     pub fn anchor(&self) -> Option<Point<Pixels>> {
@@ -45,7 +217,7 @@ impl InputGeometry {
     }
 
     pub fn hit_test(&self, x: Pixels) -> usize {
-        self.0.borrow().as_ref().map_or(0, |(line, origin)| {
+        let raw = self.0.borrow().as_ref().map_or(0, |(line, origin)| {
             let local_x = (x - origin.x).max(px(0.));
             // Include the trailing edge: GPUI's closest_index_for_x jumps
             // straight to len after the final glyph origin, even before its midpoint.
@@ -66,7 +238,20 @@ impl InputGeometry {
                 }
             }
             nearest.0
-        })
+        });
+        if let Some(boundaries) = self.1.borrow().as_ref() {
+            boundaries
+                .iter()
+                .copied()
+                .min_by_key(|b| b.abs_diff(raw))
+                .unwrap_or(0)
+        } else {
+            raw
+        }
+    }
+
+    pub fn set_valid_boundaries(&self, boundaries: Option<Vec<usize>>) {
+        *self.1.borrow_mut() = boundaries;
     }
 }
 
@@ -133,8 +318,67 @@ pub fn render<T: EntityInputHandler>(
     .size_full()
 }
 
+/// Adapter for independent input state; delegates to the canonical renderer.
+#[allow(dead_code)]
+pub fn render_state<T: EntityInputHandler>(
+    entity: Entity<T>,
+    state: &SingleLineInputState,
+) -> impl IntoElement {
+    let focus = state
+        .focus
+        .clone()
+        .expect("input state focus must be attached before rendering");
+    render(
+        entity,
+        focus,
+        state.text.clone(),
+        state.selection_anchor.min(state.selection_active)
+            ..state.selection_anchor.max(state.selection_active),
+        state.selection_active,
+        state.active,
+        state.geometry.clone(),
+    )
+}
+
+/// Renders an input using a display-only visual mode. State, selection,
+/// clipboard and hit-test offsets continue to refer to the real text.
+#[allow(dead_code)]
+pub fn render_state_with_mode<T: EntityInputHandler>(
+    entity: Entity<T>,
+    state: &SingleLineInputState,
+    mode: InputVisualMode,
+) -> impl IntoElement {
+    let boundaries = if mode == InputVisualMode::Masked {
+        Some(
+            state
+                .text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([state.text.len()])
+                .collect(),
+        )
+    } else {
+        None
+    };
+    state.geometry.set_valid_boundaries(boundaries);
+    let focus = state
+        .focus
+        .clone()
+        .expect("input state focus must be attached before rendering");
+    render(
+        entity,
+        focus,
+        visual_text(&state.text, mode),
+        state.selection_anchor.min(state.selection_active)
+            ..state.selection_anchor.max(state.selection_active),
+        state.selection_active,
+        state.active,
+        state.geometry.clone(),
+    )
+}
+
 #[cfg(test)]
-mod tests {
+mod state_isolation_tests {
     use super::*;
 
     #[test]
@@ -145,6 +389,47 @@ mod tests {
         assert!(blink_due(start + ms(500), start, start));
         assert!(!blink_due(start + ms(600), start, start + ms(500)));
         assert!(!blink_due(start + ms(600), start + ms(400), start));
+    }
+
+    #[test]
+    fn masked_visual_preserves_real_text_and_byte_offsets() {
+        let text = "sk-😀é";
+        let masked = visual_text(text, InputVisualMode::Masked);
+        assert_eq!(text, "sk-😀é");
+        assert_eq!(masked.len(), text.len());
+        assert!(masked.chars().all(|c| c == '*'));
+        assert_eq!(
+            text.char_indices().map(|(i, _)| i).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 7]
+        );
+    }
+
+    #[test]
+    fn double_click_selects_all_without_invalidating_empty_input() {
+        let mut input = SingleLineInputState {
+            text: "ab🔑ç".into(),
+            ..Default::default()
+        };
+        input.mouse_down(3, 2);
+        assert_eq!(input.selection(), 0..input.text.len());
+        let mut empty = SingleLineInputState::default();
+        empty.mouse_down(0, 2);
+        assert!(empty.selection().is_empty());
+    }
+
+    #[test]
+    fn drag_preserves_anchor_when_direction_reverses() {
+        let mut input = SingleLineInputState {
+            text: "0123456789abcdefghij".into(),
+            ..Default::default()
+        };
+        input.begin_drag(8);
+        input.drag_to(3);
+        assert_eq!(input.selection_anchor, 8);
+        assert_eq!(input.selection_active, 3);
+        input.drag_to(10);
+        assert_eq!(input.selection_anchor, 8);
+        assert_eq!(input.selection_active, 10);
     }
 
     #[test]
@@ -350,4 +635,89 @@ fn word_range_at(text: &str, offset: usize) -> Range<usize> {
         .find(|(_, ch)| !is_word(*ch))
         .map_or(text.len(), |(byte, _)| offset + byte);
     start..end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SingleLineInputState;
+
+    #[test]
+    fn single_line_input_states_are_independent() {
+        let mut a = SingleLineInputState::default();
+        let b = SingleLineInputState::default();
+        a.text = "alpha".into();
+        a.selection_anchor = 1;
+        a.selection_active = 4;
+        a.active = true;
+        a.select_all();
+        a.replace_selection("beta");
+        a.move_left();
+        a.backspace();
+        assert!(b.text.is_empty());
+        assert_eq!((b.selection_anchor, b.selection_active), (0, 0));
+        assert!(!b.active);
+        assert!(!std::ptr::eq(&a.geometry, &b.geometry));
+    }
+
+    #[test]
+    fn single_line_replacement_normalizes_newlines() {
+        let mut input = SingleLineInputState::default();
+        input.text = "prefix suffix".into();
+        input.selection_anchor = 7;
+        input.selection_active = 13;
+        let multiline = format!("a{}{}b{}c", char::from(13), char::from(10), char::from(10));
+        input.replace_selection(&multiline);
+        assert_eq!(input.text, "prefix a b c");
+        assert!(!input.text.contains(char::from(10)));
+        assert!(!input.text.contains(char::from(13)));
+    }
+
+    #[test]
+    fn single_line_handles_unicode_and_selection_bounds() {
+        let mut input = SingleLineInputState::default();
+        input.text = "😀 café".into();
+        input.select_all();
+        input.replace_selection("x	😀");
+        assert_eq!(input.text, "x	😀");
+        assert_eq!(input.selection_anchor, input.text.len());
+        assert_eq!(input.selection_active, input.text.len());
+        assert!(input.selection().end <= input.text.len());
+    }
+
+    #[test]
+    fn single_line_multiline_paste_in_middle_preserves_spaces() {
+        let mut input = SingleLineInputState::default();
+        input.text = "abCD".into();
+        input.selection_anchor = 2;
+        input.selection_active = 2;
+        let paste = format!(
+            "one{}two{}{}three{}four",
+            char::from(10),
+            char::from(13),
+            char::from(10),
+            char::from(13)
+        );
+        input.replace_selection(&paste);
+        assert_eq!(input.text, "abone two three fourCD");
+        assert!(!input.text.contains(char::from(10)));
+        assert!(!input.text.contains(char::from(13)));
+        assert!(input.selection_anchor <= input.text.len());
+    }
+
+    #[test]
+    fn single_line_empty_paste_and_large_text_remain_valid() {
+        let mut input = SingleLineInputState::default();
+        input.text = "keep".into();
+        input.selection_anchor = 2;
+        input.selection_active = 2;
+        input.replace_selection("");
+        assert_eq!(input.text, "keep");
+        let large = (0..256)
+            .map(|i| format!("line{i}{}", char::from(10)))
+            .collect::<String>();
+        input.replace_selection(&large);
+        assert!(!input.text.contains(char::from(10)));
+        assert!(!input.text.contains(char::from(13)));
+        assert!(input.selection_active <= input.text.len());
+    }
 }

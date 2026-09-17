@@ -10,6 +10,79 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_RECENT_PROJECTS: usize = 10;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderPersisted {
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub cached_models: Vec<axiom_ai_provider::ProviderModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UiSettings {
+    #[serde(default = "default_ai_panel_visible")]
+    pub ai_panel_visible: bool,
+    #[serde(default = "default_ai_panel_width")]
+    pub ai_panel_width: f32,
+    #[serde(default)]
+    pub configured_providers: Vec<(String, String)>,
+    #[serde(default)]
+    pub default_provider: Option<String>,
+    #[serde(default)]
+    pub active_provider: Option<String>,
+    #[serde(default = "default_model_label")]
+    pub model_label: String,
+    #[serde(default)]
+    pub provider_configs: Vec<ProviderPersisted>,
+    #[serde(default)]
+    pub thinking_preferences: Vec<(String, String, bool)>,
+}
+fn default_model_label() -> String {
+    "Model".to_owned()
+}
+
+fn default_ai_panel_visible() -> bool {
+    false
+}
+fn default_ai_panel_width() -> f32 {
+    340.0
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            ai_panel_visible: false,
+            ai_panel_width: 340.0,
+            configured_providers: Vec::new(),
+            default_provider: None,
+            active_provider: None,
+            model_label: default_model_label(),
+            provider_configs: Vec::new(),
+            thinking_preferences: Vec::new(),
+        }
+    }
+}
+
+impl UiSettings {
+    pub fn load(path: &Path) -> Self {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, serde_json::to_vec_pretty(self)?)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupTarget {
     Project {
@@ -139,6 +212,10 @@ pub fn recent_projects_path() -> Option<PathBuf> {
 pub fn axiom_config_dir() -> Option<PathBuf> {
     ProjectDirs::from("dev", "Axiom", "Axiom")
         .map(|directories| directories.config_dir().to_path_buf())
+}
+
+pub fn ui_settings_path() -> Option<PathBuf> {
+    axiom_config_dir().map(|path| path.join("ui-settings.json"))
 }
 
 pub fn runtime_stubs_default_path() -> Option<PathBuf> {
