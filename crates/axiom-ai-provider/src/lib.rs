@@ -291,10 +291,24 @@ impl OllamaProvider {
         &self,
         base_url: &str,
         request: &ProviderChatRequest,
+        on_event: F,
+    ) -> Result<(), ProviderError>
+    where
+        F: FnMut(ProviderChatStreamEvent) -> Result<(), ProviderError>,
+    {
+        self.chat_stream_with_cancel(base_url, request, || false, on_event)
+    }
+
+    pub fn chat_stream_with_cancel<F, C>(
+        &self,
+        base_url: &str,
+        request: &ProviderChatRequest,
+        mut is_cancelled: C,
         mut on_event: F,
     ) -> Result<(), ProviderError>
     where
         F: FnMut(ProviderChatStreamEvent) -> Result<(), ProviderError>,
+        C: FnMut() -> bool,
     {
         let parsed = url::Url::parse(base_url).map_err(|_| ProviderError::InvalidResponse)?;
         let host = parsed.host_str().ok_or(ProviderError::InvalidResponse)?;
@@ -315,9 +329,15 @@ impl OllamaProvider {
         let mut done_emitted = false;
         let mut buf = [0u8; 8192];
         loop {
+            if is_cancelled() {
+                return Ok(());
+            }
             let n = stream.read(&mut buf).map_err(|_| ProviderError::Timeout)?;
             if n == 0 {
                 break;
+            }
+            if is_cancelled() {
+                return Ok(());
             }
             raw.extend_from_slice(&buf[..n]);
             if !headers_done {
@@ -366,6 +386,9 @@ impl OllamaProvider {
                 chunk_pos = raw.len();
             }
             while let Some(pos) = decoded.iter().position(|b| *b == b'\n') {
+                if is_cancelled() {
+                    return Ok(());
+                }
                 let line = decoded.drain(..=pos).collect::<Vec<_>>();
                 let value: serde_json::Value =
                     serde_json::from_slice(&line).map_err(|_| ProviderError::InvalidResponse)?;
@@ -400,6 +423,9 @@ impl OllamaProvider {
                     )?;
                 }
             }
+        }
+        if is_cancelled() {
+            return Ok(());
         }
         if !decoded.is_empty() {
             let value: serde_json::Value =

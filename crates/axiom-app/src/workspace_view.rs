@@ -45,7 +45,10 @@ use crate::{
     terminal_view::TerminalView,
     ui::{
         components::tooltip,
-        icons::{ActivityIcon, activity_icon, arrow_down_icon, axiom_icon, file_icon, user_icon},
+        icons::{
+            ActivityIcon, activity_icon, arrow_down_icon, axiom_icon, file_icon, stop_icon,
+            user_icon,
+        },
         metrics, theme,
     },
 };
@@ -828,6 +831,18 @@ fn should_send_ai_on_enter(active: ActiveTextInput, text: &str, state: &ChatRequ
         && !matches!(state, ChatRequestState::Sending)
 }
 
+fn stop_chat_request(
+    state: &mut ChatRequestState,
+    current_request_id: &mut Option<axiom_ai_provider::ProviderRequestId>,
+) -> bool {
+    if !matches!(state, ChatRequestState::Sending) {
+        return false;
+    }
+    *state = ChatRequestState::Idle;
+    *current_request_id = None;
+    true
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProviderModel {
     id: String,
@@ -1027,6 +1042,7 @@ pub struct WorkspaceView {
     thinking_preferences: HashMap<(String, String), bool>,
     thinking_expanded: HashSet<u64>,
     chat_stream_events: Arc<Mutex<Vec<ChatStreamEvent>>>,
+    chat_cancel_token: Option<Arc<AtomicBool>>,
     chat_scroll_handle: ScrollHandle,
     chat_auto_follow: bool,
     chat_last_scroll_offset: Point<Pixels>,
@@ -2027,6 +2043,7 @@ impl WorkspaceView {
                 .collect(),
             thinking_expanded: HashSet::new(),
             chat_stream_events: Arc::new(Mutex::new(Vec::new())),
+            chat_cancel_token: None,
             chat_scroll_handle: ScrollHandle::new(),
             chat_auto_follow: true,
             chat_last_scroll_offset: Point::default(),
@@ -5028,6 +5045,32 @@ impl WorkspaceView {
         }
     }
 
+    fn stop_ai_chat_generation(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.chat_request_state, ChatRequestState::Sending) {
+            return;
+        }
+        if let Some(token) = self.chat_cancel_token.take() {
+            token.store(true, Ordering::Release);
+        }
+        stop_chat_request(
+            &mut self.chat_request_state,
+            &mut self.chat_current_request_id,
+        );
+        self.chat_generating_phase = 0;
+
+        let remove_empty = self.chat_messages.last().is_some_and(|message| {
+            message.role == ChatRole::Assistant
+                && message.content.is_empty()
+                && message.thinking.as_deref() == Some("")
+        });
+        if remove_empty {
+            self.chat_messages.pop();
+        } else {
+            self.persist_chat_activity();
+        }
+        cx.notify();
+    }
+
     fn send_ai_chat_message(&mut self, cx: &mut Context<Self>) {
         let content = self.ai_composer_text.clone();
         if content.trim().is_empty() || matches!(self.chat_request_state, ChatRequestState::Sending)
@@ -5071,6 +5114,8 @@ impl WorkspaceView {
             content: String::new(),
             thinking: Some(String::new()),
         });
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        self.chat_cancel_token = Some(cancel_token.clone());
         let base_url = self.provider_base_url.text.clone();
         let model = self.model_label.clone();
         let think = self
@@ -5094,14 +5139,18 @@ impl WorkspaceView {
         cx.spawn(async move |_, cx| {
             let result = gpui::background_executor()
                 .spawn(async move {
-                    let result = OllamaProvider::default().chat_stream(
+                    let result = OllamaProvider::default().chat_stream_with_cancel(
                         &base_url,
                         &ProviderChatRequest {
                             model,
                             messages,
                             think,
                         },
+                        || cancel_token.load(Ordering::Acquire),
                         |event| {
+                            if cancel_token.load(Ordering::Acquire) {
+                                return Ok(());
+                            }
                             let mut queue = chat_events.lock().expect("chat stream queue poisoned");
                             queue.push(ChatStreamEvent {
                                 request_id: id,
@@ -5118,6 +5167,7 @@ impl WorkspaceView {
                 if this.chat_current_request_id != Some(id) {
                     return;
                 }
+                this.chat_cancel_token = None;
                 match result {
                     Ok(_response) => this.chat_request_state = ChatRequestState::Idle,
                     Err(error) => {
@@ -7089,6 +7139,23 @@ impl WorkspaceView {
                                             .px_2()
                                             .rounded(m.border_radius_small)
                                             .when(
+                                                matches!(
+                                                    self.chat_request_state,
+                                                    ChatRequestState::Sending
+                                                ),
+                                                |this| {
+                                                    this.cursor(CursorStyle::PointingHand)
+                                                        .text_color(t.accent)
+                                                        .hover(move |s| s.bg(t.hover))
+                                                        .tooltip(|_, cx| {
+                                                            tooltip("Stop generating", cx)
+                                                        })
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.stop_ai_chat_generation(cx)
+                                                        }))
+                                                },
+                                            )
+                                            .when(
                                                 !self.ai_composer_text.trim().is_empty()
                                                     && !matches!(
                                                         self.chat_request_state,
@@ -7103,7 +7170,20 @@ impl WorkspaceView {
                                                         }))
                                                 },
                                             )
-                                            .child("↑"),
+                                            .when(
+                                                matches!(
+                                                    self.chat_request_state,
+                                                    ChatRequestState::Sending
+                                                ),
+                                                |this| this.child(stop_icon(t.accent)),
+                                            )
+                                            .when(
+                                                !matches!(
+                                                    self.chat_request_state,
+                                                    ChatRequestState::Sending
+                                                ),
+                                                |this| this.child("↑"),
+                                            ),
                                     ),
                             ),
                     ),
@@ -12410,7 +12490,18 @@ fn tab_display_path(path: &Path, project_root: Option<&Path>, runtime_root: &Pat
 
 #[cfg(test)]
 mod chat_history_tests {
-    use super::generate_chat_title;
+    use super::{ChatRequestState, generate_chat_title, stop_chat_request};
+    use axiom_ai_provider::ProviderRequestId;
+
+    #[test]
+    fn stopping_request_is_immediate_and_idempotent() {
+        let mut state = ChatRequestState::Sending;
+        let mut request = Some(ProviderRequestId(7));
+        assert!(stop_chat_request(&mut state, &mut request));
+        assert_eq!(state, ChatRequestState::Idle);
+        assert_eq!(request, None);
+        assert!(!stop_chat_request(&mut state, &mut request));
+    }
 
     #[test]
     fn auto_title_normalizes_whitespace_and_multiline() {
