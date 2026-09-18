@@ -1,66 +1,146 @@
 <?php
 
-declare(strict_types=1);
-
-namespace Probe\BaseA {
-
-    class Service
+namespace Probe\Contracts {
+    interface Runner
     {
+        public function run(): void;
+    }
+
+    interface Saver
+    {
+        public function save(): void;
     }
 }
 
-namespace Probe\BaseB {
-
-    class Service
+namespace Probe\Traits {
+    trait Runnable
     {
+        public function run(): void
+        {
+        }
+    }
+
+    trait ExecuteTrait
+    {
+        public function execute(): void
+        {
+        }
+    }
+
+    trait RunA
+    {
+        public function run(): void
+        {
+        }
+    }
+
+    trait RunB
+    {
+        public function run(): void
+        {
+        }
     }
 }
 
-namespace Probe\ModelsA {
-
-    use Probe\BaseA\Service;
-
-    class UserService extends Service
+namespace Probe\Base {
+    abstract class AbstractService
     {
+        abstract public function save(): void;
     }
 
-    class AdminService extends Service
+    class ConcreteRunner
     {
-    }
-
-    class SpecialUserService extends UserService
-    {
+        public function run(): void
+        {
+        }
     }
 }
 
-namespace Probe\ModelsB {
+namespace Probe\Models {
+    use Probe\Base\AbstractService;
+    use Probe\Base\ConcreteRunner;
+    use Probe\Contracts\Runner;
+    use Probe\Contracts\Saver;
+    use Probe\Traits\ExecuteTrait;
+    use Probe\Traits\RunA;
+    use Probe\Traits\RunB;
+    use Probe\Traits\Runnable;
 
-    use Probe\BaseB\Service;
-
-    class OrderService extends Service
+    // 1. Faltam run() e save()
+    class MissingService extends AbstractService implements Runner, Saver
     {
     }
-}
 
-namespace Probe\AliasModels {
+    // 2. Métodos locais
+    class LocalService extends AbstractService implements Runner, Saver
+    {
+        public function run(): void
+        {
+        }
 
-    use Probe\BaseA\Service as BaseService;
+        public function save(): void
+        {
+        }
+    }
 
-    class AliasedService extends BaseService
+
+    // 3. Trait satisfaz run()
+    class TraitService extends AbstractService implements Runner, Saver
+    {
+        use Runnable;
+        use Probe\Models\TraitService;
+        use Probe\Models\InheritedService;
+        use Probe\Models\AliasService;
+        use Probe\Models\InsteadOfService;
+        use Probe\Models\LocalBeatsAliasService;
+
+        public function save(): void
+        {
+        }
+    }
+
+    // 4. Método herdado satisfaz run()
+    class InheritedService extends ConcreteRunner implements Runner
     {
     }
-}
 
-namespace Probe\Usage {
+    // 5. Alias de trait cria run()
+    class AliasService implements Runner
+    {
+        use ExecuteTrait {
+            ExecuteTrait::execute as run;
+        }
+    }
 
-    use Probe\BaseA\Service as ServiceA;
-    use Probe\BaseB\Service as ServiceB;
-    use Probe\ModelsA\UserService;
+    // 6. insteadof escolhe RunA::run
+    class InsteadOfService implements Runner
+    {
+        use RunA, RunB {
+            RunA::run insteadof RunB;
+        }
+    }
 
-    function exercise(
-        ServiceA $serviceA,
-        ServiceB $serviceB,
-        UserService $userService,
-    ): void {
+    // 7. Método local deve ganhar do alias
+    class LocalBeatsAliasService implements Runner
+    {
+        use ExecuteTrait {
+            ExecuteTrait::execute as run;
+        }
+
+        public function run(): void
+        {
+        }
     }
 }
+
+
+$trait = new TraitService();
+$trait->run();
+$inherited = new InheritedService();
+$inherited->run();
+$alias = new AliasService();
+$alias->run();
+$instead = new InsteadOfService();
+$instead->run();
+$local = new LocalBeatsAliasService();
+$local->run();

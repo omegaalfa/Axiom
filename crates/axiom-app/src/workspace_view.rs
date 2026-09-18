@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -17,9 +18,9 @@ use axiom_ai_provider::{
 };
 use axiom_app::commands::Keymap;
 use axiom_app::shell_state::{
-    ProviderPersisted, RecentProjects, StartupTarget, UiSettings, composer_vendor_cache_path,
-    project_symbol_cache_path, recent_projects_path, runtime_stubs_cache_path,
-    runtime_stubs_default_path, ui_settings_path, unix_timestamp_now,
+    ProviderPersisted, RecentProjects, StartupTarget, UiSettings, axiom_config_dir,
+    composer_vendor_cache_path, project_symbol_cache_path, recent_projects_path,
+    runtime_stubs_cache_path, runtime_stubs_default_path, ui_settings_path, unix_timestamp_now,
 };
 use axiom_editor::Document;
 use axiom_index::{
@@ -95,6 +96,7 @@ actions!(
         InputCut,
         InputPaste,
         InputEnter,
+        InputEscape,
     ]
 );
 
@@ -131,6 +133,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-v", InputPaste, Some("SingleLineInput")),
         KeyBinding::new("enter", InputEnter, Some("SingleLineInput")),
         KeyBinding::new("shift-enter", InputEnter, Some("SingleLineInput")),
+        KeyBinding::new("escape", InputEscape, Some("SingleLineInput")),
     ]
 }
 
@@ -680,14 +683,130 @@ enum ActiveTextInput {
     ProviderApiKey,
     ProviderCatalogSearch,
     ModalInput,
+    AiHistoryRename,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ChatUiMessage {
     id: u64,
     role: ChatRole,
     content: String,
     thinking: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ChatConversation {
+    id: u64,
+    title: String,
+    #[serde(default)]
+    title_manually_edited: bool,
+    #[serde(default)]
+    created_at: u64,
+    #[serde(default)]
+    updated_at: u64,
+    messages: Vec<ChatUiMessage>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChatHistoryStore {
+    version: u32,
+    active_conversation_id: Option<u64>,
+    conversations: Vec<ChatConversation>,
+}
+
+const CHAT_HISTORY_VERSION: u32 = 1;
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, bytes)?;
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            if path.exists() {
+                fs::remove_file(path)?;
+                fs::rename(&temp, path)
+            } else {
+                Err(rename_error)
+            }
+        }
+    }
+}
+
+fn generate_chat_title(first_user_message: &str) -> String {
+    const MAX_CHARS: usize = 48;
+    let normalized = first_user_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let chars: Vec<char> = normalized.chars().collect();
+    if chars.len() <= MAX_CHARS {
+        return normalized;
+    }
+    let mut prefix: String = chars[..MAX_CHARS - 1].iter().collect();
+    if let Some(boundary) = prefix.rfind(' ') {
+        prefix.truncate(boundary);
+    }
+    format!("{}…", prefix.trim_end())
+}
+
+fn chat_history_path() -> Option<PathBuf> {
+    axiom_config_dir().map(|path| path.join("ai-chat-history.json"))
+}
+
+fn load_chat_history(path: Option<&Path>) -> (Vec<ChatConversation>, u64) {
+    let Some(path) = path else {
+        return (Vec::new(), 1);
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return (Vec::new(), 1);
+    };
+    let (mut conversations, stored_active) =
+        if let Ok(store) = serde_json::from_slice::<ChatHistoryStore>(&bytes) {
+            if store.version > CHAT_HISTORY_VERSION {
+                tracing::warn!(
+                    version = store.version,
+                    "unsupported AI chat history version"
+                );
+                return (Vec::new(), 1);
+            }
+            (store.conversations, store.active_conversation_id)
+        } else if let Ok(conversations) = serde_json::from_slice::<Vec<ChatConversation>>(&bytes) {
+            (conversations, None)
+        } else {
+            tracing::warn!(path = %path.display(), "invalid AI chat history; preserving file");
+            return (Vec::new(), 1);
+        };
+    for conversation in &mut conversations {
+        if conversation.created_at == 0 {
+            conversation.created_at = unix_timestamp_now();
+        }
+        if conversation.updated_at == 0 {
+            conversation.updated_at = conversation.created_at;
+        }
+        if let Some(first_user_message) = conversation
+            .messages
+            .iter()
+            .find(|message| message.role == ChatRole::User)
+            .map(|message| message.content.as_str())
+        {
+            if conversation.title == first_user_message || conversation.title == "New chat" {
+                conversation.title = generate_chat_title(first_user_message);
+            } else if conversation.title != "New chat" {
+                conversation.title_manually_edited = true;
+            }
+        }
+    }
+    conversations.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    let active = stored_active
+        .filter(|id| conversations.iter().any(|chat| chat.id == *id))
+        .or_else(|| conversations.last().map(|chat| chat.id))
+        .unwrap_or(1);
+    (conversations, active)
 }
 
 struct ChatStreamEvent {
@@ -892,6 +1011,9 @@ pub struct WorkspaceView {
     ai_composer_selection: UTF16Selection,
     ai_composer_focus: FocusHandle,
     ai_composer_geometry: crate::ui::input_line::InputGeometry,
+    chat_rename_input: crate::ui::input_line::SingleLineInputState,
+    chat_rename_focus: FocusHandle,
+    renaming_conversation_id: Option<u64>,
     ai_composer_active: bool,
     ai_composer_dragging: bool,
     ai_composer_marked_range: Option<std::ops::Range<usize>>,
@@ -905,6 +1027,10 @@ pub struct WorkspaceView {
     thinking_expanded: HashSet<u64>,
     chat_stream_events: Arc<Mutex<Vec<ChatStreamEvent>>>,
     chat_scroll_handle: ScrollHandle,
+    chat_history_path: Option<PathBuf>,
+    chat_conversations: Vec<ChatConversation>,
+    active_chat_id: u64,
+    chat_history_open: bool,
     model_picker_open: bool,
     model_label: String,
     providers_modal_visible: bool,
@@ -1136,6 +1262,172 @@ fn render_markdown_inline(text: &str, color: gpui::Rgba) -> gpui::Div {
 }
 
 impl WorkspaceView {
+    fn persist_chat_history(&mut self) {
+        let Some(path) = &self.chat_history_path else {
+            return;
+        };
+        let mut conversations = self.chat_conversations.clone();
+        if let Some(chat) = conversations
+            .iter_mut()
+            .find(|chat| chat.id == self.active_chat_id)
+        {
+            chat.messages = self.chat_messages.clone();
+        } else if !self.chat_messages.is_empty() {
+            let title = self
+                .chat_messages
+                .iter()
+                .find(|m| m.role == ChatRole::User)
+                .map(|m| generate_chat_title(&m.content))
+                .unwrap_or_else(|| "New chat".into());
+            conversations.push(ChatConversation {
+                id: self.active_chat_id,
+                title,
+                title_manually_edited: false,
+                created_at: unix_timestamp_now(),
+                updated_at: unix_timestamp_now(),
+                messages: self.chat_messages.clone(),
+            });
+        }
+        conversations.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        self.chat_conversations = conversations.clone();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let store = ChatHistoryStore {
+            version: CHAT_HISTORY_VERSION,
+            active_conversation_id: Some(self.active_chat_id),
+            conversations,
+        };
+        if let Ok(bytes) = serde_json::to_vec_pretty(&store) {
+            if let Err(error) = atomic_write(path, &bytes) {
+                tracing::warn!(%error, path = %path.display(), "failed to persist AI chat history");
+            }
+        }
+    }
+
+    fn mark_chat_activity(&mut self) {
+        if let Some(chat) = self
+            .chat_conversations
+            .iter_mut()
+            .find(|chat| chat.id == self.active_chat_id)
+        {
+            chat.updated_at = unix_timestamp_now();
+        }
+    }
+
+    fn persist_chat_activity(&mut self) {
+        self.mark_chat_activity();
+        self.persist_chat_history();
+    }
+
+    fn new_chat(&mut self, cx: &mut Context<Self>) {
+        self.persist_chat_history();
+        self.active_chat_id = self
+            .chat_conversations
+            .iter()
+            .map(|chat| chat.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        self.chat_messages.clear();
+        self.chat_request_state = ChatRequestState::Idle;
+        self.chat_history_open = false;
+        cx.notify();
+    }
+
+    fn toggle_chat_history(&mut self, cx: &mut Context<Self>) {
+        self.chat_history_open = !self.chat_history_open;
+        cx.notify();
+    }
+
+    fn begin_chat_rename(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self
+            .chat_conversations
+            .iter()
+            .find(|chat| chat.id == id)
+            .map(|chat| chat.title.clone())
+        else {
+            return;
+        };
+        self.renaming_conversation_id = Some(id);
+        self.chat_rename_input.text = title;
+        self.chat_rename_input.selection_anchor = self.chat_rename_input.text.len();
+        self.chat_rename_input.selection_active = self.chat_rename_input.text.len();
+        self.chat_rename_input.active = true;
+        self.active_text_input = ActiveTextInput::AiHistoryRename;
+        window.focus(&self.chat_rename_focus);
+        cx.notify();
+    }
+
+    fn cancel_chat_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming_conversation_id = None;
+        self.chat_rename_input = crate::ui::input_line::SingleLineInputState {
+            focus: Some(self.chat_rename_focus.clone()),
+            ..Default::default()
+        };
+        if self.active_text_input == ActiveTextInput::AiHistoryRename {
+            self.active_text_input = ActiveTextInput::None;
+        }
+        cx.notify();
+    }
+
+    fn commit_chat_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.renaming_conversation_id else {
+            return;
+        };
+        let proposed = crate::ui::input_line::SingleLineInputState::sanitize_single_line(
+            &self.chat_rename_input.text,
+        );
+        let title = proposed.trim();
+        if !title.is_empty() {
+            if let Some(chat) = self
+                .chat_conversations
+                .iter_mut()
+                .find(|chat| chat.id == id)
+            {
+                chat.title = title.to_owned();
+                chat.title_manually_edited = true;
+                chat.updated_at = unix_timestamp_now();
+                self.persist_chat_history();
+            }
+        }
+        self.cancel_chat_rename(cx);
+    }
+
+    fn open_chat(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(messages) = self
+            .chat_conversations
+            .iter()
+            .find(|chat| chat.id == id)
+            .map(|chat| chat.messages.clone())
+        {
+            self.persist_chat_history();
+            self.active_chat_id = id;
+            self.chat_messages = messages;
+            self.chat_history_open = false;
+            cx.notify();
+        }
+    }
+
+    fn delete_chat(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.chat_conversations.retain(|chat| chat.id != id);
+        if self.active_chat_id == id {
+            self.chat_messages.clear();
+            self.active_chat_id = self
+                .chat_conversations
+                .last()
+                .map(|chat| chat.id)
+                .unwrap_or(1);
+        }
+        self.persist_chat_history();
+        cx.notify();
+    }
+
     fn copy_code_block(&mut self, code: &str, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(code.to_owned()));
     }
@@ -1702,6 +1994,12 @@ impl WorkspaceView {
             },
             ai_composer_focus: cx.focus_handle(),
             ai_composer_geometry: Default::default(),
+            chat_rename_input: crate::ui::input_line::SingleLineInputState {
+                focus: Some(cx.focus_handle()),
+                ..Default::default()
+            },
+            chat_rename_focus: cx.focus_handle(),
+            renaming_conversation_id: None,
             ai_composer_active: false,
             ai_composer_dragging: false,
             ai_composer_marked_range: None,
@@ -1719,6 +2017,10 @@ impl WorkspaceView {
             thinking_expanded: HashSet::new(),
             chat_stream_events: Arc::new(Mutex::new(Vec::new())),
             chat_scroll_handle: ScrollHandle::new(),
+            chat_history_path: chat_history_path(),
+            chat_conversations: Vec::new(),
+            active_chat_id: 1,
+            chat_history_open: false,
             model_picker_open: false,
             model_label: if ui_settings
                 .configured_providers
@@ -1835,6 +2137,16 @@ impl WorkspaceView {
             key_event_id: 0,
             last_key_event_at: None,
         };
+        let (history, active_chat_id) = load_chat_history(workspace.chat_history_path.as_deref());
+        workspace.chat_conversations = history;
+        workspace.active_chat_id = active_chat_id;
+        if let Some(chat) = workspace
+            .chat_conversations
+            .iter()
+            .find(|chat| chat.id == active_chat_id)
+        {
+            workspace.chat_messages = chat.messages.clone();
+        }
         workspace.chat_thinking_enabled = workspace
             .active_provider
             .as_ref()
@@ -4270,6 +4582,13 @@ impl WorkspaceView {
             self.capture_shortcut(event, window, cx);
             return;
         }
+        if self.active_text_input == ActiveTextInput::AiHistoryRename
+            && event.keystroke.key.eq_ignore_ascii_case("escape")
+        {
+            self.cancel_chat_rename(cx);
+            window.prevent_default();
+            return;
+        }
         if event.keystroke.modifiers.control
             && event.keystroke.modifiers.alt
             && event.keystroke.key_char.is_some()
@@ -4615,6 +4934,7 @@ impl WorkspaceView {
             return;
         }
         let mut changed = false;
+        let mut completed = false;
         for event in events {
             if Some(event.request_id) != self.chat_current_request_id {
                 continue;
@@ -4649,10 +4969,14 @@ impl WorkspaceView {
                     self.chat_request_state = ChatRequestState::Idle;
                     self.chat_current_request_id = None;
                     changed = true;
+                    completed = true;
                 }
             }
         }
         if changed {
+            if completed {
+                self.persist_chat_activity();
+            }
             cx.notify();
         }
     }
@@ -4679,6 +5003,7 @@ impl WorkspaceView {
             content,
             thinking: None,
         });
+        self.persist_chat_activity();
         self.chat_next_message_id += 1;
         self.ai_composer_text.clear();
         self.ai_composer_selection = UTF16Selection {
@@ -4745,8 +5070,22 @@ impl WorkspaceView {
                 match result {
                     Ok(_response) => this.chat_request_state = ChatRequestState::Idle,
                     Err(error) => {
+                        let partial = this.chat_messages.iter().rev().any(|message| {
+                            message.role == ChatRole::Assistant
+                                && (!message.content.is_empty()
+                                    || message
+                                        .thinking
+                                        .as_deref()
+                                        .is_some_and(|thinking| !thinking.is_empty()))
+                        });
+                        if partial {
+                            this.persist_chat_activity();
+                        } else {
+                            this.chat_messages.pop();
+                        }
                         this.chat_request_state =
                             ChatRequestState::Error(error.user_message().into());
+                        this.chat_current_request_id = None;
                     }
                 }
                 cx.notify();
@@ -4818,6 +5157,7 @@ impl WorkspaceView {
         &mut self,
     ) -> Option<&mut crate::ui::input_line::SingleLineInputState> {
         match self.active_text_input {
+            ActiveTextInput::AiHistoryRename => Some(&mut self.chat_rename_input),
             ActiveTextInput::ProviderBaseUrl => Some(&mut self.provider_base_url),
             ActiveTextInput::ProviderApiKey => Some(&mut self.provider_api_key),
             ActiveTextInput::ProviderCatalogSearch => Some(&mut self.provider_catalog_input),
@@ -5038,12 +5378,22 @@ impl WorkspaceView {
     }
 
     fn input_enter(&mut self, _: &InputEnter, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiHistoryRename {
+            self.commit_chat_rename(cx);
+            return;
+        }
         if should_send_ai_on_enter(
             self.active_text_input,
             &self.ai_composer_text,
             &self.chat_request_state,
         ) {
             self.send_ai_chat_message(cx);
+        }
+    }
+
+    fn input_escape(&mut self, _: &InputEscape, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_text_input == ActiveTextInput::AiHistoryRename {
+            self.cancel_chat_rename(cx);
         }
     }
     fn provider_base_url_drag_move(
@@ -6292,7 +6642,32 @@ impl WorkspaceView {
                     .items_center()
                     .justify_between()
                     .child("Axiom AI")
-                    .child("..."),
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("ai-new-chat")
+                                    .px_1()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(move |s| s.bg(t.hover))
+                                    .tooltip(|_, cx| tooltip("New chat", cx))
+                                    .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx)))
+                                    .child("+"),
+                            )
+                            .child(
+                                div()
+                                    .id("ai-chat-history")
+                                    .px_1()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(move |s| s.bg(t.hover))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.toggle_chat_history(cx)),
+                                    )
+                                    .child("History"),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -6322,6 +6697,105 @@ impl WorkspaceView {
                             .child("Agent"),
                     ),
             )
+            .when(self.chat_history_open, |this| {
+                this.child(
+                    div()
+                        .id("ai-chat-history-list")
+                        .max_h(px(180.))
+                        .overflow_y_scroll()
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(self.chat_conversations.iter().map(|chat| {
+                            let id = chat.id;
+                            let renaming = self.renaming_conversation_id == Some(id);
+                            div()
+                                .id(SharedString::from(format!("ai-chat-history-{}", id)))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px_2()
+                                .py_1()
+                                .when(id == self.active_chat_id, |this| {
+                                    this.bg(t.inactive_selection).text_color(t.text_primary)
+                                })
+                                .hover(move |s| s.bg(t.hover))
+                                .on_click(cx.listener(move |this, _, _, cx| this.open_chat(id, cx)))
+                                .when(renaming, |this| {
+                                    this.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "ai-chat-rename-{}",
+                                                id
+                                            )))
+                                            .key_context("SingleLineInput")
+                                            .cursor(CursorStyle::IBeam)
+                                            .on_action(cx.listener(Self::input_backspace))
+                                            .on_action(cx.listener(Self::input_delete))
+                                            .on_action(cx.listener(Self::input_left))
+                                            .on_action(cx.listener(Self::input_right))
+                                            .on_action(cx.listener(Self::input_home))
+                                            .on_action(cx.listener(Self::input_end))
+                                            .on_action(cx.listener(Self::input_select_all))
+                                            .on_action(cx.listener(Self::input_select_left))
+                                            .on_action(cx.listener(Self::input_select_right))
+                                            .on_action(cx.listener(Self::input_select_home))
+                                            .on_action(cx.listener(Self::input_select_end))
+                                            .on_action(cx.listener(Self::input_copy))
+                                            .on_action(cx.listener(Self::input_cut))
+                                            .on_action(cx.listener(Self::input_paste))
+                                            .on_action(cx.listener(Self::input_enter))
+                                            .on_action(cx.listener(Self::input_escape))
+                                            .track_focus(&self.chat_rename_focus)
+                                            .overflow_hidden()
+                                            .h(px(28.))
+                                            .flex_1()
+                                            .px_1()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.active_text_input =
+                                                        ActiveTextInput::AiHistoryRename;
+                                                    window.focus(&this.chat_rename_focus);
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(crate::ui::input_line::render_state(
+                                                cx.entity(),
+                                                &self.chat_rename_input,
+                                            )),
+                                    )
+                                })
+                                .when(!renaming, |this| this.child(chat.title.clone()))
+                                .when(!renaming, |this| {
+                                    this.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "ai-chat-rename-button-{}",
+                                                id
+                                            )))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.begin_chat_rename(id, window, cx)
+                                            }))
+                                            .child("✎"),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("ai-chat-delete-{}", id)))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.delete_chat(id, cx)
+                                        }))
+                                        .child("×"),
+                                )
+                        })),
+                )
+            })
             .child(self.render_ai_chat_conversation(cx))
             .when(
                 !self.chat_messages.is_empty() && !self.chat_is_near_bottom(),
@@ -11275,6 +11749,8 @@ impl EntityInputHandler for WorkspaceView {
         actual.replace(range.clone());
         let query = if self.active_text_input == ActiveTextInput::AiComposer {
             &self.ai_composer_text
+        } else if self.active_text_input == ActiveTextInput::AiHistoryRename {
+            &self.chat_rename_input.text
         } else if self.active_text_input == ActiveTextInput::ProviderApiKey {
             &self.provider_api_key.text
         } else if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
@@ -11300,6 +11776,20 @@ impl EntityInputHandler for WorkspaceView {
             return Some(UTF16Selection {
                 range: self.ai_composer_selection.range.clone(),
                 reversed: self.ai_composer_selection.reversed,
+            });
+        }
+        if self.active_text_input == ActiveTextInput::AiHistoryRename {
+            return Some(UTF16Selection {
+                range: byte_to_utf16_offset(
+                    &self.chat_rename_input.text,
+                    self.chat_rename_input.selection_anchor,
+                )
+                    ..byte_to_utf16_offset(
+                        &self.chat_rename_input.text,
+                        self.chat_rename_input.selection_active,
+                    ),
+                reversed: self.chat_rename_input.selection_anchor
+                    > self.chat_rename_input.selection_active,
             });
         }
         if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
@@ -11378,6 +11868,29 @@ impl EntityInputHandler for WorkspaceView {
                 reversed: false,
             };
             self.ai_composer_marked_range = None;
+            cx.notify();
+            return;
+        }
+        if self.active_text_input == ActiveTextInput::AiHistoryRename {
+            let range = range.unwrap_or_else(|| {
+                byte_to_utf16_offset(
+                    &self.chat_rename_input.text,
+                    self.chat_rename_input
+                        .selection_anchor
+                        .min(self.chat_rename_input.selection_active),
+                )
+                    ..byte_to_utf16_offset(
+                        &self.chat_rename_input.text,
+                        self.chat_rename_input
+                            .selection_anchor
+                            .max(self.chat_rename_input.selection_active),
+                    )
+            });
+            let sanitized = crate::ui::input_line::SingleLineInputState::sanitize_single_line(text);
+            let (value, _) = replace_utf16_range(&self.chat_rename_input.text, range, &sanitized);
+            self.chat_rename_input.text = value;
+            self.chat_rename_input.selection_anchor = self.chat_rename_input.text.len();
+            self.chat_rename_input.selection_active = self.chat_rename_input.text.len();
             cx.notify();
             return;
         }
@@ -11810,6 +12323,34 @@ fn tab_display_path(path: &Path, project_root: Option<&Path>, runtime_root: &Pat
         return relative.display().to_string();
     }
     path.display().to_string()
+}
+
+#[cfg(test)]
+mod chat_history_tests {
+    use super::generate_chat_title;
+
+    #[test]
+    fn auto_title_normalizes_whitespace_and_multiline() {
+        assert_eq!(
+            generate_chat_title("  Minha   pergunta\ncom acento  "),
+            "Minha pergunta com acento"
+        );
+    }
+
+    #[test]
+    fn auto_title_truncates_at_utf8_safe_word_boundary() {
+        let title = generate_chat_title(
+            "Uma pergunta muito longa com çãõ e palavras adicionais para truncar",
+        );
+        assert!(title.ends_with('…'));
+        assert!(title.chars().count() <= 48);
+        assert!(title.is_char_boundary(title.len()));
+    }
+
+    #[test]
+    fn short_title_is_preserved() {
+        assert_eq!(generate_chat_title("Cor Amarela"), "Cor Amarela");
+    }
 }
 
 #[cfg(test)]
