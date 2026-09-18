@@ -33,10 +33,10 @@ use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_con
 use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSession};
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight, GlobalElementId, KeyBinding,
-    KeyDownEvent, LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, ScrollHandle, SharedString, Style, Timer, UTF16Selection, Window, actions, div,
-    prelude::*, px, relative,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
+    LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollHandle, SharedString, Style, Timer, UTF16Selection, Window, actions, div, prelude::*, px,
+    relative,
 };
 
 use crate::{
@@ -1167,31 +1167,31 @@ fn render_assistant_markdown(content: &str, cx: &mut Context<WorkspaceView>) -> 
                 div()
                     .text_color(t.text_primary)
                     .text_size(px(15.))
-                    .child(heading.to_string()),
+                    .child(strip_markdown_inline(heading)),
             );
         } else if let Some(heading) = trimmed.strip_prefix("## ") {
             blocks.push(
                 div()
                     .text_color(t.text_primary)
                     .text_size(px(16.))
-                    .child(heading.to_string()),
+                    .child(strip_markdown_inline(heading)),
             );
         } else if let Some(heading) = trimmed.strip_prefix("# ") {
             blocks.push(
                 div()
                     .text_color(t.text_primary)
                     .text_size(px(18.))
-                    .child(heading.to_string()),
+                    .child(strip_markdown_inline(heading)),
             );
         } else if let Some(item) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
-            blocks.push(div().child(format!("• {}", item.trim_matches('*'))));
+            blocks.push(div().child(format!("• {}", strip_markdown_inline(item))));
         } else if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit())
             && trimmed.contains(". ")
         {
-            blocks.push(div().child(trimmed.to_string()));
+            blocks.push(div().child(strip_markdown_inline(trimmed)));
         } else if let Some(quote) = trimmed.strip_prefix("> ") {
             blocks.push(
                 div()
@@ -1199,11 +1199,10 @@ fn render_assistant_markdown(content: &str, cx: &mut Context<WorkspaceView>) -> 
                     .border_l_1()
                     .border_color(t.accent)
                     .text_color(t.text_secondary)
-                    .child(quote.to_string()),
+                    .child(strip_markdown_inline(quote)),
             );
         } else {
-            let visible = trimmed.replace("__", "").replace('`', "");
-            blocks.push(render_markdown_inline(&visible, t.text_secondary));
+            blocks.push(render_markdown_inline(trimmed, t.text_secondary));
         }
     }
     if in_code && !code.is_empty() {
@@ -1234,31 +1233,38 @@ fn render_assistant_markdown(content: &str, cx: &mut Context<WorkspaceView>) -> 
                 .child(code_content),
         );
     }
-    div().flex().flex_col().gap_1().children(blocks)
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .children(blocks)
 }
 
 fn render_thinking_text(text: &str, color: gpui::Rgba) -> gpui::Div {
-    div().flex().flex_col().gap_1().children(
-        text.lines()
-            .map(|line| div().text_color(color).child(line.to_owned())),
-    )
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .children(text.lines().map(|line| {
+            div()
+                .w_full()
+                .min_w_0()
+                .text_color(color)
+                .child(line.to_owned())
+        }))
+}
+
+fn strip_markdown_inline(text: &str) -> String {
+    text.replace("**", "").replace("__", "").replace('`', "")
 }
 
 fn render_markdown_inline(text: &str, color: gpui::Rgba) -> gpui::Div {
-    let parts: Vec<_> = text.split("**").collect();
-    div()
-        .flex()
-        .flex_wrap()
-        .children(parts.into_iter().enumerate().map(|(index, part)| {
-            if index % 2 == 1 {
-                div()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(color)
-                    .child(part.to_owned())
-            } else {
-                div().text_color(color).child(part.to_owned())
-            }
-        }))
+    let visible = strip_markdown_inline(text);
+    div().w_full().min_w_0().text_color(color).child(visible)
 }
 
 impl WorkspaceView {
@@ -6525,6 +6531,8 @@ impl WorkspaceView {
                                 "ai-chat-message-{}",
                                 message.id
                             )))
+                            .w_full()
+                            .min_w_0()
                             .flex()
                             .flex_col()
                             .gap_1()
@@ -6575,7 +6583,7 @@ impl WorkspaceView {
                                 ChatRole::Assistant => {
                                     render_assistant_markdown(&message.content, cx)
                                 }
-                                _ => div().child(message.content.clone()),
+                                _ => div().w_full().min_w_0().child(message.content.clone()),
                             })
                             .when(is_last_assistant, |this| {
                                 this.child(
