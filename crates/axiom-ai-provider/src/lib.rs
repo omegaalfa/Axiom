@@ -126,6 +126,23 @@ pub enum ProviderChatStreamEvent {
     Done,
 }
 
+fn emit_stream_event<F>(
+    done: &mut bool,
+    event: ProviderChatStreamEvent,
+    on_event: &mut F,
+) -> Result<(), ProviderError>
+where
+    F: FnMut(ProviderChatStreamEvent) -> Result<(), ProviderError>,
+{
+    if *done {
+        return Ok(());
+    }
+    if matches!(event, ProviderChatStreamEvent::Done) {
+        *done = true;
+    }
+    on_event(event)
+}
+
 pub trait ProviderChat {
     fn chat(
         &self,
@@ -295,6 +312,7 @@ impl OllamaProvider {
         let mut headers_done = false;
         let mut chunked = false;
         let mut chunk_pos = 0usize;
+        let mut done_emitted = false;
         let mut buf = [0u8; 8192];
         loop {
             let n = stream.read(&mut buf).map_err(|_| ProviderError::Timeout)?;
@@ -357,17 +375,29 @@ impl OllamaProvider {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                 {
-                    on_event(ProviderChatStreamEvent::ThinkingDelta(delta.into()))?;
+                    emit_stream_event(
+                        &mut done_emitted,
+                        ProviderChatStreamEvent::ThinkingDelta(delta.into()),
+                        &mut on_event,
+                    )?;
                 }
                 if let Some(delta) = message
                     .and_then(|m| m.get("content"))
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                 {
-                    on_event(ProviderChatStreamEvent::ContentDelta(delta.into()))?;
+                    emit_stream_event(
+                        &mut done_emitted,
+                        ProviderChatStreamEvent::ContentDelta(delta.into()),
+                        &mut on_event,
+                    )?;
                 }
                 if value.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    on_event(ProviderChatStreamEvent::Done)?;
+                    emit_stream_event(
+                        &mut done_emitted,
+                        ProviderChatStreamEvent::Done,
+                        &mut on_event,
+                    )?;
                 }
             }
         }
@@ -380,17 +410,29 @@ impl OllamaProvider {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
             {
-                on_event(ProviderChatStreamEvent::ThinkingDelta(delta.into()))?;
+                emit_stream_event(
+                    &mut done_emitted,
+                    ProviderChatStreamEvent::ThinkingDelta(delta.into()),
+                    &mut on_event,
+                )?;
             }
             if let Some(delta) = message
                 .and_then(|m| m.get("content"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
             {
-                on_event(ProviderChatStreamEvent::ContentDelta(delta.into()))?;
+                emit_stream_event(
+                    &mut done_emitted,
+                    ProviderChatStreamEvent::ContentDelta(delta.into()),
+                    &mut on_event,
+                )?;
             }
             if value.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
-                on_event(ProviderChatStreamEvent::Done)?;
+                emit_stream_event(
+                    &mut done_emitted,
+                    ProviderChatStreamEvent::Done,
+                    &mut on_event,
+                )?;
             }
         }
         Ok(())
@@ -643,6 +685,33 @@ mod tests {
         assert_eq!(value["model"], "demo");
         assert_eq!(value["think"], true);
         assert_eq!(value["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn stream_event_emitter_applies_each_delta_once_and_stops_after_done() {
+        let mut done = false;
+        let mut content = String::new();
+        let mut done_count = 0;
+        for event in [
+            ProviderChatStreamEvent::ContentDelta("abc".into()),
+            ProviderChatStreamEvent::ContentDelta("def".into()),
+            ProviderChatStreamEvent::ContentDelta("ghi".into()),
+            ProviderChatStreamEvent::Done,
+            ProviderChatStreamEvent::Done,
+            ProviderChatStreamEvent::ContentDelta("late".into()),
+        ] {
+            emit_stream_event(&mut done, event, &mut |event| {
+                match event {
+                    ProviderChatStreamEvent::ContentDelta(delta) => content.push_str(&delta),
+                    ProviderChatStreamEvent::Done => done_count += 1,
+                    ProviderChatStreamEvent::ThinkingDelta(_) => {}
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(content, "abcdefghi");
+        assert_eq!(done_count, 1);
     }
 
     #[test]

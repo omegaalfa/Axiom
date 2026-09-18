@@ -811,6 +811,7 @@ fn load_chat_history(path: Option<&Path>) -> (Vec<ChatConversation>, u64) {
 
 struct ChatStreamEvent {
     request_id: axiom_ai_provider::ProviderRequestId,
+    assistant_id: u64,
     event: ProviderChatStreamEvent,
 }
 
@@ -4981,16 +4982,13 @@ impl WorkspaceView {
             if Some(event.request_id) != self.chat_current_request_id {
                 continue;
             }
-            let assistant_id = self
-                .chat_messages
-                .iter()
-                .rev()
-                .find(|m| m.role == ChatRole::Assistant)
-                .map(|m| m.id);
+            let assistant_id = event.assistant_id;
             match event.event {
                 ProviderChatStreamEvent::ThinkingDelta(delta) => {
-                    if let Some(id) = assistant_id
-                        .and_then(|id| self.chat_messages.iter().position(|m| m.id == id))
+                    if let Some(id) = self
+                        .chat_messages
+                        .iter()
+                        .position(|m| m.id == assistant_id && m.role == ChatRole::Assistant)
                     {
                         self.chat_messages[id]
                             .thinking
@@ -5000,8 +4998,10 @@ impl WorkspaceView {
                     }
                 }
                 ProviderChatStreamEvent::ContentDelta(delta) => {
-                    if let Some(id) = assistant_id
-                        .and_then(|id| self.chat_messages.iter().position(|m| m.id == id))
+                    if let Some(id) = self
+                        .chat_messages
+                        .iter()
+                        .position(|m| m.id == assistant_id && m.role == ChatRole::Assistant)
                     {
                         self.chat_messages[id].content.push_str(&delta);
                         changed = true;
@@ -5105,6 +5105,7 @@ impl WorkspaceView {
                             let mut queue = chat_events.lock().expect("chat stream queue poisoned");
                             queue.push(ChatStreamEvent {
                                 request_id: id,
+                                assistant_id,
                                 event,
                             });
                             Ok(())
@@ -12189,11 +12190,19 @@ fn replace_utf16_range(
     range: std::ops::Range<usize>,
     replacement: &str,
 ) -> (String, usize) {
-    let start = utf16_to_byte_offset(text, range.start);
-    let end = utf16_to_byte_offset(text, range.end);
+    let length = text.encode_utf16().count();
+    let start_utf16 = range.start.min(length);
+    let end_utf16 = range.end.min(length);
+    let (start_utf16, end_utf16) = if start_utf16 <= end_utf16 {
+        (start_utf16, end_utf16)
+    } else {
+        (end_utf16, start_utf16)
+    };
+    let start = utf16_to_byte_offset(text, start_utf16);
+    let end = utf16_to_byte_offset(text, end_utf16);
     let mut result = text.to_owned();
     result.replace_range(start..end, replacement);
-    let caret = range.start + replacement.encode_utf16().count();
+    let caret = start_utf16 + replacement.encode_utf16().count();
     (result, caret)
 }
 
@@ -13337,6 +13346,33 @@ class Service { public function run(): void {} }
             replace_utf16_range("test.php", 8..8, "X"),
             ("test.phpX".into(), 9)
         );
+    }
+
+    #[test]
+    fn replace_utf16_range_is_safe_for_reversed_and_stale_ranges() {
+        let cases = [
+            ("abcdef", 2..4, "X", "abXef"),
+            ("abcdef", 4..2, "X", "abXef"),
+            ("abcdef", 3..3, "X", "abcXdef"),
+            ("abcdef", 10..20, "X", "abcdefX"),
+            ("abcdef", 10..6, "X", "abcdefX"),
+        ];
+        for (text, range, replacement, expected) in cases {
+            let result = std::panic::catch_unwind(|| replace_utf16_range(text, range, replacement));
+            assert_eq!(result.unwrap().0, expected);
+        }
+    }
+
+    #[test]
+    fn replace_utf16_range_handles_unicode_and_surrogate_boundaries() {
+        let result = std::panic::catch_unwind(|| replace_utf16_range("a😀b", 1..3, "X"));
+        assert_eq!(result.unwrap(), ("aXb".into(), 2));
+
+        let result = std::panic::catch_unwind(|| replace_utf16_range("a😀b", 2..2, "X"));
+        assert_eq!(result.unwrap(), ("a😀Xb".into(), 3));
+
+        let result = std::panic::catch_unwind(|| replace_utf16_range("João", 3..1, "X"));
+        assert_eq!(result.unwrap().0, "JXo");
     }
 
     #[test]
