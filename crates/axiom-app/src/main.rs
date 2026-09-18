@@ -1,5 +1,6 @@
 //! Axiom desktop application.
 
+mod ai;
 mod editor_view;
 mod lsp_bridge;
 mod modal_type_completion;

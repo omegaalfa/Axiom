@@ -40,6 +40,7 @@ use gpui::{
 };
 
 use crate::{
+    ai::context::{ContextMessage, ContextRole, ContextSnapshot},
     editor_view::EditorView,
     lsp_bridge::{IdeLspEvent, LspBridge, LspRequestKind},
     terminal_view::TerminalView,
@@ -816,6 +817,40 @@ struct ChatStreamEvent {
     request_id: axiom_ai_provider::ProviderRequestId,
     assistant_id: u64,
     event: ProviderChatStreamEvent,
+}
+
+fn provider_messages_from_context(context: ContextSnapshot) -> Vec<ProviderChatMessage> {
+    context
+        .messages
+        .into_iter()
+        .map(|message| ProviderChatMessage {
+            role: match message.role {
+                ContextRole::User => ChatRole::User,
+                ContextRole::Assistant => ChatRole::Assistant,
+                ContextRole::System => ChatRole::System,
+            },
+            content: message.content,
+        })
+        .collect()
+}
+
+fn context_snapshot_from_chat_messages(messages: &[ChatUiMessage]) -> ContextSnapshot {
+    ContextSnapshot::from_messages(messages.iter().filter_map(|message| {
+        if message.role == ChatRole::Assistant
+            && message.content.is_empty()
+            && message.thinking.as_deref() == Some("")
+        {
+            return None;
+        }
+        Some(ContextMessage::new(
+            match message.role {
+                ChatRole::User => ContextRole::User,
+                ChatRole::Assistant => ContextRole::Assistant,
+                ChatRole::System => ContextRole::System,
+            },
+            message.content.clone(),
+        ))
+    }))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5141,19 +5176,8 @@ impl WorkspaceView {
         let think = self
             .selected_model_supports_thinking()
             .then_some(self.chat_thinking_enabled);
-        let messages = self
-            .chat_messages
-            .iter()
-            .filter(|message| {
-                !(message.role == ChatRole::Assistant
-                    && message.content.is_empty()
-                    && message.thinking.as_deref() == Some(""))
-            })
-            .map(|message| ProviderChatMessage {
-                role: message.role.clone(),
-                content: message.content.clone(),
-            })
-            .collect();
+        let context = context_snapshot_from_chat_messages(&self.chat_messages);
+        let messages = provider_messages_from_context(context);
         let entity = cx.entity();
         let chat_events = self.chat_stream_events.clone();
         cx.spawn(async move |_, cx| {
@@ -12528,7 +12552,11 @@ fn tab_display_path(path: &Path, project_root: Option<&Path>, runtime_root: &Pat
 
 #[cfg(test)]
 mod chat_history_tests {
-    use super::{ChatRequestState, generate_chat_title, stop_chat_request};
+    use super::{
+        ChatRequestState, ChatRole, ChatUiMessage, ContextMessage, ContextRole, ContextSnapshot,
+        context_snapshot_from_chat_messages, generate_chat_title, provider_messages_from_context,
+        stop_chat_request,
+    };
     use axiom_ai_provider::ProviderRequestId;
 
     #[test]
@@ -12562,6 +12590,46 @@ mod chat_history_tests {
     #[test]
     fn short_title_is_preserved() {
         assert_eq!(generate_chat_title("Cor Amarela"), "Cor Amarela");
+    }
+
+    #[test]
+    fn context_adapts_roles_and_content_for_provider_messages() {
+        let context = ContextSnapshot::from_messages([
+            ContextMessage::new(ContextRole::User, "pergunta"),
+            ContextMessage::new(ContextRole::Assistant, "resposta\ncompleta"),
+        ]);
+        let messages = provider_messages_from_context(context);
+        assert_eq!(messages[0].role, axiom_ai_provider::ChatRole::User);
+        assert_eq!(messages[0].content, "pergunta");
+        assert_eq!(messages[1].role, axiom_ai_provider::ChatRole::Assistant);
+        assert_eq!(messages[1].content, "resposta\ncompleta");
+    }
+
+    #[test]
+    fn context_snapshot_excludes_thinking_and_empty_placeholder() {
+        let messages = vec![
+            ChatUiMessage {
+                id: 1,
+                role: ChatRole::User,
+                content: "pergunta".into(),
+                thinking: None,
+            },
+            ChatUiMessage {
+                id: 2,
+                role: ChatRole::Assistant,
+                content: "resposta".into(),
+                thinking: Some("raciocínio interno".into()),
+            },
+            ChatUiMessage {
+                id: 3,
+                role: ChatRole::Assistant,
+                content: String::new(),
+                thinking: Some(String::new()),
+            },
+        ];
+        let snapshot = context_snapshot_from_chat_messages(&messages);
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(snapshot.messages[1].content, "resposta");
     }
 }
 
