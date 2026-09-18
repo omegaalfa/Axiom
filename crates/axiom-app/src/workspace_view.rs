@@ -1043,6 +1043,7 @@ pub struct WorkspaceView {
     thinking_expanded: HashSet<u64>,
     chat_stream_events: Arc<Mutex<Vec<ChatStreamEvent>>>,
     chat_cancel_token: Option<Arc<AtomicBool>>,
+    chat_copy_notice: Option<u64>,
     chat_scroll_handle: ScrollHandle,
     chat_auto_follow: bool,
     chat_last_scroll_offset: Point<Pixels>,
@@ -1457,6 +1458,24 @@ impl WorkspaceView {
 
     fn copy_code_block(&mut self, code: &str, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(code.to_owned()));
+        self.status = "Copied".into();
+        cx.notify();
+    }
+
+    fn show_chat_copy_notice(&mut self, message_id: u64, cx: &mut Context<Self>) {
+        self.chat_copy_notice = Some(message_id);
+        let entity = cx.entity();
+        cx.notify();
+        cx.spawn(async move |_, cx| {
+            Timer::after(std::time::Duration::from_millis(1400)).await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.chat_copy_notice == Some(message_id) {
+                    this.chat_copy_notice = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
     fn current_text_for_path(&self, path: &Path, cx: &App) -> Option<(String, TargetTextSource)> {
         let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -2044,6 +2063,7 @@ impl WorkspaceView {
             thinking_expanded: HashSet::new(),
             chat_stream_events: Arc::new(Mutex::new(Vec::new())),
             chat_cancel_token: None,
+            chat_copy_notice: None,
             chat_scroll_handle: ScrollHandle::new(),
             chat_auto_follow: true,
             chat_last_scroll_offset: Point::default(),
@@ -6652,24 +6672,6 @@ impl WorkspaceView {
                                     } else {
                                         "You".to_owned()
                                     }),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "ai-copy-message-{}",
-                                        message_id
-                                    )))
-                                    .px_1()
-                                    .cursor(CursorStyle::PointingHand)
-                                    .hover(move |s| s.bg(t.hover))
-                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                        cx.stop_propagation();
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            message_content.clone(),
-                                        ));
-                                    }))
-                                    .tooltip(|_, cx| tooltip("Copy message", cx))
-                                    .child("⧉"),
                             ),
                     )
                     .when_some(
@@ -6712,6 +6714,42 @@ impl WorkspaceView {
                         ChatRole::Assistant => render_assistant_markdown(&message.content, cx),
                         _ => div().w_full().min_w_0().child(message.content.clone()),
                     })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .mt_1()
+                            .px_1()
+                            .when(self.chat_copy_notice == Some(message_id), |this| {
+                                this.child(
+                                    div()
+                                        .px_1()
+                                        .text_size(px(11.))
+                                        .text_color(t.accent)
+                                        .child("Copied"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "ai-copy-message-{}",
+                                        message_id
+                                    )))
+                                    .px_1()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(move |s| s.bg(t.hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            message_content.clone(),
+                                        ));
+                                        this.show_chat_copy_notice(message_id, cx);
+                                        this.status = "Copied".into();
+                                    }))
+                                    .tooltip(|_, cx| tooltip("Copy message", cx))
+                                    .child("⧉"),
+                            ),
+                    )
             }))
             .when_some(
                 match &self.chat_request_state {
