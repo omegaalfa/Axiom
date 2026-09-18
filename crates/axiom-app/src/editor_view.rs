@@ -1316,6 +1316,10 @@ impl EditorView {
         self.document.content()
     }
 
+    pub fn selected_text(&self) -> Option<String> {
+        self.document.selected_text()
+    }
+
     pub fn references_revision(&self) -> u64 {
         self.document.buffer_revision()
     }

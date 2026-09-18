@@ -40,7 +40,7 @@ use gpui::{
 };
 
 use crate::{
-    ai::context::{ContextMessage, ContextRole, ContextSnapshot},
+    ai::context::{ContextMessage, ContextRole, ContextSnapshot, ContextSource, ContextSourceKind},
     editor_view::EditorView,
     lsp_bridge::{IdeLspEvent, LspBridge, LspRequestKind},
     terminal_view::TerminalView,
@@ -820,7 +820,12 @@ struct ChatStreamEvent {
 }
 
 fn provider_messages_from_context(context: ContextSnapshot) -> Vec<ProviderChatMessage> {
-    context
+    let latest_user_envelope = context
+        .messages
+        .iter()
+        .rposition(|message| message.role == ContextRole::User)
+        .and_then(|index| context.user_request_with_sources(&context.messages[index].content));
+    let mut messages: Vec<_> = context
         .messages
         .into_iter()
         .map(|message| ProviderChatMessage {
@@ -831,7 +836,15 @@ fn provider_messages_from_context(context: ContextSnapshot) -> Vec<ProviderChatM
             },
             content: message.content,
         })
-        .collect()
+        .collect();
+    if let Some(envelope) = latest_user_envelope
+        && let Some(message) = messages
+            .iter_mut()
+            .rfind(|message| message.role == ChatRole::User)
+    {
+        message.content = envelope;
+    }
+    messages
 }
 
 fn context_snapshot_from_chat_messages(messages: &[ChatUiMessage]) -> ContextSnapshot {
@@ -851,6 +864,52 @@ fn context_snapshot_from_chat_messages(messages: &[ChatUiMessage]) -> ContextSna
             message.content.clone(),
         ))
     }))
+}
+
+fn context_source_from_editor_values(
+    label: String,
+    selection: Option<String>,
+    active_file: Option<String>,
+) -> Result<ContextSource, &'static str> {
+    if let Some(selection) = selection.filter(|text| !text.is_empty()) {
+        return Ok(ContextSource::new(
+            ContextSourceKind::Selection,
+            label,
+            selection,
+        ));
+    }
+    active_file
+        .map(|content| ContextSource::new(ContextSourceKind::ActiveFile, label, content))
+        .ok_or("No active file")
+}
+
+fn context_source_ui_label(source: &ContextSource) -> String {
+    let label = truncate_context_label(&source.label, 28);
+    match source.kind {
+        ContextSourceKind::ActiveFile => label,
+        ContextSourceKind::Selection => format!("Selection · {label}"),
+    }
+}
+
+fn truncate_context_label(label: &str, max_chars: usize) -> String {
+    let chars: Vec<_> = label.chars().collect();
+    if chars.len() <= max_chars {
+        return label.to_owned();
+    }
+    let extension_start = label
+        .rfind('.')
+        .filter(|index| *index > 0)
+        .map(|index| label[index..].chars().count());
+    let suffix_len = extension_start
+        .unwrap_or(0)
+        .min(max_chars.saturating_sub(2));
+    let prefix_len = max_chars.saturating_sub(suffix_len + 1);
+    let mut result: String = chars.iter().take(prefix_len).collect();
+    result.push('…');
+    if suffix_len > 0 {
+        result.extend(chars.iter().skip(chars.len() - suffix_len));
+    }
+    result
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1079,6 +1138,8 @@ pub struct WorkspaceView {
     chat_stream_events: Arc<Mutex<Vec<ChatStreamEvent>>>,
     chat_cancel_token: Option<Arc<AtomicBool>>,
     chat_copy_notice: Option<u64>,
+    chat_context_sources: Vec<ContextSource>,
+    chat_context_feedback: Option<String>,
     chat_scroll_handle: ScrollHandle,
     chat_auto_follow: bool,
     chat_last_scroll_offset: Point<Pixels>,
@@ -1398,6 +1459,8 @@ impl WorkspaceView {
             .unwrap_or(0)
             + 1;
         self.chat_messages.clear();
+        self.chat_context_sources.clear();
+        self.chat_context_feedback = None;
         self.chat_request_state = ChatRequestState::Idle;
         self.chat_history_open = false;
         cx.notify();
@@ -1472,6 +1535,8 @@ impl WorkspaceView {
             self.persist_chat_history();
             self.active_chat_id = id;
             self.chat_messages = messages;
+            self.chat_context_sources.clear();
+            self.chat_context_feedback = None;
             self.chat_history_open = false;
             cx.notify();
         }
@@ -1481,6 +1546,8 @@ impl WorkspaceView {
         self.chat_conversations.retain(|chat| chat.id != id);
         if self.active_chat_id == id {
             self.chat_messages.clear();
+            self.chat_context_sources.clear();
+            self.chat_context_feedback = None;
             self.active_chat_id = self
                 .chat_conversations
                 .last()
@@ -1488,6 +1555,48 @@ impl WorkspaceView {
                 .unwrap_or(1);
         }
         self.persist_chat_history();
+        cx.notify();
+    }
+
+    fn capture_active_editor_context(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.active else {
+            self.chat_context_feedback = Some("No active file".into());
+            cx.notify();
+            return;
+        };
+        let Some(tab) = self.tabs.get(active) else {
+            self.chat_context_feedback = Some("No active file".into());
+            cx.notify();
+            return;
+        };
+        let editor = tab.editor.read(cx);
+        let path = tab.path.clone();
+        let label = self
+            .project
+            .as_ref()
+            .and_then(|project| path.strip_prefix(project.root_path()).ok())
+            .map(|relative| relative.display().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let source = match context_source_from_editor_values(
+            label,
+            editor.selected_text(),
+            Some(editor.document_content()),
+        ) {
+            Ok(source) => source,
+            Err(message) => {
+                self.chat_context_feedback = Some(message.into());
+                cx.notify();
+                return;
+            }
+        };
+        self.chat_context_sources = vec![source];
+        self.chat_context_feedback = Some(
+            if self.chat_context_sources[0].kind == ContextSourceKind::Selection {
+                "Selection added".into()
+            } else {
+                "Active file added".into()
+            },
+        );
         cx.notify();
     }
 
@@ -2099,6 +2208,8 @@ impl WorkspaceView {
             chat_stream_events: Arc::new(Mutex::new(Vec::new())),
             chat_cancel_token: None,
             chat_copy_notice: None,
+            chat_context_sources: Vec::new(),
+            chat_context_feedback: None,
             chat_scroll_handle: ScrollHandle::new(),
             chat_auto_follow: true,
             chat_last_scroll_offset: Point::default(),
@@ -5176,7 +5287,8 @@ impl WorkspaceView {
         let think = self
             .selected_model_supports_thinking()
             .then_some(self.chat_thinking_enabled);
-        let context = context_snapshot_from_chat_messages(&self.chat_messages);
+        let context = context_snapshot_from_chat_messages(&self.chat_messages)
+            .with_sources(self.chat_context_sources.clone());
         let messages = provider_messages_from_context(context);
         let entity = cx.entity();
         let chat_events = self.chat_stream_events.clone();
@@ -6787,6 +6899,10 @@ impl WorkspaceView {
     fn render_ai_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
+        let active_context = self.chat_context_sources.first();
+        let context_label = active_context.map(context_source_ui_label);
+        let context_full_label = active_context.map(|source| source.label.clone());
+        let context_is_active = active_context.is_some();
         div()
             .id("ai-panel")
             .relative()
@@ -7146,7 +7262,38 @@ impl WorkspaceView {
                             .items_center()
                             .justify_between()
                             .text_color(t.text_muted)
-                            .child("+ Context")
+                            .child(
+                                div()
+                                    .id("ai-context-button")
+                                    .px_2()
+                                    .py_1()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .text_color(if context_is_active {
+                                        t.accent
+                                    } else {
+                                        t.text_muted
+                                    })
+                                    .hover(move |s| s.bg(t.hover))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if this.chat_context_sources.is_empty() {
+                                            this.capture_active_editor_context(cx);
+                                        } else {
+                                            this.chat_context_sources.clear();
+                                            this.chat_context_feedback = None;
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .when_some(context_full_label, |this, label| {
+                                        this.tooltip(move |_, cx| tooltip(label.clone(), cx))
+                                    })
+                                    .child(SharedString::from(if context_is_active {
+                                        format!("[ {} × ]", context_label.unwrap_or_default())
+                                    } else {
+                                        self.chat_context_feedback
+                                            .clone()
+                                            .unwrap_or_else(|| "+ Context".into())
+                                    })),
+                            )
                             .child(
                                 div()
                                     .flex()
@@ -12554,8 +12701,9 @@ fn tab_display_path(path: &Path, project_root: Option<&Path>, runtime_root: &Pat
 mod chat_history_tests {
     use super::{
         ChatRequestState, ChatRole, ChatUiMessage, ContextMessage, ContextRole, ContextSnapshot,
-        context_snapshot_from_chat_messages, generate_chat_title, provider_messages_from_context,
-        stop_chat_request,
+        ContextSource, ContextSourceKind, context_snapshot_from_chat_messages,
+        context_source_from_editor_values, context_source_ui_label, generate_chat_title,
+        provider_messages_from_context, stop_chat_request, truncate_context_label,
     };
     use axiom_ai_provider::ProviderRequestId;
 
@@ -12603,6 +12751,134 @@ mod chat_history_tests {
         assert_eq!(messages[0].content, "pergunta");
         assert_eq!(messages[1].role, axiom_ai_provider::ChatRole::Assistant);
         assert_eq!(messages[1].content, "resposta\ncompleta");
+    }
+
+    #[test]
+    fn explicit_sources_are_serialized_in_the_current_user_turn() {
+        let context =
+            ContextSnapshot::from_messages([ContextMessage::new(ContextRole::User, "pergunta")])
+                .with_sources([ContextSource::new(
+                    ContextSourceKind::Selection,
+                    "src/main.rs",
+                    "fn main() {}",
+                )]);
+        let messages = provider_messages_from_context(context);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, axiom_ai_provider::ChatRole::User);
+        assert!(messages[0].content.contains("<axiom_explicit_context>"));
+        assert!(messages[0].content.contains("Source: src/main.rs"));
+        assert!(messages[0].content.contains("fn main() {}"));
+        assert!(
+            messages[0]
+                .content
+                .contains("<axiom_user_request>\npergunta")
+        );
+        assert!(!messages.iter().any(|message| {
+            message.role == axiom_ai_provider::ChatRole::System
+                && message.content.contains("axiom_explicit_context")
+        }));
+    }
+
+    #[test]
+    fn final_provider_payload_contains_current_context_sentinel_near_latest_user() {
+        let context = ContextSnapshot::from_messages([
+            ContextMessage::new(ContextRole::User, "old question"),
+            ContextMessage::new(ContextRole::Assistant, "old answer"),
+            ContextMessage::new(ContextRole::User, "o que vc acha disso?"),
+        ])
+        .with_sources([ContextSource::new(
+            ContextSourceKind::ActiveFile,
+            "README.md",
+            "AXIOM_CONTEXT_SENTINEL_4C92",
+        )]);
+        let request = axiom_ai_provider::ProviderChatRequest {
+            model: "test-model".into(),
+            messages: provider_messages_from_context(context),
+            think: None,
+        };
+        let payload = serde_json::to_string(&request).unwrap();
+        assert!(payload.contains("AXIOM_CONTEXT_SENTINEL_4C92"));
+        assert!(payload.contains("Source: README.md"));
+        assert!(payload.contains("<axiom_explicit_context>"));
+        assert!(payload.contains("<axiom_user_request>"));
+        assert!(payload.contains("o que vc acha disso?"));
+        let messages = &request.messages;
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, axiom_ai_provider::ChatRole::Assistant);
+        assert_eq!(messages[2].role, axiom_ai_provider::ChatRole::User);
+    }
+
+    #[test]
+    fn replacing_or_removing_context_changes_only_the_current_provider_request() {
+        let history = [ContextMessage::new(ContextRole::User, "latest")];
+        let first =
+            ContextSnapshot::from_messages(history.clone()).with_sources([ContextSource::new(
+                ContextSourceKind::ActiveFile,
+                "Probe.php",
+                "SOURCE_A",
+            )]);
+        let second =
+            ContextSnapshot::from_messages(history.clone()).with_sources([ContextSource::new(
+                ContextSourceKind::ActiveFile,
+                "README.md",
+                "SOURCE_B",
+            )]);
+        let removed = ContextSnapshot::from_messages(history);
+        let first_payload = serde_json::to_string(&provider_messages_from_context(first)).unwrap();
+        let second_payload =
+            serde_json::to_string(&provider_messages_from_context(second)).unwrap();
+        let removed_payload =
+            serde_json::to_string(&provider_messages_from_context(removed)).unwrap();
+        assert!(first_payload.contains("SOURCE_A"));
+        assert!(!first_payload.contains("SOURCE_B"));
+        assert!(second_payload.contains("SOURCE_B"));
+        assert!(!second_payload.contains("SOURCE_A"));
+        assert!(!removed_payload.contains("SOURCE_A"));
+        assert!(!removed_payload.contains("SOURCE_B"));
+    }
+
+    #[test]
+    fn context_button_prefers_selection_then_active_file_and_reports_missing_file() {
+        let selected = context_source_from_editor_values(
+            "main.rs".into(),
+            Some("let answer = 42;".into()),
+            Some("whole file".into()),
+        )
+        .unwrap();
+        assert_eq!(selected.kind, ContextSourceKind::Selection);
+        assert_eq!(selected.content, "let answer = 42;");
+
+        let active_file =
+            context_source_from_editor_values("main.rs".into(), None, Some("whole file".into()))
+                .unwrap();
+        assert_eq!(active_file.kind, ContextSourceKind::ActiveFile);
+        assert_eq!(active_file.content, "whole file");
+
+        assert_eq!(
+            context_source_from_editor_values("main.rs".into(), None, None),
+            Err("No active file")
+        );
+    }
+
+    #[test]
+    fn context_labels_are_compact_utf8_safe_and_keep_extension() {
+        assert_eq!(
+            context_source_ui_label(&ContextSource::new(
+                ContextSourceKind::ActiveFile,
+                "README.md",
+                "content",
+            )),
+            "README.md"
+        );
+        let label = truncate_context_label("UserAuthenticationServiceRepository.php", 20);
+        assert!(label.chars().count() <= 20);
+        assert!(label.ends_with(".php"));
+        assert_eq!(
+            truncate_context_label("ação muito longa.php", 12)
+                .chars()
+                .count(),
+            12
+        );
     }
 
     #[test]
