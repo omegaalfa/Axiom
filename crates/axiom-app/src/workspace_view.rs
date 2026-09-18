@@ -1027,6 +1027,10 @@ pub struct WorkspaceView {
     thinking_expanded: HashSet<u64>,
     chat_stream_events: Arc<Mutex<Vec<ChatStreamEvent>>>,
     chat_scroll_handle: ScrollHandle,
+    chat_auto_follow: bool,
+    chat_last_scroll_offset: Point<Pixels>,
+    chat_scroll_observed: bool,
+    chat_programmatic_scroll_pending: bool,
     chat_history_path: Option<PathBuf>,
     chat_conversations: Vec<ChatConversation>,
     active_chat_id: u64,
@@ -2023,6 +2027,10 @@ impl WorkspaceView {
             thinking_expanded: HashSet::new(),
             chat_stream_events: Arc::new(Mutex::new(Vec::new())),
             chat_scroll_handle: ScrollHandle::new(),
+            chat_auto_follow: true,
+            chat_last_scroll_offset: Point::default(),
+            chat_scroll_observed: false,
+            chat_programmatic_scroll_pending: false,
             chat_history_path: chat_history_path(),
             chat_conversations: Vec::new(),
             active_chat_id: 1,
@@ -2214,7 +2222,7 @@ impl WorkspaceView {
                         }
                         if matches!(this.chat_request_state, ChatRequestState::Sending) {
                             this.chat_generating_phase =
-                                this.chat_generating_phase.wrapping_add(1) % 4;
+                                this.chat_generating_phase.wrapping_add(1) % 10;
                             cx.notify();
                         }
                         let poll_started = Instant::now();
@@ -4916,7 +4924,34 @@ impl WorkspaceView {
 
     fn jump_chat_to_latest(&mut self, cx: &mut Context<Self>) {
         self.chat_scroll_handle.scroll_to_bottom();
+        self.chat_programmatic_scroll_pending = true;
+        if matches!(self.chat_request_state, ChatRequestState::Sending) {
+            self.chat_auto_follow = true;
+        }
         cx.notify();
+    }
+
+    fn observe_chat_scroll(&mut self) {
+        let offset = self.chat_scroll_handle.offset();
+        if self.chat_scroll_observed && offset != self.chat_last_scroll_offset {
+            let near_bottom = self.chat_is_near_bottom();
+            if self.chat_programmatic_scroll_pending {
+                self.chat_programmatic_scroll_pending = false;
+                if !near_bottom && matches!(self.chat_request_state, ChatRequestState::Sending) {
+                    self.chat_auto_follow = false;
+                }
+            } else if matches!(self.chat_request_state, ChatRequestState::Sending) {
+                self.chat_auto_follow = false;
+            }
+        }
+        self.chat_last_scroll_offset = offset;
+        self.chat_scroll_observed = true;
+        if matches!(self.chat_request_state, ChatRequestState::Sending)
+            && !self.chat_auto_follow
+            && self.chat_is_near_bottom()
+        {
+            self.chat_auto_follow = true;
+        }
     }
 
     fn chat_is_near_bottom(&self) -> bool {
@@ -4930,6 +4965,7 @@ impl WorkspaceView {
     }
 
     fn poll_chat_stream(&mut self, cx: &mut Context<Self>) {
+        self.observe_chat_scroll();
         let events = std::mem::take(
             &mut *self
                 .chat_stream_events
@@ -4980,6 +5016,11 @@ impl WorkspaceView {
             }
         }
         if changed {
+            if self.chat_auto_follow && matches!(self.chat_request_state, ChatRequestState::Sending)
+            {
+                self.chat_scroll_handle.scroll_to_bottom();
+                self.chat_programmatic_scroll_pending = true;
+            }
             if completed {
                 self.persist_chat_activity();
             }
@@ -5009,6 +5050,9 @@ impl WorkspaceView {
             content,
             thinking: None,
         });
+        self.chat_auto_follow = true;
+        self.chat_scroll_handle.scroll_to_bottom();
+        self.chat_programmatic_scroll_pending = true;
         self.persist_chat_activity();
         self.chat_next_message_id += 1;
         self.ai_composer_text.clear();
@@ -6602,17 +6646,6 @@ impl WorkspaceView {
                             })
                     }),
             )
-            .when(
-                matches!(self.chat_request_state, ChatRequestState::Sending),
-                |this| {
-                    let dots = ".".repeat(self.chat_generating_phase as usize);
-                    this.child(
-                        div()
-                            .text_color(t.text_muted)
-                            .child(format!("Generating {:<3}", dots)),
-                    )
-                },
-            )
             .when_some(
                 match &self.chat_request_state {
                     ChatRequestState::Error(message) => Some(message.clone()),
@@ -6805,29 +6838,46 @@ impl WorkspaceView {
                 )
             })
             .child(self.render_ai_chat_conversation(cx))
+            .when(!self.chat_messages.is_empty(), |this| {
+                this.child(
+                    div()
+                        .id("ai-scroll-to-latest")
+                        .absolute()
+                        .bottom(px(92.))
+                        .right_3()
+                        .w(m.icon_size + px(12.))
+                        .h(m.icon_size + px(12.))
+                        .rounded(px(999.))
+                        .bg(t.elevated_surface)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |s| s.bg(t.hover))
+                        .tooltip(|_, cx| tooltip("Scroll to latest", cx))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.jump_chat_to_latest(cx);
+                        }))
+                        .child(arrow_down_icon(t.text_primary)),
+                )
+            })
             .when(
-                !self.chat_messages.is_empty() && !self.chat_is_near_bottom(),
+                matches!(self.chat_request_state, ChatRequestState::Sending),
                 |this| {
+                    let dots = "•".repeat((self.chat_generating_phase as usize / 2 + 1).min(5));
                     this.child(
                         div()
-                            .id("ai-scroll-to-latest")
+                            .id("ai-chat-generating-indicator")
                             .absolute()
-                            .bottom(px(92.))
-                            .right_3()
-                            .w(m.icon_size + px(12.))
-                            .h(m.icon_size + px(12.))
-                            .rounded(px(999.))
-                            .bg(t.elevated_surface)
+                            .bottom(px(96.))
+                            .left_0()
+                            .right_0()
+                            .px_2()
+                            .py_1()
                             .flex()
-                            .items_center()
                             .justify_center()
-                            .cursor(CursorStyle::PointingHand)
-                            .hover(move |s| s.bg(t.hover))
-                            .tooltip(|_, cx| tooltip("Scroll to latest", cx))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.jump_chat_to_latest(cx);
-                            }))
-                            .child(arrow_down_icon(t.text_primary)),
+                            .text_color(t.text_muted)
+                            .child(dots),
                     )
                 },
             )
