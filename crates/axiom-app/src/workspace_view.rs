@@ -45,7 +45,7 @@ use crate::{
     terminal_view::TerminalView,
     ui::{
         components::tooltip,
-        icons::{ActivityIcon, activity_icon, arrow_down_icon, file_icon},
+        icons::{ActivityIcon, activity_icon, arrow_down_icon, axiom_icon, file_icon, user_icon},
         metrics, theme,
     },
 };
@@ -6529,19 +6529,13 @@ impl WorkspaceView {
             );
     }
 
-    fn copy_last_assistant(&mut self, cx: &mut Context<Self>) {
-        if let Some(message) = self
-            .chat_messages
-            .iter()
-            .rev()
-            .find(|message| message.role == ChatRole::Assistant)
-        {
-            cx.write_to_clipboard(ClipboardItem::new_string(message.content.clone()));
-        }
-    }
-
     fn render_ai_chat_conversation(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
+        let assistant_label = if self.model_label.trim().is_empty() || self.model_label == "Model" {
+            "Axiom".to_owned()
+        } else {
+            self.model_label.clone()
+        };
         div()
             .id("ai-chat-conversation")
             .flex_1()
@@ -6561,91 +6555,113 @@ impl WorkspaceView {
                     .child("Understand code, diagnose problems,")
                     .child("or start an agent task.")
             })
-            .children(
-                self.chat_messages
-                    .iter()
-                    .enumerate()
-                    .map(|(index, message)| {
-                        let is_last_assistant = message.role == ChatRole::Assistant
-                            && !self.chat_messages[index + 1..]
-                                .iter()
-                                .any(|candidate| candidate.role == ChatRole::Assistant);
+            .children(self.chat_messages.iter().map(|message| {
+                let message_id = message.id;
+                let message_content = message.content.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "ai-chat-message-{}",
+                        message.id
+                    )))
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .when(message.role == ChatRole::User, |this| {
+                        this.bg(t.editor_background)
+                            .rounded(metrics().border_radius_small)
+                            .px_2()
+                            .py_1()
+                    })
+                    .child(
                         div()
-                            .id(SharedString::from(format!(
-                                "ai-chat-message-{}",
-                                message.id
-                            )))
                             .w_full()
                             .min_w_0()
                             .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().text_color(t.text_primary).child(match message.role {
-                                ChatRole::Assistant => "Assistant",
-                                _ => "User",
-                            }))
-                            .when_some(
-                                (message.role == ChatRole::Assistant
-                                    && message
-                                        .thinking
-                                        .as_ref()
-                                        .is_some_and(|thinking| !thinking.trim().is_empty()))
-                                .then(|| message.thinking.clone().unwrap()),
-                                |this, thinking| {
-                                    let expanded = self.thinking_expanded.contains(&message.id);
-                                    let message_id = message.id;
-                                    this.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "ai-thinking-{}",
-                                                message_id
-                                            )))
-                                            .px_2()
-                                            .py_1()
-                                            .rounded(metrics().border_radius_small)
-                                            .bg(t.elevated_surface)
-                                            .text_color(t.text_muted)
-                                            .cursor(CursorStyle::PointingHand)
-                                            .hover(move |s| s.bg(t.hover))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if !this.thinking_expanded.insert(message_id) {
-                                                    this.thinking_expanded.remove(&message_id);
-                                                }
-                                                cx.notify();
-                                            }))
-                                            .child(if expanded {
-                                                div().child("Thinking ▾").child(
-                                                    render_thinking_text(&thinking, t.text_muted),
-                                                )
-                                            } else {
-                                                div().child("Thinking ▸")
-                                            }),
-                                    )
-                                },
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_color(if message.role == ChatRole::Assistant {
+                                        t.accent
+                                    } else {
+                                        t.text_primary
+                                    })
+                                    .child(if message.role == ChatRole::Assistant {
+                                        axiom_icon(t.accent)
+                                    } else {
+                                        user_icon(t.text_muted)
+                                    })
+                                    .child(if message.role == ChatRole::Assistant {
+                                        assistant_label.clone()
+                                    } else {
+                                        "You".to_owned()
+                                    }),
                             )
-                            .child(match message.role {
-                                ChatRole::Assistant => {
-                                    render_assistant_markdown(&message.content, cx)
-                                }
-                                _ => div().w_full().min_w_0().child(message.content.clone()),
-                            })
-                            .when(is_last_assistant, |this| {
-                                this.child(
-                                    div()
-                                        .id("ai-copy-last-assistant")
-                                        .px_2()
-                                        .py_1()
-                                        .cursor(CursorStyle::PointingHand)
-                                        .hover(move |s| s.bg(t.hover))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.copy_last_assistant(cx);
-                                        }))
-                                        .tooltip(|_, cx| tooltip("Copy response", cx))
-                                        .child("⧉"),
-                                )
-                            })
-                    }),
-            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "ai-copy-message-{}",
+                                        message_id
+                                    )))
+                                    .px_1()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(move |s| s.bg(t.hover))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            message_content.clone(),
+                                        ));
+                                    }))
+                                    .tooltip(|_, cx| tooltip("Copy message", cx))
+                                    .child("⧉"),
+                            ),
+                    )
+                    .when_some(
+                        (message.role == ChatRole::Assistant
+                            && message
+                                .thinking
+                                .as_ref()
+                                .is_some_and(|thinking| !thinking.trim().is_empty()))
+                        .then(|| message.thinking.clone().unwrap()),
+                        |this, thinking| {
+                            let expanded = self.thinking_expanded.contains(&message.id);
+                            let message_id = message.id;
+                            this.child(
+                                div()
+                                    .id(SharedString::from(format!("ai-thinking-{}", message_id)))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(metrics().border_radius_small)
+                                    .bg(t.elevated_surface)
+                                    .text_color(t.text_muted)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(move |s| s.bg(t.hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !this.thinking_expanded.insert(message_id) {
+                                            this.thinking_expanded.remove(&message_id);
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(if expanded {
+                                        div()
+                                            .child("Thinking ▾")
+                                            .child(render_thinking_text(&thinking, t.text_muted))
+                                    } else {
+                                        div().child("Thinking ▸")
+                                    }),
+                            )
+                        },
+                    )
+                    .child(match message.role {
+                        ChatRole::Assistant => render_assistant_markdown(&message.content, cx),
+                        _ => div().w_full().min_w_0().child(message.content.clone()),
+                    })
+            }))
             .when_some(
                 match &self.chat_request_state {
                     ChatRequestState::Error(message) => Some(message.clone()),
@@ -6858,7 +6874,7 @@ impl WorkspaceView {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.jump_chat_to_latest(cx);
                         }))
-                        .child(arrow_down_icon(t.text_primary)),
+                        .child(arrow_down_icon(t.accent)),
                 )
             })
             .when(
