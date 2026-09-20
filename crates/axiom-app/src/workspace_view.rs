@@ -6528,8 +6528,9 @@ impl WorkspaceView {
                             .h(px(48.))
                             .px_4()
                             .flex()
-                            .items_center()
-                            .justify_between()
+                            .flex_col()
+                            .w_full()
+                            .min_w_0()
                             .border_b_1()
                             .border_color(t.border_subtle)
                             .child(div().text_size(px(16.)).child("AI Providers"))
@@ -7259,46 +7260,73 @@ impl WorkspaceView {
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .justify_between()
+                            .flex_col()
+                            .w_full()
+                            .min_w_0()
                             .text_color(t.text_muted)
-                            .child(
-                                div()
-                                    .id("ai-context-button")
-                                    .px_2()
-                                    .py_1()
-                                    .cursor(CursorStyle::PointingHand)
-                                    .text_color(if context_is_active {
-                                        t.accent
-                                    } else {
-                                        t.text_muted
-                                    })
-                                    .hover(move |s| s.bg(t.hover))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if this.chat_context_sources.is_empty() {
-                                            this.capture_active_editor_context(cx);
+                            .when(context_is_active, |this| {
+                                this.child(
+                                    div()
+                                        .id("ai-context-button")
+                                        .w_full()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .px_2()
+                                        .py_1()
+                                        .cursor(CursorStyle::PointingHand)
+                                        .text_color(if context_is_active {
+                                            t.accent
                                         } else {
-                                            this.chat_context_sources.clear();
-                                            this.chat_context_feedback = None;
-                                            cx.notify();
-                                        }
-                                    }))
-                                    .when_some(context_full_label, |this, label| {
-                                        this.tooltip(move |_, cx| tooltip(label.clone(), cx))
-                                    })
-                                    .child(SharedString::from(if context_is_active {
-                                        format!("[ {} × ]", context_label.unwrap_or_default())
-                                    } else {
-                                        self.chat_context_feedback
-                                            .clone()
-                                            .unwrap_or_else(|| "+ Context".into())
-                                    })),
-                            )
+                                            t.text_muted
+                                        })
+                                        .hover(move |s| s.bg(t.hover))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if this.chat_context_sources.is_empty() {
+                                                this.capture_active_editor_context(cx);
+                                            } else {
+                                                this.chat_context_sources.clear();
+                                                this.chat_context_feedback = None;
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .when_some(context_full_label, |this, label| {
+                                            this.tooltip(move |_, cx| tooltip(label.clone(), cx))
+                                        })
+                                        .child(SharedString::from(if context_is_active {
+                                            format!("[ {} × ]", context_label.unwrap_or_default())
+                                        } else {
+                                            self.chat_context_feedback
+                                                .clone()
+                                                .unwrap_or_else(|| "+ Context".into())
+                                        })),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex()
+                                    .w_full()
+                                    .min_w_0()
                                     .items_center()
+                                    .justify_between()
                                     .gap_1()
+                                    .when(!context_is_active, |this| {
+                                        this.child(
+                                            div()
+                                                .id("ai-context-button")
+                                                .px_2()
+                                                .py_1()
+                                                .cursor(CursorStyle::PointingHand)
+                                                .hover(move |s| s.bg(t.hover))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.capture_active_editor_context(cx);
+                                                }))
+                                                .child(SharedString::from(
+                                                    self.chat_context_feedback
+                                                        .clone()
+                                                        .unwrap_or_else(|| "+ Context".into()),
+                                                )),
+                                        )
+                                    })
                                     .when(self.selected_model_supports_thinking(), |this| {
                                         this.child(
                                             div()

@@ -8,6 +8,8 @@ use std::{
 
 use serde::Deserialize;
 
+pub mod project_read;
+
 #[derive(Debug)]
 pub enum ProjectError {
     Io(io::Error),
