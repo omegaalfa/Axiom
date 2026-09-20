@@ -101,28 +101,53 @@ pub enum ChatRole {
     User,
     Assistant,
     System,
+    Tool,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderChatMessage {
     pub role: ChatRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ProviderToolCall>,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderChatRequest {
     pub model: String,
     pub messages: Vec<ProviderChatMessage>,
     pub think: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ProviderToolDefinition>>,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderChatResponse {
     pub content: String,
     pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ProviderToolCall>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProviderChatStreamEvent {
     ThinkingDelta(String),
     ContentDelta(String),
+    ToolCall(ProviderToolCall),
     Done,
 }
 
@@ -141,6 +166,107 @@ where
         *done = true;
     }
     on_event(event)
+}
+
+fn ollama_tool_definitions(
+    tools: Option<&Vec<ProviderToolDefinition>>,
+) -> Option<serde_json::Value> {
+    let tools = tools.filter(|tools| !tools.is_empty())?;
+    Some(serde_json::Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                })
+            })
+            .collect(),
+    ))
+}
+
+fn parse_tool_calls(
+    message: Option<&serde_json::Value>,
+) -> Result<Vec<ProviderToolCall>, ProviderError> {
+    let Some(calls) = message.and_then(|message| message.get("tool_calls")) else {
+        return Ok(Vec::new());
+    };
+    let calls = calls.as_array().ok_or(ProviderError::InvalidResponse)?;
+    calls
+        .iter()
+        .map(|call| {
+            let function = call
+                .get("function")
+                .and_then(|value| value.as_object())
+                .ok_or(ProviderError::InvalidResponse)?;
+            let name = function
+                .get("name")
+                .and_then(|value| value.as_str())
+                .ok_or(ProviderError::InvalidResponse)?
+                .to_owned();
+            let arguments = function
+                .get("arguments")
+                .cloned()
+                .ok_or(ProviderError::InvalidResponse)?;
+            let id = call
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned);
+            Ok(ProviderToolCall {
+                id,
+                name,
+                arguments,
+            })
+        })
+        .collect()
+}
+
+fn emit_chat_value_events<F>(
+    value: &serde_json::Value,
+    done: &mut bool,
+    on_event: &mut F,
+) -> Result<(), ProviderError>
+where
+    F: FnMut(ProviderChatStreamEvent) -> Result<(), ProviderError>,
+{
+    let message = value.get("message");
+    if let Some(delta) = message
+        .and_then(|message| message.get("thinking"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        emit_stream_event(
+            done,
+            ProviderChatStreamEvent::ThinkingDelta(delta.into()),
+            on_event,
+        )?;
+    }
+    if let Some(delta) = message
+        .and_then(|message| message.get("content"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        emit_stream_event(
+            done,
+            ProviderChatStreamEvent::ContentDelta(delta.into()),
+            on_event,
+        )?;
+    }
+    for call in parse_tool_calls(message)? {
+        emit_stream_event(done, ProviderChatStreamEvent::ToolCall(call), on_event)?;
+    }
+    if value
+        .get("done")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        emit_stream_event(done, ProviderChatStreamEvent::Done, on_event)?;
+    }
+    Ok(())
 }
 
 pub trait ProviderChat {
@@ -318,7 +444,11 @@ impl OllamaProvider {
         let mut stream =
             TcpStream::connect((host, port)).map_err(|_| ProviderError::ConnectionRefused)?;
         stream.set_read_timeout(Some(self.chat_timeout)).ok();
-        let body = serde_json::json!({"model": request.model, "messages": request.messages, "stream": true, "think": request.think}).to_string();
+        let mut body = serde_json::json!({"model": request.model, "messages": request.messages, "stream": true, "think": request.think});
+        if let Some(tools) = ollama_tool_definitions(request.tools.as_ref()) {
+            body["tools"] = tools;
+        }
+        let body = body.to_string();
         write!(stream, "POST /api/chat HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
             .map_err(|_| ProviderError::Unavailable("write failed".into()))?;
         let mut raw = Vec::new();
@@ -392,36 +522,7 @@ impl OllamaProvider {
                 let line = decoded.drain(..=pos).collect::<Vec<_>>();
                 let value: serde_json::Value =
                     serde_json::from_slice(&line).map_err(|_| ProviderError::InvalidResponse)?;
-                let message = value.get("message");
-                if let Some(delta) = message
-                    .and_then(|m| m.get("thinking"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    emit_stream_event(
-                        &mut done_emitted,
-                        ProviderChatStreamEvent::ThinkingDelta(delta.into()),
-                        &mut on_event,
-                    )?;
-                }
-                if let Some(delta) = message
-                    .and_then(|m| m.get("content"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    emit_stream_event(
-                        &mut done_emitted,
-                        ProviderChatStreamEvent::ContentDelta(delta.into()),
-                        &mut on_event,
-                    )?;
-                }
-                if value.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    emit_stream_event(
-                        &mut done_emitted,
-                        ProviderChatStreamEvent::Done,
-                        &mut on_event,
-                    )?;
-                }
+                emit_chat_value_events(&value, &mut done_emitted, &mut on_event)?;
             }
         }
         if is_cancelled() {
@@ -430,36 +531,7 @@ impl OllamaProvider {
         if !decoded.is_empty() {
             let value: serde_json::Value =
                 serde_json::from_slice(&decoded).map_err(|_| ProviderError::InvalidResponse)?;
-            let message = value.get("message");
-            if let Some(delta) = message
-                .and_then(|m| m.get("thinking"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                emit_stream_event(
-                    &mut done_emitted,
-                    ProviderChatStreamEvent::ThinkingDelta(delta.into()),
-                    &mut on_event,
-                )?;
-            }
-            if let Some(delta) = message
-                .and_then(|m| m.get("content"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                emit_stream_event(
-                    &mut done_emitted,
-                    ProviderChatStreamEvent::ContentDelta(delta.into()),
-                    &mut on_event,
-                )?;
-            }
-            if value.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
-                emit_stream_event(
-                    &mut done_emitted,
-                    ProviderChatStreamEvent::Done,
-                    &mut on_event,
-                )?;
-            }
+            emit_chat_value_events(&value, &mut done_emitted, &mut on_event)?;
         }
         Ok(())
     }
@@ -572,7 +644,10 @@ impl OllamaProvider {
         let mut stream =
             TcpStream::connect((host, port)).map_err(|_| ProviderError::ConnectionRefused)?;
         stream.set_read_timeout(Some(self.chat_timeout)).ok();
-        let body = serde_json::json!({"model": request.model, "messages": request.messages, "stream": false, "think": request.think});
+        let mut body = serde_json::json!({"model": request.model, "messages": request.messages, "stream": false, "think": request.think});
+        if let Some(tools) = ollama_tool_definitions(request.tools.as_ref()) {
+            body["tools"] = tools;
+        }
         let bytes = body.to_string();
         write!(stream, "POST /api/chat HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", bytes.len(), bytes).map_err(|_| ProviderError::Unavailable("write failed".into()))?;
         let mut raw = Vec::new();
@@ -598,6 +673,7 @@ impl OllamaProvider {
                 .get("thinking")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
+            tool_calls: parse_tool_calls(Some(message))?,
         })
     }
 }
@@ -704,13 +780,157 @@ mod tests {
             messages: vec![ProviderChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             think: Some(true),
+            tools: None,
         };
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["model"], "demo");
         assert_eq!(value["think"], true);
         assert_eq!(value["messages"][0]["content"], "hi");
+        assert!(value.get("tools").is_none());
+    }
+
+    #[test]
+    fn ollama_tool_definitions_use_native_function_shape() {
+        let definition = ProviderToolDefinition {
+            name: "read_file".into(),
+            description: "Read a UTF-8 file".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"}
+                },
+                "required": ["path"]
+            }),
+        };
+        let tools = ollama_tool_definitions(Some(&vec![definition])).unwrap();
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "read_file");
+        assert_eq!(tools[0]["function"]["parameters"]["required"][0], "path");
+    }
+
+    #[test]
+    fn ollama_tool_calls_parse_with_structured_arguments_and_optional_ids() {
+        let value = serde_json::json!({
+            "message": {"tool_calls": [
+                {"id": "call-1", "function": {"name": "read_file", "arguments": {"path": "README.md"}}},
+                {"function": {"name": "read_file", "arguments": {"path": "src/Test.php"}}}
+            ]}
+        });
+        let calls = parse_tool_calls(value.get("message")).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id.as_deref(), Some("call-1"));
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "README.md");
+        assert_eq!(calls[1].id, None);
+    }
+
+    #[test]
+    fn malformed_tool_calls_are_rejected_without_panic() {
+        let value =
+            serde_json::json!({"message": {"tool_calls": [{"function": {"arguments": {}}}]}});
+        assert_eq!(
+            parse_tool_calls(value.get("message")),
+            Err(ProviderError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn stream_chunk_preserves_thinking_content_multiple_calls_and_done() {
+        let value = serde_json::json!({
+            "message": {
+                "thinking": "think",
+                "content": "answer",
+                "tool_calls": [
+                    {"function": {"name": "read_file", "arguments": {"path": "a"}}},
+                    {"function": {"name": "read_file", "arguments": {"path": "b"}}}
+                ]
+            },
+            "done": true
+        });
+        let mut events = Vec::new();
+        let mut done = false;
+        emit_chat_value_events(&value, &mut done, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            events[0],
+            ProviderChatStreamEvent::ThinkingDelta(_)
+        ));
+        assert!(matches!(
+            events[1],
+            ProviderChatStreamEvent::ContentDelta(_)
+        ));
+        assert!(matches!(events[2], ProviderChatStreamEvent::ToolCall(_)));
+        assert!(matches!(events[3], ProviderChatStreamEvent::ToolCall(_)));
+        assert!(matches!(events[4], ProviderChatStreamEvent::Done));
+    }
+
+    #[test]
+    fn provider_neutral_tool_contracts_preserve_definition_call_and_result_message() {
+        let definition = ProviderToolDefinition {
+            name: "read_file".into(),
+            description: "Read a UTF-8 project file".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}}
+            }),
+        };
+        let call = ProviderToolCall {
+            id: Some("call-1".into()),
+            name: definition.name.clone(),
+            arguments: serde_json::json!({"path": "README.md"}),
+        };
+        let request = ProviderChatRequest {
+            model: "demo".into(),
+            messages: vec![ProviderChatMessage {
+                role: ChatRole::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![call.clone()],
+            }],
+            think: None,
+            tools: Some(vec![definition.clone()]),
+        };
+        assert_eq!(request.tools.as_ref().unwrap()[0], definition);
+        assert_eq!(request.messages[0].tool_calls[0], call);
+        let result_message = ProviderChatMessage {
+            role: ChatRole::Tool,
+            content: "README contents".into(),
+            tool_call_id: Some("call-1".into()),
+            tool_calls: Vec::new(),
+        };
+        let value = serde_json::to_value(result_message).unwrap();
+        assert_eq!(value["role"], "Tool");
+        assert_eq!(value["tool_call_id"], "call-1");
+    }
+
+    #[test]
+    fn tool_call_stream_event_is_representable_without_changing_existing_events() {
+        let event = ProviderChatStreamEvent::ToolCall(ProviderToolCall {
+            id: None,
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "README.md"}),
+        });
+        assert!(matches!(event, ProviderChatStreamEvent::ToolCall(_)));
+        assert!(matches!(
+            ProviderChatStreamEvent::ThinkingDelta("x".into()),
+            ProviderChatStreamEvent::ThinkingDelta(_)
+        ));
+        assert!(matches!(
+            ProviderChatStreamEvent::ContentDelta("x".into()),
+            ProviderChatStreamEvent::ContentDelta(_)
+        ));
+        assert!(matches!(
+            ProviderChatStreamEvent::Done,
+            ProviderChatStreamEvent::Done
+        ));
     }
 
     #[test]
@@ -730,6 +950,7 @@ mod tests {
                 match event {
                     ProviderChatStreamEvent::ContentDelta(delta) => content.push_str(&delta),
                     ProviderChatStreamEvent::Done => done_count += 1,
+                    ProviderChatStreamEvent::ToolCall(_) => {}
                     ProviderChatStreamEvent::ThinkingDelta(_) => {}
                 }
                 Ok(())

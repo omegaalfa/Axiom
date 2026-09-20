@@ -41,6 +41,7 @@ use gpui::{
 
 use crate::{
     ai::context::{ContextMessage, ContextRole, ContextSnapshot, ContextSource, ContextSourceKind},
+    ai::tool_orchestration::{read_file_definition, run_read_file_round_trip},
     editor_view::EditorView,
     lsp_bridge::{IdeLspEvent, LspBridge, LspRequestKind},
     terminal_view::TerminalView,
@@ -835,6 +836,8 @@ fn provider_messages_from_context(context: ContextSnapshot) -> Vec<ProviderChatM
                 ContextRole::System => ChatRole::System,
             },
             content: message.content,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         })
         .collect();
     if let Some(envelope) = latest_user_envelope
@@ -860,6 +863,7 @@ fn context_snapshot_from_chat_messages(messages: &[ChatUiMessage]) -> ContextSna
                 ChatRole::User => ContextRole::User,
                 ChatRole::Assistant => ContextRole::Assistant,
                 ChatRole::System => ContextRole::System,
+                ChatRole::Tool => ContextRole::System,
             },
             message.content.clone(),
         ))
@@ -5190,6 +5194,7 @@ impl WorkspaceView {
                         changed = true;
                     }
                 }
+                ProviderChatStreamEvent::ToolCall(_) => {}
                 ProviderChatStreamEvent::Done => {
                     self.chat_request_state = ChatRequestState::Idle;
                     self.chat_current_request_id = None;
@@ -5290,33 +5295,93 @@ impl WorkspaceView {
         let context = context_snapshot_from_chat_messages(&self.chat_messages)
             .with_sources(self.chat_context_sources.clone());
         let messages = provider_messages_from_context(context);
+        let tools_enabled = self.selected_model_supports_tools() && self.project.is_some();
+        let tool_workspace_root = tools_enabled
+            .then(|| {
+                self.project
+                    .as_ref()
+                    .map(|project| project.root_path().to_path_buf())
+            })
+            .flatten();
+        let tools = tools_enabled.then(|| vec![read_file_definition()]);
         let entity = cx.entity();
         let chat_events = self.chat_stream_events.clone();
         cx.spawn(async move |_, cx| {
             let result = gpui::background_executor()
                 .spawn(async move {
-                    let result = OllamaProvider::default().chat_stream_with_cancel(
-                        &base_url,
-                        &ProviderChatRequest {
-                            model,
-                            messages,
-                            think,
-                        },
-                        || cancel_token.load(Ordering::Acquire),
-                        |event| {
+                    let request = ProviderChatRequest {
+                        model,
+                        messages,
+                        think,
+                        tools,
+                    };
+                    if tools_enabled {
+                        let tool_registry = tool_workspace_root
+                            .as_ref()
+                            .and_then(|root| {
+                                axiom_project::project_read::ProjectReadCapability::new(root).ok()
+                            })
+                            .map(crate::ai::tools::ToolRegistry::new);
+                        let mut run_provider = |request: &ProviderChatRequest,
+                                                on_event: &mut dyn FnMut(
+                            ProviderChatStreamEvent,
+                        )
+                            -> Result<(), String>| {
+                            OllamaProvider::default()
+                                .chat_stream_with_cancel(
+                                    &base_url,
+                                    request,
+                                    || cancel_token.load(Ordering::Acquire),
+                                    |event| {
+                                        on_event(event)
+                                            .map_err(axiom_ai_provider::ProviderError::Unavailable)
+                                    },
+                                )
+                                .map_err(|error| error.user_message().to_owned())
+                        };
+                        let events = run_read_file_round_trip(
+                            request,
+                            tool_registry.as_ref(),
+                            cancel_token.as_ref(),
+                            &mut run_provider,
+                        )
+                        .map_err(|error| {
+                            axiom_ai_provider::ProviderError::Unavailable(format!(
+                                "tool round-trip failed: {error:?}"
+                            ))
+                        })?;
+                        let mut queue = chat_events.lock().expect("chat stream queue poisoned");
+                        for event in events {
                             if cancel_token.load(Ordering::Acquire) {
-                                return Ok(());
+                                break;
                             }
-                            let mut queue = chat_events.lock().expect("chat stream queue poisoned");
                             queue.push(ChatStreamEvent {
                                 request_id: id,
                                 assistant_id,
                                 event,
                             });
-                            Ok(())
-                        },
-                    );
-                    result
+                        }
+                        Ok(())
+                    } else {
+                        OllamaProvider::default().chat_stream_with_cancel(
+                            &base_url,
+                            &request,
+                            || cancel_token.load(Ordering::Acquire),
+                            |event| {
+                                if cancel_token.load(Ordering::Acquire) {
+                                    return Ok(());
+                                }
+                                let mut queue =
+                                    chat_events.lock().expect("chat stream queue poisoned");
+                                queue.push(ChatStreamEvent {
+                                    request_id: id,
+                                    assistant_id,
+                                    event,
+                                });
+                                Ok(())
+                            },
+                        )
+                    }
                 })
                 .await;
             let _ = entity.update(cx, |this, cx| {
@@ -5718,6 +5783,16 @@ impl WorkspaceView {
                 .find(|model| model.label == self.model_label)
                 .and_then(|model| model.metadata.as_ref())
                 .is_some_and(axiom_ai_provider::ModelMetadata::supports_thinking)
+    }
+
+    fn selected_model_supports_tools(&self) -> bool {
+        self.active_provider.as_deref() == Some("Ollama")
+            && self
+                .ollama_models
+                .iter()
+                .find(|model| model.label == self.model_label)
+                .and_then(|model| model.metadata.as_ref())
+                .is_some_and(|metadata| metadata.supports("tools"))
     }
 
     fn close_providers_modal(&mut self, cx: &mut Context<Self>) {
@@ -12253,10 +12328,10 @@ impl EntityInputHandler for WorkspaceView {
                 .or_else(|| self.ai_composer_marked_range.clone())
                 .unwrap_or_else(|| self.ai_composer_selection.range.clone());
             let text = crate::ui::input_line::SingleLineInputState::sanitize_single_line(text);
-            self.ai_composer_text = replace_utf16_range(&self.ai_composer_text, range, &text).0;
-            let end = self.ai_composer_text.encode_utf16().count();
+            let (value, caret) = replace_utf16_range(&self.ai_composer_text, range, &text);
+            self.ai_composer_text = value;
             self.ai_composer_selection = UTF16Selection {
-                range: end..end,
+                range: caret..caret,
                 reversed: false,
             };
             self.ai_composer_marked_range = None;
@@ -12360,17 +12435,14 @@ impl EntityInputHandler for WorkspaceView {
             let replacement = range
                 .or_else(|| self.ai_composer_marked_range.clone())
                 .unwrap_or_else(|| self.ai_composer_selection.range.clone());
-            self.ai_composer_text =
-                replace_utf16_range(&self.ai_composer_text, replacement.clone(), text).0;
-            let start = replacement
-                .start
-                .min(self.ai_composer_text.encode_utf16().count());
-            let end = start + text.encode_utf16().count();
+            let (value, caret) = replace_utf16_range(&self.ai_composer_text, replacement, text);
+            self.ai_composer_text = value;
             self.ai_composer_selection = UTF16Selection {
-                range: end..end,
+                range: caret..caret,
                 reversed: false,
             };
-            self.ai_composer_marked_range = (!text.is_empty()).then_some(start..end);
+            let start = caret.saturating_sub(text.encode_utf16().count());
+            self.ai_composer_marked_range = (!text.is_empty()).then_some(start..caret);
             cx.notify();
             return;
         }
@@ -12823,6 +12895,7 @@ mod chat_history_tests {
             model: "test-model".into(),
             messages: provider_messages_from_context(context),
             think: None,
+            tools: None,
         };
         let payload = serde_json::to_string(&request).unwrap();
         assert!(payload.contains("AXIOM_CONTEXT_SENTINEL_4C92"));
@@ -13874,6 +13947,42 @@ class Service { public function run(): void {} }
 
         let result = std::panic::catch_unwind(|| replace_utf16_range("João", 3..1, "X"));
         assert_eq!(result.unwrap().0, "JXo");
+    }
+
+    #[test]
+    fn composer_insertions_keep_caret_at_replacement_boundary() {
+        assert_eq!(
+            replace_utf16_range("abcdef", 3..3, "X"),
+            ("abcXdef".into(), 4)
+        );
+        assert_eq!(
+            replace_utf16_range("abcdef", 0..0, "X"),
+            ("Xabcdef".into(), 1)
+        );
+        assert_eq!(
+            replace_utf16_range("abcdef", 6..6, "X"),
+            ("abcdefX".into(), 7)
+        );
+        assert_eq!(
+            replace_utf16_range("abcdef", 2..4, "X"),
+            ("abXef".into(), 3)
+        );
+        assert_eq!(
+            replace_utf16_range("versão teste", 4..4, "ão"),
+            ("versãoão teste".into(), 6)
+        );
+        assert_eq!(
+            replace_utf16_range("texto 😀 final", 6..8, "X"),
+            ("texto X final".into(), 7)
+        );
+        let long = "Leia nov AI_TOOL_TEST.md e me explique detalhadamente o conteúdo";
+        let caret = "Leia nov".encode_utf16().count();
+        let (value, next) = replace_utf16_range(long, caret..caret, "o");
+        assert_eq!(
+            value,
+            "Leia novo AI_TOOL_TEST.md e me explique detalhadamente o conteúdo"
+        );
+        assert_eq!(next, "Leia novo".encode_utf16().count());
     }
 
     #[test]
