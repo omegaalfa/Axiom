@@ -41,7 +41,10 @@ use gpui::{
 
 use crate::{
     ai::context::{ContextMessage, ContextRole, ContextSnapshot, ContextSource, ContextSourceKind},
-    ai::tool_orchestration::{read_file_definition, run_read_file_round_trip},
+    ai::tool_orchestration::{
+        fetch_url_definition, list_directory_definition, read_file_definition,
+        run_read_file_round_trip,
+    },
     editor_view::EditorView,
     lsp_bridge::{IdeLspEvent, LspBridge, LspRequestKind},
     terminal_view::TerminalView,
@@ -5220,6 +5223,13 @@ impl WorkspaceView {
         if !matches!(self.chat_request_state, ChatRequestState::Sending) {
             return;
         }
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "terminal_state",
+            request = ?self.chat_current_request_id.map(|id| id.0),
+            state = "cancelled",
+            "[AI-DIAG]"
+        );
         if let Some(token) = self.chat_cancel_token.take() {
             token.store(true, Ordering::Release);
         }
@@ -5296,6 +5306,20 @@ impl WorkspaceView {
             .with_sources(self.chat_context_sources.clone());
         let messages = provider_messages_from_context(context);
         let tools_enabled = self.selected_model_supports_tools() && self.project.is_some();
+        let model_capabilities = self
+            .ollama_models
+            .iter()
+            .find(|model| model.label == self.model_label)
+            .and_then(|model| model.metadata.as_ref());
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "model_capabilities",
+            request = id.0,
+            model = %self.model_label,
+            tools = model_capabilities.is_some_and(|metadata| metadata.supports("tools")),
+            thinking = model_capabilities.is_some_and(axiom_ai_provider::ModelMetadata::supports_thinking),
+            "[AI-DIAG]"
+        );
         let tool_workspace_root = tools_enabled
             .then(|| {
                 self.project
@@ -5303,7 +5327,13 @@ impl WorkspaceView {
                     .map(|project| project.root_path().to_path_buf())
             })
             .flatten();
-        let tools = tools_enabled.then(|| vec![read_file_definition()]);
+        let tools = tools_enabled.then(|| {
+            vec![
+                read_file_definition(),
+                list_directory_definition(),
+                fetch_url_definition(),
+            ]
+        });
         let entity = cx.entity();
         let chat_events = self.chat_stream_events.clone();
         cx.spawn(async move |_, cx| {
@@ -5315,41 +5345,52 @@ impl WorkspaceView {
                         think,
                         tools,
                     };
+                    let diag_span = tracing::info_span!(
+                        target: "axiom.ai_diag",
+                        "chat_generation",
+                        request = id.0,
+                        model = %request.model
+                    );
                     if tools_enabled {
-                        let tool_registry = tool_workspace_root
-                            .as_ref()
-                            .and_then(|root| {
-                                axiom_project::project_read::ProjectReadCapability::new(root).ok()
-                            })
-                            .map(crate::ai::tools::ToolRegistry::new);
+                        let tool_registry = tool_workspace_root.as_ref().and_then(|root| {
+                            let read =
+                                axiom_project::project_read::ProjectReadCapability::new(root)
+                                    .ok()?;
+                            let directory =
+                                axiom_project::project_directory::ProjectDirectoryCapability::new(
+                                    root,
+                                )
+                                .ok()?;
+                            let web = axiom_web::FetchUrlCapability::new();
+                            Some(crate::ai::tools::ToolRegistry::new_with_fetch_url(
+                                read, directory, web,
+                            ))
+                        });
                         let mut run_provider = |request: &ProviderChatRequest,
                                                 on_event: &mut dyn FnMut(
                             ProviderChatStreamEvent,
                         )
-                            -> Result<(), String>| {
-                            OllamaProvider::default()
-                                .chat_stream_with_cancel(
-                                    &base_url,
-                                    request,
-                                    || cancel_token.load(Ordering::Acquire),
-                                    |event| {
-                                        on_event(event)
-                                            .map_err(axiom_ai_provider::ProviderError::Unavailable)
-                                    },
-                                )
-                                .map_err(|error| error.user_message().to_owned())
+                            -> Result<
+                            (),
+                            axiom_ai_provider::ProviderError,
+                        >| {
+                            OllamaProvider::default().chat_stream_with_cancel(
+                                &base_url,
+                                request,
+                                || cancel_token.load(Ordering::Acquire),
+                                on_event,
+                            )
                         };
-                        let events = run_read_file_round_trip(
-                            request,
-                            tool_registry.as_ref(),
-                            cancel_token.as_ref(),
-                            &mut run_provider,
-                        )
-                        .map_err(|error| {
-                            axiom_ai_provider::ProviderError::Unavailable(format!(
-                                "tool round-trip failed: {error:?}"
-                            ))
-                        })?;
+                        let events = diag_span
+                            .in_scope(|| {
+                                run_read_file_round_trip(
+                                    request,
+                                    tool_registry.as_ref(),
+                                    cancel_token.as_ref(),
+                                    &mut run_provider,
+                                )
+                            })
+                            .map_err(|error| crate::ai::tool_orchestration::user_message(&error))?;
                         let mut queue = chat_events.lock().expect("chat stream queue poisoned");
                         for event in events {
                             if cancel_token.load(Ordering::Acquire) {
@@ -5363,24 +5404,28 @@ impl WorkspaceView {
                         }
                         Ok(())
                     } else {
-                        OllamaProvider::default().chat_stream_with_cancel(
-                            &base_url,
-                            &request,
-                            || cancel_token.load(Ordering::Acquire),
-                            |event| {
-                                if cancel_token.load(Ordering::Acquire) {
-                                    return Ok(());
-                                }
-                                let mut queue =
-                                    chat_events.lock().expect("chat stream queue poisoned");
-                                queue.push(ChatStreamEvent {
-                                    request_id: id,
-                                    assistant_id,
-                                    event,
-                                });
-                                Ok(())
-                            },
-                        )
+                        diag_span
+                            .in_scope(|| {
+                                OllamaProvider::default().chat_stream_with_cancel(
+                                    &base_url,
+                                    &request,
+                                    || cancel_token.load(Ordering::Acquire),
+                                    |event| {
+                                        if cancel_token.load(Ordering::Acquire) {
+                                            return Ok(());
+                                        }
+                                        let mut queue =
+                                            chat_events.lock().expect("chat stream queue poisoned");
+                                        queue.push(ChatStreamEvent {
+                                            request_id: id,
+                                            assistant_id,
+                                            event,
+                                        });
+                                        Ok(())
+                                    },
+                                )
+                            })
+                            .map_err(|error| error.user_message().to_owned())
                     }
                 })
                 .await;
@@ -5390,8 +5435,25 @@ impl WorkspaceView {
                 }
                 this.chat_cancel_token = None;
                 match result {
-                    Ok(_response) => this.chat_request_state = ChatRequestState::Idle,
+                    Ok(_response) => {
+                        tracing::info!(
+                            target: "axiom.ai_diag",
+                            event = "terminal_state",
+                            request = id.0,
+                            state = "success",
+                            "[AI-DIAG]"
+                        );
+                        this.chat_request_state = ChatRequestState::Idle
+                    }
                     Err(error) => {
+                        tracing::warn!(
+                            target: "axiom.ai_diag",
+                            event = "terminal_state",
+                            request = id.0,
+                            state = "error",
+                            error = %error,
+                            "[AI-DIAG]"
+                        );
                         let partial = this.chat_messages.iter().rev().any(|message| {
                             message.role == ChatRole::Assistant
                                 && (!message.content.is_empty()
@@ -5405,8 +5467,7 @@ impl WorkspaceView {
                         } else {
                             this.chat_messages.pop();
                         }
-                        this.chat_request_state =
-                            ChatRequestState::Error(error.user_message().into());
+                        this.chat_request_state = ChatRequestState::Error(error.into());
                         this.chat_current_request_id = None;
                     }
                 }

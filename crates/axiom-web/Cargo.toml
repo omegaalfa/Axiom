@@ -1,0 +1,13 @@
+[package]
+name = "axiom-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+url.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -8,6 +8,7 @@ use std::{
 
 use serde::Deserialize;
 
+pub mod project_directory;
 pub mod project_read;
 
 #[derive(Debug)]

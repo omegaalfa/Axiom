@@ -9,6 +9,7 @@ members = [
     "crates/axiom-syntax",
     "crates/axiom-terminal",
     "crates/axiom-ai-provider",
+    "crates/axiom-web",
     "crates/axiom-index",
 ]
 

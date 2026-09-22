@@ -34,6 +34,8 @@ fn metadata(value: ReadFileMetadata) -> ToolMetadata {
         path: value.path,
         bytes: value.bytes,
         range: value.range,
+        source_bytes: None,
+        truncated: false,
     }
 }
 
@@ -42,6 +44,7 @@ fn map_error(error: ReadFileError) -> ToolError {
         ReadFileError::InvalidPath(path) => ToolError::InvalidPath(path),
         ReadFileError::OutsideWorkspace(path) => ToolError::OutsideWorkspace(path),
         ReadFileError::NotFound(path) => ToolError::NotFound(path),
+        ReadFileError::Directory(path) => ToolError::Directory(path),
         ReadFileError::TooLarge { path, bytes, limit } => {
             ToolError::TooLarge { path, bytes, limit }
         }

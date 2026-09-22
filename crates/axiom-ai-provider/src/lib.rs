@@ -195,23 +195,25 @@ fn parse_tool_calls(
     let Some(calls) = message.and_then(|message| message.get("tool_calls")) else {
         return Ok(Vec::new());
     };
-    let calls = calls.as_array().ok_or(ProviderError::InvalidResponse)?;
+    let calls = calls
+        .as_array()
+        .ok_or_else(|| diagnostic_invalid_response("tool_calls_not_array", calls))?;
     calls
         .iter()
         .map(|call| {
             let function = call
                 .get("function")
                 .and_then(|value| value.as_object())
-                .ok_or(ProviderError::InvalidResponse)?;
+                .ok_or_else(|| diagnostic_invalid_response("tool_function_missing", call))?;
             let name = function
                 .get("name")
                 .and_then(|value| value.as_str())
-                .ok_or(ProviderError::InvalidResponse)?
+                .ok_or_else(|| diagnostic_invalid_response("tool_name_missing", call))?
                 .to_owned();
             let arguments = function
                 .get("arguments")
                 .cloned()
-                .ok_or(ProviderError::InvalidResponse)?;
+                .ok_or_else(|| diagnostic_invalid_response("tool_arguments_missing", call))?;
             let id = call
                 .get("id")
                 .and_then(|value| value.as_str())
@@ -223,6 +225,17 @@ fn parse_tool_calls(
             })
         })
         .collect()
+}
+
+fn diagnostic_invalid_response(reason: &str, fragment: &serde_json::Value) -> ProviderError {
+    tracing::warn!(
+        target: "axiom.ai_diag",
+        event = "invalid_response",
+        invalid_response_reason = reason,
+        raw_fragment_type = json_type(fragment),
+        "[AI-DIAG]"
+    );
+    ProviderError::InvalidResponse
 }
 
 fn emit_chat_value_events<F>(
@@ -256,7 +269,25 @@ where
             on_event,
         )?;
     }
-    for call in parse_tool_calls(message)? {
+    let calls = parse_tool_calls(message)?;
+    tracing::debug!(
+        target: "axiom.ai_diag",
+        event = "ollama_parsed",
+        thinking = message.and_then(|m| m.get("thinking")).is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty())),
+        content = message.and_then(|m| m.get("content")).is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty())),
+        tool_calls = calls.len(),
+        done = value.get("done").and_then(|v| v.as_bool()).unwrap_or(false),
+        "[AI-DIAG]"
+    );
+    for call in calls {
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "tool_call_parsed",
+            id_present = call.id.is_some(),
+            tool = %call.name,
+            arguments_type = %json_type(&call.arguments),
+            "[AI-DIAG]"
+        );
         emit_stream_event(done, ProviderChatStreamEvent::ToolCall(call), on_event)?;
     }
     if value
@@ -267,6 +298,74 @@ where
         emit_stream_event(done, ProviderChatStreamEvent::Done, on_event)?;
     }
     Ok(())
+}
+
+fn json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+const MAX_HTTP_ERROR_BODY_BYTES: usize = 16 * 1024;
+
+fn bounded_diagnostic_body(bytes: &[u8]) -> (String, bool) {
+    let truncated = bytes.len() > MAX_HTTP_ERROR_BODY_BYTES;
+    let mut end = bytes.len().min(MAX_HTTP_ERROR_BODY_BYTES);
+    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+        end -= 1;
+    }
+    (
+        String::from_utf8_lossy(&bytes[..end]).into_owned(),
+        truncated,
+    )
+}
+
+fn capture_http_error_body(
+    stream: &mut TcpStream,
+    initial: &[u8],
+    content_length: Option<usize>,
+) -> (String, bool) {
+    let target = content_length
+        .unwrap_or(MAX_HTTP_ERROR_BODY_BYTES.saturating_add(1))
+        .min(MAX_HTTP_ERROR_BODY_BYTES.saturating_add(1));
+    let mut body = initial[..initial.len().min(target)].to_vec();
+    let mut buffer = [0u8; 4096];
+    while body.len() < target {
+        match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => body.extend_from_slice(&buffer[..read.min(target - body.len())]),
+        }
+    }
+    bounded_diagnostic_body(&body)
+}
+
+fn diagnostic_request_shape(request: &ProviderChatRequest) {
+    let messages = request
+        .messages
+        .iter()
+        .map(|message| {
+            format!(
+                "{{role={:?},tool_calls={},tool_call_id_present={},content_bytes={}}}",
+                message.role,
+                message.tool_calls.len(),
+                message.tool_call_id.is_some(),
+                message.content.len()
+            )
+        })
+        .collect::<Vec<_>>();
+    tracing::info!(
+        target: "axiom.ai_diag",
+        event = "provider_request_shape",
+        messages = ?messages,
+        tools = request.tools.as_ref().map_or(0, Vec::len),
+        thinking = ?request.think,
+        "[AI-DIAG]"
+    );
 }
 
 pub trait ProviderChat {
@@ -436,11 +535,26 @@ impl OllamaProvider {
         F: FnMut(ProviderChatStreamEvent) -> Result<(), ProviderError>,
         C: FnMut() -> bool,
     {
-        let parsed = url::Url::parse(base_url).map_err(|_| ProviderError::InvalidResponse)?;
-        let host = parsed.host_str().ok_or(ProviderError::InvalidResponse)?;
-        let port = parsed
-            .port_or_known_default()
-            .ok_or(ProviderError::InvalidResponse)?;
+        let started = std::time::Instant::now();
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "provider_request_started",
+            model = %request.model,
+            streaming = true,
+            tools_supplied = request.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+            messages = request.messages.len(),
+            thinking = ?request.think,
+            "[AI-DIAG]"
+        );
+        let parsed = url::Url::parse(base_url).map_err(|_| {
+            diagnostic_invalid_response("base_url_invalid", &serde_json::json!(base_url))
+        })?;
+        let host = parsed.host_str().ok_or_else(|| {
+            diagnostic_invalid_response("base_url_host_missing", &serde_json::json!(base_url))
+        })?;
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            diagnostic_invalid_response("base_url_port_missing", &serde_json::json!(base_url))
+        })?;
         let mut stream =
             TcpStream::connect((host, port)).map_err(|_| ProviderError::ConnectionRefused)?;
         stream.set_read_timeout(Some(self.chat_timeout)).ok();
@@ -448,6 +562,7 @@ impl OllamaProvider {
         if let Some(tools) = ollama_tool_definitions(request.tools.as_ref()) {
             body["tools"] = tools;
         }
+        diagnostic_request_shape(request);
         let body = body.to_string();
         write!(stream, "POST /api/chat HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
             .map_err(|_| ProviderError::Unavailable("write failed".into()))?;
@@ -480,13 +595,56 @@ impl OllamaProvider {
                     .split_whitespace()
                     .nth(1)
                     .and_then(|s| s.parse::<u16>().ok())
-                    .ok_or(ProviderError::InvalidResponse)?;
+                    .ok_or_else(|| {
+                        diagnostic_invalid_response(
+                            "http_status_missing",
+                            &serde_json::json!(headers),
+                        )
+                    })?;
                 if !(200..300).contains(&status) {
-                    return Err(ProviderError::Unavailable("http error".into()));
+                    let content_type = headers.lines().find_map(|line| {
+                        line.strip_prefix("Content-Type:")
+                            .or_else(|| line.strip_prefix("content-type:"))
+                            .map(str::trim)
+                    });
+                    let content_length = headers.lines().find_map(|line| {
+                        line.strip_prefix("Content-Length:")
+                            .or_else(|| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    });
+                    let (error_body, truncated) =
+                        capture_http_error_body(&mut stream, &raw[split + 4..], content_length);
+                    tracing::debug!(
+                        target: "axiom.ai_diag",
+                        event = "ollama_http_error",
+                        status,
+                        content_type = content_type.unwrap_or("<absent>"),
+                        body = %error_body,
+                        truncated,
+                        "[AI-DIAG][OLLAMA-HTTP-ERROR]"
+                    );
+                    return Err(diagnostic_invalid_response(
+                        "http_status",
+                        &serde_json::json!(status),
+                    ));
                 }
                 chunked = headers
                     .to_ascii_lowercase()
                     .contains("transfer-encoding: chunked");
+                let content_type = headers.lines().find_map(|line| {
+                    line.strip_prefix("Content-Type:")
+                        .or_else(|| line.strip_prefix("content-type:"))
+                        .map(str::trim)
+                });
+                tracing::info!(
+                    target: "axiom.ai_diag",
+                    event = "http_response",
+                    status,
+                    content_type = content_type.unwrap_or("<absent>"),
+                    chunked,
+                    streaming = true,
+                    "[AI-DIAG]"
+                );
                 chunk_pos = split + 4;
                 headers_done = true;
             }
@@ -500,7 +658,14 @@ impl OllamaProvider {
                         String::from_utf8_lossy(&raw[chunk_pos..end]).trim(),
                         16,
                     )
-                    .map_err(|_| ProviderError::InvalidResponse)?;
+                    .map_err(|_| {
+                        diagnostic_invalid_response(
+                            "chunked_framing",
+                            &serde_json::Value::String(
+                                String::from_utf8_lossy(&raw[chunk_pos..end]).into(),
+                            ),
+                        )
+                    })?;
                     if raw.len() < end + 2 + size + 2 {
                         break;
                     }
@@ -520,8 +685,12 @@ impl OllamaProvider {
                     return Ok(());
                 }
                 let line = decoded.drain(..=pos).collect::<Vec<_>>();
-                let value: serde_json::Value =
-                    serde_json::from_slice(&line).map_err(|_| ProviderError::InvalidResponse)?;
+                let value: serde_json::Value = serde_json::from_slice(&line).map_err(|_| {
+                    diagnostic_invalid_response(
+                        "ndjson_parse",
+                        &serde_json::Value::String(String::from_utf8_lossy(&line).into()),
+                    )
+                })?;
                 emit_chat_value_events(&value, &mut done_emitted, &mut on_event)?;
             }
         }
@@ -529,10 +698,21 @@ impl OllamaProvider {
             return Ok(());
         }
         if !decoded.is_empty() {
-            let value: serde_json::Value =
-                serde_json::from_slice(&decoded).map_err(|_| ProviderError::InvalidResponse)?;
+            let value: serde_json::Value = serde_json::from_slice(&decoded).map_err(|_| {
+                diagnostic_invalid_response(
+                    "ndjson_parse",
+                    &serde_json::Value::String(String::from_utf8_lossy(&decoded).into()),
+                )
+            })?;
             emit_chat_value_events(&value, &mut done_emitted, &mut on_event)?;
         }
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "provider_request_finished",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            done_observed = done_emitted,
+            "[AI-DIAG]"
+        );
         Ok(())
     }
 
@@ -602,7 +782,7 @@ impl OllamaProvider {
             .split_once("\r\n\r\n")
             .ok_or(ProviderError::InvalidResponse)?;
         if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
-            return Err(ProviderError::Unavailable("http error".into()));
+            return Err(ProviderError::InvalidResponse);
         }
         if headers
             .to_ascii_lowercase()
@@ -656,9 +836,7 @@ impl OllamaProvider {
             .map_err(|_| ProviderError::Timeout)?;
         let (status, body) = parse_http_response(&raw)?;
         if !(200..300).contains(&status) {
-            return Err(ProviderError::Unavailable(
-                String::from_utf8_lossy(&body).into(),
-            ));
+            return Err(ProviderError::InvalidResponse);
         }
         let value: serde_json::Value =
             serde_json::from_slice(&body).map_err(|_| ProviderError::InvalidResponse)?;
@@ -967,6 +1145,24 @@ mod tests {
         assert_eq!(parse_http_response(sized).unwrap().1, b"hello world");
         let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
         assert_eq!(parse_http_response(chunked).unwrap().1, b"hello world");
+    }
+
+    #[test]
+    fn diagnostic_http_error_body_is_bounded_and_utf8_safe() {
+        let input = "á".repeat(MAX_HTTP_ERROR_BODY_BYTES / 2);
+        let (body, truncated) = bounded_diagnostic_body(input.as_bytes());
+        assert!(body.len() <= MAX_HTTP_ERROR_BODY_BYTES);
+        assert!(!truncated);
+        assert!(std::str::from_utf8(body.as_bytes()).is_ok());
+
+        let oversized = format!("{}tail", "x".repeat(MAX_HTTP_ERROR_BODY_BYTES));
+        let (body, truncated) = bounded_diagnostic_body(oversized.as_bytes());
+        assert_eq!(body.len(), MAX_HTTP_ERROR_BODY_BYTES);
+        assert!(truncated);
+        assert_eq!(
+            ProviderError::InvalidResponse.user_message(),
+            "Invalid Ollama response"
+        );
     }
 
     #[test]
