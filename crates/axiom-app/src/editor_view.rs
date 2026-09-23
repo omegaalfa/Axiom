@@ -3970,10 +3970,40 @@ impl EditorView {
         if self.find.matches.is_empty() {
             return;
         }
+        let selection = self.document.selection();
+        let (anchor, active, restore_selection) = selection.first().map_or_else(
+            || {
+                let cursor = self.document.cursor_offset();
+                (cursor, cursor, false)
+            },
+            |region| (region.start, region.end, true),
+        );
         let text = self.document.content();
-        let transformed =
-            crate::ui::input_line::replace_all_text(&text, &self.find.matches, &self.replace.query);
+        let replacement = self.replace.query.as_str();
+        let matches = self.find.matches.as_slice();
+        let transformed = crate::ui::input_line::replace_all_text(&text, matches, replacement);
+        // Left affinity: an offset inside a match maps to the replacement start.
+        let map_offset = |offset: usize| {
+            let mut delta = 0_i64;
+            for range in matches {
+                if offset < range.start {
+                    break;
+                }
+                if offset < range.end {
+                    return (range.start as i64 + delta).max(0) as usize;
+                }
+                delta += replacement.len() as i64 - range.len() as i64;
+            }
+            ((offset as i64 + delta).max(0) as usize).min(transformed.len())
+        };
+        let anchor = map_offset(anchor);
+        let active = map_offset(active);
         self.document.replace_range(0..text.len(), &transformed);
+        if restore_selection {
+            self.document.set_selection(anchor, active);
+        } else {
+            self.document.move_cursor(active);
+        }
         self.after_edit(cx);
     }
 
@@ -7651,6 +7681,114 @@ mod formatter_tests {
                     assert!(editor.document.undo());
                     assert_eq!(editor.document.content(), source);
                 }
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn replace_all_maps_cursor_offsets_across_replacements(cx: &mut gpui::TestAppContext) {
+        for (case, source, replacement, cursor, expected_text, expected_cursor) in [
+            (
+                "before all matches",
+                "x foo foo",
+                "barbar",
+                1,
+                "x barbar barbar",
+                1,
+            ),
+            ("after smaller replacement", "foo tail", "x", 7, "x tail", 5),
+            (
+                "after larger replacement",
+                "foo tail",
+                "longer",
+                7,
+                "longer tail",
+                10,
+            ),
+            ("inside match", "a foo b", "XYZ", 4, "a XYZ b", 2),
+            (
+                "multiple replacement deltas",
+                "foo foo foo tail",
+                "x",
+                15,
+                "x x x tail",
+                9,
+            ),
+            (
+                "multibyte replacement",
+                "foo x🙂 foo",
+                "🌍",
+                12,
+                "🌍 x🙂 🌍",
+                11,
+            ),
+        ] {
+            let (editor, cx) = cx.add_window_view(|window, cx| {
+                let mut editor = EditorView::from_document(
+                    "replace.txt".into(),
+                    axiom_editor::Document::from_content(source),
+                    None,
+                    cx,
+                );
+                editor.find.visible = true;
+                editor.find.replace_expanded = true;
+                editor.find.query = "foo".into();
+                editor.find.refresh(source);
+                editor.find_revision = editor.document.buffer_revision();
+                editor.replace.query = replacement.into();
+                editor.document.move_cursor(cursor);
+                window.focus(&editor.replace_focus);
+                editor
+            });
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds("Replace All").expect("rendered All button");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            editor.update(cx, |editor, _| {
+                assert_eq!(editor.document.content(), expected_text, "{case}");
+                assert_eq!(editor.document.cursor_offset(), expected_cursor, "{case}");
+                assert!(expected_text.is_char_boundary(expected_cursor), "{case}");
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn replace_all_preserves_forward_and_reversed_selection(cx: &mut gpui::TestAppContext) {
+        for (case, anchor, active, expected_anchor, expected_active) in [
+            ("forward selection", 1, 15, 0, 9),
+            ("reversed selection", 15, 1, 9, 0),
+        ] {
+            let (editor, cx) = cx.add_window_view(|window, cx| {
+                let mut editor = EditorView::from_document(
+                    "replace.txt".into(),
+                    axiom_editor::Document::from_content("foo foo foo tail"),
+                    None,
+                    cx,
+                );
+                editor.find.visible = true;
+                editor.find.replace_expanded = true;
+                editor.find.query = "foo".into();
+                editor.find.refresh("foo foo foo tail");
+                editor.find_revision = editor.document.buffer_revision();
+                editor.replace.query = "x".into();
+                editor.document.set_selection(anchor, active);
+                window.focus(&editor.replace_focus);
+                editor
+            });
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds("Replace All").expect("rendered All button");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            editor.update(cx, |editor, _| {
+                assert_eq!(editor.document.content(), "x x x tail", "{case}");
+                let selection = editor.document.selection();
+                let region = selection.first().expect("restored selection");
+                assert_eq!(
+                    (region.start, region.end),
+                    (expected_anchor, expected_active),
+                    "{case}"
+                );
+                assert_eq!(editor.document.cursor_offset(), expected_active, "{case}");
+                assert!(editor.document.content().is_char_boundary(region.start), "{case}");
+                assert!(editor.document.content().is_char_boundary(region.end), "{case}");
             });
         }
     }
