@@ -402,12 +402,11 @@ impl Document {
     }
 
     fn normalize_offset(&self, offset: usize) -> usize {
-        let content = self.content();
-        let mut offset = offset.min(content.len());
-        while !content.is_char_boundary(offset) {
-            offset -= 1;
-        }
-        offset
+        let offset = offset.min(self.buffer.len());
+        self.buffer
+            .text()
+            .at_or_prev_codepoint_boundary(offset)
+            .unwrap_or(offset)
     }
 
     fn previous_codepoint_boundary(&self, offset: usize) -> usize {
@@ -490,6 +489,57 @@ mod tests {
         assert_eq!(document.cursor_offset(), 2);
         document.insert_text("X");
         assert_eq!(document.content(), "OlXá 👋");
+    }
+
+    fn string_normalize_offset(content: &str, offset: usize) -> usize {
+        let mut offset = offset.min(content.len());
+        while !content.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offset
+    }
+
+    fn assert_normalize_offset_equivalence(content: &str) {
+        let document = Document::from_content(content);
+        for offset in 0..=content.len() + 2 {
+            assert_eq!(
+                document.normalize_offset(offset),
+                string_normalize_offset(content, offset),
+                "content: {content:?}, offset: {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_offset_matches_ascii_clamp_and_end_semantics() {
+        assert_normalize_offset_equivalence("");
+        assert_normalize_offset_equivalence("ASCII");
+        let document = Document::from_content("ASCII");
+        assert_eq!(document.normalize_offset(0), 0);
+        assert_eq!(document.normalize_offset(5), 5);
+        assert_eq!(document.normalize_offset(6), 5);
+        assert_eq!(document.normalize_offset(usize::MAX), 5);
+    }
+
+    #[test]
+    fn normalize_offset_matches_utf8_codepoint_boundary_semantics() {
+        assert_normalize_offset_equivalence("Olá 👋");
+        assert_normalize_offset_equivalence("こんにちは你好");
+        let document = Document::from_content("aé🔥");
+        assert_eq!(document.normalize_offset(2), 1);
+        assert_eq!(document.normalize_offset(4), 3);
+        assert_eq!(document.normalize_offset(6), 3);
+        assert_eq!(document.normalize_offset(8), 7);
+    }
+
+    #[test]
+    fn normalize_offset_preserves_crlf_byte_semantics() {
+        assert_normalize_offset_equivalence("a\r\nb");
+        let document = Document::from_content("a\r\nb");
+        assert_eq!(document.normalize_offset(1), 1);
+        assert_eq!(document.normalize_offset(2), 2);
+        assert_eq!(document.normalize_offset(3), 3);
+        assert_eq!(document.normalize_offset(4), 4);
     }
 
     #[test]

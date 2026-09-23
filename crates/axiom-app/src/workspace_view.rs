@@ -1428,8 +1428,8 @@ pub struct WorkspaceView {
     index_generation: u64,
     index_results: Option<Receiver<(u64, Result<SemanticIndexPayload, String>)>>,
     semantic_engine: Option<Arc<SemanticEngine>>,
-    semantic_update_sender: mpsc::Sender<(u64, PathBuf, String)>,
-    semantic_update_receiver: Receiver<(u64, PathBuf, String)>,
+    semantic_update_sender: mpsc::Sender<(u64, PathBuf, String, bool)>,
+    semantic_update_receiver: Receiver<(u64, PathBuf, String, bool)>,
     semantic_update_generation: u64,
     project_semantic_generation: u64,
     semantic_update_results: Option<Receiver<(u64, u64, Result<Arc<SemanticSnapshot>, String>)>>,
@@ -3301,14 +3301,25 @@ impl WorkspaceView {
             let workspace_check_us = 0u128;
             let max_workspace_check_us = 0u128;
             let receive_started = Instant::now();
-            while let Ok((project_generation, path, text)) =
+            while let Ok((project_generation, path, text, workspace_source)) =
                 self.semantic_update_receiver.try_recv()
             {
                 items_drained += 1;
-                if semantic_update_matches(self.project_semantic_generation, project_generation) {
+                if workspace_source
+                    && semantic_update_matches(self.project_semantic_generation, project_generation)
+                {
                     updates.insert(path, text);
                 } else if debug_input_enabled() {
-                    tracing::debug!(path = %path.display(), reason = "generation_mismatch", "[SEMANTIC UPDATE REJECTED]");
+                    tracing::debug!(
+                        path = %path.display(),
+                        workspace_source,
+                        reason = if workspace_source {
+                            "generation_mismatch"
+                        } else {
+                            "non_workspace_source"
+                        },
+                        "[SEMANTIC UPDATE REJECTED]"
+                    );
                 }
             }
             receive_us = receive_started.elapsed().as_micros();

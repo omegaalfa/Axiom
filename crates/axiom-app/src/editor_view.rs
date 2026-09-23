@@ -288,7 +288,7 @@ pub struct EditorView {
     semantic_engine: Option<Arc<SemanticEngine>>,
     project_index_revision: Option<Arc<AtomicU64>>,
     index_update_sender: Option<Sender<IndexUpdateRequest>>,
-    semantic_update_sender: Option<Sender<(u64, PathBuf, String)>>,
+    semantic_update_sender: Option<Sender<(u64, PathBuf, String, bool)>>,
     semantic_update_generation: u64,
     workspace_root: Option<PathBuf>,
     workspace_source: bool,
@@ -479,10 +479,10 @@ struct UnknownClassInspectionInput {
     vendor_symbols: Option<Arc<VendorSymbolIndex>>,
 }
 
-fn compute_unknown_class_inspections(input: &UnknownClassInspectionInput) -> Vec<ByteDiagnostic> {
-    let Ok(syntax) = PhpSyntax::parse(input.text.as_ref()) else {
-        return Vec::new();
-    };
+fn compute_unknown_class_inspections(
+    input: &UnknownClassInspectionInput,
+    syntax: &PhpSyntax,
+) -> Vec<ByteDiagnostic> {
     let mut diagnostics = Vec::new();
     let mut offset = 0;
     while let Some(relative) = input.text[offset..].find("new ") {
@@ -595,6 +595,7 @@ fn compute_duplicate_class_inspections(
 
 fn compute_unknown_constant_inspections(
     input: &UnknownConstantInspectionInput,
+    syntax: &PhpSyntax,
 ) -> Vec<ByteDiagnostic> {
     const BUILT_INS: &[&str] = &[
         "PHP_VERSION",
@@ -611,9 +612,6 @@ fn compute_unknown_constant_inspections(
         "E_PARSE",
         "E_NOTICE",
     ];
-    let Ok(syntax) = PhpSyntax::parse(input.text.as_ref()) else {
-        return Vec::new();
-    };
     let mut diagnostics = Vec::new();
     let mut offset = 0;
     while let Some(relative) = input.text[offset..].find("echo ") {
@@ -675,10 +673,10 @@ struct ArgumentInspectionInput {
     file_key: PersistentFileKey,
 }
 
-fn compute_argument_inspections(input: &ArgumentInspectionInput) -> Vec<ByteDiagnostic> {
-    let Ok(syntax) = PhpSyntax::parse(input.text.as_ref()) else {
-        return Vec::new();
-    };
+fn compute_argument_inspections(
+    input: &ArgumentInspectionInput,
+    syntax: &PhpSyntax,
+) -> Vec<ByteDiagnostic> {
     let mut pending = vec![syntax.tree().root_node()];
     let mut calls = Vec::new();
     while let Some(node) = pending.pop() {
@@ -1092,9 +1090,10 @@ struct IndexUpdateRequest {
     semantic_generation: u64,
     path: PathBuf,
     text: String,
+    workspace_source: bool,
     index: Arc<std::sync::RwLock<ProjectSymbolIndex>>,
     revision: Arc<AtomicU64>,
-    semantic_updates: Option<Sender<(u64, PathBuf, String)>>,
+    semantic_updates: Option<Sender<(u64, PathBuf, String, bool)>>,
 }
 
 #[derive(Clone)]
@@ -1140,7 +1139,12 @@ fn run_index_update_worker(receiver: mpsc::Receiver<IndexUpdateRequest>) {
                 index.index_file_text_with_source(request.path, request.text, "EditorDirtyUpdate");
             if result.is_ok() {
                 if let Some(sender) = request.semantic_updates {
-                    let _ = sender.send((request.semantic_generation, path, text));
+                    let _ = sender.send((
+                        request.semantic_generation,
+                        path,
+                        text,
+                        request.workspace_source,
+                    ));
                 }
             }
         }
@@ -1734,7 +1738,7 @@ impl EditorView {
 
     pub fn set_semantic_update_sender(
         &mut self,
-        sender: Sender<(u64, PathBuf, String)>,
+        sender: Sender<(u64, PathBuf, String, bool)>,
         generation: u64,
     ) {
         if self.workspace_source {
@@ -2399,9 +2403,6 @@ impl EditorView {
         let lsp_started = Instant::now();
         self.sync_lsp_text(&text, edit.as_ref());
         let lsp_queue_us = lsp_started.elapsed().as_micros();
-        let semantic_started = Instant::now();
-        self.schedule_incremental_index_update(&text);
-        let semantic_schedule_us = semantic_started.elapsed().as_micros();
         let completion_started = Instant::now();
         let clear_started = Instant::now();
         let (trigger_us, native_total_us, native_empty) = if !self.is_php_completion_context() {
@@ -2462,6 +2463,9 @@ impl EditorView {
             (trigger_us, native_total_us, native_empty)
         };
         let completion_us = completion_started.elapsed().as_micros();
+        let semantic_started = Instant::now();
+        self.schedule_incremental_index_update(text);
+        let semantic_schedule_us = semantic_started.elapsed().as_micros();
         if native_empty {
             if debug_ui_stall_enabled() && completion_us >= 3_000 {
                 tracing::info!(target: "axiom.ui_stall",
@@ -2534,7 +2538,7 @@ impl EditorView {
         self.resolve_native_type(owner, before).is_some()
     }
 
-    fn schedule_incremental_index_update(&self, text: &str) {
+    fn schedule_incremental_index_update(&self, text: String) {
         let Some(_root) = &self.workspace_root else {
             return;
         };
@@ -2553,12 +2557,12 @@ impl EditorView {
         let generation = revision.fetch_add(1, Ordering::SeqCst) + 1;
         let path = self.file_path.clone();
         axiom_index::trace_path("incremental_request", "EditorDirtyUpdate", &path);
-        let text = text.to_owned();
         if let Some(sender) = &self.index_update_sender {
             let _ = sender.send(IndexUpdateRequest {
                 generation,
                 path,
                 text,
+                workspace_source: self.workspace_source,
                 index,
                 revision,
                 semantic_generation: self.semantic_update_generation,
@@ -2607,13 +2611,26 @@ impl EditorView {
                 }
             };
             std::thread::spawn(move || {
+                let syntax = PhpSyntax::parse(work.arguments.text.as_ref()).ok();
                 let Some(diagnostics) = run_native_inspection_rules(
                     &work.latest_generation,
                     work.generation,
-                    || compute_unknown_class_inspections(&work.unknown_class),
-                    || compute_unknown_constant_inspections(&work.unknown_constant),
+                    || {
+                        syntax.as_ref().map_or_else(Vec::new, |syntax| {
+                            compute_unknown_class_inspections(&work.unknown_class, syntax)
+                        })
+                    },
+                    || {
+                        syntax.as_ref().map_or_else(Vec::new, |syntax| {
+                            compute_unknown_constant_inspections(&work.unknown_constant, syntax)
+                        })
+                    },
                     || compute_duplicate_class_inspections(&work.duplicate_class),
-                    || compute_argument_inspections(&work.arguments),
+                    || {
+                        syntax.as_ref().map_or_else(Vec::new, |syntax| {
+                            compute_argument_inspections(&work.arguments, syntax)
+                        })
+                    },
                 ) else {
                     return;
                 };
@@ -3221,7 +3238,11 @@ impl EditorView {
                                 | RuntimeKind::Enum
                         )
                         .then(|| {
-                            self.composer_import_edit(&symbol.fqn, self.document.cursor_offset())
+                            self.composer_import_edit(
+                                text,
+                                &symbol.fqn,
+                                self.document.cursor_offset(),
+                            )
                         })
                         .flatten();
                         CompletionItem {
@@ -3280,6 +3301,7 @@ impl EditorView {
                             )
                             .then(|| {
                                 self.composer_import_edit(
+                                    text,
                                     &symbol.fully_qualified_name,
                                     self.document.cursor_offset(),
                                 )
@@ -3298,7 +3320,7 @@ impl EditorView {
                                     ProjectSymbolKind::Enum => CompletionItemKind::ENUM,
                                     _ => CompletionItemKind::VALUE,
                                 }),
-                                insert_text: (current_namespace(&self.document.content())
+                                insert_text: (current_namespace(text)
                                     .is_empty()
                                     && matches!(
                                         symbol.kind,
@@ -3347,8 +3369,11 @@ impl EditorView {
                         .filter(|item| vendor_type_kind_allowed(type_context, item.kind))
                         .map(|item| {
                             let label = item.short_name;
-                            let import =
-                                self.composer_import_edit(&item.fqn, self.document.cursor_offset());
+                            let import = self.composer_import_edit(
+                                text,
+                                &item.fqn,
+                                self.document.cursor_offset(),
+                            );
                             CompletionItem {
                                 label,
                                 detail: Some(format!("{} - Vendor", item.fqn)),
@@ -3361,7 +3386,8 @@ impl EditorView {
             } else {
                 items.extend(index.classes_matching(prefix).into_iter().map(|fqn| {
                     let label = fqn.rsplit('\\').next().unwrap_or(&fqn).to_owned();
-                    let import = self.composer_import_edit(&fqn, self.document.cursor_offset());
+                    let import =
+                        self.composer_import_edit(text, &fqn, self.document.cursor_offset());
                     CompletionItem {
                         label,
                         detail: Some(format!("{fqn} • Vendor")),
@@ -3436,9 +3462,13 @@ impl EditorView {
     /// Builds a single additional edit for a Composer/project class. The edit
     /// is deliberately narrow: it only inserts a missing `use` statement and
     /// never rewrites or reformats the document.
-    fn composer_import_edit(&self, fqn: &str, caret: usize) -> Option<lsp_types::TextEdit> {
+    fn composer_import_edit(
+        &self,
+        text: &str,
+        fqn: &str,
+        caret: usize,
+    ) -> Option<lsp_types::TextEdit> {
         let fqn = fqn.trim_start_matches('\\');
-        let text = self.document.content();
         let caret = caret.min(text.len());
         let mut ns_start = 0usize;
         let mut current_namespace = String::new();
@@ -8510,7 +8540,7 @@ mod formatter_tests {
 mod diagnostic_store_tests {
     use super::{
         ArgumentInspectionInput, ByteDiagnostic, DiagnosticStore, DuplicateClassDeclaration,
-        DuplicateClassInspectionInput, ParameterArity, PersistentFileKey,
+        DuplicateClassInspectionInput, ParameterArity, PersistentFileKey, PhpSyntax,
         UnknownConstantInspectionInput, compute_argument_inspections,
         compute_duplicate_class_inspections, compute_unknown_constant_inspections,
         run_native_inspection_rules, signature_counts_from_detail,
@@ -8524,6 +8554,16 @@ mod diagnostic_store_tests {
 
     fn assert_send_sync<T: Send + Sync>() {}
 
+    fn argument_fixture(input: &ArgumentInspectionInput) -> Vec<ByteDiagnostic> {
+        let syntax = PhpSyntax::parse(input.text.as_ref()).unwrap();
+        compute_argument_inspections(input, &syntax)
+    }
+
+    fn unknown_constant_fixture(input: &UnknownConstantInspectionInput) -> Vec<ByteDiagnostic> {
+        let syntax = PhpSyntax::parse(input.text.as_ref()).unwrap();
+        compute_unknown_constant_inspections(input, &syntax)
+    }
+
     fn method_fixture(source: &str) -> Vec<ByteDiagnostic> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fixture.php");
@@ -8535,7 +8575,7 @@ mod diagnostic_store_tests {
             axiom_index::SemanticRevision(1),
         ));
         let text: Arc<str> = Arc::from(source);
-        compute_argument_inspections(&ArgumentInspectionInput {
+        argument_fixture(&ArgumentInspectionInput {
             text,
             project_symbols: index.symbols().to_vec(),
             runtime_symbols: None,
@@ -8710,7 +8750,7 @@ mod diagnostic_store_tests {
             semantic_snapshot: None,
             file_key: PersistentFileKey::workspace_lexical("test.php"),
         };
-        assert_eq!(compute_argument_inspections(&input).len(), 1);
+        assert_eq!(argument_fixture(&input).len(), 1);
     }
 
     #[test]
@@ -8753,7 +8793,7 @@ mod diagnostic_store_tests {
             semantic_snapshot: None,
             file_key: PersistentFileKey::workspace_lexical("test.php"),
         };
-        let diagnostics = compute_argument_inspections(&input);
+        let diagnostics = argument_fixture(&input);
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Expected 1 argument"));
     }
@@ -8821,7 +8861,7 @@ mod diagnostic_store_tests {
             semantic_snapshot: Some(Arc::new(snapshot)),
             file_key: PersistentFileKey::workspace_lexical(&path),
         };
-        let diagnostics = compute_argument_inspections(&input);
+        let diagnostics = argument_fixture(&input);
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Expected 1 argument"));
     }
@@ -8845,7 +8885,7 @@ mod diagnostic_store_tests {
             semantic_snapshot: Some(Arc::new(snapshot)),
             file_key: PersistentFileKey::workspace_lexical(&path),
         };
-        let diagnostics = compute_argument_inspections(&input);
+        let diagnostics = argument_fixture(&input);
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("Expected 1 argument"));
     }
@@ -8869,7 +8909,7 @@ mod diagnostic_store_tests {
             semantic_snapshot: Some(Arc::new(snapshot)),
             file_key: PersistentFileKey::workspace_lexical(&path),
         };
-        let diagnostics = compute_argument_inspections(&input);
+        let diagnostics = argument_fixture(&input);
         let arguments_start = text.rfind("()").expect("arguments node");
         let expected = arguments_start..arguments_start + 2;
         assert_eq!(diagnostics.len(), 1);
@@ -8909,7 +8949,7 @@ function test(Service $service, $unknown): void {
             file_key: PersistentFileKey::workspace_lexical(&path),
         };
 
-        let diagnostics = compute_argument_inspections(&input);
+        let diagnostics = argument_fixture(&input);
         let other_ranges = text
             .match_indices("new Other()")
             .map(|(start, value)| start..start + value.len())
@@ -8970,7 +9010,7 @@ b($qualquer);
             semantic_snapshot: Some(Arc::new(snapshot)),
             file_key: PersistentFileKey::workspace_lexical(&path),
         };
-        let diagnostics = compute_argument_inspections(&input);
+        let diagnostics = argument_fixture(&input);
         let actual = diagnostics
             .iter()
             .map(|diagnostic| (&text[diagnostic.range.clone()], diagnostic.message.as_str()))
@@ -8987,7 +9027,7 @@ b($qualquer);
         }));
         let mut without_snapshot = input;
         without_snapshot.semantic_snapshot = None;
-        assert!(compute_argument_inspections(&without_snapshot).is_empty());
+        assert!(argument_fixture(&without_snapshot).is_empty());
     }
 
     #[test]
@@ -9051,7 +9091,7 @@ b($qualquer);
             known_constants: Vec::new(),
             runtime_symbols: None,
         };
-        let diagnostics = compute_unknown_constant_inspections(&input);
+        let diagnostics = unknown_constant_fixture(&input);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].message, "Undefined constant 'UNKNOWN_VALUE'");
     }
@@ -9065,7 +9105,7 @@ b($qualquer);
             known_constants: vec![("VALUE".into(), "App\\VALUE".into())],
             runtime_symbols: None,
         };
-        assert!(compute_unknown_constant_inspections(&input).is_empty());
+        assert!(unknown_constant_fixture(&input).is_empty());
     }
 
     #[test]
