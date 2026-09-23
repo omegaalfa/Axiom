@@ -1017,8 +1017,130 @@ enum AgentUiState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentActivityIndicatorPhase {
+    Thinking,
+    Generating,
+}
+
+impl AgentActivityIndicatorPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Thinking => "Thinking",
+            Self::Generating => "Generating",
+        }
+    }
+
+    fn for_event(event: &axiom_agent::AgentEvent) -> Option<Self> {
+        match event {
+            axiom_agent::AgentEvent::RunStarted { .. }
+            | axiom_agent::AgentEvent::ModelStarted { .. }
+            | axiom_agent::AgentEvent::ThinkingDelta { .. }
+            | axiom_agent::AgentEvent::ToolRequested { .. }
+            | axiom_agent::AgentEvent::ToolStarted { .. }
+            | axiom_agent::AgentEvent::ToolCompleted { .. } => Some(Self::Thinking),
+            axiom_agent::AgentEvent::ContentDelta { .. }
+            | axiom_agent::AgentEvent::Finalizing { .. } => Some(Self::Generating),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentApprovalDecision {
+    Approve,
+    Deny,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentApprovalUiState {
+    run_id: axiom_agent::AgentRunId,
+    approval_id: axiom_agent::ApprovalId,
+    tool_name: String,
+    reason: String,
+    arguments_preview: String,
+}
+
+impl From<axiom_agent::ApprovalRequest> for AgentApprovalUiState {
+    fn from(request: axiom_agent::ApprovalRequest) -> Self {
+        Self {
+            run_id: request.run_id,
+            approval_id: request.approval_id,
+            tool_name: request.tool_name,
+            reason: request.reason,
+            arguments_preview: request.arguments,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AgentApprovalSubmission {
+    decision: AgentApprovalDecision,
+    run_id: axiom_agent::AgentRunId,
+    approval_id: axiom_agent::ApprovalId,
+}
+
+fn show_agent_approval(
+    pending: &mut Option<AgentApprovalUiState>,
+    active_run_id: axiom_agent::AgentRunId,
+    request: Option<axiom_agent::ApprovalRequest>,
+) -> bool {
+    let Some(request) = request.filter(|request| request.run_id == active_run_id) else {
+        if pending
+            .as_ref()
+            .is_some_and(|state| state.run_id != active_run_id)
+        {
+            *pending = None;
+        }
+        return false;
+    };
+    *pending = Some(request.into());
+    true
+}
+
+fn take_agent_approval_submission(
+    pending: &mut Option<AgentApprovalUiState>,
+    active_run_id: Option<axiom_agent::AgentRunId>,
+    approval_id: axiom_agent::ApprovalId,
+    decision: AgentApprovalDecision,
+) -> Option<AgentApprovalSubmission> {
+    let state = pending.as_ref()?;
+    if active_run_id != Some(state.run_id) {
+        *pending = None;
+        return None;
+    }
+    if state.approval_id != approval_id {
+        return None;
+    }
+    let submission = AgentApprovalSubmission {
+        decision,
+        run_id: state.run_id,
+        approval_id: state.approval_id,
+    };
+    *pending = None;
+    Some(submission)
+}
+
+fn agent_approval_visible(
+    panel_mode: AiPanelMode,
+    pending: &Option<AgentApprovalUiState>,
+) -> bool {
+    panel_mode == AiPanelMode::Agent && pending.is_some()
+}
+
 fn agent_loading_visible(state: AgentUiState) -> bool {
     state == AgentUiState::Running
+}
+
+fn agent_activity_indicator_visible(
+    state: AgentUiState,
+    pending_approval: &Option<AgentApprovalUiState>,
+) -> bool {
+    agent_loading_visible(state) && pending_approval.is_none()
+}
+
+fn agent_activity_dots(phase: u8) -> String {
+    "•".repeat((phase % 10) as usize / 2 + 1)
 }
 
 fn agent_failure_status(diagnostic: &axiom_agent::AgentFailureDiagnostic) -> String {
@@ -1255,6 +1377,10 @@ pub struct WorkspaceView {
     agent_ui_state: AgentUiState,
     agent_run_id: Option<axiom_agent::AgentRunId>,
     agent_cancellation: Option<axiom_agent::Cancellation>,
+    approval_bridge: agent_bridge::ApprovalBridge,
+    agent_pending_approval: Option<AgentApprovalUiState>,
+    agent_activity_phase: AgentActivityIndicatorPhase,
+    agent_activity_animation_phase: u8,
     agent_events: AgentEventQueue,
     agent_messages: Vec<AgentUiMessage>,
     agent_next_message_id: u64,
@@ -2335,6 +2461,10 @@ impl WorkspaceView {
             agent_ui_state: AgentUiState::Idle,
             agent_run_id: None,
             agent_cancellation: None,
+            approval_bridge: agent_bridge::ApprovalBridge::default(),
+            agent_pending_approval: None,
+            agent_activity_phase: AgentActivityIndicatorPhase::Thinking,
+            agent_activity_animation_phase: 0,
             agent_events: Arc::new(Mutex::new(Vec::new())),
             agent_messages: Vec::new(),
             agent_next_message_id: 1,
@@ -2540,6 +2670,14 @@ impl WorkspaceView {
                         if matches!(this.chat_request_state, ChatRequestState::Sending) {
                             this.chat_generating_phase =
                                 this.chat_generating_phase.wrapping_add(1) % 10;
+                            cx.notify();
+                        }
+                        if agent_activity_indicator_visible(
+                            this.agent_ui_state,
+                            &this.agent_pending_approval,
+                        ) {
+                            this.agent_activity_animation_phase =
+                                this.agent_activity_animation_phase.wrapping_add(1) % 10;
                             cx.notify();
                         }
                         let poll_started = Instant::now();
@@ -5413,6 +5551,9 @@ impl WorkspaceView {
             ) {
                 apply_agent_message_event(&mut self.agent_messages, &event);
             }
+            if let Some(phase) = AgentActivityIndicatorPhase::for_event(&event) {
+                self.agent_activity_phase = phase;
+            }
             match event {
                 axiom_agent::AgentEvent::RunStarted { .. }
                 | axiom_agent::AgentEvent::ModelStarted { .. } => {
@@ -5424,10 +5565,14 @@ impl WorkspaceView {
                 axiom_agent::AgentEvent::ToolRequested { .. } => {
                     self.agent_status = Some("Tool requested".into())
                 }
-                axiom_agent::AgentEvent::ApprovalRequested { .. } => {
-                    self.agent_status = Some("Waiting for approval".into())
+                axiom_agent::AgentEvent::ApprovalRequested { run_id, .. } => {
+                    self.agent_status = Some("Waiting for approval".into());
+                    let request = self.approval_bridge.pending(run_id);
+                    show_agent_approval(&mut self.agent_pending_approval, active_id, request);
+                    self.agent_activity_animation_phase = 0;
                 }
                 axiom_agent::AgentEvent::ToolStarted { .. } => {
+                    self.agent_pending_approval = None;
                     self.agent_status = Some("Running tool".into())
                 }
                 axiom_agent::AgentEvent::ToolCompleted { succeeded, .. } => {
@@ -5447,16 +5592,22 @@ impl WorkspaceView {
                     self.agent_ui_state = AgentUiState::Completed;
                     self.agent_status = None;
                     self.agent_cancellation = None;
+                    self.agent_pending_approval = None;
+                    self.agent_activity_animation_phase = 0;
                 }
                 axiom_agent::AgentEvent::Cancelled { .. } => {
                     self.agent_ui_state = AgentUiState::Cancelled;
                     self.agent_status = Some("Agent run cancelled".into());
                     self.agent_cancellation = None;
+                    self.agent_pending_approval = None;
+                    self.agent_activity_animation_phase = 0;
                 }
                 axiom_agent::AgentEvent::Failed { diagnostic, .. } => {
                     self.agent_ui_state = AgentUiState::Failed;
                     self.agent_status = Some(agent_failure_status(&diagnostic));
                     self.agent_cancellation = None;
+                    self.agent_pending_approval = None;
+                    self.agent_activity_animation_phase = 0;
                 }
             }
             changed = true;
@@ -5482,10 +5633,72 @@ impl WorkspaceView {
         let Some(cancellation) = self.agent_cancellation.take() else {
             return;
         };
+        if let Some(run_id) = self.agent_run_id {
+            self.approval_bridge.cancel(run_id);
+        }
+        self.agent_pending_approval = None;
+        self.agent_activity_animation_phase = 0;
         cancellation.cancel();
         self.agent_ui_state = AgentUiState::Cancelled;
         self.agent_status = Some("Agent run cancelled".into());
         self.agent_run_id = None;
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn pending_agent_approval(
+        &self,
+        run_id: axiom_agent::AgentRunId,
+    ) -> Option<axiom_agent::ApprovalRequest> {
+        self.approval_bridge.pending(run_id)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn approve_agent_run(
+        &self,
+        run_id: axiom_agent::AgentRunId,
+        approval_id: axiom_agent::ApprovalId,
+    ) -> Result<(), agent_bridge::ApprovalBridgeError> {
+        self.approval_bridge.approve(run_id, approval_id)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn deny_agent_run(
+        &self,
+        run_id: axiom_agent::AgentRunId,
+        approval_id: axiom_agent::ApprovalId,
+    ) -> Result<(), agent_bridge::ApprovalBridgeError> {
+        self.approval_bridge.deny(run_id, approval_id)
+    }
+
+    fn submit_agent_approval(
+        &mut self,
+        approval_id: axiom_agent::ApprovalId,
+        decision: AgentApprovalDecision,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(submission) = take_agent_approval_submission(
+            &mut self.agent_pending_approval,
+            self.agent_run_id,
+            approval_id,
+            decision,
+        ) else {
+            cx.notify();
+            return;
+        };
+        let result = match submission.decision {
+            AgentApprovalDecision::Approve => {
+                self.approve_agent_run(submission.run_id, submission.approval_id)
+            }
+            AgentApprovalDecision::Deny => {
+                self.deny_agent_run(submission.run_id, submission.approval_id)
+            }
+        };
+        if result.is_err() && self.agent_run_id == Some(submission.run_id) {
+            self.agent_pending_approval = self
+                .pending_agent_approval(submission.run_id)
+                .map(AgentApprovalUiState::from);
+        }
         cx.notify();
     }
 
@@ -5547,6 +5760,9 @@ impl WorkspaceView {
         self.agent_cancellation = Some(cancellation.clone());
         self.agent_ui_state = AgentUiState::Running;
         self.agent_status = None;
+        self.agent_pending_approval = None;
+        self.agent_activity_phase = AgentActivityIndicatorPhase::Thinking;
+        self.agent_activity_animation_phase = 0;
         let user_id = self.agent_next_message_id;
         self.agent_next_message_id += 1;
         self.agent_messages.push(AgentUiMessage {
@@ -5578,11 +5794,19 @@ impl WorkspaceView {
         };
         let base_url = self.provider_base_url.text.clone();
         let queue = self.agent_events.clone();
+        let approval_bridge = self.approval_bridge.clone();
         let entity = cx.entity();
         cx.spawn(async move |_, cx| {
             let result = gpui::background_executor()
                 .spawn(async move {
-                    agent_bridge::execute_agent_run(&mut run, request, base_url, registry, &queue)
+                    agent_bridge::execute_agent_run(
+                        &mut run,
+                        request,
+                        base_url,
+                        registry,
+                        &approval_bridge,
+                        &queue,
+                    )
                 })
                 .await;
             let _ = entity.update(cx, |this, cx| {
@@ -7517,14 +7741,155 @@ impl WorkspaceView {
                         )
                     })
             }))
-            .when(agent_loading_visible(self.agent_ui_state), |this| {
-                this.child(
-                    div()
-                        .id("ai-agent-generating-indicator")
-                        .text_color(t.text_muted)
-                        .child("Generating…"),
-                )
-            })
+            .when(
+                agent_approval_visible(self.ai_panel_mode, &self.agent_pending_approval),
+                |this| {
+                    let approval = self
+                        .agent_pending_approval
+                        .clone()
+                        .expect("approval visibility checked");
+                    let approve_approval_id = approval.approval_id;
+                    let deny_approval_id = approval.approval_id;
+                    this.child(
+                        div()
+                            .id("ai-agent-approval-card")
+                            .w_full()
+                            .mt_2()
+                            .p_2()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .rounded(metrics().border_radius_small)
+                            .bg(t.elevated_surface)
+                            .border_1()
+                            .border_color(t.border)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_color(t.text_primary)
+                                    .child("Approval required")
+                                    .child(
+                                        div()
+                                            .ml_auto()
+                                            .text_size(px(11.))
+                                            .text_color(t.text_muted)
+                                            .child("Tool"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("ai-agent-approval-tool")
+                                    .text_color(t.accent)
+                                    .child(approval.tool_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(t.text_muted)
+                                    .child("Reason"),
+                            )
+                            .child(
+                                div()
+                                    .id("ai-agent-approval-reason")
+                                    .text_color(t.text_secondary)
+                                    .child(approval.reason.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(t.text_muted)
+                                    .child("Arguments"),
+                            )
+                            .child(
+                                div()
+                                    .id("ai-agent-approval-arguments")
+                                    .max_h(px(120.))
+                                    .overflow_hidden()
+                                    .p_2()
+                                    .rounded(metrics().border_radius_small)
+                                    .bg(t.editor_background)
+                                    .text_size(px(11.))
+                                    .text_color(t.text_secondary)
+                                    .child(approval.arguments_preview.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .id("ai-agent-approval-deny")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded(metrics().border_radius_small)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .cursor(CursorStyle::PointingHand)
+                                            .hover(move |s| s.bg(t.hover))
+                                            .on_click(cx.listener(
+                                                move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.submit_agent_approval(
+                                                        deny_approval_id,
+                                                        AgentApprovalDecision::Deny,
+                                                        cx,
+                                                    );
+                                                },
+                                            ))
+                                            .child("Deny"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("ai-agent-approval-approve")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded(metrics().border_radius_small)
+                                            .bg(t.accent)
+                                            .text_color(t.text_primary)
+                                            .cursor(CursorStyle::PointingHand)
+                                            .hover(move |s| s.bg(t.accent_hover))
+                                            .on_click(cx.listener(
+                                                move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.submit_agent_approval(
+                                                        approve_approval_id,
+                                                        AgentApprovalDecision::Approve,
+                                                        cx,
+                                                    );
+                                                },
+                                            ))
+                                            .child("Approve"),
+                                    ),
+                            ),
+                    )
+                },
+            )
+            .when(
+                agent_activity_indicator_visible(
+                    self.agent_ui_state,
+                    &self.agent_pending_approval,
+                ),
+                |this| {
+                    let dots = agent_activity_dots(self.agent_activity_animation_phase);
+                    this.child(
+                        div()
+                            .id("ai-agent-generating-indicator")
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_color(t.text_muted)
+                            .child(
+                                div()
+                                    .w(px(72.))
+                                    .child(self.agent_activity_phase.label()),
+                            )
+                            .child(div().w(px(36.)).child(dots)),
+                    )
+                },
+            )
             .when_some(self.agent_status.clone(), |this, status| {
                 this.child(div().text_color(t.text_muted).child(status))
             })
@@ -13725,6 +14090,17 @@ mod agent_session_tests {
     }
 
     #[test]
+    fn chat_projection_is_independent_of_approval_protocol() {
+        let provider = provider_messages_from_agent_session(&session());
+        assert!(provider.iter().all(|message| {
+            !message.content.contains("approval")
+                && !message.content.contains("tool_call")
+                && message.reasoning.is_none()
+                && message.tool_calls.is_empty()
+        }));
+    }
+
+    #[test]
     fn failed_status_preserves_safe_category_and_message() {
         let diagnostic = AgentFailureDiagnostic {
             kind: AgentFailureKind::Tool,
@@ -13743,6 +14119,254 @@ mod agent_session_tests {
         assert!(!agent_loading_visible(AgentUiState::Completed));
         assert!(!agent_loading_visible(AgentUiState::Cancelled));
         assert!(!agent_loading_visible(AgentUiState::Failed));
+    }
+}
+
+#[cfg(test)]
+mod agent_activity_tests {
+    use super::{
+        AgentActivityIndicatorPhase, AgentApprovalUiState, AgentUiState, agent_activity_dots,
+        agent_activity_indicator_visible,
+    };
+    use axiom_agent::{AgentEvent, AgentRunId, ApprovalId};
+
+    fn pending_approval() -> AgentApprovalUiState {
+        AgentApprovalUiState {
+            run_id: AgentRunId::new(1),
+            approval_id: ApprovalId::new(1),
+            tool_name: "read_file".into(),
+            reason: "review".into(),
+            arguments_preview: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn indicator_distinguishes_thinking_from_generating() {
+        assert_eq!(
+            AgentActivityIndicatorPhase::for_event(&AgentEvent::RunStarted {
+                run_id: AgentRunId::new(1)
+            }),
+            Some(AgentActivityIndicatorPhase::Thinking)
+        );
+        assert_eq!(
+            AgentActivityIndicatorPhase::for_event(&AgentEvent::ContentDelta {
+                run_id: AgentRunId::new(1),
+                delta: "answer".into()
+            }),
+            Some(AgentActivityIndicatorPhase::Generating)
+        );
+        assert_eq!(
+            AgentActivityIndicatorPhase::for_event(&AgentEvent::Finalizing {
+                run_id: AgentRunId::new(1)
+            }),
+            Some(AgentActivityIndicatorPhase::Generating)
+        );
+        assert_eq!(
+            AgentActivityIndicatorPhase::for_event(&AgentEvent::ApprovalRequested {
+                run_id: AgentRunId::new(1),
+                approval_id: ApprovalId::new(1),
+                tool_name: "read_file".into(),
+                arguments: "{}".into(),
+                reason: "review".into()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn indicator_animates_only_during_active_agent_processing() {
+        assert_eq!(agent_activity_dots(0), "•");
+        assert_eq!(agent_activity_dots(4), "•••");
+        assert_eq!(agent_activity_dots(8), "•••••");
+        assert!(agent_activity_indicator_visible(
+            AgentUiState::Running,
+            &None
+        ));
+        assert!(!agent_activity_indicator_visible(
+            AgentUiState::Running,
+            &Some(pending_approval())
+        ));
+        assert!(!agent_activity_indicator_visible(
+            AgentUiState::Completed,
+            &None
+        ));
+        assert!(!agent_activity_indicator_visible(
+            AgentUiState::Failed,
+            &None
+        ));
+        assert!(!agent_activity_indicator_visible(
+            AgentUiState::Cancelled,
+            &None
+        ));
+    }
+}
+
+#[cfg(test)]
+mod approval_ui_tests {
+    use super::{
+        AiPanelMode, AgentApprovalDecision, AgentApprovalSubmission, AgentApprovalUiState,
+        AgentUiState, WorkspaceView, agent_approval_visible, show_agent_approval,
+        take_agent_approval_submission,
+    };
+    use axiom_agent::{AgentRunId, ApprovalId, ApprovalRequest, Cancellation};
+    use gpui::TestAppContext;
+
+    fn request(run_id: u64, approval_id: u64) -> ApprovalRequest {
+        ApprovalRequest {
+            run_id: AgentRunId::new(run_id),
+            approval_id: ApprovalId::new(approval_id),
+            tool_name: "read_file".into(),
+            arguments: r#"{"path":"safe-preview"}"#.into(),
+            reason: "review requested".into(),
+        }
+    }
+
+    #[test]
+    fn approval_request_makes_safe_presentation_visible() {
+        let mut pending = None;
+        assert!(show_agent_approval(
+            &mut pending,
+            AgentRunId::new(1),
+            Some(request(1, 1))
+        ));
+        let AgentApprovalUiState {
+            run_id,
+            approval_id,
+            tool_name,
+            reason,
+            arguments_preview,
+        } = pending.unwrap();
+        assert_eq!(run_id, AgentRunId::new(1));
+        assert_eq!(approval_id, ApprovalId::new(1));
+        assert_eq!(tool_name, "read_file");
+        assert_eq!(reason, "review requested");
+        assert_eq!(arguments_preview, r#"{"path":"safe-preview"}"#);
+        assert!(agent_approval_visible(
+            AiPanelMode::Agent,
+            &Some(AgentApprovalUiState {
+                run_id,
+                approval_id,
+                tool_name,
+                reason,
+                arguments_preview,
+            })
+        ));
+    }
+
+    #[test]
+    fn approve_submits_only_identity_and_removes_controls() {
+        let mut pending = Some(request(1, 1).into());
+        let AgentApprovalSubmission {
+            decision,
+            run_id,
+            approval_id,
+        } = take_agent_approval_submission(
+            &mut pending,
+            Some(AgentRunId::new(1)),
+            ApprovalId::new(1),
+            AgentApprovalDecision::Approve,
+        )
+        .unwrap();
+        assert_eq!(decision, AgentApprovalDecision::Approve);
+        assert_eq!(run_id, AgentRunId::new(1));
+        assert_eq!(approval_id, ApprovalId::new(1));
+        assert!(pending.is_none());
+        assert!(!agent_approval_visible(AiPanelMode::Agent, &pending));
+    }
+
+    #[test]
+    fn deny_submits_only_identity_and_removes_controls() {
+        let mut pending = Some(request(1, 1).into());
+        let AgentApprovalSubmission {
+            decision,
+            run_id,
+            approval_id,
+        } = take_agent_approval_submission(
+            &mut pending,
+            Some(AgentRunId::new(1)),
+            ApprovalId::new(1),
+            AgentApprovalDecision::Deny,
+        )
+        .unwrap();
+        assert_eq!(decision, AgentApprovalDecision::Deny);
+        assert_eq!(run_id, AgentRunId::new(1));
+        assert_eq!(approval_id, ApprovalId::new(1));
+        assert!(pending.is_none());
+        assert!(!agent_approval_visible(AiPanelMode::Agent, &pending));
+    }
+
+    #[gpui::test]
+    fn stop_removes_pending_approval(cx: &mut TestAppContext) {
+        let (workspace, cx) =
+            cx.add_window_view(|_, cx| WorkspaceView::new(super::StartupTarget::Welcome, cx));
+        workspace.update(cx, |this, cx| {
+            this.agent_run_id = Some(AgentRunId::new(1));
+            this.agent_cancellation = Some(Cancellation::default());
+            this.agent_pending_approval = Some(request(1, 1).into());
+            this.stop_agent_run(cx);
+            assert!(this.agent_pending_approval.is_none());
+        });
+    }
+
+    #[test]
+    fn stale_approval_is_not_shown_in_a_new_run() {
+        let mut pending = None;
+        assert!(!show_agent_approval(
+            &mut pending,
+            AgentRunId::new(2),
+            Some(request(1, 1))
+        ));
+        assert!(pending.is_none());
+        assert!(show_agent_approval(
+            &mut pending,
+            AgentRunId::new(2),
+            Some(request(2, 1))
+        ));
+        assert_eq!(pending.unwrap().run_id, AgentRunId::new(2));
+    }
+
+    #[test]
+    fn duplicate_decision_cannot_submit_again() {
+        let mut pending = Some(request(1, 1).into());
+        assert!(take_agent_approval_submission(
+            &mut pending,
+            Some(AgentRunId::new(1)),
+            ApprovalId::new(1),
+            AgentApprovalDecision::Approve,
+        )
+        .is_some());
+        assert!(take_agent_approval_submission(
+            &mut pending,
+            Some(AgentRunId::new(1)),
+            ApprovalId::new(1),
+            AgentApprovalDecision::Approve,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn new_request_replaces_resolved_approval() {
+        let mut pending = Some(request(1, 1).into());
+        assert!(take_agent_approval_submission(
+            &mut pending,
+            Some(AgentRunId::new(1)),
+            ApprovalId::new(1),
+            AgentApprovalDecision::Deny,
+        )
+        .is_some());
+        assert!(show_agent_approval(
+            &mut pending,
+            AgentRunId::new(1),
+            Some(request(1, 2))
+        ));
+        assert_eq!(pending.unwrap().approval_id, ApprovalId::new(2));
+    }
+
+    #[test]
+    fn chat_never_shows_agent_approval_ui() {
+        let pending = Some(request(1, 1).into());
+        assert!(!agent_approval_visible(AiPanelMode::Chat, &pending));
+        assert!(agent_approval_visible(AiPanelMode::Agent, &pending));
     }
 }
 
