@@ -1462,9 +1462,15 @@ mod tests {
         let mut provider = FakeProvider {
             scripts: vec![
                 Ok(vec![
-                    ProviderChatStreamEvent::ThinkingDelta("visible thought".into()),
-                    ProviderChatStreamEvent::ReasoningDelta("replay reasoning".into()),
+                    ProviderChatStreamEvent::ThinkingDelta("visible-a".into()),
+                    ProviderChatStreamEvent::ReasoningDelta("reasoning-a".into()),
                     tool_call("call-1", "read_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ThinkingDelta("visible-b".into()),
+                    ProviderChatStreamEvent::ReasoningDelta("reasoning-b".into()),
+                    tool_call("call-2", "read_file"),
                     ProviderChatStreamEvent::Done,
                 ]),
                 Ok(vec![
@@ -1476,23 +1482,219 @@ mod tests {
             requests: Vec::new(),
         };
         let mut tools = FakeTools {
-            outcomes: vec![Ok(ToolOutcome::Success("contents".into()))],
+            outcomes: vec![
+                Ok(ToolOutcome::Success("contents-a".into())),
+                Ok(ToolOutcome::Success("contents-b".into())),
+            ],
             calls: Vec::new(),
         };
-        let mut run = AgentRun::new(AgentRunId::new(45), AgentBudget::new(2, 1));
+        let mut run = AgentRun::new(AgentRunId::new(45), AgentBudget::new(3, 2));
         let mut events = Vec::new();
         let result = AgentExecutor::new(&mut provider, &mut tools)
             .execute(&mut run, request(), &mut |event| events.push(event))
             .unwrap();
 
-        assert_eq!(result.thinking, "visible thought");
-        assert!(events.iter().any(|event| matches!(
+        assert_eq!(result.thinking, "visible-avisible-b");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ThinkingDelta { .. }))
+                .count(),
+            2
+        );
+        assert!(!events.iter().any(|event| matches!(
             event,
-            AgentEvent::ThinkingDelta { delta, .. } if delta == "visible thought"
+            AgentEvent::ThinkingDelta { delta, .. }
+                if delta.contains("reasoning")
         )));
-        assert_eq!(provider.requests[1].messages[1].reasoning.as_deref(), Some("replay reasoning"));
-        assert_eq!(result.messages()[1].reasoning.as_deref(), Some("replay reasoning"));
+        assert_eq!(
+            provider.requests[1].messages[1].reasoning.as_deref(),
+            Some("reasoning-a")
+        );
+        assert_eq!(
+            provider.requests[1].messages[1].tool_calls[0].id.as_deref(),
+            Some("call-1")
+        );
+        assert_eq!(
+            result.messages()[1].reasoning.as_deref(),
+            Some("reasoning-a")
+        );
+        assert_eq!(
+            result.messages()[3].reasoning.as_deref(),
+            Some("reasoning-b")
+        );
         assert_eq!(result.messages()[1].content, "");
+        assert!(provider.requests[2].tools.is_none());
+        assert!(
+            provider.requests[2]
+                .messages
+                .iter()
+                .all(|message| !matches!(message.role, ChatRole::Assistant | ChatRole::Tool))
+        );
+        assert!(
+            provider.requests[2]
+                .messages
+                .iter()
+                .all(|message| message.reasoning.is_none() && message.tool_calls.is_empty())
+        );
+    }
+
+    #[test]
+    fn multiple_tool_rounds_preserve_reasoning_by_turn() {
+        let mut provider = FakeProvider {
+            scripts: vec![
+                Ok(vec![
+                    ProviderChatStreamEvent::ThinkingDelta("visible-a".into()),
+                    ProviderChatStreamEvent::ReasoningDelta("reasoning-a".into()),
+                    tool_call("call-1", "read_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ThinkingDelta("visible-b".into()),
+                    ProviderChatStreamEvent::ReasoningDelta("reasoning-b".into()),
+                    tool_call("call-2", "read_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ReasoningDelta("reasoning-c".into()),
+                    tool_call("call-3", "read_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ContentDelta("done".into()),
+                    ProviderChatStreamEvent::Done,
+                ]),
+            ],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: vec![
+                Ok(ToolOutcome::Success("contents-a".into())),
+                Ok(ToolOutcome::Success("contents-b".into())),
+                Ok(ToolOutcome::Success("contents-c".into())),
+            ],
+            calls: Vec::new(),
+        };
+        let mut run = AgentRun::new(AgentRunId::new(46), AgentBudget::new(4, 3));
+        let mut events = Vec::new();
+        let result = AgentExecutor::new(&mut provider, &mut tools)
+            .execute(&mut run, request(), &mut |event| events.push(event))
+            .unwrap();
+
+        assert_eq!(result.thinking, "visible-avisible-b");
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ThinkingDelta { delta, .. }
+                if delta.contains("reasoning")
+        )));
+        assert_eq!(
+            provider.requests[1].messages[1].reasoning.as_deref(),
+            Some("reasoning-a")
+        );
+        assert_eq!(
+            provider.requests[2].messages[1].reasoning.as_deref(),
+            Some("reasoning-a")
+        );
+        assert_eq!(
+            provider.requests[2].messages[3].reasoning.as_deref(),
+            Some("reasoning-b")
+        );
+        assert_eq!(
+            result
+                .messages()
+                .iter()
+                .filter_map(|message| message.reasoning.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["reasoning-a", "reasoning-b", "reasoning-c"]
+        );
+        assert_eq!(tools.calls, vec!["read_file", "read_file", "read_file"]);
+        assert!(provider.requests[3].tools.is_none());
+        assert!(
+            provider.requests[3]
+                .messages
+                .iter()
+                .all(|message| !matches!(message.role, ChatRole::Assistant | ChatRole::Tool))
+        );
+        assert!(
+            provider.requests[3]
+                .messages
+                .iter()
+                .all(|message| message.reasoning.is_none() && message.tool_calls.is_empty())
+        );
+    }
+
+    #[test]
+    fn provider_local_reasoning_is_isolated_between_runs() {
+        let mut provider = FakeProvider {
+            scripts: vec![
+                Ok(vec![
+                    ProviderChatStreamEvent::ReasoningDelta("run-a reasoning".into()),
+                    tool_call("run-a-call", "read_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ContentDelta("run-a done".into()),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ReasoningDelta("run-b reasoning".into()),
+                    tool_call("run-b-call", "read_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ContentDelta("run-b done".into()),
+                    ProviderChatStreamEvent::Done,
+                ]),
+            ],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: vec![
+                Ok(ToolOutcome::Success("run-a result".into())),
+                Ok(ToolOutcome::Success("run-b result".into())),
+            ],
+            calls: Vec::new(),
+        };
+        let mut run_a = AgentRun::new(AgentRunId::new(47), AgentBudget::new(2, 1));
+        let mut run_b = AgentRun::new(AgentRunId::new(48), AgentBudget::new(2, 1));
+        let mut events_a = Vec::new();
+        let mut events_b = Vec::new();
+        let mut executor = AgentExecutor::new(&mut provider, &mut tools);
+        let result_a = executor
+            .execute(&mut run_a, request(), &mut |event| events_a.push(event))
+            .unwrap();
+        let result_b = executor
+            .execute(&mut run_b, request(), &mut |event| events_b.push(event))
+            .unwrap();
+
+        assert_eq!(
+            result_a.messages()[1].reasoning.as_deref(),
+            Some("run-a reasoning")
+        );
+        assert_eq!(
+            result_b.messages()[1].reasoning.as_deref(),
+            Some("run-b reasoning")
+        );
+        assert!(
+            !result_b
+                .messages()
+                .iter()
+                .any(|message| message.reasoning.as_deref() == Some("run-a reasoning"))
+        );
+        assert!(
+            provider.requests[2..]
+                .iter()
+                .flat_map(|request| request.messages.iter())
+                .all(|message| message.reasoning.as_deref() != Some("run-a reasoning"))
+        );
+        assert!(events_a.iter().all(|event| event.run_id() == run_a.id()));
+        assert!(events_b.iter().all(|event| event.run_id() == run_b.id()));
+        assert!(is_stale_event(&events_a[0], run_b.id()));
+        assert!(!is_stale_event(&events_b[0], run_b.id()));
+        assert!(!run_a.cancel());
+        assert_eq!(run_b.state(), AgentState::Completed);
     }
 
     #[test]
@@ -1660,6 +1862,11 @@ mod tests {
                     ProviderChatStreamEvent::Done,
                 ]),
                 Ok(vec![
+                    ProviderChatStreamEvent::ReasoningDelta("continuation reasoning".into()),
+                    tool_call("followup-1", "write_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
                     ProviderChatStreamEvent::ContentDelta("approved".into()),
                     ProviderChatStreamEvent::Done,
                 ]),
@@ -1668,16 +1875,24 @@ mod tests {
             requests: Vec::new(),
         };
         let mut tools = FakeTools {
-            outcomes: vec![Ok(ToolOutcome::Success("fetched".into()))],
+            outcomes: vec![
+                Ok(ToolOutcome::Success("fetched".into())),
+                Ok(ToolOutcome::Success("must not run".into())),
+            ],
             calls: Vec::new(),
         };
         let policy = ScriptedPolicy {
-            decisions: vec![ToolPolicyDecision::RequireApproval {
-                reason: "network access".into(),
-            }],
+            decisions: vec![
+                ToolPolicyDecision::RequireApproval {
+                    reason: "network access".into(),
+                },
+                ToolPolicyDecision::Deny {
+                    reason: "write access".into(),
+                },
+            ],
             calls: Arc::new(Mutex::new(Vec::new())),
         };
-        let mut run = AgentRun::new(AgentRunId::new(39), AgentBudget::new(2, 1));
+        let mut run = AgentRun::new(AgentRunId::new(39), AgentBudget::new(3, 2));
         let mut events = Vec::new();
         let mut executor = AgentExecutor::with_policy(&mut provider, &mut tools, policy);
         let error = executor
@@ -1715,11 +1930,47 @@ mod tests {
             Err(AgentExecutionError::Approval(ApprovalError::NotPending))
         ));
         assert_eq!(tools.calls, vec!["fetch_url"]);
-        assert_eq!(provider.calls, 2);
-        assert_eq!(provider.requests[1].messages[1].reasoning.as_deref(), Some("approval reasoning"));
-        assert_eq!(run.usage().provider_turns, 2);
-        assert_eq!(run.usage().tool_calls, 1);
+        assert_eq!(provider.calls, 3);
+        assert_eq!(
+            provider.requests[1].messages[1].reasoning.as_deref(),
+            Some("approval reasoning")
+        );
+        assert_eq!(
+            provider.requests[1].messages[1].tool_calls[0].id.as_deref(),
+            Some("approval-1")
+        );
+        assert_eq!(
+            result.messages()[3].reasoning.as_deref(),
+            Some("continuation reasoning")
+        );
+        assert_eq!(run.usage().provider_turns, 3);
+        assert_eq!(run.usage().tool_calls, 2);
         assert_eq!(run.state(), AgentState::Completed);
+        assert!(provider.requests[2].tools.is_none());
+        assert!(
+            provider.requests[2]
+                .messages
+                .iter()
+                .all(|message| !matches!(message.role, ChatRole::Assistant | ChatRole::Tool))
+        );
+        assert!(
+            provider.requests[2]
+                .messages
+                .iter()
+                .all(|message| message.reasoning.is_none() && message.tool_calls.is_empty())
+        );
+        assert!(provider.requests[2].messages.iter().any(|message| {
+            matches!(message.role, ChatRole::System)
+                && message.content.contains("fetched")
+                && message.content.contains("denied by policy")
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ApprovalRequested { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1732,6 +1983,11 @@ mod tests {
                     ProviderChatStreamEvent::Done,
                 ]),
                 Ok(vec![
+                    ProviderChatStreamEvent::ReasoningDelta("continuation reasoning".into()),
+                    tool_call("followup-1", "write_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
                     ProviderChatStreamEvent::ContentDelta("denied".into()),
                     ProviderChatStreamEvent::Done,
                 ]),
@@ -1740,16 +1996,24 @@ mod tests {
             requests: Vec::new(),
         };
         let mut tools = FakeTools {
-            outcomes: vec![Ok(ToolOutcome::Success("must not run".into()))],
+            outcomes: vec![
+                Ok(ToolOutcome::Success("must not run".into())),
+                Ok(ToolOutcome::Success("must not run".into())),
+            ],
             calls: Vec::new(),
         };
         let policy = ScriptedPolicy {
-            decisions: vec![ToolPolicyDecision::RequireApproval {
-                reason: "needs confirmation".into(),
-            }],
+            decisions: vec![
+                ToolPolicyDecision::RequireApproval {
+                    reason: "needs confirmation".into(),
+                },
+                ToolPolicyDecision::Deny {
+                    reason: "write access".into(),
+                },
+            ],
             calls: Arc::new(Mutex::new(Vec::new())),
         };
-        let mut run = AgentRun::new(AgentRunId::new(40), AgentBudget::new(2, 1));
+        let mut run = AgentRun::new(AgentRunId::new(40), AgentBudget::new(3, 2));
         let mut executor = AgentExecutor::with_policy(&mut provider, &mut tools, policy);
         let approval = match executor
             .execute(&mut run, request(), &mut |_| {})
@@ -1764,12 +2028,39 @@ mod tests {
 
         assert_eq!(result.content, "denied");
         assert!(tools.calls.is_empty());
-        assert_eq!(run.usage().tool_calls, 1);
+        assert_eq!(provider.calls, 3);
+        assert_eq!(run.usage().provider_turns, 3);
+        assert_eq!(run.usage().tool_calls, 2);
         assert!(result.messages().iter().any(|message| {
             matches!(message.role, ChatRole::Tool)
                 && message.content.contains("denied by approval decision")
         }));
-        assert_eq!(provider.requests[1].messages[1].reasoning.as_deref(), Some("deny reasoning"));
+        assert_eq!(
+            provider.requests[1].messages[1].reasoning.as_deref(),
+            Some("deny reasoning")
+        );
+        assert_eq!(
+            result.messages()[3].reasoning.as_deref(),
+            Some("continuation reasoning")
+        );
+        assert!(provider.requests[2].tools.is_none());
+        assert!(
+            provider.requests[2]
+                .messages
+                .iter()
+                .all(|message| !matches!(message.role, ChatRole::Assistant | ChatRole::Tool))
+        );
+        assert!(
+            provider.requests[2]
+                .messages
+                .iter()
+                .all(|message| message.reasoning.is_none() && message.tool_calls.is_empty())
+        );
+        assert!(provider.requests[2].messages.iter().any(|message| {
+            matches!(message.role, ChatRole::System)
+                && message.content.contains("denied by approval decision")
+                && message.content.contains("denied by policy")
+        }));
     }
 
     #[test]

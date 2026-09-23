@@ -1160,6 +1160,10 @@ mod tests {
             ProviderChatStreamEvent::ThinkingDelta(_)
         ));
         assert!(matches!(
+            ProviderChatStreamEvent::ReasoningDelta("x".into()),
+            ProviderChatStreamEvent::ReasoningDelta(_)
+        ));
+        assert!(matches!(
             ProviderChatStreamEvent::ContentDelta("x".into()),
             ProviderChatStreamEvent::ContentDelta(_)
         ));
@@ -1188,6 +1192,7 @@ mod tests {
                     ProviderChatStreamEvent::Done => done_count += 1,
                     ProviderChatStreamEvent::ToolCall(_) => {}
                     ProviderChatStreamEvent::ThinkingDelta(_) => {}
+                    ProviderChatStreamEvent::ReasoningDelta(_) => {}
                 }
                 Ok(())
             })
