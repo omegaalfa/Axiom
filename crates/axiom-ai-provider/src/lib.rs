@@ -122,6 +122,11 @@ pub struct ProviderToolCall {
 pub struct ProviderChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Provider-local reasoning needed to replay an assistant turn.
+    /// This is never user-visible and is optional for providers that do not
+    /// require reasoning history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -146,6 +151,9 @@ pub struct ProviderChatResponse {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProviderChatStreamEvent {
     ThinkingDelta(String),
+    /// Reasoning intended for provider-local history replay. Adapters may
+    /// also emit ThinkingDelta when the same reasoning should be presented.
+    ReasoningDelta(String),
     ContentDelta(String),
     ToolCall(ProviderToolCall),
     Done,
@@ -958,6 +966,7 @@ mod tests {
             messages: vec![ProviderChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                reasoning: None,
                 tool_call_id: None,
                 tool_calls: Vec::new(),
             }],
@@ -969,6 +978,24 @@ mod tests {
         assert_eq!(value["think"], true);
         assert_eq!(value["messages"][0]["content"], "hi");
         assert!(value.get("tools").is_none());
+    }
+
+    #[test]
+    fn provider_reasoning_is_optional_and_stays_on_provider_message() {
+        let message = ProviderChatMessage {
+            role: ChatRole::Assistant,
+            content: String::new(),
+            reasoning: Some("provider-local plan".into()),
+            tool_call_id: None,
+            tool_calls: vec![ProviderToolCall {
+                id: Some("call-1".into()),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "README.md"}),
+            }],
+        };
+        let value = serde_json::to_value(message).unwrap();
+        assert_eq!(value["reasoning"], "provider-local plan");
+        assert_eq!(value["role"], "Assistant");
     }
 
     #[test]
@@ -1051,6 +1078,35 @@ mod tests {
     }
 
     #[test]
+    fn textual_tool_markup_is_content_not_a_structured_tool_call() {
+        let value = serde_json::json!({
+            "message": {
+                "content": "<tool_call><function=></function></tool_call>",
+                "tool_calls": []
+            },
+            "done": true
+        });
+        let mut events = Vec::new();
+        let mut done = false;
+        emit_chat_value_events(&value, &mut done, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(ProviderChatStreamEvent::ContentDelta(content))
+                if content.contains("<tool_call>")
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderChatStreamEvent::ToolCall(_)))
+        );
+        assert!(matches!(events.last(), Some(ProviderChatStreamEvent::Done)));
+    }
+
+    #[test]
     fn provider_neutral_tool_contracts_preserve_definition_call_and_result_message() {
         let definition = ProviderToolDefinition {
             name: "read_file".into(),
@@ -1070,6 +1126,7 @@ mod tests {
             messages: vec![ProviderChatMessage {
                 role: ChatRole::Assistant,
                 content: String::new(),
+                reasoning: None,
                 tool_call_id: None,
                 tool_calls: vec![call.clone()],
             }],
@@ -1081,6 +1138,7 @@ mod tests {
         let result_message = ProviderChatMessage {
             role: ChatRole::Tool,
             content: "README contents".into(),
+            reasoning: None,
             tool_call_id: Some("call-1".into()),
             tool_calls: Vec::new(),
         };

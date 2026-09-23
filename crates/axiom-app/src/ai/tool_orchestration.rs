@@ -191,6 +191,7 @@ pub(crate) fn run_read_file_round_trip(
         let assistant = ProviderChatMessage {
             role: axiom_ai_provider::ChatRole::Assistant,
             content: String::new(),
+            reasoning: None,
             tool_call_id: None,
             tool_calls: calls.clone(),
         };
@@ -237,6 +238,7 @@ pub(crate) fn run_read_file_round_trip(
             messages.push(ProviderChatMessage {
                 role: axiom_ai_provider::ChatRole::Tool,
                 content: tool_result_content(&result, &call.name),
+                reasoning: None,
                 tool_call_id: call.id,
                 tool_calls: Vec::new(),
             });
@@ -508,6 +510,7 @@ mod tests {
             messages: vec![ProviderChatMessage {
                 role: ChatRole::User,
                 content: "read README".into(),
+                reasoning: None,
                 tool_call_id: None,
                 tool_calls: Vec::new(),
             }],

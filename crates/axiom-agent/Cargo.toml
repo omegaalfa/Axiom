@@ -1,0 +1,13 @@
+[package]
+name = "axiom-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless lifecycle contracts for Axiom agent runs"
+
+[dependencies]
+axiom-ai-provider = { path = "../axiom-ai-provider" }
+
+[dev-dependencies]
+serde_json.workspace = true

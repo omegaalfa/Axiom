@@ -480,6 +480,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "axiom-agent"
+version = "0.1.0"
+dependencies = [
+ "axiom-ai-provider",
+ "serde_json",
+]
+
+[[package]]
 name = "axiom-ai-provider"
 version = "0.1.0"
 dependencies = [
@@ -494,6 +502,7 @@ name = "axiom-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axiom-agent",
  "axiom-ai-provider",
  "axiom-editor",
  "axiom-index",

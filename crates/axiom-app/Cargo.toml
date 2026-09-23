@@ -24,6 +24,7 @@ axiom-index = { path = "../axiom-index" }
 axiom-syntax = { path = "../axiom-syntax" }
 axiom-terminal = { path = "../axiom-terminal" }
 axiom-ai-provider = { path = "../axiom-ai-provider" }
+axiom-agent = { path = "../axiom-agent" }
 axiom-web = { path = "../axiom-web" }
 anyhow.workspace = true
 tracing.workspace = true

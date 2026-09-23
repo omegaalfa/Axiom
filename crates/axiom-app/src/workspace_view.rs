@@ -40,10 +40,13 @@ use gpui::{
 };
 
 use crate::{
-    ai::context::{ContextMessage, ContextRole, ContextSnapshot, ContextSource, ContextSourceKind},
     ai::tool_orchestration::{
         fetch_url_definition, list_directory_definition, read_file_definition,
         run_read_file_round_trip,
+    },
+    ai::{
+        agent_bridge::{self, AgentEventQueue},
+        context::{ContextMessage, ContextRole, ContextSnapshot, ContextSource, ContextSourceKind},
     },
     editor_view::EditorView,
     lsp_bridge::{IdeLspEvent, LspBridge, LspRequestKind},
@@ -702,6 +705,15 @@ struct ChatUiMessage {
     thinking: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentUiMessage {
+    id: u64,
+    run_id: Option<axiom_agent::AgentRunId>,
+    role: ChatRole,
+    content: String,
+    thinking: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ChatConversation {
     id: u64,
@@ -839,6 +851,7 @@ fn provider_messages_from_context(context: ContextSnapshot) -> Vec<ProviderChatM
                 ContextRole::System => ChatRole::System,
             },
             content: message.content,
+            reasoning: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
         })
@@ -851,6 +864,49 @@ fn provider_messages_from_context(context: ContextSnapshot) -> Vec<ProviderChatM
         message.content = envelope;
     }
     messages
+}
+
+fn provider_messages_from_agent_session(messages: &[AgentUiMessage]) -> Vec<ProviderChatMessage> {
+    messages
+        .iter()
+        .filter(|message| {
+            matches!(message.role, ChatRole::User | ChatRole::Assistant)
+                && !(message.role == ChatRole::Assistant && message.content.is_empty())
+        })
+        .map(|message| ProviderChatMessage {
+            role: message.role.clone(),
+            content: message.content.clone(),
+            reasoning: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        })
+        .collect()
+}
+
+fn apply_agent_message_event(
+    messages: &mut [AgentUiMessage],
+    event: &axiom_agent::AgentEvent,
+) -> bool {
+    let (run_id, delta, thinking) = match event {
+        axiom_agent::AgentEvent::ThinkingDelta { run_id, delta } => (*run_id, delta, true),
+        axiom_agent::AgentEvent::ContentDelta { run_id, delta } => (*run_id, delta, false),
+        _ => return false,
+    };
+    let Some(message) = messages
+        .iter_mut()
+        .find(|message| message.run_id == Some(run_id) && message.role == ChatRole::Assistant)
+    else {
+        return false;
+    };
+    if thinking {
+        message
+            .thinking
+            .get_or_insert_with(String::new)
+            .push_str(delta);
+    } else {
+        message.content.push_str(delta);
+    }
+    true
 }
 
 fn context_snapshot_from_chat_messages(messages: &[ChatUiMessage]) -> ContextSnapshot {
@@ -871,6 +927,26 @@ fn context_snapshot_from_chat_messages(messages: &[ChatUiMessage]) -> ContextSna
             message.content.clone(),
         ))
     }))
+}
+
+fn append_chat_turn(messages: &mut Vec<ChatUiMessage>, next_id: &mut u64, content: String) -> u64 {
+    let user_id = *next_id;
+    *next_id += 1;
+    messages.push(ChatUiMessage {
+        id: user_id,
+        role: ChatRole::User,
+        content,
+        thinking: None,
+    });
+    let assistant_id = *next_id;
+    *next_id += 1;
+    messages.push(ChatUiMessage {
+        id: assistant_id,
+        role: ChatRole::Assistant,
+        content: String::new(),
+        thinking: Some(String::new()),
+    });
+    assistant_id
 }
 
 fn context_source_from_editor_values(
@@ -924,6 +1000,36 @@ enum ChatRequestState {
     Idle,
     Sending,
     Error(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AiPanelMode {
+    Chat,
+    Agent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentUiState {
+    Idle,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+fn agent_loading_visible(state: AgentUiState) -> bool {
+    state == AgentUiState::Running
+}
+
+fn agent_failure_status(diagnostic: &axiom_agent::AgentFailureDiagnostic) -> String {
+    let category = match diagnostic.kind {
+        axiom_agent::AgentFailureKind::Provider => "provider",
+        axiom_agent::AgentFailureKind::Tool => "tool",
+        axiom_agent::AgentFailureKind::BudgetExceeded => "budget",
+        axiom_agent::AgentFailureKind::Transition => "transition",
+        axiom_agent::AgentFailureKind::Infrastructure => "infrastructure",
+    };
+    format!("Agent {category} failure: {}", diagnostic.message)
 }
 
 fn should_send_ai_on_enter(active: ActiveTextInput, text: &str, state: &ChatRequestState) -> bool {
@@ -1145,6 +1251,16 @@ pub struct WorkspaceView {
     chat_stream_events: Arc<Mutex<Vec<ChatStreamEvent>>>,
     chat_cancel_token: Option<Arc<AtomicBool>>,
     chat_copy_notice: Option<u64>,
+    ai_panel_mode: AiPanelMode,
+    agent_ui_state: AgentUiState,
+    agent_run_id: Option<axiom_agent::AgentRunId>,
+    agent_cancellation: Option<axiom_agent::Cancellation>,
+    agent_events: AgentEventQueue,
+    agent_messages: Vec<AgentUiMessage>,
+    agent_next_message_id: u64,
+    agent_copy_notice: Option<u64>,
+    agent_scroll_handle: ScrollHandle,
+    agent_status: Option<String>,
     chat_context_sources: Vec<ContextSource>,
     chat_context_feedback: Option<String>,
     chat_scroll_handle: ScrollHandle,
@@ -2215,6 +2331,16 @@ impl WorkspaceView {
             chat_stream_events: Arc::new(Mutex::new(Vec::new())),
             chat_cancel_token: None,
             chat_copy_notice: None,
+            ai_panel_mode: AiPanelMode::Chat,
+            agent_ui_state: AgentUiState::Idle,
+            agent_run_id: None,
+            agent_cancellation: None,
+            agent_events: Arc::new(Mutex::new(Vec::new())),
+            agent_messages: Vec::new(),
+            agent_next_message_id: 1,
+            agent_copy_notice: None,
+            agent_scroll_handle: ScrollHandle::new(),
+            agent_status: None,
             chat_context_sources: Vec::new(),
             chat_context_feedback: None,
             chat_scroll_handle: ScrollHandle::new(),
@@ -2419,6 +2545,7 @@ impl WorkspaceView {
                         let poll_started = Instant::now();
                         this.poll_lsp(cx);
                         this.poll_chat_stream(cx);
+                        this.poll_agent_events(cx);
                         let lsp_us = poll_started.elapsed().as_micros();
                         if this.index_results.is_some() {
                             this.indexing_phase = this.indexing_phase.wrapping_add(6) % 100;
@@ -5187,6 +5314,7 @@ impl WorkspaceView {
                         changed = true;
                     }
                 }
+                ProviderChatStreamEvent::ReasoningDelta(_) => {}
                 ProviderChatStreamEvent::ContentDelta(delta) => {
                     if let Some(id) = self
                         .chat_messages
@@ -5252,7 +5380,240 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn poll_agent_events(&mut self, cx: &mut Context<Self>) {
+        let Some(active_id) = self.agent_run_id else {
+            return;
+        };
+        let follow = self.agent_is_near_bottom();
+        let events = self
+            .agent_events
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default();
+        let mut changed = false;
+        for event in events {
+            if event.run_id() != active_id {
+                continue;
+            }
+            if matches!(
+                self.agent_ui_state,
+                AgentUiState::Completed | AgentUiState::Cancelled | AgentUiState::Failed
+            ) && !matches!(
+                event,
+                axiom_agent::AgentEvent::Completed { .. }
+                    | axiom_agent::AgentEvent::Cancelled { .. }
+                    | axiom_agent::AgentEvent::Failed { .. }
+            ) {
+                continue;
+            }
+            if matches!(
+                event,
+                axiom_agent::AgentEvent::ThinkingDelta { .. }
+                    | axiom_agent::AgentEvent::ContentDelta { .. }
+            ) {
+                apply_agent_message_event(&mut self.agent_messages, &event);
+            }
+            match event {
+                axiom_agent::AgentEvent::RunStarted { .. }
+                | axiom_agent::AgentEvent::ModelStarted { .. } => {
+                    self.agent_ui_state = AgentUiState::Running;
+                    self.agent_status = None;
+                }
+                axiom_agent::AgentEvent::ThinkingDelta { .. }
+                | axiom_agent::AgentEvent::ContentDelta { .. } => {}
+                axiom_agent::AgentEvent::ToolRequested { .. } => {
+                    self.agent_status = Some("Tool requested".into())
+                }
+                axiom_agent::AgentEvent::ApprovalRequested { .. } => {
+                    self.agent_status = Some("Waiting for approval".into())
+                }
+                axiom_agent::AgentEvent::ToolStarted { .. } => {
+                    self.agent_status = Some("Running tool".into())
+                }
+                axiom_agent::AgentEvent::ToolCompleted { succeeded, .. } => {
+                    self.agent_status = Some(
+                        if succeeded {
+                            "Tool completed"
+                        } else {
+                            "Tool returned an error"
+                        }
+                        .into(),
+                    )
+                }
+                axiom_agent::AgentEvent::Finalizing { .. } => {
+                    self.agent_status = Some("Finalizing".into())
+                }
+                axiom_agent::AgentEvent::Completed { .. } => {
+                    self.agent_ui_state = AgentUiState::Completed;
+                    self.agent_status = None;
+                    self.agent_cancellation = None;
+                }
+                axiom_agent::AgentEvent::Cancelled { .. } => {
+                    self.agent_ui_state = AgentUiState::Cancelled;
+                    self.agent_status = Some("Agent run cancelled".into());
+                    self.agent_cancellation = None;
+                }
+                axiom_agent::AgentEvent::Failed { diagnostic, .. } => {
+                    self.agent_ui_state = AgentUiState::Failed;
+                    self.agent_status = Some(agent_failure_status(&diagnostic));
+                    self.agent_cancellation = None;
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            if follow && matches!(self.agent_ui_state, AgentUiState::Running) {
+                self.agent_scroll_handle.scroll_to_bottom();
+            }
+            cx.notify();
+        }
+    }
+
+    fn agent_is_near_bottom(&self) -> bool {
+        let max_offset = self.agent_scroll_handle.max_offset().height;
+        if max_offset <= px(0.) {
+            return true;
+        }
+        let offset = self.agent_scroll_handle.offset().y;
+        (-offset - max_offset).abs() <= px(6.)
+    }
+
+    fn stop_agent_run(&mut self, cx: &mut Context<Self>) {
+        let Some(cancellation) = self.agent_cancellation.take() else {
+            return;
+        };
+        cancellation.cancel();
+        self.agent_ui_state = AgentUiState::Cancelled;
+        self.agent_status = Some("Agent run cancelled".into());
+        self.agent_run_id = None;
+        cx.notify();
+    }
+
+    fn send_agent_message(&mut self, cx: &mut Context<Self>) {
+        let content = self.ai_composer_text.trim().to_owned();
+        if content.is_empty() || matches!(self.agent_ui_state, AgentUiState::Running) {
+            return;
+        }
+        if self.provider_config_target != "Ollama"
+            || self.model_label.trim().is_empty()
+            || self.model_label == "Model"
+            || self.provider_base_url.text.trim().is_empty()
+        {
+            self.agent_ui_state = AgentUiState::Failed;
+            self.agent_status = Some("Ollama provider/model unavailable".into());
+            cx.notify();
+            return;
+        }
+        let tools_enabled = self.selected_model_supports_tools();
+        let root = self
+            .project
+            .as_ref()
+            .map(|project| project.root_path().to_path_buf());
+        if tools_enabled && root.is_none() {
+            self.agent_ui_state = AgentUiState::Failed;
+            self.agent_status = Some("Open a project before using Agent tools".into());
+            cx.notify();
+            return;
+        }
+        let registry = if tools_enabled {
+            let root = root.as_ref().expect("checked above");
+            let Ok(read) = axiom_project::project_read::ProjectReadCapability::new(root) else {
+                self.agent_ui_state = AgentUiState::Failed;
+                self.agent_status = Some("Agent workspace is unavailable".into());
+                cx.notify();
+                return;
+            };
+            let Ok(directory) =
+                axiom_project::project_directory::ProjectDirectoryCapability::new(root)
+            else {
+                self.agent_ui_state = AgentUiState::Failed;
+                self.agent_status = Some("Agent workspace is unavailable".into());
+                cx.notify();
+                return;
+            };
+            Some(crate::ai::tools::ToolRegistry::new_with_fetch_url(
+                read,
+                directory,
+                axiom_web::FetchUrlCapability::new(),
+            ))
+        } else {
+            None
+        };
+        let run_id = agent_bridge::next_agent_run_id();
+        let budget = axiom_agent::AgentBudget::new(5, 16);
+        let mut run = axiom_agent::AgentRun::new(run_id, budget);
+        let cancellation = run.cancellation();
+        self.agent_run_id = Some(run_id);
+        self.agent_cancellation = Some(cancellation.clone());
+        self.agent_ui_state = AgentUiState::Running;
+        self.agent_status = None;
+        let user_id = self.agent_next_message_id;
+        self.agent_next_message_id += 1;
+        self.agent_messages.push(AgentUiMessage {
+            id: user_id,
+            run_id: None,
+            role: ChatRole::User,
+            content: content.clone(),
+            thinking: None,
+        });
+        self.agent_scroll_handle.scroll_to_bottom();
+        let assistant_id = self.agent_next_message_id;
+        self.agent_next_message_id += 1;
+        self.agent_messages.push(AgentUiMessage {
+            id: assistant_id,
+            run_id: Some(run_id),
+            role: ChatRole::Assistant,
+            content: String::new(),
+            thinking: Some(String::new()),
+        });
+        self.ai_composer_text.clear();
+        let tools = tools_enabled.then(agent_bridge::read_only_tool_definitions);
+        let request = ProviderChatRequest {
+            model: self.model_label.clone(),
+            messages: provider_messages_from_agent_session(&self.agent_messages),
+            think: self
+                .selected_model_supports_thinking()
+                .then_some(self.chat_thinking_enabled),
+            tools,
+        };
+        let base_url = self.provider_base_url.text.clone();
+        let queue = self.agent_events.clone();
+        let entity = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = gpui::background_executor()
+                .spawn(async move {
+                    agent_bridge::execute_agent_run(&mut run, request, base_url, registry, &queue)
+                })
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.agent_run_id != Some(run_id) {
+                    return;
+                }
+                if let Err(error) = result {
+                    let cancelled = matches!(error, axiom_agent::AgentExecutionError::Cancelled);
+                    this.agent_status = Some(if cancelled {
+                        "Agent run cancelled".into()
+                    } else {
+                        agent_failure_status(&error.diagnostic())
+                    });
+                    if cancelled {
+                        this.agent_ui_state = AgentUiState::Cancelled;
+                    } else {
+                        this.agent_ui_state = AgentUiState::Failed;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn send_ai_chat_message(&mut self, cx: &mut Context<Self>) {
+        if self.ai_panel_mode == AiPanelMode::Agent {
+            self.send_agent_message(cx);
+            return;
+        }
         let content = self.ai_composer_text.clone();
         if content.trim().is_empty() || matches!(self.chat_request_state, ChatRequestState::Sending)
         {
@@ -5268,17 +5629,15 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
-        self.chat_messages.push(ChatUiMessage {
-            id: self.chat_next_message_id,
-            role: ChatRole::User,
+        let assistant_id = append_chat_turn(
+            &mut self.chat_messages,
+            &mut self.chat_next_message_id,
             content,
-            thinking: None,
-        });
+        );
         self.chat_auto_follow = true;
         self.chat_scroll_handle.scroll_to_bottom();
         self.chat_programmatic_scroll_pending = true;
         self.persist_chat_activity();
-        self.chat_next_message_id += 1;
         self.ai_composer_text.clear();
         self.ai_composer_selection = UTF16Selection {
             range: 0..0,
@@ -5287,14 +5646,6 @@ impl WorkspaceView {
         self.chat_request_state = ChatRequestState::Sending;
         let id = self.provider_request_tracker.begin();
         self.chat_current_request_id = Some(id);
-        let assistant_id = self.chat_next_message_id;
-        self.chat_next_message_id += 1;
-        self.chat_messages.push(ChatUiMessage {
-            id: assistant_id,
-            role: ChatRole::Assistant,
-            content: String::new(),
-            thinking: Some(String::new()),
-        });
         let cancel_token = Arc::new(AtomicBool::new(false));
         self.chat_cancel_token = Some(cancel_token.clone());
         let base_url = self.provider_base_url.text.clone();
@@ -7033,6 +7384,183 @@ impl WorkspaceView {
             )
     }
 
+    fn show_agent_copy_notice(&mut self, message_id: u64, cx: &mut Context<Self>) {
+        self.agent_copy_notice = Some(message_id);
+        let entity = cx.entity();
+        cx.notify();
+        cx.spawn(async move |_, cx| {
+            Timer::after(std::time::Duration::from_millis(1400)).await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.agent_copy_notice == Some(message_id) {
+                    this.agent_copy_notice = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn render_agent_conversation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let assistant_label = if self.model_label.trim().is_empty() || self.model_label == "Model" {
+            "Axiom".to_owned()
+        } else {
+            self.model_label.clone()
+        };
+        div()
+            .id("ai-agent-conversation")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.agent_scroll_handle)
+            .p_3()
+            .text_color(t.text_secondary)
+            .when(self.agent_messages.is_empty(), |this| {
+                this.items_center()
+                    .justify_center()
+                    .child("Start an agent task")
+            })
+            .children(self.agent_messages.iter().map(|message| {
+                let message_id = message.id;
+                let message_content = message.content.clone();
+                div()
+                    .id(SharedString::from(format!("ai-agent-message-{message_id}")))
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .when(message.role == ChatRole::User, |this| {
+                        this.bg(t.editor_background)
+                            .rounded(metrics().border_radius_small)
+                            .px_2()
+                            .py_1()
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_color(if message.role == ChatRole::Assistant {
+                                t.accent
+                            } else {
+                                t.text_primary
+                            })
+                            .child(if message.role == ChatRole::Assistant {
+                                axiom_icon(t.accent)
+                            } else {
+                                user_icon(t.text_muted)
+                            })
+                            .child(if message.role == ChatRole::Assistant {
+                                assistant_label.clone()
+                            } else {
+                                "You".to_owned()
+                            }),
+                    )
+                    .when_some(
+                        (message.role == ChatRole::Assistant
+                            && message
+                                .thinking
+                                .as_ref()
+                                .is_some_and(|thinking| !thinking.trim().is_empty()))
+                        .then(|| message.thinking.clone().unwrap()),
+                        |this, thinking| {
+                            this.child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .bg(t.elevated_surface)
+                                    .text_color(t.text_muted)
+                                    .child(render_thinking_text(&thinking, t.text_muted)),
+                            )
+                        },
+                    )
+                    .child(match message.role {
+                        ChatRole::Assistant => render_assistant_markdown(&message.content, cx),
+                        _ => div().w_full().min_w_0().child(message.content.clone()),
+                    })
+                    .when(message.role == ChatRole::Assistant, |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .mt_1()
+                                .px_1()
+                                .when(self.agent_copy_notice == Some(message_id), |this| {
+                                    this.child(
+                                        div()
+                                            .px_1()
+                                            .text_size(px(11.))
+                                            .text_color(t.accent)
+                                            .child("Copied"),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "ai-agent-copy-message-{message_id}"
+                                        )))
+                                        .px_1()
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(move |s| s.bg(t.hover))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                message_content.clone(),
+                                            ));
+                                            this.show_agent_copy_notice(message_id, cx);
+                                            this.status = "Copied".into();
+                                        }))
+                                        .tooltip(|_, cx| tooltip("Copy message", cx))
+                                        .child("⧉"),
+                                ),
+                        )
+                    })
+            }))
+            .when(agent_loading_visible(self.agent_ui_state), |this| {
+                this.child(
+                    div()
+                        .id("ai-agent-generating-indicator")
+                        .text_color(t.text_muted)
+                        .child("Generating…"),
+                )
+            })
+            .when_some(self.agent_status.clone(), |this, status| {
+                this.child(div().text_color(t.text_muted).child(status))
+            })
+    }
+
+    fn is_ai_generation_active(&self) -> bool {
+        match self.ai_panel_mode {
+            AiPanelMode::Chat => matches!(self.chat_request_state, ChatRequestState::Sending),
+            AiPanelMode::Agent => matches!(self.agent_ui_state, AgentUiState::Running),
+        }
+    }
+
+    fn switch_ai_panel_mode(&mut self, mode: AiPanelMode, cx: &mut Context<Self>) {
+        if self.ai_panel_mode == mode {
+            return;
+        }
+        self.ai_panel_mode = mode;
+        if mode == AiPanelMode::Chat {
+            self.chat_scroll_handle.scroll_to_bottom();
+            self.chat_auto_follow = true;
+            self.chat_scroll_observed = false;
+            self.chat_programmatic_scroll_pending = true;
+        } else {
+            self.agent_scroll_handle.scroll_to_bottom();
+        }
+        cx.notify();
+    }
+
+    fn stop_ai_generation(&mut self, cx: &mut Context<Self>) {
+        if self.ai_panel_mode == AiPanelMode::Agent {
+            self.stop_agent_run(cx);
+        } else {
+            self.stop_ai_chat_generation(cx);
+        }
+    }
+
     fn render_ai_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
@@ -7103,146 +7631,179 @@ impl WorkspaceView {
                     .border_color(t.border_subtle)
                     .child(
                         div()
+                            .id("ai-chat-tab")
+                            .cursor(CursorStyle::PointingHand)
                             .px_3()
                             .py_1()
                             .rounded(m.border_radius_small)
-                            .bg(t.inactive_selection)
+                            .when(self.ai_panel_mode == AiPanelMode::Chat, |this| {
+                                this.bg(t.inactive_selection)
+                            })
                             .text_color(t.text_primary)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.switch_ai_panel_mode(AiPanelMode::Chat, cx);
+                            }))
                             .child("Chat"),
                     )
                     .child(
                         div()
+                            .id("ai-agent-tab")
                             .px_3()
                             .py_1()
                             .rounded(m.border_radius_small)
+                            .cursor(CursorStyle::PointingHand)
+                            .when(self.ai_panel_mode == AiPanelMode::Agent, |this| {
+                                this.bg(t.inactive_selection)
+                            })
                             .text_color(t.text_muted)
                             .hover(move |s| s.bg(t.hover).text_color(t.text_primary))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.switch_ai_panel_mode(AiPanelMode::Agent, cx);
+                            }))
                             .child("Agent"),
                     ),
             )
-            .when(self.chat_history_open, |this| {
-                this.child(
-                    div()
-                        .id("ai-chat-history-list")
-                        .max_h(px(180.))
-                        .overflow_y_scroll()
-                        .p_2()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .children(self.chat_conversations.iter().map(|chat| {
-                            let id = chat.id;
-                            let renaming = self.renaming_conversation_id == Some(id);
-                            div()
-                                .id(SharedString::from(format!("ai-chat-history-{}", id)))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .px_2()
-                                .py_1()
-                                .when(id == self.active_chat_id, |this| {
-                                    this.bg(t.inactive_selection).text_color(t.text_primary)
-                                })
-                                .hover(move |s| s.bg(t.hover))
-                                .on_click(cx.listener(move |this, _, _, cx| this.open_chat(id, cx)))
-                                .when(renaming, |this| {
-                                    this.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "ai-chat-rename-{}",
-                                                id
-                                            )))
-                                            .key_context("SingleLineInput")
-                                            .cursor(CursorStyle::IBeam)
-                                            .on_action(cx.listener(Self::input_backspace))
-                                            .on_action(cx.listener(Self::input_delete))
-                                            .on_action(cx.listener(Self::input_left))
-                                            .on_action(cx.listener(Self::input_right))
-                                            .on_action(cx.listener(Self::input_home))
-                                            .on_action(cx.listener(Self::input_end))
-                                            .on_action(cx.listener(Self::input_select_all))
-                                            .on_action(cx.listener(Self::input_select_left))
-                                            .on_action(cx.listener(Self::input_select_right))
-                                            .on_action(cx.listener(Self::input_select_home))
-                                            .on_action(cx.listener(Self::input_select_end))
-                                            .on_action(cx.listener(Self::input_copy))
-                                            .on_action(cx.listener(Self::input_cut))
-                                            .on_action(cx.listener(Self::input_paste))
-                                            .on_action(cx.listener(Self::input_enter))
-                                            .on_action(cx.listener(Self::input_escape))
-                                            .track_focus(&self.chat_rename_focus)
-                                            .overflow_hidden()
-                                            .h(px(28.))
-                                            .flex_1()
-                                            .px_1()
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.active_text_input =
-                                                        ActiveTextInput::AiHistoryRename;
-                                                    window.focus(&this.chat_rename_focus);
-                                                    cx.notify();
-                                                }),
-                                            )
-                                            .child(crate::ui::input_line::render_state(
-                                                cx.entity(),
-                                                &self.chat_rename_input,
-                                            )),
+            .when(
+                self.chat_history_open && self.ai_panel_mode == AiPanelMode::Chat,
+                |this| {
+                    this.child(
+                        div()
+                            .id("ai-chat-history-list")
+                            .max_h(px(180.))
+                            .overflow_y_scroll()
+                            .p_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .children(self.chat_conversations.iter().map(|chat| {
+                                let id = chat.id;
+                                let renaming = self.renaming_conversation_id == Some(id);
+                                div()
+                                    .id(SharedString::from(format!("ai-chat-history-{}", id)))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .px_2()
+                                    .py_1()
+                                    .when(id == self.active_chat_id, |this| {
+                                        this.bg(t.inactive_selection).text_color(t.text_primary)
+                                    })
+                                    .hover(move |s| s.bg(t.hover))
+                                    .on_click(
+                                        cx.listener(move |this, _, _, cx| this.open_chat(id, cx)),
                                     )
-                                })
-                                .when(!renaming, |this| this.child(chat.title.clone()))
-                                .when(!renaming, |this| {
-                                    this.child(
+                                    .when(renaming, |this| {
+                                        this.child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "ai-chat-rename-{}",
+                                                    id
+                                                )))
+                                                .key_context("SingleLineInput")
+                                                .cursor(CursorStyle::IBeam)
+                                                .on_action(cx.listener(Self::input_backspace))
+                                                .on_action(cx.listener(Self::input_delete))
+                                                .on_action(cx.listener(Self::input_left))
+                                                .on_action(cx.listener(Self::input_right))
+                                                .on_action(cx.listener(Self::input_home))
+                                                .on_action(cx.listener(Self::input_end))
+                                                .on_action(cx.listener(Self::input_select_all))
+                                                .on_action(cx.listener(Self::input_select_left))
+                                                .on_action(cx.listener(Self::input_select_right))
+                                                .on_action(cx.listener(Self::input_select_home))
+                                                .on_action(cx.listener(Self::input_select_end))
+                                                .on_action(cx.listener(Self::input_copy))
+                                                .on_action(cx.listener(Self::input_cut))
+                                                .on_action(cx.listener(Self::input_paste))
+                                                .on_action(cx.listener(Self::input_enter))
+                                                .on_action(cx.listener(Self::input_escape))
+                                                .track_focus(&self.chat_rename_focus)
+                                                .overflow_hidden()
+                                                .h(px(28.))
+                                                .flex_1()
+                                                .px_1()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.active_text_input =
+                                                            ActiveTextInput::AiHistoryRename;
+                                                        window.focus(&this.chat_rename_focus);
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(crate::ui::input_line::render_state(
+                                                    cx.entity(),
+                                                    &self.chat_rename_input,
+                                                )),
+                                        )
+                                    })
+                                    .when(!renaming, |this| this.child(chat.title.clone()))
+                                    .when(!renaming, |this| {
+                                        this.child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "ai-chat-rename-button-{}",
+                                                    id
+                                                )))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.begin_chat_rename(id, window, cx)
+                                                    },
+                                                ))
+                                                .child("✎"),
+                                        )
+                                    })
+                                    .child(
                                         div()
                                             .id(SharedString::from(format!(
-                                                "ai-chat-rename-button-{}",
+                                                "ai-chat-delete-{}",
                                                 id
                                             )))
                                             .cursor(CursorStyle::PointingHand)
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.begin_chat_rename(id, window, cx)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.delete_chat(id, cx)
                                             }))
-                                            .child("✎"),
+                                            .child("×"),
                                     )
-                                })
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("ai-chat-delete-{}", id)))
-                                        .cursor(CursorStyle::PointingHand)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.delete_chat(id, cx)
-                                        }))
-                                        .child("×"),
-                                )
-                        })),
-                )
+                            })),
+                    )
+                },
+            )
+            .when(self.ai_panel_mode == AiPanelMode::Chat, |this| {
+                this.child(self.render_ai_chat_conversation(cx))
             })
-            .child(self.render_ai_chat_conversation(cx))
-            .when(!self.chat_messages.is_empty(), |this| {
-                this.child(
-                    div()
-                        .id("ai-scroll-to-latest")
-                        .absolute()
-                        .bottom(px(92.))
-                        .right_3()
-                        .w(m.icon_size + px(12.))
-                        .h(m.icon_size + px(12.))
-                        .rounded(px(999.))
-                        .bg(t.elevated_surface)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor(CursorStyle::PointingHand)
-                        .hover(move |s| s.bg(t.hover))
-                        .tooltip(|_, cx| tooltip("Scroll to latest", cx))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.jump_chat_to_latest(cx);
-                        }))
-                        .child(arrow_down_icon(t.accent)),
-                )
+            .when(self.ai_panel_mode == AiPanelMode::Agent, |this| {
+                this.child(self.render_agent_conversation(cx))
             })
+            .when(
+                !self.chat_messages.is_empty() && self.ai_panel_mode == AiPanelMode::Chat,
+                |this| {
+                    this.child(
+                        div()
+                            .id("ai-scroll-to-latest")
+                            .absolute()
+                            .bottom(px(92.))
+                            .right_3()
+                            .w(m.icon_size + px(12.))
+                            .h(m.icon_size + px(12.))
+                            .rounded(px(999.))
+                            .bg(t.elevated_surface)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(move |s| s.bg(t.hover))
+                            .tooltip(|_, cx| tooltip("Scroll to latest", cx))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.jump_chat_to_latest(cx);
+                            }))
+                            .child(arrow_down_icon(t.accent)),
+                    )
+                },
+            )
             .when(
                 matches!(self.chat_request_state, ChatRequestState::Sending),
                 |this| {
@@ -7511,29 +8072,18 @@ impl WorkspaceView {
                                             .id("ai-send-button")
                                             .px_2()
                                             .rounded(m.border_radius_small)
-                                            .when(
-                                                matches!(
-                                                    self.chat_request_state,
-                                                    ChatRequestState::Sending
-                                                ),
-                                                |this| {
-                                                    this.cursor(CursorStyle::PointingHand)
-                                                        .text_color(t.accent)
-                                                        .hover(move |s| s.bg(t.hover))
-                                                        .tooltip(|_, cx| {
-                                                            tooltip("Stop generating", cx)
-                                                        })
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.stop_ai_chat_generation(cx)
-                                                        }))
-                                                },
-                                            )
+                                            .when(self.is_ai_generation_active(), |this| {
+                                                this.cursor(CursorStyle::PointingHand)
+                                                    .text_color(t.accent)
+                                                    .hover(move |s| s.bg(t.hover))
+                                                    .tooltip(|_, cx| tooltip("Stop generating", cx))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.stop_ai_generation(cx)
+                                                    }))
+                                            })
                                             .when(
                                                 !self.ai_composer_text.trim().is_empty()
-                                                    && !matches!(
-                                                        self.chat_request_state,
-                                                        ChatRequestState::Sending
-                                                    ),
+                                                    && !self.is_ai_generation_active(),
                                                 |this| {
                                                     this.cursor(CursorStyle::PointingHand)
                                                         .text_color(t.accent)
@@ -7543,20 +8093,12 @@ impl WorkspaceView {
                                                         }))
                                                 },
                                             )
-                                            .when(
-                                                matches!(
-                                                    self.chat_request_state,
-                                                    ChatRequestState::Sending
-                                                ),
-                                                |this| this.child(stop_icon(t.accent)),
-                                            )
-                                            .when(
-                                                !matches!(
-                                                    self.chat_request_state,
-                                                    ChatRequestState::Sending
-                                                ),
-                                                |this| this.child("↑"),
-                                            ),
+                                            .when(self.is_ai_generation_active(), |this| {
+                                                this.child(stop_icon(t.accent))
+                                            })
+                                            .when(!self.is_ai_generation_active(), |this| {
+                                                this.child("↑")
+                                            }),
                                     ),
                             ),
                     ),
@@ -12862,7 +13404,7 @@ fn tab_display_path(path: &Path, project_root: Option<&Path>, runtime_root: &Pat
 mod chat_history_tests {
     use super::{
         ChatRequestState, ChatRole, ChatUiMessage, ContextMessage, ContextRole, ContextSnapshot,
-        ContextSource, ContextSourceKind, context_snapshot_from_chat_messages,
+        ContextSource, ContextSourceKind, append_chat_turn, context_snapshot_from_chat_messages,
         context_source_from_editor_values, context_source_ui_label, generate_chat_title,
         provider_messages_from_context, stop_chat_request, truncate_context_label,
     };
@@ -12876,6 +13418,23 @@ mod chat_history_tests {
         assert_eq!(state, ChatRequestState::Idle);
         assert_eq!(request, None);
         assert!(!stop_chat_request(&mut state, &mut request));
+    }
+
+    #[test]
+    fn chat_turns_are_inserted_as_user_then_owned_assistant() {
+        let mut messages = Vec::new();
+        let mut next_id = 1;
+        let first = append_chat_turn(&mut messages, &mut next_id, "bom dia 1".into());
+        let second = append_chat_turn(&mut messages, &mut next_id, "bom dia 2".into());
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, ChatRole::User);
+        assert_eq!(messages[0].content, "bom dia 1");
+        assert_eq!(messages[1].role, ChatRole::Assistant);
+        assert_eq!(messages[1].id, first);
+        assert_eq!(messages[2].role, ChatRole::User);
+        assert_eq!(messages[3].role, ChatRole::Assistant);
+        assert_eq!(messages[3].id, second);
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -13068,6 +13627,122 @@ mod chat_history_tests {
         let snapshot = context_snapshot_from_chat_messages(&messages);
         assert_eq!(snapshot.messages.len(), 2);
         assert_eq!(snapshot.messages[1].content, "resposta");
+    }
+}
+
+#[cfg(test)]
+mod agent_session_tests {
+    use super::{
+        AgentUiMessage, AgentUiState, ChatRole, agent_failure_status, agent_loading_visible,
+        apply_agent_message_event, provider_messages_from_agent_session,
+    };
+    use axiom_agent::{AgentEvent, AgentFailureDiagnostic, AgentFailureKind, AgentRunId};
+
+    fn session() -> Vec<AgentUiMessage> {
+        vec![
+            AgentUiMessage {
+                id: 1,
+                run_id: None,
+                role: ChatRole::User,
+                content: "Inspect axiom-agent".into(),
+                thinking: None,
+            },
+            AgentUiMessage {
+                id: 2,
+                run_id: Some(AgentRunId::new(1)),
+                role: ChatRole::Assistant,
+                content: "First answer".into(),
+                thinking: Some("hidden reasoning".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn subsequent_send_preserves_order_and_uses_a_new_run_owner() {
+        let mut messages = session();
+        messages.push(AgentUiMessage {
+            id: 3,
+            run_id: None,
+            role: ChatRole::User,
+            content: "Explain its cancellation model".into(),
+            thinking: None,
+        });
+        messages.push(AgentUiMessage {
+            id: 4,
+            run_id: Some(AgentRunId::new(2)),
+            role: ChatRole::Assistant,
+            content: String::new(),
+            thinking: Some(String::new()),
+        });
+        assert_eq!(messages.len(), 4);
+        assert_ne!(messages[1].run_id, messages[3].run_id);
+        assert!(apply_agent_message_event(
+            &mut messages,
+            &AgentEvent::ContentDelta {
+                run_id: AgentRunId::new(2),
+                delta: "Second answer".into(),
+            }
+        ));
+        assert_eq!(messages[1].content, "First answer");
+        assert_eq!(messages[3].content, "Second answer");
+    }
+
+    #[test]
+    fn stale_event_cannot_mutate_a_different_assistant() {
+        let mut messages = session();
+        messages.push(AgentUiMessage {
+            id: 3,
+            run_id: Some(AgentRunId::new(2)),
+            role: ChatRole::Assistant,
+            content: "Second".into(),
+            thinking: Some(String::new()),
+        });
+        assert!(!apply_agent_message_event(
+            &mut messages,
+            &AgentEvent::ContentDelta {
+                run_id: AgentRunId::new(99),
+                delta: "late".into(),
+            }
+        ));
+        assert_eq!(messages[1].content, "First answer");
+        assert_eq!(messages[2].content, "Second");
+    }
+
+    #[test]
+    fn provider_context_contains_only_visible_user_and_assistant_text() {
+        let messages = session();
+        let provider = provider_messages_from_agent_session(&messages);
+        assert_eq!(provider.len(), 2);
+        assert_eq!(provider[0].role, ChatRole::User);
+        assert_eq!(provider[1].content, "First answer");
+        assert!(!provider[1].content.contains("hidden reasoning"));
+        assert!(
+            provider
+                .iter()
+                .all(|message| message.tool_call_id.is_none())
+        );
+        assert!(provider.iter().all(|message| message.tool_calls.is_empty()));
+    }
+
+    #[test]
+    fn failed_status_preserves_safe_category_and_message() {
+        let diagnostic = AgentFailureDiagnostic {
+            kind: AgentFailureKind::Tool,
+            message: "tool execution failed: path is a directory".into(),
+        };
+        assert_eq!(
+            agent_failure_status(&diagnostic),
+            "Agent tool failure: tool execution failed: path is a directory"
+        );
+    }
+
+    #[test]
+    fn agent_loading_is_visible_only_while_running() {
+        assert!(agent_loading_visible(AgentUiState::Running));
+        assert!(!agent_loading_visible(AgentUiState::Idle));
+        assert!(!agent_loading_visible(AgentUiState::Completed));
+        assert!(!agent_loading_visible(AgentUiState::Cancelled));
+        assert!(!agent_loading_visible(AgentUiState::Failed));
     }
 }
 

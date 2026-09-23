@@ -11,6 +11,7 @@ members = [
     "crates/axiom-ai-provider",
     "crates/axiom-web",
     "crates/axiom-index",
+    "crates/axiom-agent",
 ]
 
 [workspace.package]
