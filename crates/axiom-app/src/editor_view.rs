@@ -1852,11 +1852,10 @@ impl EditorView {
             })
     }
 
-    fn completion_replacement_range(&self) -> Range<usize> {
+    fn completion_replacement_range(&self, content: &str) -> Range<usize> {
         if self.document.selection_offsets().is_some() {
             return self.selected_range();
         }
-        let content = self.document.content();
         let cursor = self.document.cursor_offset().min(content.len());
         let start = content[..cursor]
             .char_indices()
@@ -3940,13 +3939,17 @@ impl EditorView {
         };
         let replacement = self.replace.query.clone();
         self.document.replace_range(range.clone(), &replacement);
+        let replacement_end = self.document.cursor_offset();
         self.after_edit(cx);
+        let text = self.document.content();
+        self.find.refresh(&text);
+        self.find_revision = self.document.buffer_revision();
         if !self.find.matches.is_empty() {
             let next = self
                 .find
                 .matches
                 .iter()
-                .position(|candidate| candidate.start >= range.start + replacement.len())
+                .position(|candidate| candidate.start >= replacement_end)
                 .unwrap_or(0);
             self.find.current = Some(next);
             self.select_find_match(self.find.matches[next].clone(), cx);
@@ -4181,11 +4184,25 @@ impl EditorView {
             .as_ref()
             .map(|lsp| lsp.encoding())
             .unwrap_or_default();
-        let formatted = axiom_lsp::apply_text_edits(&self.document.content(), edits, encoding);
-        let cursor = self.document.cursor_offset();
+        let selection = self.document.selection();
+        let (anchor, active) = selection.first().map_or_else(
+            || {
+                let cursor = self.document.cursor_offset();
+                (cursor, cursor)
+            },
+            |region| (region.start, region.end),
+        );
+        let text = self.document.content();
+        let (formatted, mapped_offsets) = axiom_lsp::apply_text_edits_with_offsets(
+            &text,
+            edits,
+            encoding,
+            &[anchor, active],
+        );
         self.document.select_all();
         self.document.insert_text(&formatted);
-        self.document.move_cursor(cursor.min(formatted.len()));
+        self.document
+            .set_selection(mapped_offsets[0], mapped_offsets[1]);
         self.after_edit(cx);
         self.status = Some("Code reformatted".into());
     }
@@ -4209,30 +4226,39 @@ impl EditorView {
         let Some(item) = self.completions.get(self.completion_selected).cloned() else {
             return;
         };
+        let content = self.document.content();
+        let encoding = self
+            .lsp
+            .as_ref()
+            .map(|lsp| lsp.encoding())
+            .unwrap_or_default();
         let (range, mut text) = match item.text_edit {
-            Some(CompletionTextEdit::Edit(edit)) => {
-                (self.lsp_range_to_bytes(edit.range), edit.new_text)
-            }
+            Some(CompletionTextEdit::Edit(edit)) => (
+                Self::lsp_range_to_bytes_in(&content, edit.range, encoding),
+                edit.new_text,
+            ),
             Some(CompletionTextEdit::InsertAndReplace(edit)) => {
-                (self.lsp_range_to_bytes(edit.replace), edit.new_text)
+                (
+                    Self::lsp_range_to_bytes_in(&content, edit.replace, encoding),
+                    edit.new_text,
+                )
             }
             None => (
-                self.completion_replacement_range(),
+                self.completion_replacement_range(&content),
                 item.insert_text.unwrap_or_else(|| item.label.clone()),
             ),
         };
         if item.insert_text_format == Some(InsertTextFormat::SNIPPET) {
             text = strip_snippet_placeholders(&text);
         }
-        let content_before = self.document.content();
         let call_like = matches!(
             item.kind,
             Some(CompletionItemKind::FUNCTION)
                 | Some(CompletionItemKind::METHOD)
                 | Some(CompletionItemKind::CONSTRUCTOR)
         ) || (item.kind == Some(CompletionItemKind::CLASS)
-            && content_before[..range.start].trim_end().ends_with("new"));
-        let has_open = content_before[range.end..].starts_with('(')
+            && content[..range.start].trim_end().ends_with("new"));
+        let has_open = content[range.end..].starts_with('(')
             || text.ends_with('(')
             || text.ends_with(')')
             || text.contains("()");
@@ -4240,14 +4266,8 @@ impl EditorView {
             text.push('(');
             text.push(')');
         }
-        let inserted_text = text.clone();
+        let caret_inside_parentheses = call_like && text.ends_with("()");
         let mut edits = item.additional_text_edits.unwrap_or_default();
-        let encoding = self
-            .lsp
-            .as_ref()
-            .map(|lsp| lsp.encoding())
-            .unwrap_or_default();
-        let content = self.document.content();
         let main_range = lsp_types::Range::new(
             PositionCodec::offset_to_position(&content, range.start, encoding),
             PositionCodec::offset_to_position(&content, range.end, encoding),
@@ -4256,28 +4276,19 @@ impl EditorView {
             range: main_range,
             new_text: text,
         });
-        let updated = axiom_lsp::apply_text_edits(&content, &edits, encoding);
+        let (updated, mapped_offsets) = axiom_lsp::apply_text_edits_with_offsets(
+            &content,
+            &edits,
+            encoding,
+            &[range.end],
+        );
+        let mut caret = mapped_offsets[0].min(updated.len());
+        if caret_inside_parentheses {
+            caret = caret.saturating_sub(1);
+        }
         self.document.select_all();
         self.document.insert_text(&updated);
-        let inserted = if call_like {
-            inserted_text.trim_end_matches(')')
-        } else {
-            inserted_text.as_str()
-        };
-        // Search from the edited range. Searching the whole document can
-        // select an earlier identical call and leave the caret inside an old
-        // completion context, causing the same item to reappear on the next
-        // Enter/newline.
-        let search_start = range.start.min(updated.len());
-        if let Some(relative) = updated[search_start..].find(inserted) {
-            let position = search_start + relative;
-            let caret = if call_like && inserted_text.ends_with("()") {
-                position + inserted_text.len() - 1
-            } else {
-                position + inserted_text.len()
-            };
-            self.document.move_cursor(caret.min(updated.len()));
-        }
+        self.document.set_selection(caret, caret);
         self.completions.clear();
         self.after_edit(cx);
     }
@@ -4289,8 +4300,16 @@ impl EditorView {
             .as_ref()
             .map(|lsp| lsp.encoding())
             .unwrap_or_default();
-        PositionCodec::position_to_offset(&text, range.start, encoding)
-            ..PositionCodec::position_to_offset(&text, range.end, encoding)
+        Self::lsp_range_to_bytes_in(&text, range, encoding)
+    }
+
+    fn lsp_range_to_bytes_in(
+        text: &str,
+        range: lsp_types::Range,
+        encoding: PositionEncoding,
+    ) -> Range<usize> {
+        PositionCodec::position_to_offset(text, range.start, encoding)
+            ..PositionCodec::position_to_offset(text, range.end, encoding)
     }
 
     pub fn set_completions(&mut self, items: Vec<CompletionItem>, cx: &mut Context<Self>) {
@@ -4345,16 +4364,20 @@ impl EditorView {
     fn mouse_offset(&self, line: usize, x: Pixels, window: &mut Window) -> usize {
         let text = self.document.line_content(line);
         let text = trim_eol(text.as_ref());
-        let viewport_left = self.scroll.0.borrow().base_handle.bounds().left();
+        let scroll = self.scroll.0.borrow();
+        let viewport_left = scroll.base_handle.bounds().left();
+        let scroll_x = scroll.base_handle.offset().x;
+        let viewport_left: f32 = viewport_left.into();
+        let scroll_x: f32 = scroll_x.into();
         let local_x = px(axiom_app::interaction::text_local_x(
             x.into(),
-            viewport_left.into(),
+            viewport_left + scroll_x,
             GUTTER_WIDTH + TEXT_PADDING,
         ));
         self.document.offset_of_line(line)
             + self
                 .line_layout(line, text, window)
-                .closest_index_for_x(local_x)
+                .closest_boundary_index_for_x(local_x)
     }
 
     fn line_layout(&self, line: usize, text: &str, window: &mut Window) -> gpui::ShapedLine {
@@ -7132,6 +7155,34 @@ fn shape(window: &mut Window, text: &str) -> gpui::ShapedLine {
     window.text_system().shape_line(text, px(14.), &[run], None)
 }
 
+trait ShapedLineMouseHitTest {
+    fn closest_boundary_index_for_x(&self, x: Pixels) -> usize;
+}
+
+impl ShapedLineMouseHitTest for gpui::ShapedLine {
+    fn closest_boundary_index_for_x(&self, x: Pixels) -> usize {
+        let x: f32 = x.into();
+        let mut nearest_index = 0;
+        let mut nearest_distance = x.abs();
+        for run in &self.runs {
+            for glyph in &run.glyphs {
+                let glyph_x: f32 = glyph.position.x.into();
+                let distance = (glyph_x - x).abs();
+                if distance < nearest_distance {
+                    nearest_index = glyph.index.min(self.len);
+                    nearest_distance = distance;
+                }
+            }
+        }
+        let width: f32 = self.width.into();
+        if (width - x).abs() < nearest_distance {
+            nearest_index = self.len;
+        }
+        debug_assert!(nearest_index <= self.len);
+        nearest_index
+    }
+}
+
 #[cfg(test)]
 mod completion_ranking_tests {
     use super::{
@@ -7294,6 +7345,183 @@ mod completion_ranking_tests {
 
 #[cfg(test)]
 mod formatter_tests {
+    fn shaped_line_boundaries(layout: &gpui::ShapedLine) -> Vec<usize> {
+        let mut boundaries = vec![0, layout.len];
+        for run in &layout.runs {
+            boundaries.extend(run.glyphs.iter().map(|glyph| glyph.index));
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries
+    }
+
+    fn diagnose_mouse_offset(
+        cx: &mut gpui::VisualTestContext,
+        source: &str,
+        offsets: &[usize],
+        scroll_x: f32,
+        boundary_failures: &mut Vec<String>,
+        midpoint_failures: &mut Vec<String>,
+    ) {
+        let path = std::path::PathBuf::from(format!(
+            "mouse-offset-diagnostic-{}.php",
+            source.len()
+        ));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_document(
+                path,
+                axiom_editor::Document::from_content(source),
+                None,
+                cx,
+            )
+        });
+        view.update_in(cx, |editor, window, _| {
+            editor
+                .scroll
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(gpui::point(gpui::px(scroll_x), gpui::px(0.)));
+            let layout = editor.line_layout(0, source, window);
+            let viewport_left: f32 = editor
+                .scroll
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+                .left()
+                .into();
+            let actual_scroll_x: f32 = editor
+                .scroll
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .x
+                .into();
+            let pointer_x = |text_x: f32| {
+                gpui::px(
+                    viewport_left
+                        + super::GUTTER_WIDTH
+                        + super::TEXT_PADDING
+                        + text_x
+                        + actual_scroll_x,
+                )
+            };
+
+            for offset in offsets {
+                let text_x: f32 = layout.x_for_index(*offset).into();
+                let actual = editor.mouse_offset(0, pointer_x(text_x), window);
+                if actual != *offset {
+                    boundary_failures.push(format!(
+                        "{source:?} scroll_x={actual_scroll_x} offset={offset} text_x={text_x} actual={actual}"
+                    ));
+                }
+            }
+
+            if scroll_x == 0.0 {
+                let boundaries = shaped_line_boundaries(&layout);
+                for boundary in &boundaries {
+                    if !source.is_char_boundary(*boundary) {
+                        boundary_failures.push(format!(
+                            "{source:?} shaped boundary={boundary} is not a UTF-8 boundary"
+                        ));
+                    }
+                }
+                for pair in boundaries.windows(2) {
+                    let left = pair[0];
+                    let right = pair[1];
+                    let left_x: f32 = layout.x_for_index(left).into();
+                    let right_x: f32 = layout.x_for_index(right).into();
+                    if right_x <= left_x {
+                        continue;
+                    }
+                    let midpoint = (left_x + right_x) / 2.0;
+                    let before = editor.mouse_offset(0, pointer_x(midpoint - 0.01), window);
+                    let after = editor.mouse_offset(0, pointer_x(midpoint + 0.01), window);
+                    if before != left {
+                        midpoint_failures.push(format!(
+                            "{source:?} bytes={left}..{right} before midpoint expected={left} actual={before}"
+                        ));
+                    }
+                    if after != right {
+                        midpoint_failures.push(format!(
+                            "{source:?} bytes={left}..{right} after midpoint expected={right} actual={after}"
+                        ));
+                    }
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn editor_mouse_offset_layout_diagnostic(cx: &mut gpui::TestAppContext) {
+        let ascii = "$trait = new TraitService();";
+        let unicode = "José";
+        let ascii_offsets = [
+            0,
+            ascii.find("trait").unwrap() + 2,
+            ascii.find(" =").unwrap(),
+            ascii.find(" =").unwrap() + 1,
+            ascii.find("TraitService").unwrap(),
+            ascii.find("TraitService").unwrap() + 5,
+            ascii.find(';').unwrap(),
+            ascii.len(),
+        ];
+        let unicode_offsets = unicode
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain([unicode.len()])
+            .collect::<Vec<_>>();
+        let mut boundary_failures = Vec::new();
+        let mut midpoint_failures = Vec::new();
+        let mut horizontal_scroll_failures = Vec::new();
+
+        let cx = cx.add_empty_window();
+        diagnose_mouse_offset(
+            cx,
+            ascii,
+            &ascii_offsets,
+            0.0,
+            &mut boundary_failures,
+            &mut midpoint_failures,
+        );
+        diagnose_mouse_offset(
+            cx,
+            unicode,
+            &unicode_offsets,
+            0.0,
+            &mut boundary_failures,
+            &mut midpoint_failures,
+        );
+        diagnose_mouse_offset(
+            cx,
+            ascii,
+            &ascii_offsets,
+            -37.5,
+            &mut horizontal_scroll_failures,
+            &mut Vec::new(),
+        );
+
+        let mut failures = Vec::new();
+        if !boundary_failures.is_empty() {
+            failures.push(format!(
+                "without scroll:\n{}",
+                boundary_failures.join("\n")
+            ));
+        }
+        if !midpoint_failures.is_empty() {
+            failures.push(format!("midpoints:\n{}", midpoint_failures.join("\n")));
+        }
+        if !horizontal_scroll_failures.is_empty() {
+            failures.push(format!(
+                "horizontal scroll:\n{}",
+                horizontal_scroll_failures.join("\n")
+            ));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
     #[test]
     fn horizontal_content_range_includes_visual_end_padding_only() {
         let logical_width = 640.0_f32;
@@ -7567,15 +7795,227 @@ mod formatter_tests {
                     "{source}"
                 );
                 if !expected.is_empty() {
-                    assert_eq!(editor.completion_replacement_range(), cursor - 4..cursor);
+                    assert_eq!(editor.completion_replacement_range(source), cursor - 4..cursor);
                     editor.set_completions(batch.items, cx);
                     editor.accept_completion(cx);
                     let mut result = source.to_owned();
                     result.replace_range(cursor - 4..cursor, expected[0]);
                     assert_eq!(editor.document.content(), result);
+                    assert_eq!(
+                        editor.document.cursor_offset(),
+                        cursor - 4 + expected[0].len()
+                    );
                 }
             });
         }
+    }
+
+    fn completion_text_range(text: &str, start: usize, end: usize) -> lsp_types::Range {
+        lsp_types::Range::new(
+            axiom_lsp::PositionCodec::offset_to_position(
+                text,
+                start,
+                axiom_lsp::PositionEncoding::Utf16,
+            ),
+            axiom_lsp::PositionCodec::offset_to_position(
+                text,
+                end,
+                axiom_lsp::PositionEncoding::Utf16,
+            ),
+        )
+    }
+
+    #[gpui::test]
+    fn completion_caret_maps_main_and_additional_edits(cx: &mut gpui::TestAppContext) {
+        for (case, source, main_start, main_end, import_at, import_text, expected, expected_caret) in [
+            (
+                "import before repeated completion",
+                "<?php\nrun();\nru",
+                13,
+                15,
+                6,
+                "use Foo\\Bar;\n",
+                "<?php\nuse Foo\\Bar;\nrun();\nrun",
+                29,
+            ),
+            (
+                "import after completion",
+                "ru run();",
+                0,
+                2,
+                9,
+                "\nuse Later;\n",
+                "run run();\nuse Later;\n",
+                3,
+            ),
+            (
+                "repeated completion with later import",
+                "run(); Xru",
+                8,
+                10,
+                10,
+                "\nuse Z;\n",
+                "run(); Xrun\nuse Z;\n",
+                11,
+            ),
+        ] {
+            let item = CompletionItem {
+                label: "run".into(),
+                kind: Some(lsp_types::CompletionItemKind::VARIABLE),
+                text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                    range: completion_text_range(source, main_start, main_end),
+                    new_text: "run".into(),
+                })),
+                additional_text_edits: Some(vec![lsp_types::TextEdit {
+                    range: completion_text_range(source, import_at, import_at),
+                    new_text: import_text.into(),
+                }]),
+                ..Default::default()
+            };
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                EditorView::from_document(
+                    "completion-caret.php".into(),
+                    axiom_editor::Document::from_content(source),
+                    None,
+                    cx,
+                )
+            });
+            view.update(cx, |editor, cx| {
+                editor.set_completions(vec![item], cx);
+                editor.accept_completion(cx);
+                assert_eq!(editor.document.content(), expected, "{case}");
+                assert_eq!(editor.document.cursor_offset(), expected_caret, "{case}");
+                let selection = editor.document.selection();
+                let region = selection.first().expect("collapsed caret");
+                assert_eq!(
+                    (region.start, region.end),
+                    (expected_caret, expected_caret),
+                    "{case}"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn completion_call_caret_uses_mapped_main_end(cx: &mut gpui::TestAppContext) {
+        for inserted in ["foo", "foo()"] {
+            let source = "call ru";
+            let item = CompletionItem {
+                label: "foo".into(),
+                kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+                text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                    range: completion_text_range(source, 5, 7),
+                    new_text: inserted.into(),
+                })),
+                ..Default::default()
+            };
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                EditorView::from_document(
+                    "completion-call.php".into(),
+                    axiom_editor::Document::from_content(source),
+                    None,
+                    cx,
+                )
+            });
+            view.update(cx, |editor, cx| {
+                editor.set_completions(vec![item], cx);
+                editor.accept_completion(cx);
+                assert_eq!(editor.document.content(), "call foo()");
+                assert_eq!(editor.document.cursor_offset(), 9);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn completion_selection_collapses_to_fallback_caret(cx: &mut gpui::TestAppContext) {
+        let source = "pre ab post";
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut editor = EditorView::from_document(
+                "completion-selection.php".into(),
+                axiom_editor::Document::from_content(source),
+                None,
+                cx,
+            );
+            editor.document.set_selection(4, 6);
+            editor
+        });
+        let item = CompletionItem {
+            label: "done".into(),
+            insert_text: Some("done".into()),
+            ..Default::default()
+        };
+        view.update(cx, |editor, cx| {
+            editor.set_completions(vec![item], cx);
+            editor.accept_completion(cx);
+            assert_eq!(editor.document.content(), "pre done post");
+            assert_eq!(editor.document.cursor_offset(), 8);
+            let selection = editor.document.selection();
+            let region = selection.first().expect("collapsed caret");
+            assert_eq!((region.start, region.end), (8, 8));
+        });
+    }
+
+    #[gpui::test]
+    fn completion_insert_and_replace_uses_replace_range(cx: &mut gpui::TestAppContext) {
+        let source = "x ab y";
+        let item = CompletionItem {
+            label: "LONG".into(),
+            text_edit: Some(lsp_types::CompletionTextEdit::InsertAndReplace(
+                lsp_types::InsertReplaceEdit {
+                    new_text: "LONG".into(),
+                    insert: completion_text_range(source, 0, 1),
+                    replace: completion_text_range(source, 2, 4),
+                },
+            )),
+            ..Default::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_document(
+                "completion-insert-replace.php".into(),
+                axiom_editor::Document::from_content(source),
+                None,
+                cx,
+            )
+        });
+        view.update(cx, |editor, cx| {
+            editor.set_completions(vec![item], cx);
+            editor.accept_completion(cx);
+            assert_eq!(editor.document.content(), "x LONG y");
+            assert_eq!(editor.document.cursor_offset(), 6);
+        });
+    }
+
+    #[gpui::test]
+    fn completion_caret_handles_utf16_non_bmp_edits(cx: &mut gpui::TestAppContext) {
+        let source = "😀 x 😀 ru";
+        let main_start = source.rfind("ru").unwrap();
+        let item = CompletionItem {
+            label: "done".into(),
+            text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range: completion_text_range(source, main_start, source.len()),
+                new_text: "🌍done".into(),
+            })),
+            additional_text_edits: Some(vec![lsp_types::TextEdit {
+                range: completion_text_range(source, 0, 0),
+                new_text: "🚀use;\n".into(),
+            }]),
+            ..Default::default()
+        };
+        let expected = "🚀use;\n😀 x 😀 🌍done";
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_document(
+                "completion-unicode.php".into(),
+                axiom_editor::Document::from_content(source),
+                None,
+                cx,
+            )
+        });
+        view.update(cx, |editor, cx| {
+            editor.set_completions(vec![item], cx);
+            editor.accept_completion(cx);
+            assert_eq!(editor.document.content(), expected);
+            assert_eq!(editor.document.cursor_offset(), expected.len());
+        });
     }
 
     #[gpui::test]
@@ -7840,6 +8280,108 @@ mod formatter_tests {
             assert_eq!(editor.edit_generation, 3);
             assert_eq!(editor.find.refresh_count, 4);
         });
+    }
+
+    #[gpui::test]
+    fn replace_current_revalidates_next_match_ranges(cx: &mut gpui::TestAppContext) {
+        for (
+            case,
+            source,
+            replacement,
+            current,
+            expected_text,
+            expected_range,
+            expected_current,
+        ) in [
+            (
+                "larger replacement",
+                "foo foo",
+                "longer",
+                0,
+                "longer foo",
+                Some((6, 9)),
+                Some(0),
+            ),
+            (
+                "smaller replacement",
+                "foo foo",
+                "x",
+                0,
+                "x foo",
+                Some((2, 5)),
+                Some(0),
+            ),
+            (
+                "multiple occurrences",
+                "foo foo foo",
+                "x",
+                0,
+                "x foo foo",
+                Some((2, 5)),
+                Some(0),
+            ),
+            (
+                "last match wraps to remaining match",
+                "foo foo",
+                "x",
+                1,
+                "foo x",
+                Some((0, 3)),
+                Some(0),
+            ),
+            (
+                "utf-8 replacement",
+                "foo ação foo",
+                "🌍",
+                0,
+                "🌍 ação foo",
+                Some((12, 15)),
+                Some(0),
+            ),
+            (
+                "no remaining match",
+                "foo",
+                "x",
+                0,
+                "x",
+                None,
+                None,
+            ),
+        ] {
+            let (editor, cx) = cx.add_window_view(|window, cx| {
+                let mut editor = EditorView::from_document(
+                    "replace.txt".into(),
+                    axiom_editor::Document::from_content(source),
+                    None,
+                    cx,
+                );
+                editor.find.visible = true;
+                editor.find.replace_expanded = true;
+                editor.find.query = "foo".into();
+                editor.find.refresh(source);
+                editor.find_revision = editor.document.buffer_revision();
+                editor.replace.query = replacement.into();
+                editor.find.current = Some(current);
+                window.focus(&editor.replace_focus);
+                editor
+            });
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds("Replace").expect("rendered Replace button");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            editor.update(cx, |editor, _| {
+                let content = editor.document.content();
+                assert_eq!(content, expected_text, "{case}");
+                assert_eq!(editor.find.current, expected_current, "{case}");
+                assert_eq!(
+                    editor.find.current_match().map(|range| (range.start, range.end)),
+                    expected_range,
+                    "{case}"
+                );
+                if let Some((start, end)) = expected_range {
+                    assert_eq!(&content[start..end], "foo", "{case}");
+                }
+            });
+        }
     }
 
     #[gpui::test]
@@ -8473,6 +9015,84 @@ mod formatter_tests {
             );
             assert_eq!(editor.document.content(), "formatted\n");
         });
+    }
+
+    #[gpui::test]
+    fn lsp_formatting_restores_caret_and_selection_direction(cx: &mut gpui::TestAppContext) {
+        for (case, anchor, active, expected_anchor, expected_active) in [
+            ("caret", 2, 2, 4, 4),
+            ("forward selection", 2, 7, 4, 8),
+            ("reversed selection", 7, 2, 8, 4),
+        ] {
+            let path = std::path::PathBuf::from(format!("format-selection-{case}.php"));
+            let (view, cx) = cx.add_window_view(move |_, cx| {
+                EditorView::from_document(
+                    path,
+                    axiom_editor::Document::from_content("abcDEFghi"),
+                    None,
+                    cx,
+                )
+            });
+            view.update(cx, |editor, cx| {
+                let document_session = editor.document_session;
+                let document_revision = editor.edit_generation;
+                editor.document.set_selection(anchor, active);
+                editor.apply_formatting(
+                    &[
+                        lsp_types::TextEdit {
+                            range: lsp_types::Range::new(
+                                lsp_types::Position::new(0, 0),
+                                lsp_types::Position::new(0, 1),
+                            ),
+                            new_text: "111".into(),
+                        },
+                        lsp_types::TextEdit {
+                            range: lsp_types::Range::new(
+                                lsp_types::Position::new(0, 6),
+                                lsp_types::Position::new(0, 9),
+                            ),
+                            new_text: "x".into(),
+                        },
+                    ],
+                    document_session,
+                    document_revision,
+                    cx,
+                );
+                assert_eq!(editor.document.content(), "111bcDEFx", "{case}");
+                let selection = editor.document.selection();
+                let region = selection.first().expect("restored selection");
+                assert_eq!(
+                    (region.start, region.end),
+                    (expected_anchor, expected_active),
+                    "{case}"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn native_format_php_captures_real_manual_regression_output() {
+        let input = r#"<?php
+
+function exemplo($nome,$valor){
+if($valor>10){
+echo "Olá {$nome}";
+}
+}
+
+exemplo("José",20);
+"#;
+        let expected = r#"<?php
+
+function exemplo($nome,$valor){
+    if($valor>10){
+        echo "Olá {$nome}";
+    }
+}
+
+exemplo("José",20);
+"#;
+        assert_eq!(native_format_php(input), expected);
     }
 
     #[test]

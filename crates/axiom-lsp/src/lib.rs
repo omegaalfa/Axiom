@@ -638,30 +638,194 @@ pub fn hover_text(hover: Option<Hover>) -> Option<String> {
     })
 }
 
-/// Applies LSP edits as one deterministic transaction to a UTF-8 document.
-/// LSP positions are converted using the negotiated encoding and edits are
-/// applied from the end so earlier ranges remain valid.
-pub fn apply_text_edits(text: &str, edits: &[TextEdit], encoding: PositionEncoding) -> String {
+struct NormalizedTextEdit<'a> {
+    start: usize,
+    end: usize,
+    replacement: &'a str,
+}
+
+const LARGE_EDIT_CONTEXT_BYTES: usize = 48;
+const LARGE_EDIT_MIN_BYTES: usize = 128;
+
+fn normalize_text_edits<'a>(
+    text: &str,
+    edits: &'a [TextEdit],
+    encoding: PositionEncoding,
+) -> Vec<NormalizedTextEdit<'a>> {
     let mut edits = edits
         .iter()
         .map(|edit| {
             let start = PositionCodec::position_to_offset(text, edit.range.start, encoding);
             let end = PositionCodec::position_to_offset(text, edit.range.end, encoding);
-            (start.min(end), start.max(end), edit.new_text.as_str())
+            NormalizedTextEdit {
+                start: start.min(end),
+                end: start.max(end),
+                replacement: edit.new_text.as_str(),
+            }
         })
         .collect::<Vec<_>>();
-    edits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    let mut result = text.to_owned();
-    for (start, end, replacement) in edits {
-        if start <= end
-            && end <= result.len()
-            && result.is_char_boundary(start)
-            && result.is_char_boundary(end)
-        {
-            result.replace_range(start..end, replacement);
+    edits.sort_by(|a, b| b.start.cmp(&a.start).then_with(|| b.end.cmp(&a.end)));
+    edits
+}
+
+fn is_large_text_edit(old_text: &str, previous_len: usize) -> bool {
+    old_text.contains('\n')
+        && (old_text.len() >= LARGE_EDIT_MIN_BYTES
+            || old_text.len().saturating_add(1) >= previous_len)
+}
+
+fn map_offset_inside_large_edit(
+    old_text: &str,
+    replacement: &str,
+    local_offset: usize,
+) -> Option<usize> {
+    let mut prefix_start = local_offset;
+    let mut prefix_bytes = 0;
+    for (index, character) in old_text[..local_offset].char_indices().rev() {
+        if prefix_bytes + character.len_utf8() > LARGE_EDIT_CONTEXT_BYTES {
+            break;
+        }
+        prefix_start = index;
+        prefix_bytes += character.len_utf8();
+    }
+    let mut suffix_end = local_offset;
+    let mut suffix_bytes = 0;
+    for (_, character) in old_text[local_offset..].char_indices() {
+        if suffix_bytes + character.len_utf8() > LARGE_EDIT_CONTEXT_BYTES {
+            break;
+        }
+        suffix_end += character.len_utf8();
+        suffix_bytes += character.len_utf8();
+    }
+
+    let mut prefix_starts = vec![local_offset];
+    let mut boundary = local_offset;
+    while boundary > prefix_start {
+        boundary = old_text[..boundary]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index);
+        prefix_starts.push(boundary);
+    }
+    let mut suffix_ends = vec![local_offset];
+    let mut boundary = local_offset;
+    while boundary < suffix_end {
+        boundary += old_text[boundary..]
+            .chars()
+            .next()
+            .map_or(0, char::len_utf8);
+        suffix_ends.push(boundary);
+    }
+
+    let mut best: Option<((usize, usize, usize), usize)> = None;
+    for prefix_start in prefix_starts {
+        for suffix_end in &suffix_ends {
+            let suffix_end = *suffix_end;
+            let prefix_len = local_offset - prefix_start;
+            let suffix_len = suffix_end - local_offset;
+            if prefix_len + suffix_len == 0 {
+                continue;
+            }
+            let preserved = &old_text[prefix_start..suffix_end];
+            let matches = replacement
+                .match_indices(preserved)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if let [match_start] = matches.as_slice() {
+                let score = (
+                    prefix_len + suffix_len,
+                    prefix_len.min(suffix_len),
+                    prefix_len,
+                );
+                let candidate = (score, match_start + prefix_len);
+                if best.is_none_or(|(best_score, _)| candidate.0 > best_score) {
+                    best = Some(candidate);
+                }
+            }
         }
     }
-    result
+    best.map(|(_, offset)| offset)
+}
+
+fn map_text_edit_offset(
+    offset: usize,
+    start: usize,
+    end: usize,
+    old_text: &str,
+    replacement: &str,
+    previous_len: usize,
+    updated_len: usize,
+) -> usize {
+    let offset = offset.min(previous_len);
+    let mapped = if start == end {
+        if offset <= start {
+            offset
+        } else {
+            offset.saturating_add(replacement.len())
+        }
+    } else if offset < start {
+        offset
+    } else if offset < end {
+        let local_offset = offset - start;
+        (is_large_text_edit(old_text, previous_len))
+            .then(|| map_offset_inside_large_edit(old_text, replacement, local_offset))
+            .flatten()
+            .map_or(start, |mapped| start + mapped)
+    } else if offset == end {
+        start.saturating_add(replacement.len())
+    } else if replacement.len() >= end - start {
+        offset.saturating_add(replacement.len() - (end - start))
+    } else {
+        offset.saturating_sub((end - start) - replacement.len())
+    };
+    mapped.min(updated_len)
+}
+
+/// Applies LSP edits and maps offsets through the exact same edit transaction.
+pub fn apply_text_edits_with_offsets(
+    text: &str,
+    edits: &[TextEdit],
+    encoding: PositionEncoding,
+    offsets: &[usize],
+) -> (String, Vec<usize>) {
+    let edits = normalize_text_edits(text, edits, encoding);
+    let mut result = text.to_owned();
+    let mut mapped_offsets = offsets
+        .iter()
+        .map(|offset| (*offset).min(text.len()))
+        .collect::<Vec<_>>();
+    for edit in edits {
+        if edit.start <= edit.end
+            && edit.end <= result.len()
+            && result.is_char_boundary(edit.start)
+            && result.is_char_boundary(edit.end)
+        {
+            let previous_len = result.len();
+            let updated_len =
+                previous_len - (edit.end - edit.start) + edit.replacement.len();
+            let old_text = &result[edit.start..edit.end];
+            for offset in &mut mapped_offsets {
+                *offset = map_text_edit_offset(
+                    *offset,
+                    edit.start,
+                    edit.end,
+                    old_text,
+                    edit.replacement,
+                    previous_len,
+                    updated_len,
+                );
+            }
+            result.replace_range(edit.start..edit.end, edit.replacement);
+        }
+    }
+    (result, mapped_offsets)
+}
+
+/// Applies LSP edits as one deterministic transaction to a UTF-8 document.
+/// LSP positions are converted using the negotiated encoding and edits are
+/// applied from the end so earlier ranges remain valid.
+pub fn apply_text_edits(text: &str, edits: &[TextEdit], encoding: PositionEncoding) -> String {
+    apply_text_edits_with_offsets(text, edits, encoding, &[]).0
 }
 
 #[derive(Debug, Clone)]
@@ -797,6 +961,170 @@ mod tests {
             apply_text_edits(text, &edits, PositionEncoding::Utf16),
             "Olá Axiom\n🚀 fim"
         );
+    }
+
+    #[test]
+    fn text_edit_mapping_preserves_caret_and_selection_boundaries() {
+        let (text, offsets) = apply_text_edits_with_offsets(
+            "abcdef",
+            &[TextEdit {
+                range: lsp_types::Range::new(Position::new(0, 0), Position::new(0, 1)),
+                new_text: "XYZ".into(),
+            }],
+            PositionEncoding::Utf16,
+            &[3],
+        );
+        assert_eq!(text, "XYZbcdef");
+        assert_eq!(offsets, vec![5]);
+
+        let edit = TextEdit {
+            range: lsp_types::Range::new(Position::new(0, 1), Position::new(0, 4)),
+            new_text: "X".into(),
+        };
+        let (_, offsets) = apply_text_edits_with_offsets(
+            "abcdef",
+            &[edit],
+            PositionEncoding::Utf16,
+            &[2, 4],
+        );
+        assert_eq!(offsets, vec![1, 2]);
+
+        let (text, offsets) = apply_text_edits_with_offsets(
+            "abcdef",
+            &[TextEdit {
+                range: lsp_types::Range::new(Position::new(0, 2), Position::new(0, 2)),
+                new_text: "[]".into(),
+            }],
+            PositionEncoding::Utf16,
+            &[2, 3],
+        );
+        assert_eq!(text, "ab[]cdef");
+        assert_eq!(offsets, vec![2, 5]);
+
+        let edits = [
+            TextEdit {
+                range: lsp_types::Range::new(Position::new(0, 0), Position::new(0, 1)),
+                new_text: "111".into(),
+            },
+            TextEdit {
+                range: lsp_types::Range::new(Position::new(0, 6), Position::new(0, 9)),
+                new_text: "x".into(),
+            },
+        ];
+        let (text, offsets) = apply_text_edits_with_offsets(
+            "abcDEFghi",
+            &edits,
+            PositionEncoding::Utf16,
+            &[2, 7, 9],
+        );
+        assert_eq!(text, "111bcDEFx");
+        assert_eq!(offsets, vec![4, 8, 9]);
+        let (_, forward) =
+            apply_text_edits_with_offsets("abcDEFghi", &edits, PositionEncoding::Utf16, &[2, 7]);
+        let (_, reversed) =
+            apply_text_edits_with_offsets("abcDEFghi", &edits, PositionEncoding::Utf16, &[7, 2]);
+        assert_eq!(forward, vec![4, 8]);
+        assert_eq!(reversed, vec![8, 4]);
+    }
+
+    #[test]
+    fn text_edit_mapping_handles_utf16_non_bmp_invalid_and_overlap_edits() {
+        let edits = [
+            TextEdit {
+                range: lsp_types::Range::new(Position::new(0, 1), Position::new(0, 3)),
+                new_text: "X".into(),
+            },
+            TextEdit {
+                range: lsp_types::Range::new(Position::new(0, 4), Position::new(0, 6)),
+                new_text: "YY".into(),
+            },
+        ];
+        let (text, offsets) = apply_text_edits_with_offsets(
+            "a🙂b🙂c",
+            &edits,
+            PositionEncoding::Utf16,
+            &[1, 6, 10],
+        );
+        assert_eq!(text, "aXbYYc");
+        assert_eq!(offsets, vec![1, 3, 5]);
+
+        let overlapping = [
+            TextEdit {
+                range: lsp_types::Range::new(Position::new(0, 3), Position::new(0, 8)),
+                new_text: "X".into(),
+            },
+            TextEdit {
+                range: lsp_types::Range::new(Position::new(0, 0), Position::new(0, 6)),
+                new_text: "Y".into(),
+            },
+        ];
+        let (text, offsets) = apply_text_edits_with_offsets(
+            "abcdefghij",
+            &overlapping,
+            PositionEncoding::Utf16,
+            &[4, 9],
+        );
+        assert_eq!(text, "Y");
+        assert_eq!(offsets, vec![0, 0]);
+
+        let (text, offsets) = apply_text_edits_with_offsets(
+            "abc",
+            &[TextEdit {
+                range: lsp_types::Range::new(Position::new(99, 99), Position::new(99, 99)),
+                new_text: "!".into(),
+            }],
+            PositionEncoding::Utf16,
+            &[3],
+        );
+        assert_eq!(text, "abc!");
+        assert_eq!(offsets, vec![3]);
+    }
+
+    #[test]
+    fn large_formatting_edit_maps_caret_and_selection_near_preserved_text() {
+        let before = r#"function exemplo($nome,$valor){
+if($valor>10){
+echo "Olá {$nome}";
+}
+}
+
+exemplo("José",20);
+"#;
+        let formatted = r#"function exemplo($nome, $valor) {
+    if ($valor > 10) {
+        echo "Olá {$nome}";
+    }
+}
+
+exemplo("José", 20);
+"#;
+        let anchor_before = before.find("José").unwrap();
+        let active_before = anchor_before + "José".len();
+        let anchor_after = formatted.find("José").unwrap();
+        let active_after = anchor_after + "José".len();
+        let edits = [TextEdit {
+            range: lsp_types::Range::new(
+                Position::new(0, 0),
+                PositionCodec::offset_to_position(before, before.len(), PositionEncoding::Utf16),
+            ),
+            new_text: formatted.into(),
+        }];
+        let (text, offsets) = apply_text_edits_with_offsets(
+            before,
+            &edits,
+            PositionEncoding::Utf16,
+            &[active_before, anchor_before, active_before],
+        );
+        assert_eq!(text, formatted);
+        assert_eq!(offsets, vec![active_after, anchor_after, active_after]);
+
+        let (_, reversed) = apply_text_edits_with_offsets(
+            before,
+            &edits,
+            PositionEncoding::Utf16,
+            &[active_before, anchor_before],
+        );
+        assert_eq!(reversed, vec![active_after, anchor_after]);
     }
 
     #[test]
