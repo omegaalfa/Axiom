@@ -5852,22 +5852,30 @@ impl Render for EditorView {
         if self.width_cache_dirty {
             let _stage = UiStageGuard::new(UI_STAGE_WIDTH_CACHE_REBUILD);
             let width_rebuild_started = Instant::now();
-            self.line_width_cache.clear();
-            self.max_width_line = None;
             for line in 0..line_count {
+                if self.line_width_cache.contains_key(&line) {
+                    cache_hits += 1;
+                    continue;
+                }
                 let raw = self.document.line_content(line);
                 let text = trim_eol(raw.as_ref());
                 let width =
                     px(GUTTER_WIDTH + TEXT_PADDING) + self.line_layout(line, text, window).width;
                 self.line_width_cache.insert(line, width);
+                lines_laid_out += 1;
+                cache_misses += 1;
+            }
+            self.max_width_line = None;
+            for line in 0..line_count {
+                let Some(width) = self.line_width_cache.get(&line) else {
+                    continue;
+                };
                 if self
                     .max_width_line
-                    .is_none_or(|max| width > self.line_width_cache[&max])
+                    .is_none_or(|max| *width > self.line_width_cache[&max])
                 {
                     self.max_width_line = Some(line);
                 }
-                lines_laid_out += 1;
-                cache_misses += 1;
             }
             self.width_cache_dirty = false;
             let elapsed_us = width_rebuild_started.elapsed().as_micros();
@@ -9291,6 +9299,110 @@ exemplo("José",20);
     fn project_hit_short_circuits_vendor_lookup() {
         assert!(!vendor_lookup_needed(true));
         assert!(vendor_lookup_needed(false));
+    }
+}
+
+#[cfg(test)]
+mod width_cache_tests {
+    use super::{EditorView, px};
+    use gpui::Render as _;
+
+    fn render_editor(view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext) {
+        view.update_in(cx, |editor, window, cx| {
+            let _ = editor.render(window, cx);
+        });
+    }
+
+    #[gpui::test]
+    fn unchanged_line_count_preserves_width_cache_entries(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_document(
+                "width-cache-preserved.php".into(),
+                axiom_editor::Document::from_content("short\nlongest line\nmid"),
+                None,
+                cx,
+            )
+        });
+        render_editor(&view, cx);
+        view.update_in(cx, |editor, window, cx| {
+            let preserved = px(12_345.);
+            editor.line_width_cache.insert(0, preserved);
+            editor.width_cache_dirty = true;
+            let before = editor.line_width_cache.clone();
+
+            let _ = editor.render(window, cx);
+
+            assert_eq!(editor.line_width_cache, before);
+            assert_eq!(editor.line_width_cache.get(&0), Some(&preserved));
+        });
+    }
+
+    #[gpui::test]
+    fn invalidated_line_is_recalculated_without_replacing_cached_lines(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "short\nlongest line\nmid";
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_document(
+                "width-cache-invalidated.php".into(),
+                axiom_editor::Document::from_content(source),
+                None,
+                cx,
+            )
+        });
+        render_editor(&view, cx);
+        view.update_in(cx, |editor, window, cx| {
+            let preserved = px(12_345.);
+            editor.line_width_cache.insert(0, preserved);
+            editor.line_width_cache.insert(2, preserved);
+            editor.line_width_cache.remove(&1);
+            editor.width_cache_dirty = true;
+
+            let _ = editor.render(window, cx);
+
+            let raw = editor.document.line_content(1);
+            let text = super::trim_eol(raw.as_ref());
+            let expected = px(super::GUTTER_WIDTH + super::TEXT_PADDING)
+                + editor.line_layout(1, text, window).width;
+            assert_eq!(editor.line_width_cache.get(&0), Some(&preserved));
+            assert_eq!(editor.line_width_cache.get(&1), Some(&expected));
+            assert_eq!(editor.line_width_cache.get(&2), Some(&preserved));
+            assert!(!editor.width_cache_dirty);
+        });
+    }
+
+    #[gpui::test]
+    fn structural_line_count_change_rebuilds_all_widths(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_document(
+                "width-cache-structural.php".into(),
+                axiom_editor::Document::from_content("short\nlongest line\nmid"),
+                None,
+                cx,
+            )
+        });
+        render_editor(&view, cx);
+        view.update_in(cx, |editor, window, cx| {
+            let stale = px(12_345.);
+            for line in 0..editor.document.line_count() {
+                editor.line_width_cache.insert(line, stale);
+            }
+            editor.document.insert_text("\n");
+
+            let _ = editor.render(window, cx);
+
+            let line_count = editor.document.line_count();
+            assert_eq!(editor.line_width_cache.len(), line_count);
+            for line in 0..line_count {
+                let raw = editor.document.line_content(line);
+                let text = super::trim_eol(raw.as_ref());
+                let expected = px(super::GUTTER_WIDTH + super::TEXT_PADDING)
+                    + editor.line_layout(line, text, window).width;
+                assert_eq!(editor.line_width_cache.get(&line), Some(&expected));
+                assert_ne!(editor.line_width_cache.get(&line), Some(&stale));
+            }
+            assert!(!editor.width_cache_dirty);
+        });
     }
 }
 
