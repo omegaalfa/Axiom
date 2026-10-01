@@ -12,6 +12,18 @@ use axiom_syntax::PhpSyntax;
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
+mod artifact;
+#[cfg(feature = "embedded-runtime")]
+mod embedded;
+pub mod stub_generation;
+
+pub use artifact::EmbeddedStubArtifact;
+#[cfg(feature = "embedded-runtime")]
+pub use embedded::{
+    EmbeddedStubError, EmbeddedStubProvider, RuntimeStubLoadError, RuntimeStubProvider,
+    EMBEDDED_STUB_SCHEMA_VERSION,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
     Function,
@@ -294,7 +306,7 @@ impl StubProvider {
 const STUB_CACHE_SCHEMA: u32 = 2;
 // Bump when symbol extraction changes so an old incremental cache cannot hide
 // newly indexed methods/properties from completion.
-const STUB_PARSER_VERSION: u32 = 3;
+pub const STUB_PARSER_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StubCache {
@@ -550,19 +562,14 @@ fn discover_php_files(root: &Path, directory: &Path, files: &mut Vec<StubFile>) 
     Ok(())
 }
 
-fn extract_symbols(text: &str, file: &Path, extension: &str) -> Result<Vec<Symbol>, String> {
+pub fn extract_symbols(text: &str, file: &Path, extension: &str) -> Result<Vec<Symbol>, String> {
     let syntax = PhpSyntax::parse(text.to_owned()).map_err(|error| error.to_string())?;
     let had_errors = syntax.has_errors();
-    let namespace = syntax
-        .symbols()
-        .iter()
-        .find(|symbol| symbol.kind == axiom_syntax::SymbolKind::Namespace)
-        .map(|symbol| symbol.name.as_str());
     let root = syntax.tree().root_node();
     let mut symbols = Vec::new();
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        visit_node(child, text, file, extension, namespace, None, &mut symbols);
+        visit_node(child, text, file, extension, None, None, &mut symbols);
     }
     // PHP distributions frequently ship stubs containing newer attributes or
     // annotations that an older grammar flags while still producing valid
@@ -583,6 +590,26 @@ fn visit_node(
     owner: Option<&str>,
     symbols: &mut Vec<Symbol>,
 ) {
+    if node.kind() == "namespace_definition" {
+        let namespace = node
+            .child_by_field_name("name")
+            .map(|name| node_text(name, text).trim_matches('\\').to_owned())
+            .filter(|name| !name.is_empty());
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_node(
+                child,
+                text,
+                file,
+                extension,
+                namespace.as_deref(),
+                owner,
+                symbols,
+            );
+        }
+        return;
+    }
+
     let declaration_kind = match node.kind() {
         "class_declaration" => Some(SymbolKind::Class),
         "interface_declaration" => Some(SymbolKind::Interface),
@@ -928,6 +955,75 @@ mod tests {
                 .iter()
                 .all(|file| file.path.extension().unwrap() == "php")
         );
+    }
+
+    #[test]
+    fn diagnostic_extracts_bracketed_global_pdo_shape() {
+        let source = r#"<?php
+namespace {
+    const PDO_ATTR_AUTOCOMMIT = 0;
+
+    class PDOException extends RuntimeException {}
+
+    class PDO
+    {
+        public const ATTR_AUTOCOMMIT = 0;
+
+        public function __construct(string $dsn = "") {}
+    }
+}
+"#;
+        let symbols = extract_symbols(source, Path::new("PDO/PDO.php"), "PDO")
+            .expect("PDO-shaped fixture should be extractable");
+
+        for symbol in &symbols {
+            println!(
+                "diagnostic symbol: name={} fqn={} kind={:?}",
+                symbol.name, symbol.fqn, symbol.kind
+            );
+        }
+
+        let pdo = symbols
+            .iter()
+            .find(|symbol| symbol.name == "PDO" && symbol.kind == SymbolKind::Class)
+            .expect("PDO class declaration must be extracted");
+        assert_eq!(pdo.fqn, "PDO");
+        assert!(symbols.iter().any(|symbol| {
+            symbol.name == "PDOException" && symbol.kind == SymbolKind::Class
+        }));
+        assert!(symbols.iter().any(|symbol| {
+            symbol.fqn == "PDO::__construct" && symbol.kind == SymbolKind::Method
+        }));
+        assert!(symbols.iter().any(|symbol| {
+            symbol.fqn == "PDO::ATTR_AUTOCOMMIT" && symbol.kind == SymbolKind::ClassConstant
+        }));
+        assert!(symbols.iter().any(|symbol| {
+            symbol.fqn == "PDO_ATTR_AUTOCOMMIT" && symbol.kind == SymbolKind::GlobalConstant
+        }));
+    }
+
+    #[test]
+    fn extraction_restores_global_namespace_after_named_namespace() {
+        let source = r#"<?php
+namespace Pdo {
+    class Mysql {}
+}
+
+namespace {
+    class PDO {}
+}
+"#;
+        let symbols = extract_symbols(source, Path::new("PDO/PDO.php"), "PDO").unwrap();
+
+        assert!(symbols.iter().any(|symbol| {
+            symbol.name == "Mysql"
+                && symbol.fqn == "Pdo\\Mysql"
+                && symbol.kind == SymbolKind::Class
+        }));
+        assert!(symbols.iter().any(|symbol| {
+            symbol.name == "PDO" && symbol.fqn == "PDO" && symbol.kind == SymbolKind::Class
+        }));
+        assert!(!symbols.iter().any(|symbol| symbol.fqn == "Pdo\\PDO"));
     }
 
     #[test]

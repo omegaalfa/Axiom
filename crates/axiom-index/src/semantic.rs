@@ -22,6 +22,10 @@ fn text_fingerprint(text: &str) -> u64 {
     hasher.finish()
 }
 
+pub fn semantic_text_fingerprint(text: &str) -> u64 {
+    text_fingerprint(text)
+}
+
 const SCOPE_COMPACTION_RATIO: usize = 8;
 const SCOPE_COMPACTION_MIN_TOTAL: usize = 256;
 
@@ -528,6 +532,10 @@ pub struct SemanticSymbol {
     #[serde(default)]
     pub structured_return_type: Option<DeclaredType>,
     pub return_type: Option<String>,
+    #[serde(default)]
+    pub declared_throws: Vec<String>,
+    #[serde(default)]
+    pub docblock_range: Option<std::ops::Range<usize>>,
     pub owner: Option<SymbolId>,
     pub owner_key: Option<PersistentSymbolKey>,
 }
@@ -988,7 +996,17 @@ impl<'a> MemberResolver<'a> {
         binding_name: &str,
         prefix: &str,
     ) -> Vec<SymbolId> {
-        let Some(binding) = self.snapshot.lookup_binding(scope, binding_name) else {
+        self.completion_methods_for_binding_at(scope, binding_name, prefix, usize::MAX)
+    }
+
+    pub fn completion_methods_for_binding_at(
+        &self,
+        scope: ScopeId,
+        binding_name: &str,
+        prefix: &str,
+        offset: usize,
+    ) -> Vec<SymbolId> {
+        let Some(binding) = self.snapshot.lookup_binding_at(scope, binding_name, offset) else {
             return Vec::new();
         };
         let Some(DeclaredType::Named { resolved, .. }) = binding.declared_type.as_ref() else {
@@ -1477,6 +1495,10 @@ pub struct SemanticSnapshot {
     pub file_fingerprints: HashMap<FileId, u64>,
     pub interface_relations: InterfaceRelationIndexes,
     #[serde(default)]
+    direct_callees_by_callable: HashMap<SymbolId, Vec<SymbolId>>,
+    #[serde(skip)]
+    docblock_callables_by_file: HashMap<FileId, HashMap<(usize, usize), Option<SymbolId>>>,
+    #[serde(default)]
     completion_scopes: HashMap<FileId, Vec<(usize, Option<ScopeId>)>>,
     #[serde(default)]
     trait_aliases_by_class: HashMap<String, Vec<TraitMethodAlias>>,
@@ -1765,6 +1787,8 @@ impl SemanticSnapshot {
             scopes: ScopeStore::default(),
             file_fingerprints: HashMap::new(),
             interface_relations: InterfaceRelationIndexes::default(),
+            direct_callees_by_callable: HashMap::new(),
+            docblock_callables_by_file: HashMap::new(),
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
             trait_precedence_by_class: HashMap::new(),
@@ -1785,6 +1809,25 @@ impl SemanticSnapshot {
         self.file_id(key)
             .and_then(|file| self.file_fingerprints.get(&file))
             .is_some_and(|expected| *expected == text_fingerprint(text))
+    }
+
+    pub fn file_fingerprint(&self, file: FileId) -> Option<u64> {
+        self.file_fingerprints.get(&file).copied()
+    }
+
+    pub fn matches_file_fingerprint(&self, file: FileId, fingerprint: u64) -> bool {
+        self.file_fingerprint(file) == Some(fingerprint)
+    }
+
+    pub fn callable_for_docblock(
+        &self,
+        file: FileId,
+        docblock_range: &std::ops::Range<usize>,
+    ) -> Option<SymbolId> {
+        self.docblock_callables_by_file
+            .get(&file)?
+            .get(&(docblock_range.start, docblock_range.end))
+            .and_then(|value| *value)
     }
 
     /// Finds the lexical scope containing a byte offset in a snapshot file.
@@ -1842,6 +1885,60 @@ impl SemanticSnapshot {
         }
     }
 
+    fn rebuild_direct_callees(&mut self) {
+        let mut direct_callees = HashMap::<SymbolId, Vec<SymbolId>>::new();
+        for reference in &self.references.records {
+            if !matches!(
+                reference.role,
+                ReferenceRole::FunctionCall
+                    | ReferenceRole::MethodCall
+                    | ReferenceRole::StaticMethodCall
+            ) {
+                continue;
+            }
+            let (Some(caller), ReferenceTarget::Resolved(callee)) =
+                (reference.source_symbol, &reference.target)
+            else {
+                continue;
+            };
+            direct_callees.entry(caller).or_default().push(*callee);
+        }
+        for callees in direct_callees.values_mut() {
+            callees.sort_unstable();
+            callees.dedup();
+        }
+        self.direct_callees_by_callable = direct_callees;
+    }
+
+    fn rebuild_docblock_callables(&mut self) {
+        let mut callables = HashMap::<FileId, HashMap<(usize, usize), Option<SymbolId>>>::new();
+        for record in &self.files.records {
+            for symbol_id in &record.symbols {
+                let Some(symbol) = self.symbols.records.get(symbol_id.0 as usize) else {
+                    continue;
+                };
+                if !matches!(
+                    symbol.kind,
+                    ProjectSymbolKind::Function | ProjectSymbolKind::Method
+                ) {
+                    continue;
+                }
+                let Some(docblock_range) = &symbol.docblock_range else {
+                    continue;
+                };
+                let entry = callables
+                    .entry(symbol.file)
+                    .or_default()
+                    .entry((docblock_range.start, docblock_range.end))
+                    .or_insert(Some(symbol.id));
+                if *entry != Some(symbol.id) {
+                    *entry = None;
+                }
+            }
+        }
+        self.docblock_callables_by_file = callables;
+    }
+
     pub fn symbol_id(&self, key: &PersistentSymbolKey) -> Option<SymbolId> {
         self.symbols.by_key.get(key).copied()
     }
@@ -1866,6 +1963,13 @@ impl SemanticSnapshot {
         self.declarations
             .symbols_by_file
             .get(&file)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn direct_callees(&self, callable: SymbolId) -> &[SymbolId] {
+        self.direct_callees_by_callable
+            .get(&callable)
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -2895,7 +2999,7 @@ impl SemanticSnapshot {
         })
     }
 
-    pub fn lookup_binding(&self, mut scope: ScopeId, name: &str) -> Option<&VariableBinding> {
+pub fn lookup_binding(&self, mut scope: ScopeId, name: &str) -> Option<&VariableBinding> {
         loop {
             let current = self.scope(scope)?;
             if let Some(binding) = current
@@ -2903,6 +3007,26 @@ impl SemanticSnapshot {
                 .iter()
                 .rev()
                 .find(|binding| binding.name == name)
+            {
+                return Some(binding);
+            }
+            scope = current.parent?;
+        }
+    }
+
+    pub fn lookup_binding_at(
+        &self,
+        mut scope: ScopeId,
+        name: &str,
+        offset: usize,
+    ) -> Option<&VariableBinding> {
+        loop {
+            let current = self.scope(scope)?;
+            if let Some(binding) = current
+                .bindings
+                .iter()
+                .rev()
+                .find(|binding| binding.name == name && binding.declaration_span.start <= offset)
             {
                 return Some(binding);
             }
@@ -3270,6 +3394,8 @@ impl SemanticSnapshot {
             scopes: persisted.scopes,
             file_fingerprints: persisted.file_fingerprints,
             interface_relations: InterfaceRelationIndexes::default(),
+            direct_callees_by_callable: HashMap::new(),
+            docblock_callables_by_file: HashMap::new(),
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
             trait_precedence_by_class: HashMap::new(),
@@ -3322,6 +3448,8 @@ impl SemanticSnapshot {
         }
         snapshot.rebuild_interface_relations();
         snapshot.rebuild_completion_scopes();
+        snapshot.rebuild_direct_callees();
+        snapshot.rebuild_docblock_callables();
         let active_symbols: HashSet<SymbolId> = snapshot
             .files
             .records
@@ -3505,6 +3633,8 @@ impl SnapshotBuilder {
                     .collect(),
                 return_type: source.return_type,
                 structured_return_type: source.structured_return_type.clone(),
+                declared_throws: source.declared_throws,
+                docblock_range: source.docblock_range,
                 owner: None,
                 owner_key: None,
             });
@@ -3787,6 +3917,8 @@ impl SnapshotBuilder {
             scopes: self.scopes.clone(),
             file_fingerprints: self.file_fingerprints.clone(),
             interface_relations: InterfaceRelationIndexes::default(),
+            direct_callees_by_callable: HashMap::new(),
+            docblock_callables_by_file: HashMap::new(),
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
             trait_precedence_by_class: HashMap::new(),
@@ -3842,6 +3974,8 @@ impl SnapshotBuilder {
             scopes: self.scopes,
             file_fingerprints: self.file_fingerprints,
             interface_relations: InterfaceRelationIndexes::default(),
+            direct_callees_by_callable: HashMap::new(),
+            docblock_callables_by_file: HashMap::new(),
             completion_scopes: HashMap::new(),
             trait_aliases_by_class: HashMap::new(),
             trait_precedence_by_class: HashMap::new(),
@@ -3889,6 +4023,8 @@ impl SnapshotBuilder {
         }
         snapshot.rebuild_interface_relations();
         snapshot.rebuild_completion_scopes();
+        snapshot.rebuild_direct_callees();
+        snapshot.rebuild_docblock_callables();
         snapshot
     }
 
@@ -4210,6 +4346,8 @@ impl SnapshotBuilder {
                 structured_parameters: Vec::new(),
                 return_type: source.return_type,
                 structured_return_type: source.structured_return_type.clone(),
+                declared_throws: source.declared_throws,
+                docblock_range: source.docblock_range,
                 owner: None,
                 owner_key: None,
             };
@@ -4739,21 +4877,23 @@ fn extract_assignments(
     file: FileId,
 ) {
     let mut stack = vec![root];
+    let mut assignments = Vec::new();
     while let Some(node) = stack.pop() {
         if node.kind() == "assignment_expression" {
-            let Some(left) = node.child_by_field_name("left") else {
-                stack.extend(node.named_children(&mut node.walk()));
-                continue;
-            };
-            let Some(right) = node.child_by_field_name("right") else {
-                stack.extend(node.named_children(&mut node.walk()));
-                continue;
-            };
-            let name = node_text(left, text).trim();
-            if left.kind() == "variable_name" {
-                if let Some(scope) = assignment_scope(builder, file, node.start_byte()) {
-                    let right_text = node_text(right, text).trim();
-                    let raw_type = if right.kind() == "object_creation_expression" {
+            assignments.push(node);
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+    assignments.sort_by_key(|node| node.start_byte());
+    for node in assignments {
+        let Some(left) = node.child_by_field_name("left") else { continue };
+        let Some(right) = node.child_by_field_name("right") else { continue };
+        let name = node_text(left, text).trim();
+        if left.kind() == "variable_name"
+            && let Some(scope) = assignment_scope(builder, file, node.start_byte())
+        {
+            let right_text = node_text(right, text).trim();
+            let raw_type = if right.kind() == "object_creation_expression" {
                         right
                             .child_by_field_name("class")
                             .map(|class| node_text(class, text).trim().to_owned())
@@ -4761,6 +4901,16 @@ fn extract_assignments(
                                 right_text.strip_prefix("new ").map(|value| {
                                     value.split('(').next().unwrap_or(value).trim().to_owned()
                                 })
+                            })
+                    } else if right.kind() == "variable_name" {
+                        builder.scopes.records[scope.0 as usize]
+                            .bindings
+                            .iter()
+                            .rev()
+                            .find(|binding| binding.name == right_text)
+                            .and_then(|binding| match &binding.declared_type {
+                                Some(DeclaredType::Named { written, .. }) => Some(written.clone()),
+                                _ => None,
                             })
                     } else if right.kind() == "function_call_expression" {
                         right
@@ -4779,39 +4929,63 @@ fn extract_assignments(
                                         .and_then(|symbol| symbol.return_type.clone())
                                 })
                             })
+                    } else if matches!(
+                        right.kind(),
+                        "member_call_expression" | "nullsafe_member_call_expression"
+                    ) {
+                        right
+                            .child_by_field_name("object")
+                            .and_then(|object| {
+                                let receiver = node_text(object, text).trim();
+                                builder.scopes.records[scope.0 as usize]
+                                    .bindings
+                                    .iter()
+                                    .rev()
+                                    .find(|binding| binding.name == receiver)
+                                    .and_then(|binding| match &binding.declared_type {
+                                        Some(DeclaredType::Named { resolved, .. }) => {
+                                            Some(resolved)
+                                        }
+                                        _ => None,
+                                    })
+                                    .and_then(|receiver_type| {
+                                        let owner_ids = builder.symbols.by_fqn.get(receiver_type)?;
+                                        let method = right.child_by_field_name("name")?;
+                                        let method_name = node_text(method, text).trim();
+                                        let mut return_types = owner_ids
+                                            .iter()
+                                            .flat_map(|owner| {
+                                                builder
+                                                    .declarations
+                                                    .members_by_owner_name
+                                                    .get(&(
+                                                        *owner,
+                                                        method_name.to_owned(),
+                                                        ProjectSymbolKind::Method,
+                                                    ))
+                                                    .into_iter()
+                                                    .flatten()
+                                            })
+                                            .filter_map(|id| {
+                                                builder.symbols.records.get(id.0 as usize)
+                                            })
+                                            .filter_map(|symbol| symbol.return_type.clone())
+                                            .collect::<Vec<_>>();
+                                        return_types.sort();
+                                        return_types.dedup();
+                                        (return_types.len() == 1).then(|| return_types.pop().unwrap())
+                                    })
+                            })
                     } else {
                         None
                     };
-                    if raw_type.is_some()
-                        || !builder.scopes.records[scope.0 as usize]
-                            .bindings
-                            .iter()
-                            .any(|binding| binding.name == name)
-                    {
-                        let binding = VariableBinding {
-                            name: name.to_owned(),
-                            declaration_span: left.byte_range(),
-                            declared_type: raw_type.map(|raw| declared_type(&raw, builder, scope)),
-                        };
-                        let bindings = &mut builder.scopes.records[scope.0 as usize].bindings;
-                        if let Some(existing) =
-                            bindings.iter_mut().find(|existing| existing.name == name)
-                        {
-                            // AST traversal is stack-based, so assignments
-                            // may be visited in reverse source order. Keep
-                            // the binding from the latest source assignment
-                            // regardless of traversal order.
-                            if existing.declaration_span.start <= binding.declaration_span.start {
-                                *existing = binding;
-                            }
-                        } else {
-                            bindings.push(binding);
-                        }
-                    }
-                }
-            }
+            let binding = VariableBinding {
+                name: name.to_owned(),
+                declaration_span: left.byte_range(),
+                declared_type: raw_type.map(|raw| declared_type(&raw, builder, scope)),
+            };
+            builder.scopes.records[scope.0 as usize].bindings.push(binding);
         }
-        stack.extend(node.named_children(&mut node.walk()));
     }
 }
 
@@ -5077,7 +5251,7 @@ fn extract_references(
                     );
                 }
             }
-            "static_call_expression" => {
+            "static_call_expression" | "scoped_call_expression" => {
                 if let Some((class, name)) = static_member_parts(node) {
                     let target = static_member_target(
                         snapshot,
@@ -9828,6 +10002,8 @@ function run(User $user): void { foo(); echo $user->name; $user->name = 'A'; ech
             structured_parameters: Vec::new(),
             return_type: None,
             structured_return_type: None,
+            declared_throws: Vec::new(),
+            docblock_range: None,
             owner: None,
             owner_key: None,
         });

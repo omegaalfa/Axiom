@@ -196,10 +196,40 @@ impl ApprovalRequest {
             run_id,
             approval_id,
             tool_name: call.name.clone(),
-            arguments: bounded_arguments(&call.arguments.to_string()),
+            arguments: safe_approval_arguments(call),
             reason: bounded_arguments(reason),
         }
     }
+}
+
+fn safe_approval_arguments(call: &axiom_ai_provider::ProviderToolCall) -> String {
+    if !matches!(call.name.as_str(), "write_file" | "update_file") {
+        return bounded_arguments(&call.arguments.to_string());
+    }
+    let arguments = call.arguments.as_object().cloned().unwrap_or_default();
+    let path = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(|path| serde_json::Value::String(path.to_owned()))
+        .unwrap_or(serde_json::Value::Null);
+    let content_bytes = arguments
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(|content| content.as_bytes().len())
+        .unwrap_or(0);
+    let mut preview = serde_json::json!({
+        "tool": call.name,
+        "path": path,
+        "content_bytes": content_bytes,
+    });
+    if call.name == "update_file" {
+        preview["expected_fingerprint"] = arguments
+            .get("expected_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            .map(|fingerprint| serde_json::Value::String(fingerprint.to_owned()))
+            .unwrap_or_else(|| serde_json::Value::Null);
+    }
+    bounded_arguments(&preview.to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -501,12 +531,17 @@ impl ToolPolicy for ReadOnlyToolPolicy {
     ) -> ToolPolicyDecision {
         match call.name.as_str() {
             "read_file" | "list_directory" | "fetch_url" => ToolPolicyDecision::Allow,
+            "write_file" | "update_file" => ToolPolicyDecision::RequireApproval {
+                reason: "file mutation requires approval".into(),
+            },
             _ => ToolPolicyDecision::Deny {
                 reason: format!("tool '{}' is not allowed", call.name),
             },
         }
     }
 }
+
+pub type ProductionToolPolicy = ReadOnlyToolPolicy;
 
 #[derive(Debug)]
 pub enum AgentExecutionError {
@@ -630,7 +665,7 @@ fn contains_tool_protocol_markup(content: &str) -> bool {
 fn finalization_request(
     request: &axiom_ai_provider::ProviderChatRequest,
 ) -> axiom_ai_provider::ProviderChatRequest {
-    let mut messages = request
+    let original = request
         .messages
         .iter()
         .filter(|message| {
@@ -650,17 +685,25 @@ fn finalization_request(
             format!("[tool result {id}]\n{}", message.content)
         })
         .collect::<Vec<_>>();
-    let mut synthesis = String::from(
-        "Final response mode: tools are disabled. Do not emit tool calls or tool-call markup. \
-         Produce only the final user-facing answer using the read-only tool results below.",
-    );
-    if !tool_results.is_empty() {
-        synthesis.push_str("\n\n");
-        synthesis.push_str(&tool_results.join("\n\n"));
-    }
-    messages.push(axiom_ai_provider::ProviderChatMessage {
+    let context = if tool_results.is_empty() {
+        "Tool results/context for the final response:\n\nNo tool results are available.".into()
+    } else {
+        format!(
+            "Tool results/context for the final response:\n\n{}",
+            tool_results.join("\n\n")
+        )
+    };
+    let mut messages = vec![axiom_ai_provider::ProviderChatMessage {
         role: axiom_ai_provider::ChatRole::System,
-        content: synthesis,
+        content: context,
+        reasoning: None,
+        tool_call_id: None,
+        tool_calls: Vec::new(),
+    }];
+    messages.extend(original);
+    messages.push(axiom_ai_provider::ProviderChatMessage {
+        role: axiom_ai_provider::ChatRole::User,
+        content: "Produce the final user-facing answer for the original request using the tool context above. Do not call tools or emit tool-call markup.".into(),
         reasoning: None,
         tool_call_id: None,
         tool_calls: Vec::new(),
@@ -669,6 +712,50 @@ fn finalization_request(
         tools: None,
         messages,
         ..request.clone()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RequestMetadata {
+    message_count: usize,
+    user_count: usize,
+    system_count: usize,
+    assistant_count: usize,
+    tool_count: usize,
+    last_role: &'static str,
+    tools_present: bool,
+    think_enabled: bool,
+    think_present: bool,
+}
+
+impl RequestMetadata {
+    fn from_request(request: &axiom_ai_provider::ProviderChatRequest) -> Self {
+        let mut metadata = Self {
+            message_count: request.messages.len(),
+            user_count: 0,
+            system_count: 0,
+            assistant_count: 0,
+            tool_count: 0,
+            last_role: "none",
+            tools_present: request.tools.is_some(),
+            think_enabled: request.think.unwrap_or(false),
+            think_present: request.think.is_some(),
+        };
+        for message in &request.messages {
+            match message.role {
+                axiom_ai_provider::ChatRole::User => metadata.user_count += 1,
+                axiom_ai_provider::ChatRole::System => metadata.system_count += 1,
+                axiom_ai_provider::ChatRole::Assistant => metadata.assistant_count += 1,
+                axiom_ai_provider::ChatRole::Tool => metadata.tool_count += 1,
+            }
+            metadata.last_role = match message.role {
+                axiom_ai_provider::ChatRole::User => "user",
+                axiom_ai_provider::ChatRole::System => "system",
+                axiom_ai_provider::ChatRole::Assistant => "assistant",
+                axiom_ai_provider::ChatRole::Tool => "tool",
+            };
+        }
+        metadata
     }
 }
 
@@ -895,6 +982,24 @@ where
             } else {
                 continuation.request.clone()
             };
+            let request_metadata = RequestMetadata::from_request(&request_for_turn);
+            tracing::info!(
+                target: "axiom.ai_diag",
+                event = "agent_request_metadata",
+                run_id = run.id().value(),
+                provider_turn = run.usage().provider_turns,
+                finalization = finalization_turn,
+                tools_present = request_metadata.tools_present,
+                message_count = request_metadata.message_count,
+                user_count = request_metadata.user_count,
+                system_count = request_metadata.system_count,
+                assistant_count = request_metadata.assistant_count,
+                tool_count = request_metadata.tool_count,
+                last_role = request_metadata.last_role,
+                think_enabled = request_metadata.think_enabled,
+                think_present = request_metadata.think_present,
+                "[AI-DIAG]"
+            );
             emit(AgentEvent::ModelStarted { run_id: run.id() });
             let mut calls = Vec::new();
             let mut final_content = String::new();
@@ -1169,6 +1274,195 @@ mod tests {
             think: None,
             tools: Some(Vec::new()),
         }
+    }
+
+    fn message(role: ChatRole, content: &str) -> ProviderChatMessage {
+        ProviderChatMessage {
+            role,
+            content: content.into(),
+            reasoning: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn tool_result(id: &str, content: &str) -> ProviderChatMessage {
+        ProviderChatMessage {
+            role: ChatRole::Tool,
+            content: content.into(),
+            reasoning: None,
+            tool_call_id: Some(id.into()),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn occurrence_count(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+
+    #[test]
+    fn request_metadata_contains_counts_without_message_content() {
+        let request = ProviderChatRequest {
+            model: "fake".into(),
+            messages: vec![
+                ProviderChatMessage {
+                    role: ChatRole::User,
+                    content: "sensitive user content".into(),
+                    reasoning: Some("sensitive reasoning".into()),
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+                ProviderChatMessage {
+                    role: ChatRole::System,
+                    content: "sensitive system content".into(),
+                    reasoning: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+            ],
+            think: Some(true),
+            tools: Some(Vec::new()),
+        };
+        let metadata = RequestMetadata::from_request(&request);
+        assert_eq!(metadata.message_count, 2);
+        assert_eq!(metadata.user_count, 1);
+        assert_eq!(metadata.system_count, 1);
+        assert_eq!(metadata.assistant_count, 0);
+        assert_eq!(metadata.tool_count, 0);
+        assert_eq!(metadata.last_role, "system");
+        assert!(metadata.tools_present);
+        assert!(metadata.think_enabled);
+        assert!(metadata.think_present);
+        let debug = format!("{metadata:?}");
+        assert!(!debug.contains("sensitive"));
+    }
+
+    #[test]
+    fn legacy_user_system_finalization_shape_is_replaced_by_user_termination() {
+        let request = ProviderChatRequest {
+            model: "fake".into(),
+            messages: vec![
+                message(ChatRole::User, "original request"),
+                tool_result("call-1", "tool context"),
+            ],
+            think: None,
+            tools: Some(Vec::new()),
+        };
+
+        let legacy_roles = vec![ChatRole::User, ChatRole::System];
+
+        let projected = finalization_request(&request);
+        assert!(projected.tools.is_none());
+        let projected_roles = projected
+            .messages
+            .iter()
+            .map(|message| message.role.clone())
+            .collect::<Vec<_>>();
+        assert_ne!(projected_roles, legacy_roles);
+        assert_eq!(
+            projected_roles,
+            vec![ChatRole::System, ChatRole::User, ChatRole::User]
+        );
+        assert_eq!(
+            projected.messages.last().map(|message| &message.role),
+            Some(&ChatRole::User)
+        );
+    }
+
+    #[test]
+    fn tool_only_context_projects_system_then_user() {
+        let request = ProviderChatRequest {
+            model: "fake".into(),
+            messages: vec![tool_result("result-1", "tool context")],
+            think: None,
+            tools: Some(Vec::new()),
+        };
+
+        let projected = finalization_request(&request);
+        assert!(projected.tools.is_none());
+        assert_eq!(
+            projected
+                .messages
+                .iter()
+                .map(|message| message.role.clone())
+                .collect::<Vec<_>>(),
+            vec![ChatRole::System, ChatRole::User]
+        );
+        assert!(projected.messages[0].content.contains("tool context"));
+    }
+
+    #[test]
+    fn original_context_and_tool_results_project_user_system_user() {
+        let mut assistant = message(ChatRole::Assistant, "");
+        assistant.tool_calls = vec![ProviderToolCall {
+            id: Some("call-1".into()),
+            name: "read_file".into(),
+            arguments: serde_json::json!({}),
+        }];
+        let request = ProviderChatRequest {
+            model: "fake".into(),
+            messages: vec![
+                message(ChatRole::User, "original request"),
+                assistant,
+                tool_result("call-1", "success marker"),
+                tool_result("call-2", "controlled error marker"),
+            ],
+            think: None,
+            tools: Some(Vec::new()),
+        };
+
+        let projected = finalization_request(&request);
+        assert!(projected.tools.is_none());
+        assert_eq!(
+            projected
+                .messages
+                .iter()
+                .map(|message| message.role.clone())
+                .collect::<Vec<_>>(),
+            vec![ChatRole::System, ChatRole::User, ChatRole::User]
+        );
+        assert_eq!(projected.messages[1].content, "original request");
+        assert_eq!(
+            occurrence_count(&projected.messages[0].content, "success marker"),
+            1
+        );
+        assert_eq!(
+            occurrence_count(&projected.messages[0].content, "controlled error marker"),
+            1
+        );
+        assert!(
+            projected
+                .messages
+                .iter()
+                .all(|message| message.reasoning.is_none() && message.tool_calls.is_empty())
+        );
+    }
+
+    #[test]
+    fn finalization_leads_with_system_then_user_user() {
+        let request = ProviderChatRequest {
+            model: "fake".into(),
+            messages: vec![
+                message(ChatRole::User, "original request"),
+                tool_result("call-1", "tool context"),
+            ],
+            think: None,
+            tools: Some(Vec::new()),
+        };
+        let projected = finalization_request(&request);
+        assert!(projected.tools.is_none());
+        assert_eq!(
+            projected
+                .messages
+                .iter()
+                .map(|message| message.role.clone())
+                .collect::<Vec<_>>(),
+            vec![ChatRole::System, ChatRole::User, ChatRole::User]
+        );
+        assert_eq!(projected.messages[0].role, ChatRole::System);
+        assert_eq!(projected.messages[1].role, ChatRole::User);
+        assert_eq!(projected.messages[1].content, "original request");
+        assert_eq!(projected.messages[2].role, ChatRole::User);
     }
 
     struct FakeProvider {
@@ -2296,6 +2590,84 @@ mod tests {
     }
 
     #[test]
+    fn production_policy_allows_reads_and_requires_mutation_approval() {
+        let mut policy = ProductionToolPolicy::default();
+        let call = |name: &str| ProviderToolCall {
+            id: Some("call".into()),
+            name: name.into(),
+            arguments: serde_json::json!({}),
+        };
+
+        for name in ["read_file", "list_directory", "fetch_url"] {
+            assert_eq!(
+                policy.decide(
+                    ToolPolicyContext {
+                        run_id: AgentRunId::new(1)
+                    },
+                    &call(name)
+                ),
+                ToolPolicyDecision::Allow
+            );
+        }
+        assert!(matches!(
+            policy.decide(
+                ToolPolicyContext {
+                    run_id: AgentRunId::new(1)
+                },
+                &call("write_file")
+            ),
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
+        assert!(matches!(
+            policy.decide(
+                ToolPolicyContext {
+                    run_id: AgentRunId::new(1)
+                },
+                &call("update_file")
+            ),
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
+        assert!(matches!(
+            policy.decide(
+                ToolPolicyContext {
+                    run_id: AgentRunId::new(1)
+                },
+                &call("shell")
+            ),
+            ToolPolicyDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn update_file_approval_preview_excludes_content() {
+        let call = ProviderToolCall {
+            id: Some("update-1".into()),
+            name: "update_file".into(),
+            arguments: serde_json::json!({
+                "path": "src/file.txt",
+                "expected_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "content": "sensitive replacement content"
+            }),
+        };
+        let request = ApprovalRequest::from_call(
+            AgentRunId::new(1),
+            ApprovalId::new(1),
+            &call,
+            "file mutation requires approval",
+        );
+
+        assert!(!request.arguments.contains("sensitive replacement content"));
+        let preview: serde_json::Value = serde_json::from_str(&request.arguments).unwrap();
+        assert_eq!(preview["tool"], "update_file");
+        assert_eq!(preview["path"], "src/file.txt");
+        assert_eq!(preview["content_bytes"], 29);
+        assert_eq!(
+            preview["expected_fingerprint"],
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
     fn reserves_last_provider_turn_for_finalization() {
         let mut scripts = Vec::new();
         for index in 0..4 {
@@ -2350,17 +2722,23 @@ mod tests {
                 .iter()
                 .all(|message| !matches!(message.role, ChatRole::Assistant | ChatRole::Tool))
         );
-        assert!(provider.requests[4].messages.iter().any(|message| {
-            matches!(message.role, ChatRole::System)
-                && message.content.contains("one")
-                && message.content.contains("four")
-        }));
+        assert_eq!(
+            provider.requests[4]
+                .messages
+                .iter()
+                .map(|message| message.role.clone())
+                .collect::<Vec<_>>(),
+            vec![ChatRole::System, ChatRole::User, ChatRole::User]
+        );
+        let context = &provider.requests[4].messages[0].content;
+        assert_eq!(occurrence_count(context, "[tool result call-0]"), 1);
+        assert_eq!(occurrence_count(context, "[tool result call-3]"), 1);
         assert_eq!(
             provider.requests[4]
                 .messages
                 .last()
                 .map(|message| &message.role),
-            Some(&ChatRole::System)
+            Some(&ChatRole::User)
         );
         assert_eq!(run.state(), AgentState::Completed);
     }
@@ -2507,9 +2885,23 @@ mod tests {
             .execute(&mut run, request(), &mut |_| {})
             .unwrap();
         assert_eq!(result.content, "recovered");
-        assert!(provider.requests[1].messages.iter().any(|message| {
-            matches!(message.role, ChatRole::System) && message.content.contains("not found")
-        }));
+        let context = &provider.requests[1].messages[0].content;
+        assert_eq!(occurrence_count(context, "not found"), 1);
+        assert_eq!(
+            provider.requests[1]
+                .messages
+                .iter()
+                .map(|message| message.role.clone())
+                .collect::<Vec<_>>(),
+            vec![ChatRole::System, ChatRole::User, ChatRole::User]
+        );
+        assert_eq!(
+            provider.requests[1]
+                .messages
+                .last()
+                .map(|message| &message.role),
+            Some(&ChatRole::User)
+        );
     }
 
     #[test]

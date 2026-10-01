@@ -36,6 +36,7 @@ fn metadata(value: ReadFileMetadata) -> ToolMetadata {
         range: value.range,
         source_bytes: None,
         truncated: false,
+        fingerprint: value.fingerprint,
     }
 }
 

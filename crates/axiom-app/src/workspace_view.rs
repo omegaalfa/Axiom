@@ -28,7 +28,7 @@ use axiom_index::{
     SemanticSnapshot, SnapshotBuilder, VendorSymbolIndex,
 };
 use axiom_lsp::{PositionCodec, ServerStatus, uri_to_path};
-use axiom_php::{RuntimeSymbolIndex, StubProvider};
+use axiom_php::{RuntimeSymbolIndex, RuntimeStubProvider};
 use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_content};
 use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSession};
 use gpui::{
@@ -2878,10 +2878,14 @@ impl WorkspaceView {
         RuntimeStubStatus,
         Option<std::sync::Arc<RuntimeSymbolIndex>>,
     ) {
-        let provider = StubProvider::from_env()
-            .unwrap_or_else(|| StubProvider::new(Self::runtime_stub_path()));
-        let configured_path = provider.root().to_path_buf();
-        let _ = fs::create_dir_all(&configured_path);
+        let provider = RuntimeStubProvider::from_env_or_embedded();
+        let configured_path = provider
+            .root()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("<embedded>"));
+        if let Some(path) = provider.root() {
+            let _ = fs::create_dir_all(path);
+        }
         let cache = runtime_stubs_cache_path();
         let result = cache
             .as_deref()
@@ -2928,8 +2932,8 @@ impl WorkspaceView {
     fn begin_runtime_stub_load(&mut self, cx: &mut Context<Self>, updating: bool) {
         self.runtime_load_generation = self.runtime_load_generation.wrapping_add(1);
         let generation = self.runtime_load_generation;
-        let path = self.runtime_stub_path.clone();
         let cache = self.runtime_stub_cache_path.clone();
+        let provider = RuntimeStubProvider::from_env_or_embedded();
         let (sender, receiver) = mpsc::channel();
         self.runtime_load_results = Some(receiver);
         self.runtime_stubs = RuntimeStubStatus::Loading;
@@ -2940,7 +2944,6 @@ impl WorkspaceView {
         }
         .into();
         thread::spawn(move || {
-            let provider = StubProvider::new(path);
             let result = cache
                 .as_deref()
                 .map_or_else(|| provider.load(), |cache| provider.load_incremental(cache))
@@ -4922,8 +4925,10 @@ impl WorkspaceView {
     #[allow(dead_code)]
     fn reload_runtime_stubs_sync(&mut self, cx: &mut Context<Self>) {
         self.status = "Runtime Stubs: Updating...".into();
-        let provider = StubProvider::new(self.runtime_stub_path.clone());
-        let _ = fs::create_dir_all(&self.runtime_stub_path);
+        let provider = RuntimeStubProvider::from_env_or_embedded();
+        if let Some(path) = provider.root() {
+            let _ = fs::create_dir_all(path);
+        }
         let result = self
             .runtime_stub_cache_path
             .as_deref()
@@ -5755,10 +5760,24 @@ impl WorkspaceView {
                 cx.notify();
                 return;
             };
-            Some(crate::ai::tools::ToolRegistry::new_with_fetch_url(
+            let Ok(write) = axiom_project::project_write::ProjectWriteCapability::new(root) else {
+                self.agent_ui_state = AgentUiState::Failed;
+                self.agent_status = Some("Agent workspace is unavailable".into());
+                cx.notify();
+                return;
+            };
+            let Ok(update) = axiom_project::project_update::ProjectUpdateCapability::new(root) else {
+                self.agent_ui_state = AgentUiState::Failed;
+                self.agent_status = Some("Agent workspace is unavailable".into());
+                cx.notify();
+                return;
+            };
+            Some(crate::ai::tools::ToolRegistry::new_with_mutations(
                 read,
                 directory,
                 axiom_web::FetchUrlCapability::new(),
+                write,
+                update,
             ))
         } else {
             None
@@ -5794,7 +5813,7 @@ impl WorkspaceView {
             thinking: Some(String::new()),
         });
         self.ai_composer_text.clear();
-        let tools = tools_enabled.then(agent_bridge::read_only_tool_definitions);
+        let tools = tools_enabled.then(agent_bridge::production_tool_definitions);
         let request = ProviderChatRequest {
             model: self.model_label.clone(),
             messages: provider_messages_from_agent_session(&self.agent_messages),
@@ -14216,8 +14235,7 @@ mod agent_activity_tests {
 mod approval_ui_tests {
     use super::{
         AiPanelMode, AgentApprovalDecision, AgentApprovalSubmission, AgentApprovalUiState,
-        AgentUiState, WorkspaceView, agent_approval_visible, show_agent_approval,
-        take_agent_approval_submission,
+        WorkspaceView, agent_approval_visible, show_agent_approval, take_agent_approval_submission,
     };
     use axiom_agent::{AgentRunId, ApprovalId, ApprovalRequest, Cancellation};
     use gpui::TestAppContext;

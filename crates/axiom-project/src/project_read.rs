@@ -10,7 +10,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::{FileContent, read_file_content};
+use crate::{
+    FileContent, read_file_content,
+    project_update::{TextFileFingerprint, fingerprint_bytes},
+};
 
 pub const MAX_READ_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -32,6 +35,7 @@ pub struct ReadFileMetadata {
     pub bytes: usize,
     pub truncated: bool,
     pub range: Option<ReadFileRange>,
+    pub fingerprint: Option<TextFileFingerprint>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +152,10 @@ impl ProjectReadCapability {
             }
         };
         let content_bytes = content.len();
+        let fingerprint = request
+            .range
+            .is_none()
+            .then(|| fingerprint_bytes(content.as_bytes()));
         Ok(ReadFileOutput {
             content,
             metadata: ReadFileMetadata {
@@ -155,6 +163,7 @@ impl ProjectReadCapability {
                 bytes: content_bytes,
                 truncated: false,
                 range: request.range,
+                fingerprint,
             },
         })
     }

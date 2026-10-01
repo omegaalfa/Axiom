@@ -22,6 +22,7 @@ namespace Probe\Traits {
 
     trait ExecuteTrait
     {
+
         public function execute(): void
         {
         }
@@ -29,6 +30,9 @@ namespace Probe\Traits {
 
     trait RunA
     {
+        /**
+         *
+         */
         public function run(): void
         {
         }
@@ -36,6 +40,9 @@ namespace Probe\Traits {
 
     trait RunB
     {
+        /**
+         * @return void
+         */
         public function run(): void
         {
         }
@@ -80,6 +87,7 @@ namespace Probe\Models {
 
         public function save(): void
         {
+            for
         }
     }
 
@@ -129,6 +137,25 @@ namespace Probe\Models {
 
         public function run(): void
         {
+        }
+        
+
+        public function save(string $name): void
+        {
+
+        }
+
+
+        /**
+        *
+        *
+        * @param string $name
+        * @param int $count
+        * @return bool
+        */
+        public function process(string $name, int $count): bool
+        {
+            return true;
         }
     }
 }

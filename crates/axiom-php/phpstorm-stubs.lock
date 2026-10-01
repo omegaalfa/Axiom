@@ -1,0 +1,9 @@
+{
+  "repository": "JetBrains/phpstorm-stubs",
+  "commit": "5f68c1021badebe34119fb8fa10ba7cc25de6c0c",
+  "archive_sha256": "8b9bf4b69196d9193f56a4a6ad88b9ff8a230e372312ae8a181c04df1972c4a1",
+  "map_path": "PhpStormStubsMap.php",
+  "artifact_schema_version": 1,
+  "symbol_parser_version": 3,
+  "generator_version": 1
+}

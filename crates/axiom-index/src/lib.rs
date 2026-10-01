@@ -3,6 +3,7 @@
 //! This crate is deliberately headless. It owns no UI or LSP state and can be
 //! queried from completion/navigation providers without blocking rendering.
 
+use axiom_php::parse_phpdoc;
 use axiom_syntax::PhpSyntax;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,7 +29,7 @@ pub use semantic::{
     ScopeKind, ScopeStore, SemanticDefinitionOutcome, SemanticDefinitionResult, SemanticEngine,
     SemanticParameter, SemanticReference, SemanticRevision, SemanticSnapshot, SemanticSymbol,
     SnapshotBuilder, SourceOrigin, SymbolId, TypeCompatibility, UsageLocation, VariableBinding,
-    declared_type_compatibility, declared_type_label,
+    declared_type_compatibility, declared_type_label, semantic_text_fingerprint,
 };
 pub use source::{
     ComposerSource, DeferredSource, RuntimeSource, SourceCandidate, SourceError, SourceFile,
@@ -74,6 +75,10 @@ pub struct ProjectSymbol {
     pub structured_parameters: Vec<IndexedParameter>,
     #[serde(default)]
     pub structured_return_type: Option<DeclaredType>,
+    #[serde(default)]
+    pub declared_throws: Vec<String>,
+    #[serde(default)]
+    pub docblock_range: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -102,7 +107,7 @@ pub struct ProjectSymbolIndex {
 
 // Bumped when symbol FQNs/owner indexing change so stale caches cannot keep
 // invalid member names (for example the old `\\Base::save` global FQN).
-const PROJECT_CACHE_SCHEMA: u32 = 3;
+const PROJECT_CACHE_SCHEMA: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ProjectCacheFile {
@@ -508,6 +513,8 @@ impl VendorSymbolIndex {
                             return_type: None,
                             structured_parameters: Vec::new(),
                             structured_return_type: None,
+                            declared_throws: Vec::new(),
+                            docblock_range: None,
                         });
                     }
                     break;
@@ -552,6 +559,8 @@ impl VendorSymbolIndex {
                         return_type: return_type.clone(),
                         structured_parameters: Vec::new(),
                         structured_return_type: return_type.as_deref().map(indexed_declared_type),
+                        declared_throws: Vec::new(),
+                        docblock_range: None,
                     });
                 }
             }
@@ -587,6 +596,8 @@ impl VendorSymbolIndex {
                             return_type: None,
                             structured_parameters: Vec::new(),
                             structured_return_type: None,
+                            declared_throws: Vec::new(),
+                            docblock_range: None,
                         });
                     }
                 }
@@ -1445,6 +1456,22 @@ pub fn is_workspace_source_lexical(path: impl AsRef<Path>, project_root: impl As
     })
 }
 
+fn callable_docblock(node: Node<'_>, text: &str) -> (Option<std::ops::Range<usize>>, Vec<String>) {
+    let Some(comment) = node.prev_named_sibling().filter(|comment| {
+        comment.kind() == "comment" && text[comment.byte_range()].trim_start().starts_with("/**")
+    }) else {
+        return (None, Vec::new());
+    };
+    let range = comment.byte_range();
+    let mut declared_throws = Vec::new();
+    for exception in parse_phpdoc(&text[range.clone()]).throws {
+        if !declared_throws.contains(&exception) {
+            declared_throws.push(exception);
+        }
+    }
+    (Some(range), declared_throws)
+}
+
 fn walk(
     node: Node<'_>,
     text: &str,
@@ -1515,6 +1542,14 @@ fn walk(
                         .then(|| property_declared_type(node, name_node, text))
                         .flatten()
                 });
+            let (docblock_range, declared_throws) = if matches!(
+                kind,
+                ProjectSymbolKind::Function | ProjectSymbolKind::Method
+            ) {
+                callable_docblock(node, text)
+            } else {
+                (None, Vec::new())
+            };
             let fqn = match (class, kind) {
                 (
                     Some(parent),
@@ -1554,6 +1589,8 @@ fn walk(
                     })
                     .unwrap_or_default(),
                 structured_return_type: return_type.as_deref().map(indexed_declared_type),
+                declared_throws,
+                docblock_range,
             };
             trace_symbol_insert(&symbol, source);
             out.push(symbol);

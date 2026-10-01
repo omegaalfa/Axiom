@@ -246,6 +246,8 @@ mod tests {
                 return_type: None,
                 structured_parameters: Vec::new(),
                 structured_return_type: None,
+                declared_throws: Vec::new(),
+                docblock_range: None,
             },
             ProjectSymbol {
                 name: "A".into(),
@@ -260,6 +262,8 @@ mod tests {
                 return_type: None,
                 structured_parameters: Vec::new(),
                 structured_return_type: None,
+                declared_throws: Vec::new(),
+                docblock_range: None,
             },
         ];
         let outline = build_file_outline(symbols.iter(), &file);

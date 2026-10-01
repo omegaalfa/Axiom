@@ -1,11 +1,15 @@
-//! Minimal, provider-independent read-only tool layer.
+//! Minimal, provider-independent Agent tool layer.
 
 mod fetch_url;
 mod list_directory;
 mod read_file;
+mod update_file;
+mod write_file;
 
 use axiom_project::project_directory::ProjectDirectoryCapability;
 use axiom_project::project_read::{ProjectReadCapability, ReadFileRange};
+use axiom_project::project_update::{ProjectUpdateCapability, TextFileFingerprint};
+use axiom_project::project_write::ProjectWriteCapability;
 
 pub(crate) use fetch_url::FetchUrlTool;
 
@@ -15,19 +19,20 @@ pub(crate) use fetch_url::FetchUrlTool;
 pub(crate) const MAX_TOOL_CONTENT_BYTES: usize = 24 * 1024;
 pub(crate) use list_directory::ListDirectoryTool;
 pub(crate) use read_file::ReadFileTool;
+pub(crate) use update_file::UpdateFileTool;
+pub(crate) use write_file::WriteFileTool;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ToolName {
     ReadFile,
     ListDirectory,
     FetchUrl,
+    WriteFile,
+    UpdateFile,
     Unknown(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-// Mutating tools are intentionally not implemented yet, but the category is
-// part of the registry contract for the future agent runtime.
-#[allow(dead_code)]
 pub(crate) enum ToolKind {
     ReadOnly,
     Mutating,
@@ -45,6 +50,15 @@ pub(crate) enum ToolArguments {
     FetchUrl {
         url: String,
     },
+    WriteFile {
+        path: String,
+        content: String,
+    },
+    UpdateFile {
+        path: String,
+        expected_fingerprint: String,
+        content: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +74,7 @@ pub(crate) struct ToolMetadata {
     pub(crate) range: Option<ReadFileRange>,
     pub(crate) source_bytes: Option<usize>,
     pub(crate) truncated: bool,
+    pub(crate) fingerprint: Option<TextFileFingerprint>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +110,8 @@ pub(crate) enum ToolError {
         message: String,
     },
     UnsupportedEncoding(String),
+    AlreadyExists(String),
+    SymlinkNotAllowed(String),
     InvalidUrl,
     UnsupportedScheme(String),
     BlockedAddress(String),
@@ -104,6 +121,10 @@ pub(crate) enum ToolError {
     Network(String),
     Cancelled,
     RedirectLimit,
+    InvalidFingerprint,
+    FingerprintMismatch,
+    NotRegularFile(String),
+    CurrentFileTooLarge { path: String, limit: usize, actual: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,6 +138,8 @@ pub(crate) struct ToolRegistry {
     read_file: ReadFileTool,
     list_directory: ListDirectoryTool,
     fetch_url: FetchUrlTool,
+    write_file: Option<WriteFileTool>,
+    update_file: Option<UpdateFileTool>,
 }
 
 impl ToolRegistry {
@@ -141,15 +164,51 @@ impl ToolRegistry {
             read_file: ReadFileTool::new(read_capability),
             list_directory: ListDirectoryTool::new(directory_capability),
             fetch_url: FetchUrlTool::new(fetch_url_capability),
+            write_file: None,
+            update_file: None,
+        }
+    }
+
+    pub(crate) fn new_with_write_file(
+        read_capability: ProjectReadCapability,
+        directory_capability: ProjectDirectoryCapability,
+        fetch_url_capability: axiom_web::FetchUrlCapability,
+        write_capability: ProjectWriteCapability,
+    ) -> Self {
+        Self {
+            read_file: ReadFileTool::new(read_capability),
+            list_directory: ListDirectoryTool::new(directory_capability),
+            fetch_url: FetchUrlTool::new(fetch_url_capability),
+            write_file: Some(WriteFileTool::new(write_capability)),
+            update_file: None,
+        }
+    }
+
+    pub(crate) fn new_with_mutations(
+        read_capability: ProjectReadCapability,
+        directory_capability: ProjectDirectoryCapability,
+        fetch_url_capability: axiom_web::FetchUrlCapability,
+        write_capability: ProjectWriteCapability,
+        update_capability: ProjectUpdateCapability,
+    ) -> Self {
+        Self {
+            read_file: ReadFileTool::new(read_capability),
+            list_directory: ListDirectoryTool::new(directory_capability),
+            fetch_url: FetchUrlTool::new(fetch_url_capability),
+            write_file: Some(WriteFileTool::new(write_capability)),
+            update_file: Some(UpdateFileTool::new(update_capability)),
         }
     }
 
     pub(crate) fn kind(&self, name: &ToolName) -> Option<ToolKind> {
-        matches!(
-            name,
-            ToolName::ReadFile | ToolName::ListDirectory | ToolName::FetchUrl
-        )
-        .then_some(ToolKind::ReadOnly)
+        match name {
+            ToolName::ReadFile | ToolName::ListDirectory | ToolName::FetchUrl => {
+                Some(ToolKind::ReadOnly)
+            }
+            ToolName::WriteFile => self.write_file.is_some().then_some(ToolKind::Mutating),
+            ToolName::UpdateFile => self.update_file.is_some().then_some(ToolKind::Mutating),
+            ToolName::Unknown(_) => None,
+        }
     }
 
     pub(crate) fn execute(&self, request: ToolRequest) -> ToolResult {
@@ -174,6 +233,49 @@ impl ToolRegistry {
                 arguments: ToolArguments::FetchUrl { url },
             } => self.fetch_url.execute(url, cancelled),
             ToolRequest {
+                name: ToolName::WriteFile,
+                arguments: ToolArguments::WriteFile { path, content },
+            } => {
+                if cancelled() {
+                    return ToolResult {
+                        tool: ToolName::WriteFile,
+                        result: Err(ToolError::Cancelled),
+                    };
+                }
+                match self.write_file.as_ref() {
+                    Some(write_file) => write_file.execute(path, content),
+                    None => ToolResult {
+                        tool: ToolName::WriteFile,
+                        result: Err(ToolError::UnknownTool("write_file".into())),
+                    },
+                }
+            }
+            ToolRequest {
+                name: ToolName::UpdateFile,
+                arguments:
+                    ToolArguments::UpdateFile {
+                        path,
+                        expected_fingerprint,
+                        content,
+                    },
+            } => {
+                if cancelled() {
+                    return ToolResult {
+                        tool: ToolName::UpdateFile,
+                        result: Err(ToolError::Cancelled),
+                    };
+                }
+                match self.update_file.as_ref() {
+                    Some(update_file) => {
+                        update_file.execute(path, expected_fingerprint, content)
+                    }
+                    None => ToolResult {
+                        tool: ToolName::UpdateFile,
+                        result: Err(ToolError::UnknownTool("update_file".into())),
+                    },
+                }
+            }
+            ToolRequest {
                 name: ToolName::Unknown(name),
                 ..
             } => ToolResult {
@@ -194,6 +296,8 @@ impl ToolRegistry {
 mod tests {
     use super::*;
     use axiom_project::project_read::ProjectReadCapability;
+    use axiom_project::project_update::ProjectUpdateCapability;
+    use axiom_project::project_write::ProjectWriteCapability;
     use std::fs;
     use tempfile::tempdir;
 
@@ -202,6 +306,40 @@ mod tests {
         let read = ProjectReadCapability::new(dir.path()).unwrap();
         let directory = ProjectDirectoryCapability::new(dir.path()).unwrap();
         (dir, ToolRegistry::new(read, directory))
+    }
+
+    fn mutation_registry() -> (tempfile::TempDir, ToolRegistry) {
+        let dir = tempdir().unwrap();
+        let read = ProjectReadCapability::new(dir.path()).unwrap();
+        let directory = ProjectDirectoryCapability::new(dir.path()).unwrap();
+        let write = ProjectWriteCapability::new(dir.path()).unwrap();
+        (
+            dir,
+            ToolRegistry::new_with_write_file(
+                read,
+                directory,
+                axiom_web::FetchUrlCapability::new(),
+                write,
+            ),
+        )
+    }
+
+    fn update_registry() -> (tempfile::TempDir, ToolRegistry) {
+        let dir = tempdir().unwrap();
+        let read = ProjectReadCapability::new(dir.path()).unwrap();
+        let directory = ProjectDirectoryCapability::new(dir.path()).unwrap();
+        let write = ProjectWriteCapability::new(dir.path()).unwrap();
+        let update = ProjectUpdateCapability::new(dir.path()).unwrap();
+        (
+            dir,
+            ToolRegistry::new_with_mutations(
+                read,
+                directory,
+                axiom_web::FetchUrlCapability::new(),
+                write,
+                update,
+            ),
+        )
     }
 
     fn request(path: &str) -> ToolRequest {
@@ -223,6 +361,140 @@ mod tests {
             Some(ToolKind::ReadOnly)
         );
         assert_eq!(registry.kind(&ToolName::FetchUrl), Some(ToolKind::ReadOnly));
+        assert_eq!(registry.kind(&ToolName::WriteFile), None);
+    }
+
+    #[test]
+    fn write_file_is_mutating_and_creates_utf8_content() {
+        let (dir, registry) = mutation_registry();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        assert_eq!(
+            registry.kind(&ToolName::WriteFile),
+            Some(ToolKind::Mutating)
+        );
+        let result = registry.execute(ToolRequest {
+            name: ToolName::WriteFile,
+            arguments: ToolArguments::WriteFile {
+                path: "src/new.txt".into(),
+                content: "Olá, Axiom! 🚀".into(),
+            },
+        });
+        assert!(matches!(result.result, Ok(ToolOutput { .. })));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/new.txt")).unwrap(),
+            "Olá, Axiom! 🚀"
+        );
+    }
+
+    #[test]
+    fn write_file_rejects_existing_destination_without_overwriting() {
+        let (dir, registry) = mutation_registry();
+        fs::write(dir.path().join("existing.txt"), "original").unwrap();
+        let result = registry.execute(ToolRequest {
+            name: ToolName::WriteFile,
+            arguments: ToolArguments::WriteFile {
+                path: "existing.txt".into(),
+                content: "replacement".into(),
+            },
+        });
+        assert!(matches!(result.result, Err(ToolError::AlreadyExists(_))));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("existing.txt")).unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    fn update_file_requires_matching_fingerprint_and_preserves_utf8() {
+        let (dir, registry) = update_registry();
+        fs::write(dir.path().join("file.txt"), "old").unwrap();
+        let expected = ProjectUpdateCapability::new(dir.path())
+            .unwrap()
+            .fingerprint_text_file("file.txt")
+            .unwrap()
+            .to_wire_string();
+        assert_eq!(
+            registry.kind(&ToolName::UpdateFile),
+            Some(ToolKind::Mutating)
+        );
+        let result = registry.execute(ToolRequest {
+            name: ToolName::UpdateFile,
+            arguments: ToolArguments::UpdateFile {
+                path: "file.txt".into(),
+                expected_fingerprint: expected,
+                content: "Olá, Axiom! 🚀".into(),
+            },
+        });
+        assert!(matches!(result.result, Ok(ToolOutput { .. })));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "Olá, Axiom! 🚀"
+        );
+    }
+
+    #[test]
+    fn update_file_rejects_stale_and_malformed_fingerprints_without_mutation() {
+        let (dir, registry) = update_registry();
+        fs::write(dir.path().join("file.txt"), "current").unwrap();
+        for expected_fingerprint in [
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            "malformed".into(),
+        ] {
+            let result = registry.execute(ToolRequest {
+                name: ToolName::UpdateFile,
+                arguments: ToolArguments::UpdateFile {
+                    path: "file.txt".into(),
+                    expected_fingerprint,
+                    content: "replacement".into(),
+                },
+            });
+            assert!(matches!(
+                result.result,
+                Err(ToolError::FingerprintMismatch | ToolError::InvalidFingerprint)
+            ));
+        }
+        assert_eq!(
+            fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "current"
+        );
+    }
+
+    #[test]
+    fn update_file_conflict_preserves_newer_content_and_missing_file_is_not_created() {
+        let (dir, registry) = update_registry();
+        fs::write(dir.path().join("file.txt"), "old").unwrap();
+        let expected = ProjectUpdateCapability::new(dir.path())
+            .unwrap()
+            .fingerprint_text_file("file.txt")
+            .unwrap()
+            .to_wire_string();
+        fs::write(dir.path().join("file.txt"), "newer").unwrap();
+        let result = registry.execute(ToolRequest {
+            name: ToolName::UpdateFile,
+            arguments: ToolArguments::UpdateFile {
+                path: "file.txt".into(),
+                expected_fingerprint: expected,
+                content: "stale replacement".into(),
+            },
+        });
+        assert!(matches!(result.result, Err(ToolError::FingerprintMismatch)));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "newer"
+        );
+
+        let missing = registry.execute(ToolRequest {
+            name: ToolName::UpdateFile,
+            arguments: ToolArguments::UpdateFile {
+                path: "missing.txt".into(),
+                expected_fingerprint:
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                        .into(),
+                content: "must not be created".into(),
+            },
+        });
+        assert!(matches!(missing.result, Err(ToolError::NotFound(_))));
+        assert!(!dir.path().join("missing.txt").exists());
     }
 
     #[test]

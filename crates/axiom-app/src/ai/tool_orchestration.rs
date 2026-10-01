@@ -82,6 +82,54 @@ pub(crate) fn fetch_url_definition() -> ProviderToolDefinition {
     }
 }
 
+pub(crate) fn write_file_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: "write_file".into(),
+        description: "Create a new UTF-8 text file at a workspace-relative path.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative destination path."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "UTF-8 text content to create."
+                }
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn update_file_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: "update_file".into(),
+        description: "Replace an existing UTF-8 text file only when its current SHA-256 fingerprint matches expected_fingerprint. Obtain that fingerprint from a full read_file first; a stale/conflict result means the file changed and must not be retried with old content.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative existing file path."
+                },
+                "expected_fingerprint": {
+                    "type": "string",
+                    "description": "Canonical sha256:<64 lowercase hex> fingerprint returned by full read_file."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Complete replacement UTF-8 text content."
+                }
+            },
+            "required": ["path", "expected_fingerprint", "content"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 type RunProvider<'a> = dyn FnMut(
         &ProviderChatRequest,
         &mut dyn FnMut(ProviderChatStreamEvent) -> Result<(), ProviderError>,
@@ -100,8 +148,6 @@ pub(crate) fn run_read_file_round_trip(
     tracing::info!(
         target: "axiom.ai_diag",
         event = "orchestration_started",
-        model = %request.model,
-        tools_supplied = request.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
         "[AI-DIAG]"
     );
     if cancelled.load(std::sync::atomic::Ordering::Acquire) {
@@ -206,7 +252,7 @@ pub(crate) fn run_read_file_round_trip(
                 target: "axiom.ai_diag",
                 event = "tool_start",
                 round = round + 1,
-                tool = %call.name,
+                tool_call_id_present = call.id.is_some(),
                 "[AI-DIAG]"
             );
             let result = execute_call(registry, &call, cancelled);
@@ -215,7 +261,7 @@ pub(crate) fn run_read_file_round_trip(
                     target: "axiom.ai_diag",
                     event = "tool_complete",
                     round = round + 1,
-                    tool = %call.name,
+                    tool_call_id_present = call.id.is_some(),
                     status = "success",
                     elapsed_ms = tool_started.elapsed().as_millis() as u64,
                     bytes = output.metadata.bytes,
@@ -229,7 +275,7 @@ pub(crate) fn run_read_file_round_trip(
                     target: "axiom.ai_diag",
                     event = "tool_complete",
                     round = round + 1,
-                    tool = %call.name,
+                    tool_call_id_present = call.id.is_some(),
                     status = "error",
                     elapsed_ms = tool_started.elapsed().as_millis() as u64,
                     "[AI-DIAG]"
@@ -501,6 +547,7 @@ mod tests {
     use crate::ai::tools::{MAX_TOOL_CONTENT_BYTES, ToolMetadata, ToolOutput};
     use axiom_ai_provider::{ChatRole, ProviderToolCall};
     use axiom_project::project_read::ProjectReadCapability;
+    use axiom_project::project_update::TextFileFingerprint;
     use std::fs;
     use tempfile::tempdir;
 
@@ -819,6 +866,7 @@ mod tests {
                     range: None,
                     source_bytes: Some(MAX_TOOL_CONTENT_BYTES),
                     truncated: false,
+                    fingerprint: None,
                 },
             }),
         };
@@ -829,6 +877,29 @@ mod tests {
             MAX_TOOL_CONTENT_BYTES
         );
         assert!(serialized.len() < MAX_TOOL_CONTENT_BYTES + 512);
+    }
+
+    #[test]
+    fn chat_read_file_payload_does_not_include_agent_fingerprint() {
+        let result = ToolResult {
+            tool: ToolName::ReadFile,
+            result: Ok(ToolOutput {
+                content: "contents".into(),
+                metadata: ToolMetadata {
+                    path: "file.txt".into(),
+                    bytes: 8,
+                    range: None,
+                    source_bytes: None,
+                    truncated: false,
+                    fingerprint: Some(TextFileFingerprint::from_bytes([7; 32])),
+                },
+            }),
+        };
+        let serialized = tool_result_content(&result, "read_file");
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["content"], "contents");
+        assert_eq!(value["metadata"]["bytes"], 8);
+        assert!(value["metadata"].get("fingerprint").is_none());
     }
 
     #[test]
@@ -1074,7 +1145,9 @@ mod tests {
         );
         assert_eq!(
             user_message(&ToolRoundTripError::Provider(
-                ProviderError::InvalidResponse
+                ProviderError::invalid_response(
+                    axiom_ai_provider::InvalidResponseCategory::HttpStatus
+                )
             )),
             "Invalid Ollama response"
         );

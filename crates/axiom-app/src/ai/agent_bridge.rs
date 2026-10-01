@@ -2,12 +2,13 @@
 
 use super::tool_orchestration::{
     fetch_url_definition, list_directory_definition, read_file_definition,
+    update_file_definition, write_file_definition,
 };
 use super::tools::{ToolArguments, ToolError, ToolName, ToolRegistry, ToolRequest};
 use axiom_agent::{
     AgentEvent, AgentExecutionError, AgentExecutor, AgentRun, AgentRunId, ApprovalId,
-    ApprovalRequest, Cancellation, ProviderExecutor, ReadOnlyToolPolicy, ToolExecutor,
-    ToolInfrastructureError, ToolOutcome, ToolPolicy, ToolPolicyContext, ToolPolicyDecision,
+    ApprovalRequest, Cancellation, ProductionToolPolicy, ProviderExecutor, ToolExecutor,
+    ToolInfrastructureError, ToolOutcome, ToolPolicy,
 };
 use axiom_ai_provider::{
     OllamaProvider, ProviderChatRequest, ProviderChatStreamEvent, ProviderError, ProviderToolCall,
@@ -223,11 +224,13 @@ pub(crate) fn next_agent_run_id() -> AgentRunId {
     AgentRunId::new(NEXT_AGENT_RUN_ID.fetch_add(1, Ordering::Relaxed))
 }
 
-pub(crate) fn read_only_tool_definitions() -> Vec<axiom_ai_provider::ProviderToolDefinition> {
+pub(crate) fn production_tool_definitions() -> Vec<axiom_ai_provider::ProviderToolDefinition> {
     vec![
         read_file_definition(),
         list_directory_definition(),
         fetch_url_definition(),
+        write_file_definition(),
+        update_file_definition(),
     ]
 }
 
@@ -296,11 +299,35 @@ impl ToolExecutor for AgentToolAdapter {
             });
         };
         let result = registry.execute_with_cancel(request, || self.cancellation.is_cancelled());
+        let tool = result.tool;
         Ok(match result.result {
-            Ok(output) => ToolOutcome::Success(output.content),
+            Ok(output) => ToolOutcome::Success(agent_tool_result(tool, output)),
             Err(error) => ToolOutcome::ControlledError(tool_error_message(&error)),
         })
     }
+}
+
+fn agent_tool_result(tool: ToolName, output: super::tools::ToolOutput) -> String {
+    if tool != ToolName::ReadFile {
+        return output.content;
+    }
+    let mut metadata = serde_json::json!({
+        "bytes": output.metadata.bytes,
+        "range": output.metadata.range.as_ref().map(|range| serde_json::json!({
+            "start_line": range.start_line,
+            "end_line": range.end_line,
+        })),
+    });
+    if let Some(fingerprint) = output.metadata.fingerprint {
+        metadata["fingerprint"] = Value::String(fingerprint.to_wire_string());
+    }
+    serde_json::json!({
+        "tool": "read_file",
+        "path": output.metadata.path,
+        "content": output.content,
+        "metadata": metadata,
+    })
+    .to_string()
 }
 
 fn provider_call_to_request(call: &ProviderToolCall) -> Result<ToolRequest, String> {
@@ -356,6 +383,45 @@ fn provider_call_to_request(call: &ProviderToolCall) -> Result<ToolRequest, Stri
                 arguments: ToolArguments::FetchUrl { url: url.into() },
             })
         }
+        "write_file" => {
+            let path = object
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "path must be a string".to_owned())?;
+            let content = object
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "content must be a string".to_owned())?;
+            Ok(ToolRequest {
+                name: ToolName::WriteFile,
+                arguments: ToolArguments::WriteFile {
+                    path: path.into(),
+                    content: content.into(),
+                },
+            })
+        }
+        "update_file" => {
+            let path = object
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "path must be a string".to_owned())?;
+            let expected_fingerprint = object
+                .get("expected_fingerprint")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "expected_fingerprint must be a string".to_owned())?;
+            let content = object
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "content must be a string".to_owned())?;
+            Ok(ToolRequest {
+                name: ToolName::UpdateFile,
+                arguments: ToolArguments::UpdateFile {
+                    path: path.into(),
+                    expected_fingerprint: expected_fingerprint.into(),
+                    content: content.into(),
+                },
+            })
+        }
         other => Ok(ToolRequest {
             name: ToolName::Unknown(other.into()),
             arguments: ToolArguments::ListDirectory {
@@ -374,6 +440,10 @@ fn tool_error_message(error: &ToolError) -> String {
         ToolError::NotDirectory(path) => format!("path is not a directory: {path}"),
         ToolError::OutsideWorkspace(path) => format!("path is outside the workspace: {path}"),
         ToolError::InvalidPath(path) => format!("invalid path: {path}"),
+        ToolError::AlreadyExists(path) => format!("file already exists: {path}"),
+        ToolError::SymlinkNotAllowed(path) => {
+            format!("symbolic links are not allowed in write paths: {path}")
+        }
         ToolError::TooLarge { path, .. } => format!("file is too large: {path}"),
         ToolError::TooManyEntries { path, .. } => format!("too many directory entries: {path}"),
         ToolError::UnsupportedEncoding(path) => format!("unsupported encoding: {path}"),
@@ -390,6 +460,16 @@ fn tool_error_message(error: &ToolError) -> String {
         ToolError::Network(message) => format!("network error: {message}"),
         ToolError::Cancelled => "tool cancelled".into(),
         ToolError::RedirectLimit => "redirect limit reached".into(),
+        ToolError::InvalidFingerprint => {
+            "expected_fingerprint must be sha256:<64 lowercase hex chars>".into()
+        }
+        ToolError::FingerprintMismatch => {
+            "file changed since it was read; refresh it and use the current fingerprint".into()
+        }
+        ToolError::NotRegularFile(path) => format!("path is not a regular file: {path}"),
+        ToolError::CurrentFileTooLarge { path, .. } => {
+            format!("current file is too large: {path}")
+        }
     }
 }
 
@@ -412,7 +492,7 @@ pub(crate) fn execute_agent_run(
         request,
         &mut provider,
         &mut tools,
-        ReadOnlyToolPolicy::default(),
+        ProductionToolPolicy::default(),
         bridge,
         queue,
     );
@@ -423,7 +503,6 @@ pub(crate) fn execute_agent_run(
             event = "agent_terminal_failure",
             run_id = run.id().value(),
             category = ?diagnostic.kind,
-            diagnostic = %diagnostic.message,
             "[AI-DIAG]"
         );
     }
@@ -483,6 +562,34 @@ where
 }
 
 fn publish_event(handle: &ApprovalRunHandle, queue: &AgentEventQueue, event: AgentEvent) {
+    match &event {
+        AgentEvent::ModelStarted { run_id } => tracing::info!(
+            target: "axiom.ai_diag",
+            event = "agent_provider_turn_started",
+            run_id = run_id.value(),
+            "[AI-DIAG]"
+        ),
+        AgentEvent::ToolRequested { run_id } => tracing::info!(
+            target: "axiom.ai_diag",
+            event = "agent_tool_requested",
+            run_id = run_id.value(),
+            "[AI-DIAG]"
+        ),
+        AgentEvent::ToolStarted { run_id } => tracing::info!(
+            target: "axiom.ai_diag",
+            event = "agent_tool_started",
+            run_id = run_id.value(),
+            "[AI-DIAG]"
+        ),
+        AgentEvent::ToolCompleted { run_id, succeeded } => tracing::info!(
+            target: "axiom.ai_diag",
+            event = "agent_tool_completed",
+            run_id = run_id.value(),
+            succeeded = *succeeded,
+            "[AI-DIAG]"
+        ),
+        _ => {}
+    }
     handle.record_event(&event);
     if let Ok(mut events) = queue.lock() {
         events.push(event);
@@ -494,6 +601,7 @@ mod tests {
     use super::*;
     use axiom_project::{
         project_directory::ProjectDirectoryCapability, project_read::ProjectReadCapability,
+        project_update::ProjectUpdateCapability,
     };
     use std::fs;
 
@@ -545,12 +653,66 @@ mod tests {
             Ok(ToolOutcome::ControlledError(_))
         ));
     }
+
+    #[test]
+    fn full_read_exposes_fingerprint_and_ranged_read_does_not() {
+        let (dir, mut adapter) = adapter();
+        std::fs::write(dir.path().join("file.txt"), "exact bytes").unwrap();
+        let full = ProviderToolCall {
+            id: Some("read-full".into()),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "file.txt"}),
+        };
+        let ToolOutcome::Success(content) = adapter.execute(&full).unwrap() else {
+            panic!("read failed");
+        };
+        let value: Value = serde_json::from_str(&content).unwrap();
+        let expected = ProjectUpdateCapability::new(dir.path())
+            .unwrap()
+            .fingerprint_text_file("file.txt")
+            .unwrap()
+            .to_wire_string();
+        assert_eq!(value["metadata"]["fingerprint"], expected);
+
+        let ranged = ProviderToolCall {
+            id: Some("read-range".into()),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "file.txt", "start_line": 1, "end_line": 1}),
+        };
+        let ToolOutcome::Success(content) = adapter.execute(&ranged).unwrap() else {
+            panic!("ranged read failed");
+        };
+        let value: Value = serde_json::from_str(&content).unwrap();
+        assert!(value["metadata"].get("fingerprint").is_none());
+    }
+
+    #[test]
+    fn production_tool_set_registers_write_and_update_files() {
+        let names: Vec<_> = production_tool_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "read_file",
+                "list_directory",
+                "fetch_url",
+                "write_file",
+                "update_file"
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
 mod approval_bridge_tests {
     use super::*;
+    use axiom_agent::{ToolPolicyContext, ToolPolicyDecision};
     use axiom_ai_provider::{ChatRole, ProviderChatMessage, ProviderChatStreamEvent};
+    use axiom_project::{
+        project_update::ProjectUpdateCapability, project_write::ProjectWriteCapability,
+    };
     use std::{
         sync::{Arc, Mutex},
         thread,
@@ -651,6 +813,72 @@ mod approval_bridge_tests {
         })
     }
 
+    fn write_tool_call(id: &str, path: &str, content: &str) -> ProviderChatStreamEvent {
+        ProviderChatStreamEvent::ToolCall(ProviderToolCall {
+            id: Some(id.into()),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": path, "content": content}),
+        })
+    }
+
+    fn update_tool_call(
+        id: &str,
+        path: &str,
+        expected_fingerprint: &str,
+        content: &str,
+    ) -> ProviderChatStreamEvent {
+        ProviderChatStreamEvent::ToolCall(ProviderToolCall {
+            id: Some(id.into()),
+            name: "update_file".into(),
+            arguments: serde_json::json!({
+                "path": path,
+                "expected_fingerprint": expected_fingerprint,
+                "content": content,
+            }),
+        })
+    }
+
+    fn write_adapter() -> (tempfile::TempDir, AgentToolAdapter) {
+        let dir = tempfile::tempdir().unwrap();
+        let read =
+            axiom_project::project_read::ProjectReadCapability::new(dir.path()).unwrap();
+        let directory =
+            axiom_project::project_directory::ProjectDirectoryCapability::new(dir.path()).unwrap();
+        let write = ProjectWriteCapability::new(dir.path()).unwrap();
+        let registry = ToolRegistry::new_with_write_file(
+            read,
+            directory,
+            axiom_web::FetchUrlCapability::new(),
+            write,
+        );
+        (
+            dir,
+            AgentToolAdapter::new(registry, Cancellation::default()),
+        )
+    }
+
+    fn update_adapter() -> (tempfile::TempDir, AgentToolAdapter) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "old").unwrap();
+        let read =
+            axiom_project::project_read::ProjectReadCapability::new(dir.path()).unwrap();
+        let directory =
+            axiom_project::project_directory::ProjectDirectoryCapability::new(dir.path()).unwrap();
+        let write = ProjectWriteCapability::new(dir.path()).unwrap();
+        let update = ProjectUpdateCapability::new(dir.path()).unwrap();
+        let registry = ToolRegistry::new_with_mutations(
+            read,
+            directory,
+            axiom_web::FetchUrlCapability::new(),
+            write,
+            update,
+        );
+        (
+            dir,
+            AgentToolAdapter::new(registry, Cancellation::default()),
+        )
+    }
+
     fn approval(reason: &str) -> ToolPolicyDecision {
         ToolPolicyDecision::RequireApproval {
             reason: reason.into(),
@@ -666,6 +894,245 @@ mod approval_bridge_tests {
             assert!(Instant::now() < deadline, "approval did not become pending");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn approved_write_executes_once_and_preserves_utf8_content() {
+        let (dir, mut tools) = write_adapter();
+        let mut provider = ScriptedProvider {
+            scripts: vec![
+                vec![
+                    write_tool_call("write-1", "new.txt", "Olá, Axiom! 🚀"),
+                    ProviderChatStreamEvent::Done,
+                ],
+                vec![
+                    ProviderChatStreamEvent::ContentDelta("created".into()),
+                    ProviderChatStreamEvent::Done,
+                ],
+            ],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            calls: 0,
+        };
+        let mut run = AgentRun::new(
+            AgentRunId::new(501),
+            axiom_agent::AgentBudget::new(2, 1),
+        );
+        let mut executor = AgentExecutor::with_policy(
+            &mut provider,
+            &mut tools,
+            ProductionToolPolicy::default(),
+        );
+        let error = executor
+            .execute(&mut run, request(), &mut |_| {})
+            .unwrap_err();
+        let approval = match error {
+            AgentExecutionError::ApprovalRequired(approval) => approval,
+            other => panic!("expected approval: {other:?}"),
+        };
+        assert!(!dir.path().join("new.txt").exists());
+
+        let result = executor
+            .approve(&mut run, approval.approval_id, &mut |_| {})
+            .unwrap();
+        assert!(!result
+            .messages()
+            .iter()
+            .any(|message| message.content.contains("Olá, Axiom! 🚀")));
+        assert!(result
+            .messages()
+            .iter()
+            .all(|message| !message.content.contains("<tool_call")));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+            "Olá, Axiom! 🚀"
+        );
+        assert!(matches!(
+            executor.approve(&mut run, approval.approval_id, &mut |_| {}),
+            Err(AgentExecutionError::Approval(axiom_agent::ApprovalError::NotPending))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+            "Olá, Axiom! 🚀"
+        );
+    }
+
+    #[test]
+    fn approved_update_executes_once_and_approval_hides_content() {
+        let (dir, mut tools) = update_adapter();
+        let expected = ProjectUpdateCapability::new(dir.path())
+            .unwrap()
+            .fingerprint_text_file("file.txt")
+            .unwrap()
+            .to_wire_string();
+        let mut provider = ScriptedProvider {
+            scripts: vec![
+                vec![
+                    update_tool_call(
+                        "update-1",
+                        "file.txt",
+                        &expected,
+                        "Olá, atualização! 🚀",
+                    ),
+                    ProviderChatStreamEvent::Done,
+                ],
+                vec![
+                    ProviderChatStreamEvent::ContentDelta("updated".into()),
+                    ProviderChatStreamEvent::Done,
+                ],
+            ],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            calls: 0,
+        };
+        let mut run = AgentRun::new(
+            AgentRunId::new(503),
+            axiom_agent::AgentBudget::new(2, 1),
+        );
+        let mut executor = AgentExecutor::with_policy(
+            &mut provider,
+            &mut tools,
+            ProductionToolPolicy::default(),
+        );
+        let error = executor
+            .execute(&mut run, request(), &mut |_| {})
+            .unwrap_err();
+        let approval = match error {
+            AgentExecutionError::ApprovalRequired(approval) => approval,
+            other => panic!("expected approval: {other:?}"),
+        };
+        assert!(!approval.arguments.contains("Olá, atualização! 🚀"));
+        assert!(approval.arguments.contains("content_bytes"));
+        assert!(approval.arguments.contains(&expected));
+
+        let result = executor
+            .approve(&mut run, approval.approval_id, &mut |_| {})
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "Olá, atualização! 🚀"
+        );
+        assert!(!result
+            .messages()
+            .iter()
+            .any(|message| message.content.contains("Olá, atualização! 🚀")));
+        assert!(matches!(
+            executor.approve(&mut run, approval.approval_id, &mut |_| {}),
+            Err(AgentExecutionError::Approval(axiom_agent::ApprovalError::NotPending))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "Olá, atualização! 🚀"
+        );
+    }
+
+    #[test]
+    fn denied_wrong_and_duplicate_update_approvals_never_mutate() {
+        let (dir, mut tools) = update_adapter();
+        let expected = ProjectUpdateCapability::new(dir.path())
+            .unwrap()
+            .fingerprint_text_file("file.txt")
+            .unwrap()
+            .to_wire_string();
+        let mut provider = ScriptedProvider {
+            scripts: vec![
+                vec![
+                    update_tool_call("update-1", "file.txt", &expected, "must not write"),
+                    ProviderChatStreamEvent::Done,
+                ],
+                vec![
+                    ProviderChatStreamEvent::ContentDelta("denied".into()),
+                    ProviderChatStreamEvent::Done,
+                ],
+            ],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            calls: 0,
+        };
+        let mut run = AgentRun::new(
+            AgentRunId::new(504),
+            axiom_agent::AgentBudget::new(2, 1),
+        );
+        let mut executor = AgentExecutor::with_policy(
+            &mut provider,
+            &mut tools,
+            ProductionToolPolicy::default(),
+        );
+        let error = executor
+            .execute(&mut run, request(), &mut |_| {})
+            .unwrap_err();
+        let approval = match error {
+            AgentExecutionError::ApprovalRequired(approval) => approval,
+            other => panic!("expected approval: {other:?}"),
+        };
+        assert!(matches!(
+            executor.approve(&mut run, ApprovalId::new(999), &mut |_| {}),
+            Err(AgentExecutionError::Approval(
+                axiom_agent::ApprovalError::UnknownApproval
+            ))
+        ));
+        executor
+            .deny(&mut run, approval.approval_id, &mut |_| {})
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "old"
+        );
+        assert!(matches!(
+            executor.approve(&mut run, approval.approval_id, &mut |_| {}),
+            Err(AgentExecutionError::Approval(axiom_agent::ApprovalError::NotPending))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn denied_or_stale_write_approval_never_creates_a_file() {
+        let (dir, mut tools) = write_adapter();
+        let mut provider = ScriptedProvider {
+            scripts: vec![
+                vec![
+                    write_tool_call("write-1", "blocked.txt", "must not exist"),
+                    ProviderChatStreamEvent::Done,
+                ],
+                vec![
+                    ProviderChatStreamEvent::ContentDelta("denied".into()),
+                    ProviderChatStreamEvent::Done,
+                ],
+            ],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            calls: 0,
+        };
+        let mut run = AgentRun::new(
+            AgentRunId::new(502),
+            axiom_agent::AgentBudget::new(2, 1),
+        );
+        let mut executor = AgentExecutor::with_policy(
+            &mut provider,
+            &mut tools,
+            ProductionToolPolicy::default(),
+        );
+        let error = executor
+            .execute(&mut run, request(), &mut |_| {})
+            .unwrap_err();
+        let approval = match error {
+            AgentExecutionError::ApprovalRequired(approval) => approval,
+            other => panic!("expected approval: {other:?}"),
+        };
+        assert!(matches!(
+            executor.approve(&mut run, ApprovalId::new(999), &mut |_| {}),
+            Err(AgentExecutionError::Approval(
+                axiom_agent::ApprovalError::UnknownApproval
+            ))
+        ));
+        executor
+            .deny(&mut run, approval.approval_id, &mut |_| {})
+            .unwrap();
+        assert!(!dir.path().join("blocked.txt").exists());
+        assert!(matches!(
+            executor.approve(&mut run, approval.approval_id, &mut |_| {}),
+            Err(AgentExecutionError::Approval(axiom_agent::ApprovalError::NotPending))
+        ));
+        assert!(!dir.path().join("blocked.txt").exists());
     }
 
     fn spawn_run(

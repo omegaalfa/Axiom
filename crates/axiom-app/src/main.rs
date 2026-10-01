@@ -8,6 +8,7 @@ mod outline;
 mod outline_popup;
 mod php_type_template;
 mod syntax_theme;
+mod snippet;
 mod terminal_view;
 mod ui;
 mod workspace_view;

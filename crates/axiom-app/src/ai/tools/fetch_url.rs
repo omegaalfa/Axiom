@@ -44,6 +44,7 @@ impl FetchUrlTool {
                         range: None,
                         source_bytes: Some(source_bytes),
                         truncated,
+                        fingerprint: None,
                     },
                 }
             })

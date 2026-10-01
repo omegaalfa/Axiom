@@ -9,6 +9,5 @@ description = "Headless PHP project, Composer, and PSR-4 model for Axiom"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
+sha2 = "0.10.9"
 tempfile = "3.27"

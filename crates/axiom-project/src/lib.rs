@@ -10,6 +10,8 @@ use serde::Deserialize;
 
 pub mod project_directory;
 pub mod project_read;
+pub mod project_update;
+pub mod project_write;
 
 #[derive(Debug)]
 pub enum ProjectError {

@@ -40,6 +40,7 @@ impl ListDirectoryTool {
                     range: None,
                     source_bytes: None,
                     truncated: false,
+                    fingerprint: None,
                 },
             })
             .map_err(map_error);
