@@ -13,8 +13,9 @@ use std::{
 };
 
 use axiom_ai_provider::{
-    ChatRole, OllamaProvider, ProviderChatMessage, ProviderChatRequest, ProviderChatStreamEvent,
-    ProviderConnectionRequest, ProviderConnectivity, ProviderKind, ProviderUiState, RequestTracker,
+    ChatRole, ProviderChatMessage, ProviderChatRequest, ProviderChatStreamEvent,
+    ProviderConnectionRequest, ProviderError, ProviderKind, ProviderUiState, RequestTracker,
+    provider_chat_stream_with_cancel, provider_protocol, test_provider_connection,
 };
 use axiom_app::commands::Keymap;
 use axiom_app::shell_state::{
@@ -146,6 +147,26 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-enter", InputEnter, Some("SingleLineInput")),
         KeyBinding::new("escape", InputEscape, Some("SingleLineInput")),
     ]
+}
+
+macro_rules! attach_single_line_input_actions {
+    ($element:expr, $cx:expr) => {{
+        $element
+            .on_action($cx.listener(Self::input_backspace))
+            .on_action($cx.listener(Self::input_delete))
+            .on_action($cx.listener(Self::input_left))
+            .on_action($cx.listener(Self::input_right))
+            .on_action($cx.listener(Self::input_home))
+            .on_action($cx.listener(Self::input_end))
+            .on_action($cx.listener(Self::input_select_all))
+            .on_action($cx.listener(Self::input_select_left))
+            .on_action($cx.listener(Self::input_select_right))
+            .on_action($cx.listener(Self::input_select_home))
+            .on_action($cx.listener(Self::input_select_end))
+            .on_action($cx.listener(Self::input_copy))
+            .on_action($cx.listener(Self::input_cut))
+            .on_action($cx.listener(Self::input_paste))
+    }};
 }
 
 struct OpenTab {
@@ -692,6 +713,7 @@ enum ActiveTextInput {
     AiComposer,
     ProviderBaseUrl,
     ProviderApiKey,
+    ProviderModel,
     ProviderCatalogSearch,
     ModalInput,
     AiHistoryRename,
@@ -1178,33 +1200,96 @@ struct ProviderModel {
     label: String,
 }
 
-fn provider_models(provider: &str) -> Vec<ProviderModel> {
+fn supports_model_discovery(provider: &str) -> bool {
+    matches!(provider, "Ollama" | "LM Studio")
+}
+
+fn resident_provider_models(
+    provider: &str,
+    ollama_models: &[axiom_ai_provider::ProviderModel],
+    configs: &[ProviderPersisted],
+    discovered_models: &HashMap<String, Vec<axiom_ai_provider::ProviderModel>>,
+) -> Vec<ProviderModel> {
+    let cached = match provider {
+        "Ollama" => Some(ollama_models),
+        "LM Studio" => configs
+            .iter()
+            .find(|config| config.provider == provider)
+            .map(|config| config.cached_models.as_slice()),
+        _ => None,
+    };
+    let models = discovered_models
+        .get(provider)
+        .map(Vec::as_slice)
+        .or(cached)
+        .unwrap_or_default();
+    models
+        .iter()
+        .map(|model| ProviderModel {
+            id: model.id.clone(),
+            label: model.label.clone(),
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedProviderConfig {
+    provider: String,
+    kind: ProviderKind,
+    model: String,
+    base_url: String,
+    api_key: String,
+}
+
+fn provider_kind(provider: &str) -> ProviderKind {
     match provider {
-        "Ollama" => Vec::new(),
-        "Anthropic" => vec![
-            ProviderModel {
-                id: "claude-sonnet".into(),
-                label: "Claude Sonnet".into(),
-            },
-            ProviderModel {
-                id: "claude-opus".into(),
-                label: "Claude Opus".into(),
-            },
-        ],
-        _ => vec![
-            ProviderModel {
-                id: "gpt-5.6-sol".into(),
-                label: "GPT-5.6 Sol".into(),
-            },
-            ProviderModel {
-                id: "gpt-5.6".into(),
-                label: "GPT-5.6".into(),
-            },
-            ProviderModel {
-                id: "gpt-5.6-pro".into(),
-                label: "GPT-5.6 Pro".into(),
-            },
-        ],
+        "Ollama" => ProviderKind::Ollama,
+        "OpenAI" | "OpenAI Compatible" => ProviderKind::OpenAi,
+        "Anthropic" => ProviderKind::Anthropic,
+        other => ProviderKind::Other(other.to_owned()),
+    }
+}
+
+fn resolve_provider_config(
+    configs: &[ProviderPersisted],
+    active_provider: Option<&str>,
+    model: &str,
+) -> Option<ResolvedProviderConfig> {
+    let provider = active_provider?;
+    let config = configs.iter().find(|config| config.provider == provider)?;
+    Some(ResolvedProviderConfig {
+        provider: provider.to_owned(),
+        kind: provider_kind(provider),
+        model: model.to_owned(),
+        base_url: config.base_url.clone(),
+        api_key: config.api_key.clone(),
+    })
+}
+
+fn provider_connection_request(
+    provider: &str,
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+) -> ProviderConnectionRequest {
+    ProviderConnectionRequest {
+        kind: provider_kind(provider),
+        base_url: base_url.to_owned(),
+        api_key: api_key.to_owned(),
+        model: model.to_owned(),
+    }
+}
+
+fn provider_error_message(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::Authentication => "Authentication failed",
+        ProviderError::ConnectionRefused => "Endpoint unreachable",
+        ProviderError::Timeout => "Connection timed out",
+        ProviderError::InvalidResponse(_) => "Invalid provider response",
+        ProviderError::Unavailable(message) if message == "model unavailable" => {
+            "Model unavailable"
+        }
+        ProviderError::Unavailable(_) => "Provider unavailable",
     }
 }
 
@@ -1405,12 +1490,15 @@ pub struct WorkspaceView {
     provider_config_target: String,
     provider_api_key: crate::ui::input_line::SingleLineInputState,
     provider_base_url: crate::ui::input_line::SingleLineInputState,
+    provider_model_input: crate::ui::input_line::SingleLineInputState,
     provider_base_url_active: bool,
     active_text_input: ActiveTextInput,
     configured_providers: Vec<(String, String)>,
     provider_configs: Vec<ProviderPersisted>,
+    provider_discovered_models: HashMap<String, Vec<axiom_ai_provider::ProviderModel>>,
     provider_catalog_input: crate::ui::input_line::SingleLineInputState,
     provider_model_picker_open: bool,
+    provider_model_picker_suppress_toggle: bool,
     provider_default_model: Option<String>,
     provider_connection_state: ProviderUiState,
     provider_request_tracker: RequestTracker,
@@ -2503,15 +2591,21 @@ impl WorkspaceView {
                 focus: Some(cx.focus_handle()),
                 ..Default::default()
             },
+            provider_model_input: crate::ui::input_line::SingleLineInputState {
+                focus: Some(cx.focus_handle()),
+                ..Default::default()
+            },
             provider_base_url_active: false,
             active_text_input: ActiveTextInput::None,
             configured_providers: ui_settings.configured_providers.clone(),
             provider_configs: ui_settings.provider_configs.clone(),
+            provider_discovered_models: HashMap::new(),
             provider_catalog_input: crate::ui::input_line::SingleLineInputState {
                 focus: Some(cx.focus_handle()),
                 ..Default::default()
             },
             provider_model_picker_open: false,
+            provider_model_picker_suppress_toggle: false,
             provider_default_model: None,
             provider_connection_state: ProviderUiState::Idle,
             provider_request_tracker: RequestTracker::default(),
@@ -2627,7 +2721,7 @@ impl WorkspaceView {
             {
                 workspace.provider_base_url.text = config.base_url.clone();
             }
-            workspace.test_ollama_connection(cx);
+            workspace.test_provider_connection(cx);
         }
         workspace.begin_runtime_stub_load(cx, false);
         workspace.start_runtime_watcher(cx);
@@ -2650,6 +2744,7 @@ impl WorkspaceView {
                                 ActiveTextInput::AiComposer
                                     | ActiveTextInput::ProviderBaseUrl
                                     | ActiveTextInput::ProviderApiKey
+                                    | ActiveTextInput::ProviderModel
                             ))
                             && crate::ui::input_line::blink_due(
                                 cycle_started,
@@ -2663,6 +2758,9 @@ impl WorkspaceView {
                             }
                             if this.active_text_input == ActiveTextInput::ProviderApiKey {
                                 this.provider_api_key.active = this.modal_caret_visible;
+                            }
+                            if this.active_text_input == ActiveTextInput::ProviderModel {
+                                this.provider_model_input.active = this.modal_caret_visible;
                             }
                             this.modal_caret_toggle = cycle_started;
                             cx.notify();
@@ -5082,6 +5180,36 @@ impl WorkspaceView {
             return;
         }
         let key = event.keystroke.key.to_ascii_lowercase();
+        if self.providers_modal_visible
+            && key == "tab"
+            && matches!(
+                self.active_text_input,
+                ActiveTextInput::ProviderApiKey
+                    | ActiveTextInput::ProviderBaseUrl
+                    | ActiveTextInput::ProviderModel
+            )
+        {
+            let next = next_provider_text_input(
+                self.active_text_input,
+                !supports_model_discovery(&self.provider_config_target),
+            );
+            self.active_text_input = next;
+            self.provider_api_key.active = next == ActiveTextInput::ProviderApiKey;
+            self.provider_base_url.active = next == ActiveTextInput::ProviderBaseUrl;
+            self.provider_model_input.active = next == ActiveTextInput::ProviderModel;
+            let focus = match next {
+                ActiveTextInput::ProviderBaseUrl => self.provider_base_url.focus.clone(),
+                ActiveTextInput::ProviderModel => self.provider_model_input.focus.clone(),
+                _ => self.provider_api_key.focus.clone(),
+            };
+            if let Some(focus) = focus {
+                window.focus(&focus);
+            }
+            cx.stop_propagation();
+            window.prevent_default();
+            cx.notify();
+            return;
+        }
         if self.pending_delete.is_some() {
             if debug_input_enabled() {
                 tracing::info!(key = %key, "[DELETE MODAL KEY]");
@@ -5723,16 +5851,24 @@ impl WorkspaceView {
         if content.is_empty() || matches!(self.agent_ui_state, AgentUiState::Running) {
             return;
         }
-        if self.provider_config_target != "Ollama"
-            || self.model_label.trim().is_empty()
+        if self.model_label.trim().is_empty()
             || self.model_label == "Model"
-            || self.provider_base_url.text.trim().is_empty()
         {
             self.agent_ui_state = AgentUiState::Failed;
-            self.agent_status = Some("Ollama provider/model unavailable".into());
+            self.agent_status = Some("Provider/model unavailable".into());
             cx.notify();
             return;
         }
+        let Some(provider) = resolve_provider_config(
+            &self.provider_configs,
+            self.active_provider.as_deref(),
+            &self.model_label,
+        ) else {
+            self.agent_ui_state = AgentUiState::Failed;
+            self.agent_status = Some("Provider/model unavailable".into());
+            cx.notify();
+            return;
+        };
         let tools_enabled = self.selected_model_supports_tools();
         let root = self
             .project
@@ -5822,7 +5958,6 @@ impl WorkspaceView {
                 .then_some(self.chat_thinking_enabled),
             tools,
         };
-        let base_url = self.provider_base_url.text.clone();
         let queue = self.agent_events.clone();
         let approval_bridge = self.approval_bridge.clone();
         let entity = cx.entity();
@@ -5832,7 +5967,9 @@ impl WorkspaceView {
                     agent_bridge::execute_agent_run(
                         &mut run,
                         request,
-                        base_url,
+                        provider.kind,
+                        provider.api_key,
+                        provider.base_url,
                         registry,
                         &approval_bridge,
                         &queue,
@@ -5873,16 +6010,22 @@ impl WorkspaceView {
         {
             return;
         }
-        if self.provider_config_target != "Ollama"
-            || self.model_label.trim().is_empty()
+        if self.model_label.trim().is_empty()
             || self.model_label == "Model"
-            || self.provider_base_url.text.trim().is_empty()
         {
-            self.chat_request_state =
-                ChatRequestState::Error("Ollama provider/model unavailable".into());
+            self.chat_request_state = ChatRequestState::Error("Provider/model unavailable".into());
             cx.notify();
             return;
         }
+        let Some(provider) = resolve_provider_config(
+            &self.provider_configs,
+            self.active_provider.as_deref(),
+            &self.model_label,
+        ) else {
+            self.chat_request_state = ChatRequestState::Error("Provider/model unavailable".into());
+            cx.notify();
+            return;
+        };
         let assistant_id = append_chat_turn(
             &mut self.chat_messages,
             &mut self.chat_next_message_id,
@@ -5902,7 +6045,9 @@ impl WorkspaceView {
         self.chat_current_request_id = Some(id);
         let cancel_token = Arc::new(AtomicBool::new(false));
         self.chat_cancel_token = Some(cancel_token.clone());
-        let base_url = self.provider_base_url.text.clone();
+        let provider_kind = provider.kind.clone();
+        let provider_api_key = provider.api_key.clone();
+        let base_url = provider.base_url.clone();
         let model = self.model_label.clone();
         let think = self
             .selected_model_supports_thinking()
@@ -5916,6 +6061,18 @@ impl WorkspaceView {
             .iter()
             .find(|model| model.label == self.model_label)
             .and_then(|model| model.metadata.as_ref());
+        let protocol = provider_protocol(&provider_kind);
+        tracing::info!(
+            target: "axiom.ai_diag",
+            operation = "chat",
+            provider = protocol.as_str(),
+            model_present = !model.trim().is_empty(),
+            base_url_present = !base_url.trim().is_empty(),
+            adapter = protocol.as_str(),
+            parser = protocol.as_str(),
+            request_started = false,
+            "[AI-DIAG]"
+        );
         tracing::info!(
             target: "axiom.ai_diag",
             event = "model_capabilities",
@@ -5979,7 +6136,9 @@ impl WorkspaceView {
                             (),
                             axiom_ai_provider::ProviderError,
                         >| {
-                            OllamaProvider::default().chat_stream_with_cancel(
+                            provider_chat_stream_with_cancel(
+                                &provider_kind,
+                                &provider_api_key,
                                 &base_url,
                                 request,
                                 || cancel_token.load(Ordering::Acquire),
@@ -6011,7 +6170,9 @@ impl WorkspaceView {
                     } else {
                         diag_span
                             .in_scope(|| {
-                                OllamaProvider::default().chat_stream_with_cancel(
+                                provider_chat_stream_with_cancel(
+                                    &provider_kind,
+                                    &provider_api_key,
                                     &base_url,
                                     &request,
                                     || cancel_token.load(Ordering::Acquire),
@@ -6083,58 +6244,64 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn test_ollama_connection(&mut self, cx: &mut Context<Self>) {
-        if self.provider_config_target != "Ollama"
+    fn reload_provider_models(&mut self, cx: &mut Context<Self>) {
+        if !supports_model_discovery(&self.provider_config_target) {
+            return;
+        }
+        self.test_provider_connection(cx);
+    }
+
+    fn test_provider_connection(&mut self, cx: &mut Context<Self>) {
+        if self.provider_config_target.is_empty()
             || matches!(self.provider_connection_state, ProviderUiState::Testing)
         {
             return;
         }
         let id = self.provider_request_tracker.begin();
-        let base_url = self.provider_base_url.text.clone();
+        let provider = self.provider_config_target.clone();
+        let request = provider_connection_request(
+            &provider,
+            &self.provider_api_key.text,
+            &self.provider_base_url.text,
+            &provider_model_value(
+                &provider,
+                &self.provider_model_input.text,
+                self.provider_default_model.as_deref(),
+            ),
+        );
+        let protocol = provider_protocol(&request.kind);
+        tracing::info!(
+            target: "axiom.ai_diag",
+            operation = "test_connection",
+            provider = protocol.as_str(),
+            model_present = !request.model.is_empty(),
+            base_url_present = !request.base_url.is_empty(),
+            adapter = protocol.as_str(),
+            parser = protocol.as_str(),
+            request_started = false,
+            "[AI-DIAG]"
+        );
         self.provider_connection_state = ProviderUiState::Testing;
         let entity = cx.entity();
         cx.spawn(async move |_, cx| {
             let result = gpui::background_executor()
-                .spawn(async move {
-                    let provider = OllamaProvider::default();
-                    let request = ProviderConnectionRequest {
-                        kind: ProviderKind::Ollama,
-                        base_url,
-                    };
-                    match provider.test_connection(&request) {
-                        axiom_ai_provider::ProviderConnectionStatus::Connected => {
-                            provider.list_models(&request)
-                        }
-                        axiom_ai_provider::ProviderConnectionStatus::Failed(e) => Err(e),
-                    }
-                })
+                .spawn(async move { test_provider_connection(&request) })
                 .await;
             let _ = entity.update(cx, |this, cx| {
                 if this.provider_request_tracker.current() != Some(id) {
                     return;
                 }
                 this.provider_connection_state = match result {
-                    Ok(models) => ProviderUiState::Connected { models },
+                    Ok(models) => {
+                        this.provider_discovered_models
+                            .insert(provider.clone(), models.clone());
+                        if provider == "Ollama" {
+                            this.ollama_models = models.clone();
+                        }
+                        ProviderUiState::Connected { models }
+                    }
                     Err(e) => ProviderUiState::Error(e),
                 };
-                if let ProviderUiState::Connected { models } = &this.provider_connection_state {
-                    this.ollama_models = models.clone();
-                    let selected = if models.iter().any(|m| m.label == this.model_label) {
-                        this.model_label.clone()
-                    } else {
-                        models.first().map(|m| m.label.clone()).unwrap_or_default()
-                    };
-                    this.provider_default_model =
-                        (!selected.is_empty()).then_some(selected.clone());
-                    if let Some(config) = this
-                        .provider_configs
-                        .iter_mut()
-                        .find(|c| c.provider == "Ollama")
-                    {
-                        config.cached_models = models.clone();
-                    }
-                    this.persist_ui_settings();
-                }
                 cx.notify();
             });
         })
@@ -6148,6 +6315,7 @@ impl WorkspaceView {
             ActiveTextInput::AiHistoryRename => Some(&mut self.chat_rename_input),
             ActiveTextInput::ProviderBaseUrl => Some(&mut self.provider_base_url),
             ActiveTextInput::ProviderApiKey => Some(&mut self.provider_api_key),
+            ActiveTextInput::ProviderModel => Some(&mut self.provider_model_input),
             ActiveTextInput::ProviderCatalogSearch => Some(&mut self.provider_catalog_input),
             _ => None,
         }
@@ -6311,8 +6479,10 @@ impl WorkspaceView {
         }
         if let Some(i) = self.active_provider_input() {
             let r = i.selection();
-            if let Some(s) = i.text.get(r) {
-                cx.write_to_clipboard(ClipboardItem::new_string(s.to_owned()));
+            if !r.is_empty() {
+                if let Some(s) = i.text.get(r) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(s.to_owned()));
+                }
             }
         }
     }
@@ -6335,10 +6505,12 @@ impl WorkspaceView {
         }
         if let Some(i) = self.active_provider_input() {
             let r = i.selection();
-            if let Some(s) = i.text.get(r.clone()) {
-                cx.write_to_clipboard(ClipboardItem::new_string(s.to_owned()));
-                i.replace_selection("");
-                cx.notify();
+            if !r.is_empty() {
+                if let Some(s) = i.text.get(r.clone()) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(s.to_owned()));
+                    i.replace_selection("");
+                    cx.notify();
+                }
             }
         }
     }
@@ -6392,12 +6564,17 @@ impl WorkspaceView {
     ) {
         if matches!(
             self.active_text_input,
-            ActiveTextInput::ProviderBaseUrl | ActiveTextInput::ProviderApiKey
+            ActiveTextInput::ProviderBaseUrl
+                | ActiveTextInput::ProviderApiKey
+                | ActiveTextInput::ProviderModel
         ) && event.dragging()
         {
             if self.active_text_input == ActiveTextInput::ProviderApiKey {
                 let byte = self.provider_api_key.geometry.hit_test(event.position.x);
                 self.provider_api_key.drag_to(byte);
+            } else if self.active_text_input == ActiveTextInput::ProviderModel {
+                let byte = self.provider_model_input.geometry.hit_test(event.position.x);
+                self.provider_model_input.drag_to(byte);
             } else {
                 let byte = self.provider_base_url.geometry.hit_test(event.position.x);
                 self.provider_base_url.drag_to(byte);
@@ -6414,6 +6591,8 @@ impl WorkspaceView {
     ) {
         if self.active_text_input == ActiveTextInput::ProviderApiKey {
             self.provider_api_key.end_drag();
+        } else if self.active_text_input == ActiveTextInput::ProviderModel {
+            self.provider_model_input.end_drag();
         } else {
             self.provider_base_url.end_drag();
         }
@@ -6466,21 +6645,29 @@ impl WorkspaceView {
         self.active_text_input = ActiveTextInput::None;
         self.provider_base_url_active = false;
         self.provider_base_url.active = false;
+        self.provider_model_input.active = false;
+        self.provider_model_picker_open = false;
+        self.provider_model_picker_suppress_toggle = false;
         self.provider_modal_view = ProviderModalView::ProvidersList;
         cx.notify();
     }
 
     fn configure_provider(&mut self, provider: &str, cx: &mut Context<Self>) {
         self.provider_config_target = provider.to_owned();
+        self.provider_request_tracker.begin();
+        self.provider_connection_state = ProviderUiState::Idle;
         self.provider_api_key.text.clear();
         self.provider_api_key.selection_anchor = 0;
         self.provider_api_key.selection_active = 0;
-        self.provider_base_url.text = if provider == "Anthropic" {
-            "https://api.anthropic.com".to_owned()
-        } else if provider == "Ollama" {
-            "http://localhost:11434".to_owned()
-        } else {
-            "https://api.openai.com/v1".to_owned()
+        self.provider_model_input.text.clear();
+        self.provider_model_input.selection_anchor = 0;
+        self.provider_model_input.selection_active = 0;
+        self.provider_base_url.text = match provider {
+            "Anthropic" => "https://api.anthropic.com".to_owned(),
+            "Google" | "Gemini" => "https://generativelanguage.googleapis.com".to_owned(),
+            "LM Studio" => "http://localhost:1234/v1".to_owned(),
+            "Ollama" => "http://localhost:11434".to_owned(),
+            _ => "https://api.openai.com/v1".to_owned(),
         };
         if let Some(saved) = self
             .provider_configs
@@ -6492,15 +6679,36 @@ impl WorkspaceView {
         }
         self.provider_base_url.selection_anchor = self.provider_base_url.text.len();
         self.provider_base_url.selection_active = self.provider_base_url.text.len();
-        let models = provider_models(provider);
-        self.provider_default_model = self
+        let saved_model = self
+            .provider_configs
+            .iter()
+            .find(|config| config.provider == provider)
+            .map(|config| config.model.clone());
+        let configured_model = self
             .configured_providers
             .iter()
             .find(|(name, _)| name == provider)
-            .map(|(_, model)| model.clone())
-            .filter(|m| models.iter().any(|item| &item.label == m))
-            .or_else(|| models.first().map(|m| m.label.clone()));
+            .map(|(_, model)| model.clone());
+        self.provider_default_model = if supports_model_discovery(provider) {
+            provider_model_selection(
+                saved_model.as_deref(),
+                configured_model.as_deref(),
+                &resident_provider_models(
+                    provider,
+                    &self.ollama_models,
+                    &self.provider_configs,
+                    &self.provider_discovered_models,
+                ),
+            )
+        } else {
+            Some(remote_provider_model(saved_model, configured_model))
+        };
+        self.provider_model_input.text =
+            self.provider_default_model.clone().unwrap_or_default();
+        self.provider_model_input.selection_anchor = self.provider_model_input.text.len();
+        self.provider_model_input.selection_active = self.provider_model_input.text.len();
         self.provider_model_picker_open = false;
+        self.provider_model_picker_suppress_toggle = false;
         self.provider_modal_view = if provider == "Anthropic" {
             ProviderModalView::ConfigureAnthropic
         } else {
@@ -6512,21 +6720,18 @@ impl WorkspaceView {
     fn render_provider_config(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let workspace = cx.entity();
-        let models: Vec<ProviderModel> = if self.provider_config_target == "Ollama" {
-            self.ollama_models
-                .iter()
-                .map(|m| ProviderModel {
-                    id: m.id.clone(),
-                    label: m.label.clone(),
-                })
-                .collect()
+        let model_discovery = supports_model_discovery(&self.provider_config_target);
+        let models = resident_provider_models(
+            &self.provider_config_target,
+            &self.ollama_models,
+            &self.provider_configs,
+            &self.provider_discovered_models,
+        );
+        let model = if model_discovery {
+            self.provider_default_model.clone().unwrap_or_default()
         } else {
-            provider_models(&self.provider_config_target)
+            self.provider_model_input.text.clone()
         };
-        let model = self
-            .provider_default_model
-            .clone()
-            .unwrap_or_else(|| models.first().map(|m| m.label.clone()).unwrap_or_default());
         div()
             .id("provider-config")
             .w(px(520.))
@@ -6570,10 +6775,13 @@ impl WorkspaceView {
             )
             .child(div().text_color(t.text_secondary).child("API Key"))
             .child(
-                div()
-                    .id("provider-api-key-input")
-                    .key_context("SingleLineInput")
-                    .cursor(CursorStyle::IBeam)
+                attach_single_line_input_actions!(
+                    div()
+                        .id("provider-api-key-input")
+                        .key_context("SingleLineInput")
+                        .cursor(CursorStyle::IBeam),
+                    cx
+                )
                     .track_focus(
                         self.provider_api_key
                             .focus
@@ -6586,12 +6794,18 @@ impl WorkspaceView {
                     .items_center()
                     .bg(t.editor_background)
                     .border_1()
-                    .border_color(t.border_subtle)
+                    .border_color(if self.active_text_input == ActiveTextInput::ProviderApiKey {
+                        t.accent
+                    } else {
+                        t.border_subtle
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             this.active_text_input = ActiveTextInput::ProviderApiKey;
                             this.provider_api_key.active = true;
+                            this.provider_model_input.active = false;
+                            this.provider_base_url.active = false;
                             this.modal_caret_visible = true;
                             this.modal_caret_activity = Instant::now();
                             this.modal_caret_toggle = this.modal_caret_activity;
@@ -6615,90 +6829,183 @@ impl WorkspaceView {
                     )),
             )
             .child(div().text_color(t.text_secondary).child("Default model"))
-            .child(
-                div()
+            .when(model_discovery, |d| {
+                let models = models.clone();
+                d.child(
+                    div()
+                        .h(px(34.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .bg(t.editor_background)
+                        .border_1()
+                        .border_color(t.border_subtle)
+                        .rounded(metrics().border_radius_small)
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.bg(t.hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if this.provider_model_picker_suppress_toggle {
+                                    this.provider_model_picker_suppress_toggle = false;
+                                    this.provider_model_picker_open = false;
+                                } else {
+                                    this.provider_model_picker_open = true;
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .child(model.clone())
+                        .child("▾"),
+                )
+                .when(self.provider_model_picker_open, |d| {
+                    d.child(
+                        gpui::deferred(
+                            div()
+                                .id("provider-model-picker")
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .p_2()
+                                .absolute()
+                                .left(px(20.))
+                                .top(px(178.))
+                                .w_full()
+                                .max_w(px(480.))
+                                .max_h(px(220.))
+                                .overflow_y_scroll()
+                                .bg(t.window_background)
+                                .border_1()
+                                .border_color(t.border_subtle)
+                                .on_mouse_down_out(cx.listener(
+                                    |this, _, window, cx| {
+                                        if !this.provider_model_picker_open {
+                                            return;
+                                        }
+                                        let (selected, open, suppress_toggle) =
+                                            provider_model_picker_outside_click(
+                                                this.provider_default_model.clone(),
+                                            );
+                                        this.provider_default_model = selected;
+                                        this.provider_model_picker_open = open;
+                                        this.provider_model_picker_suppress_toggle =
+                                            suppress_toggle;
+                                        cx.defer_in(window, |this, _, cx| {
+                                            this.provider_model_picker_suppress_toggle = false;
+                                            cx.notify();
+                                        });
+                                        cx.notify();
+                                    },
+                                ))
+                                .children(models.into_iter().map(|item| {
+                                    let label = item.label.clone();
+                                    let selected = self.provider_default_model.as_deref()
+                                        == Some(label.as_str());
+                                    let row = div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(metrics().border_radius_small)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .when(selected, |row| {
+                                            row.bg(t.hover).text_color(t.text_primary)
+                                        })
+                                        .hover(|row| {
+                                            row.bg(t.hover).text_color(t.text_primary)
+                                        })
+                                        .child(div().flex_1().child(item.label))
+                                        .when(selected, |row| row.child("✓"));
+                                    row.on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            let (selected, open) =
+                                                select_provider_model(label.clone());
+                                            this.provider_default_model = selected;
+                                            this.provider_model_input.text = label.clone();
+                                            this.provider_model_input.selection_anchor =
+                                                this.provider_model_input.text.len();
+                                            this.provider_model_input.selection_active =
+                                                this.provider_model_input.text.len();
+                                            this.provider_model_picker_open = open;
+                                            cx.notify();
+                                        }),
+                                    )
+                                })),
+                        )
+                        .with_priority(2),
+                    )
+                })
+            })
+            .when(!model_discovery, |d| {
+                d.child(
+                    attach_single_line_input_actions!(
+                        div()
+                            .id("provider-model-input")
+                            .key_context("SingleLineInput")
+                            .cursor(CursorStyle::IBeam),
+                        cx
+                    )
+                    .track_focus(
+                        self.provider_model_input
+                            .focus
+                            .as_ref()
+                            .expect("provider model focus"),
+                    )
                     .h(px(34.))
                     .px_2()
                     .flex()
                     .items_center()
-                    .justify_between()
                     .bg(t.editor_background)
                     .border_1()
-                    .border_color(t.border_subtle)
+                    .border_color(if self.active_text_input
+                        == ActiveTextInput::ProviderModel
+                    {
+                        t.accent
+                    } else {
+                        t.border_subtle
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.provider_model_picker_open = !this.provider_model_picker_open;
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.active_text_input = ActiveTextInput::ProviderModel;
+                            this.provider_model_input.active = true;
+                            this.provider_api_key.active = false;
+                            this.provider_base_url.active = false;
+                            this.modal_caret_visible = true;
+                            this.modal_caret_activity = Instant::now();
+                            this.modal_caret_toggle = this.modal_caret_activity;
+                            let byte =
+                                this.provider_model_input.geometry.hit_test(event.position.x);
+                            this.provider_model_input.mouse_down(byte, event.click_count);
+                            if let Some(focus) = this.provider_model_input.focus.clone() {
+                                window.focus(&focus);
+                            }
                             cx.notify();
                         }),
                     )
-                    .child(model)
-                    .child("▾"),
-            )
-            .when(self.provider_model_picker_open, |d| {
-                let models = models.clone();
-                d.child(
-                    gpui::deferred(
-                        div()
-                            .id("provider-model-picker")
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .p_2()
-                            .absolute()
-                            .left(px(20.))
-                            .top(px(178.))
-                            .w_full()
-                            .max_w(px(480.))
-                            .max_h(px(220.))
-                            .overflow_y_scroll()
-                            .bg(t.window_background)
-                            .border_1()
-                            .border_color(t.border_subtle)
-                            .children(models.into_iter().map(|item| {
-                                let label = item.label.clone();
-                                let selected =
-                                    self.provider_default_model.as_deref() == Some(label.as_str());
-                                let row = div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(metrics().border_radius_small)
-                                    .cursor(CursorStyle::PointingHand)
-                                    .when(selected, |row| {
-                                        row.bg(t.hover).text_color(t.text_primary)
-                                    })
-                                    .hover(|row| row.bg(t.hover).text_color(t.text_primary))
-                                    .child(div().flex_1().child(item.label))
-                                    .when(selected, |row| row.child("✓"));
-                                row.on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.provider_default_model = Some(label.clone());
-                                        this.provider_model_picker_open = false;
-                                        cx.notify();
-                                    }),
-                                )
-                            })),
+                    .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(Self::provider_base_url_drag_end),
                     )
-                    .with_priority(2),
+                    .child(crate::ui::input_line::render_state(
+                        cx.entity(),
+                        &self.provider_model_input,
+                    )),
                 )
             })
             .child(div().text_color(t.text_secondary).child("Base URL"))
             .child(
-                div()
-                    .id("provider-base-url-input")
-                    .key_context("SingleLineInput")
-                    .cursor(CursorStyle::IBeam)
-                    .on_action(cx.listener(Self::input_backspace))
-                    .on_action(cx.listener(Self::input_delete))
-                    .on_action(cx.listener(Self::input_left))
-                    .on_action(cx.listener(Self::input_right))
-                    .on_action(cx.listener(Self::input_home))
-                    .on_action(cx.listener(Self::input_end))
-                    .on_action(cx.listener(Self::input_select_all))
+                attach_single_line_input_actions!(
+                    div()
+                        .id("provider-base-url-input")
+                        .key_context("SingleLineInput")
+                        .cursor(CursorStyle::IBeam),
+                    cx
+                )
                     .track_focus(
                         self.provider_base_url
                             .focus
@@ -6711,19 +7018,24 @@ impl WorkspaceView {
                     .items_center()
                     .bg(t.editor_background)
                     .border_1()
-                    .border_color(t.border_subtle)
+                    .border_color(if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
+                        t.accent
+                    } else {
+                        t.border_subtle
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             this.provider_base_url_active = true;
                             this.active_text_input = ActiveTextInput::ProviderBaseUrl;
                             this.provider_base_url.active = true;
+                            this.provider_api_key.active = false;
+                            this.provider_model_input.active = false;
                             this.modal_caret_visible = true;
                             this.modal_caret_activity = Instant::now();
                             this.modal_caret_toggle = this.modal_caret_activity;
                             let byte = this.provider_base_url.geometry.hit_test(event.position.x);
-                            let caret = byte_to_utf16_offset(&this.provider_base_url.text, byte);
-                            this.provider_base_url.mouse_down(caret, event.click_count);
+                            this.provider_base_url.mouse_down(byte, event.click_count);
                             this.ai_composer_active = false;
                             if let Some(focus) = this.provider_base_url.focus.clone() {
                                 window.focus(&focus);
@@ -6750,16 +7062,16 @@ impl WorkspaceView {
                     .hover(|s| s.bg(t.hover))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.test_ollama_connection(cx)),
+                        cx.listener(|this, _, _, cx| this.test_provider_connection(cx)),
                     )
                     .child(match &self.provider_connection_state {
                         ProviderUiState::Idle => "Test Connection",
                         ProviderUiState::Testing => "Testing...",
                         ProviderUiState::Connected { .. } => "Connected",
-                        ProviderUiState::Error(_) => "Retry Connection",
+                        ProviderUiState::Error(error) => provider_error_message(error),
                     }),
             )
-            .when(self.provider_config_target == "Ollama", |this| {
+            .when(model_discovery, |this| {
                 this.child(
                     div()
                         .px_2()
@@ -6770,7 +7082,7 @@ impl WorkspaceView {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
-                                this.test_ollama_connection(cx);
+                                this.reload_provider_models(cx);
                             }),
                         )
                         .child("Reload models"),
@@ -6779,19 +7091,21 @@ impl WorkspaceView {
             .child(
                 div().flex().justify_end().child(
                     div()
+                        .id("provider-save")
                         .px_3()
                         .py_1()
                         .bg(t.accent)
                         .text_color(t.text_primary)
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.bg(t.accent_hover))
                         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                             workspace.update(cx, |this, cx| {
-                                let model =
-                                    this.provider_default_model.clone().unwrap_or_else(|| {
-                                        provider_models(&this.provider_config_target)
-                                            .first()
-                                            .map(|m| m.label.clone())
-                                            .unwrap_or_default()
-                                    });
+                                let model = provider_model_value(
+                                    &this.provider_config_target,
+                                    &this.provider_model_input.text,
+                                    this.provider_default_model.as_deref(),
+                                );
+                                this.provider_default_model = Some(model.clone());
                                 if let Some(entry) = this
                                     .configured_providers
                                     .iter_mut()
@@ -6810,22 +7124,33 @@ impl WorkspaceView {
                                         this.model_label = model.to_owned();
                                     }
                                 }
+                                let cached_models = this
+                                    .provider_discovered_models
+                                    .get(&this.provider_config_target)
+                                    .cloned()
+                                    .or_else(|| {
+                                        this.provider_configs
+                                            .iter()
+                                            .find(|config| {
+                                                config.provider == this.provider_config_target
+                                            })
+                                            .map(|config| config.cached_models.clone())
+                                    })
+                                    .unwrap_or_else(|| {
+                                        if this.provider_config_target == "Ollama" {
+                                            this.ollama_models.clone()
+                                        } else {
+                                            Vec::new()
+                                        }
+                                    });
                                 let config = ProviderPersisted {
                                     provider: this.provider_config_target.clone(),
                                     api_key: this.provider_api_key.text.clone(),
                                     base_url: this.provider_base_url.text.clone(),
                                     model: model.to_owned(),
-                                    cached_models: this.ollama_models.clone(),
+                                    cached_models,
                                 };
-                                if let Some(existing) = this
-                                    .provider_configs
-                                    .iter_mut()
-                                    .find(|c| c.provider == config.provider)
-                                {
-                                    *existing = config;
-                                } else {
-                                    this.provider_configs.push(config);
-                                }
+                                upsert_provider_config(&mut this.provider_configs, config);
                                 this.provider_modal_view = ProviderModalView::ProvidersList;
                                 this.persist_ui_settings();
                                 cx.notify();
@@ -7057,10 +7382,13 @@ impl WorkspaceView {
                         .rounded(m.border_radius_medium)
                         .child(div().text_size(px(16.)).child("Add Provider"))
                         .child(
-                            div()
-                                .id("provider-catalog-search")
-                                .key_context("SingleLineInput")
-                                .cursor(CursorStyle::IBeam)
+                            attach_single_line_input_actions!(
+                                div()
+                                    .id("provider-catalog-search")
+                                    .key_context("SingleLineInput")
+                                    .cursor(CursorStyle::IBeam),
+                                cx
+                            )
                                 .track_focus(
                                     self.provider_catalog_input
                                         .focus
@@ -8272,6 +8600,8 @@ impl WorkspaceView {
                                     this.active_text_input = ActiveTextInput::AiComposer;
                                     this.provider_base_url_active = false;
                                     this.provider_base_url.active = false;
+                                    this.provider_api_key.active = false;
+                                    this.provider_model_input.active = false;
                                     window.focus(&this.ai_composer_focus);
                                     let byte = this.ai_composer_geometry.hit_test(event.position.x);
                                     let caret = byte_to_utf16_offset(&this.ai_composer_text, byte);
@@ -13218,6 +13548,8 @@ impl EntityInputHandler for WorkspaceView {
             &self.chat_rename_input.text
         } else if self.active_text_input == ActiveTextInput::ProviderApiKey {
             &self.provider_api_key.text
+        } else if self.active_text_input == ActiveTextInput::ProviderModel {
+            &self.provider_model_input.text
         } else if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
             &self.provider_base_url.text
         } else if self.explorer_operation.is_some() {
@@ -13259,8 +13591,14 @@ impl EntityInputHandler for WorkspaceView {
         }
         if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
             return Some(UTF16Selection {
-                range: self.provider_base_url.selection_anchor
-                    ..self.provider_base_url.selection_active,
+                range: byte_to_utf16_offset(
+                    &self.provider_base_url.text,
+                    self.provider_base_url.selection_anchor,
+                )
+                    ..byte_to_utf16_offset(
+                        &self.provider_base_url.text,
+                        self.provider_base_url.selection_active,
+                    ),
                 reversed: self.provider_base_url.selection_anchor
                     > self.provider_base_url.selection_active,
             });
@@ -13277,6 +13615,20 @@ impl EntityInputHandler for WorkspaceView {
                     ),
                 reversed: self.provider_api_key.selection_anchor
                     > self.provider_api_key.selection_active,
+            });
+        }
+        if self.active_text_input == ActiveTextInput::ProviderModel {
+            return Some(UTF16Selection {
+                range: byte_to_utf16_offset(
+                    &self.provider_model_input.text,
+                    self.provider_model_input.selection_anchor,
+                )
+                    ..byte_to_utf16_offset(
+                        &self.provider_model_input.text,
+                        self.provider_model_input.selection_active,
+                    ),
+                reversed: self.provider_model_input.selection_anchor
+                    > self.provider_model_input.selection_active,
             });
         }
         if self.explorer_operation.is_some() {
@@ -13360,42 +13712,17 @@ impl EntityInputHandler for WorkspaceView {
             return;
         }
         if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
-            let range = range.unwrap_or_else(|| {
-                self.provider_base_url
-                    .selection_anchor
-                    .min(self.provider_base_url.selection_active)
-                    ..self
-                        .provider_base_url
-                        .selection_anchor
-                        .max(self.provider_base_url.selection_active)
-            });
-            let sanitized = crate::ui::input_line::SingleLineInputState::sanitize_single_line(text);
-            let (text, _) = replace_utf16_range(&self.provider_base_url.text, range, &sanitized);
-            self.provider_base_url.text = text;
-            let end = self.provider_base_url.text.encode_utf16().count();
-            self.provider_base_url.selection_anchor = end;
-            self.provider_base_url.selection_active = end;
+            replace_provider_input_text(&mut self.provider_base_url, range, text);
             cx.notify();
             return;
         }
         if self.active_text_input == ActiveTextInput::ProviderApiKey {
-            let range = range.unwrap_or_else(|| {
-                let a = byte_to_utf16_offset(
-                    &self.provider_api_key.text,
-                    self.provider_api_key.selection_anchor,
-                );
-                let b = byte_to_utf16_offset(
-                    &self.provider_api_key.text,
-                    self.provider_api_key.selection_active,
-                );
-                a.min(b)..a.max(b)
-            });
-            let sanitized = crate::ui::input_line::SingleLineInputState::sanitize_single_line(text);
-            let (text, _) = replace_utf16_range(&self.provider_api_key.text, range, &sanitized);
-            self.provider_api_key.text = text;
-            let end = self.provider_api_key.text.len();
-            self.provider_api_key.selection_anchor = end;
-            self.provider_api_key.selection_active = end;
+            replace_provider_input_text(&mut self.provider_api_key, range, text);
+            cx.notify();
+            return;
+        }
+        if self.active_text_input == ActiveTextInput::ProviderModel {
+            replace_provider_input_text(&mut self.provider_model_input, range, text);
             cx.notify();
             return;
         }
@@ -13470,6 +13797,9 @@ impl EntityInputHandler for WorkspaceView {
         } else if self.active_text_input == ActiveTextInput::ProviderApiKey {
             let byte = self.provider_api_key.geometry.hit_test(point.x);
             byte_to_utf16_offset(&self.provider_api_key.text, byte)
+        } else if self.active_text_input == ActiveTextInput::ProviderModel {
+            let byte = self.provider_model_input.geometry.hit_test(point.x);
+            byte_to_utf16_offset(&self.provider_model_input.text, byte)
         } else if self.explorer_operation.is_some() {
             let byte =
                 self.modal_field_geometry[self.explorer_modal_field as usize].hit_test(point.x);
@@ -13591,6 +13921,94 @@ fn replace_utf16_range(
     result.replace_range(start..end, replacement);
     let caret = start_utf16 + replacement.encode_utf16().count();
     (result, caret)
+}
+
+fn replace_provider_input_text(
+    input: &mut crate::ui::input_line::SingleLineInputState,
+    range: Option<std::ops::Range<usize>>,
+    replacement: &str,
+) {
+    let range = range.unwrap_or_else(|| {
+        let selection = input.selection();
+        byte_to_utf16_offset(&input.text, selection.start)
+            ..byte_to_utf16_offset(&input.text, selection.end)
+    });
+    let replacement =
+        crate::ui::input_line::SingleLineInputState::sanitize_single_line(replacement);
+    let (text, caret) = replace_utf16_range(&input.text, range, &replacement);
+    input.text = text;
+    let caret = utf16_to_byte_offset(&input.text, caret);
+    input.selection_anchor = caret;
+    input.selection_active = caret;
+}
+
+fn provider_model_selection(
+    saved_model: Option<&str>,
+    configured_model: Option<&str>,
+    models: &[ProviderModel],
+) -> Option<String> {
+    [saved_model, configured_model]
+        .into_iter()
+        .flatten()
+        .find(|label| models.iter().any(|model| model.label == *label))
+        .map(ToOwned::to_owned)
+        .or_else(|| models.first().map(|model| model.label.clone()))
+}
+
+fn remote_provider_model(
+    saved_model: Option<String>,
+    configured_model: Option<String>,
+) -> String {
+    saved_model.or(configured_model).unwrap_or_default()
+}
+
+fn provider_model_value(
+    provider: &str,
+    editable_model: &str,
+    selected_model: Option<&str>,
+) -> String {
+    if supports_model_discovery(provider) {
+        selected_model.unwrap_or_default().to_owned()
+    } else {
+        editable_model.to_owned()
+    }
+}
+
+fn select_provider_model(label: String) -> (Option<String>, bool) {
+    (Some(label), false)
+}
+
+fn provider_model_picker_outside_click(
+    selection: Option<String>,
+) -> (Option<String>, bool, bool) {
+    (selection, false, true)
+}
+
+fn next_provider_text_input(
+    active: ActiveTextInput,
+    model_is_text: bool,
+) -> ActiveTextInput {
+    match active {
+        ActiveTextInput::ProviderApiKey if model_is_text => ActiveTextInput::ProviderModel,
+        ActiveTextInput::ProviderApiKey | ActiveTextInput::ProviderModel => {
+            ActiveTextInput::ProviderBaseUrl
+        }
+        _ => ActiveTextInput::ProviderApiKey,
+    }
+}
+
+fn upsert_provider_config(
+    configs: &mut Vec<ProviderPersisted>,
+    config: ProviderPersisted,
+) {
+    if let Some(existing) = configs
+        .iter_mut()
+        .find(|existing| existing.provider == config.provider)
+    {
+        *existing = config;
+    } else {
+        configs.push(config);
+    }
 }
 
 #[cfg(test)]
@@ -15423,5 +15841,309 @@ class Service { public function run(): void {} }
     fn modal_selection_slice_handles_unicode_ranges() {
         assert_eq!(utf16_slice("A😀B.php", 0, 3), "A😀");
         assert_eq!(utf16_slice("A😀B.php", 3, 4), "B");
+    }
+
+    #[test]
+    fn provider_model_discovery_is_limited_to_local_model_services() {
+        assert!(super::supports_model_discovery("Ollama"));
+        assert!(super::supports_model_discovery("LM Studio"));
+        assert!(!super::supports_model_discovery("Google"));
+        assert!(!super::supports_model_discovery("Gemini"));
+        assert!(!super::supports_model_discovery("OpenAI"));
+        assert!(!super::supports_model_discovery("Anthropic"));
+        assert!(!super::supports_model_discovery("OpenRouter"));
+        assert!(!super::supports_model_discovery("OpenAI Compatible"));
+    }
+
+    #[test]
+    fn remote_provider_models_round_trip_as_exact_arbitrary_strings() {
+        let saved = Some("models/company:model-name@revision-v2".to_owned());
+        let configured = Some("must-not-win".to_owned());
+        let editable = super::remote_provider_model(saved, configured);
+        assert_eq!(editable, "models/company:model-name@revision-v2");
+        assert_eq!(
+            super::provider_model_value("Google", &editable, None),
+            editable
+        );
+        assert_eq!(
+            super::provider_model_value("OpenAI Compatible", &editable, None),
+            editable
+        );
+
+        let mut configs = Vec::new();
+        super::upsert_provider_config(
+            &mut configs,
+            super::ProviderPersisted {
+                provider: "Google".into(),
+                api_key: "api-key".into(),
+                base_url: "https://generativelanguage.googleapis.com".into(),
+                model: editable.clone(),
+                cached_models: Vec::new(),
+            },
+        );
+        assert_eq!(
+            super::remote_provider_model(Some(configs[0].model.clone()), None),
+            editable
+        );
+    }
+
+    #[test]
+    fn resident_provider_models_use_only_the_expected_provider_state() {
+        let ollama_models = vec![axiom_ai_provider::ProviderModel {
+            id: "ollama-model".into(),
+            label: "Ollama Model".into(),
+            metadata: None,
+        }];
+        let lm_studio_models = vec![axiom_ai_provider::ProviderModel {
+            id: "lm-model".into(),
+            label: "LM Studio Model".into(),
+            metadata: None,
+        }];
+        let configs = vec![
+            super::ProviderPersisted {
+                provider: "LM Studio".into(),
+                api_key: String::new(),
+                base_url: "http://localhost:1234".into(),
+                model: "LM Studio Model".into(),
+                cached_models: lm_studio_models,
+            },
+            super::ProviderPersisted {
+                provider: "OpenAI".into(),
+                api_key: String::new(),
+                base_url: String::new(),
+                model: "remote-model".into(),
+                cached_models: vec![axiom_ai_provider::ProviderModel {
+                    id: "must-not-appear".into(),
+                    label: "Must Not Appear".into(),
+                    metadata: None,
+                }],
+            },
+        ];
+
+        assert_eq!(
+            super::resident_provider_models(
+                "Ollama",
+                &ollama_models,
+                &configs,
+                &HashMap::new()
+            ),
+            vec![super::ProviderModel {
+                id: "ollama-model".into(),
+                label: "Ollama Model".into(),
+            }]
+        );
+        assert_eq!(
+            super::resident_provider_models(
+                "LM Studio",
+                &ollama_models,
+                &configs,
+                &HashMap::new()
+            ),
+            vec![super::ProviderModel {
+                id: "lm-model".into(),
+                label: "LM Studio Model".into(),
+            }]
+        );
+        assert!(super::resident_provider_models(
+            "Google",
+            &ollama_models,
+            &configs,
+            &HashMap::new()
+        )
+        .is_empty());
+        assert!(super::resident_provider_models(
+            "OpenAI",
+            &ollama_models,
+            &configs,
+            &HashMap::new()
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn active_non_ollama_provider_resolves_without_form_state() {
+        let configs = vec![
+            super::ProviderPersisted {
+                provider: "Ollama".into(),
+                api_key: "unused".into(),
+                base_url: "http://localhost:11434".into(),
+                model: "local".into(),
+                cached_models: Vec::new(),
+            },
+            super::ProviderPersisted {
+                provider: "Google".into(),
+                api_key: "google-key".into(),
+                base_url: "https://generativelanguage.googleapis.com".into(),
+                model: "models/gemini-2.5-pro".into(),
+                cached_models: Vec::new(),
+            },
+        ];
+        let resolved =
+            super::resolve_provider_config(&configs, Some("Google"), "models/gemini-2.5-pro")
+                .unwrap();
+        assert_eq!(resolved.kind, axiom_ai_provider::ProviderKind::Other("Google".into()));
+        assert_eq!(
+            axiom_ai_provider::provider_protocol(&resolved.kind),
+            axiom_ai_provider::ProviderProtocol::Google
+        );
+        assert_eq!(resolved.model, "models/gemini-2.5-pro");
+        assert_eq!(
+            resolved.base_url,
+            "https://generativelanguage.googleapis.com"
+        );
+    }
+
+    #[test]
+    fn test_connection_request_uses_current_unsaved_form_values_without_persisting() {
+        let configs = vec![super::ProviderPersisted {
+            provider: "Google".into(),
+            api_key: "saved-key".into(),
+            base_url: "https://saved.example".into(),
+            model: "saved-model".into(),
+            cached_models: Vec::new(),
+        }];
+        let before = configs.clone();
+        let request = super::provider_connection_request(
+            "Google",
+            "unsaved-key",
+            "https://unsaved.example",
+            "unsaved-model",
+        );
+        assert_eq!(request.kind, axiom_ai_provider::ProviderKind::Other("Google".into()));
+        assert_eq!(request.api_key, "unsaved-key");
+        assert_eq!(request.base_url, "https://unsaved.example");
+        assert_eq!(request.model, "unsaved-model");
+        assert_eq!(configs, before);
+    }
+
+    #[test]
+    fn provider_error_message_redacts_internal_error_values() {
+        let message = super::provider_error_message(
+            &axiom_ai_provider::ProviderError::Unavailable("secret-provider-detail".into()),
+        );
+        assert_eq!(message, "Provider unavailable");
+        assert!(!message.contains("secret-provider-detail"));
+    }
+
+    #[test]
+    fn provider_model_picker_preserves_selection_on_outside_click() {
+        let selection = Some("existing model".to_owned());
+        assert_eq!(
+            super::provider_model_picker_outside_click(selection),
+            (Some("existing model".to_owned()), false, true)
+        );
+    }
+
+    #[test]
+    fn selecting_provider_model_closes_picker_and_updates_selection() {
+        assert_eq!(
+            super::select_provider_model("chosen model".to_owned()),
+            (Some("chosen model".to_owned()), false)
+        );
+    }
+
+    #[test]
+    fn provider_focus_traversal_includes_model_only_for_text_input() {
+        use super::ActiveTextInput::*;
+
+        assert_eq!(
+            super::next_provider_text_input(ProviderApiKey, true),
+            ProviderModel
+        );
+        assert_eq!(
+            super::next_provider_text_input(ProviderModel, true),
+            ProviderBaseUrl
+        );
+        assert_eq!(
+            super::next_provider_text_input(ProviderApiKey, false),
+            ProviderBaseUrl
+        );
+        assert_eq!(
+            super::next_provider_text_input(ProviderBaseUrl, true),
+            ProviderApiKey
+        );
+        assert_eq!(
+            super::next_provider_text_input(ProviderBaseUrl, false),
+            ProviderApiKey
+        );
+    }
+
+    #[test]
+    fn provider_saved_model_and_config_update_remain_editable() {
+        let models = vec![
+            super::ProviderModel {
+                id: "first".into(),
+                label: "First".into(),
+            },
+            super::ProviderModel {
+                id: "second".into(),
+                label: "Second".into(),
+            },
+        ];
+        assert_eq!(
+            super::provider_model_selection(Some("Second"), Some("First"), &models),
+            Some("Second".into())
+        );
+        assert_eq!(
+            super::provider_model_selection(None, Some("Second"), &models),
+            Some("Second".into())
+        );
+        assert_eq!(
+            super::provider_model_selection(Some("missing"), Some("missing"), &models),
+            Some("First".into())
+        );
+        assert_eq!(
+            super::provider_model_selection(Some("missing"), Some("Second"), &models),
+            Some("Second".into())
+        );
+
+        let mut configs = vec![super::ProviderPersisted {
+            provider: "OpenAI".into(),
+            api_key: "old-key".into(),
+            base_url: "https://old.example".into(),
+            model: "First".into(),
+            cached_models: Vec::new(),
+        }];
+        super::upsert_provider_config(
+            &mut configs,
+            super::ProviderPersisted {
+                provider: "OpenAI".into(),
+                api_key: "new-key".into(),
+                base_url: "https://new.example".into(),
+                model: "Second".into(),
+                cached_models: Vec::new(),
+            },
+        );
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].api_key, "new-key");
+        assert_eq!(configs[0].base_url, "https://new.example");
+        assert_eq!(configs[0].model, "Second");
+    }
+
+    #[test]
+    fn provider_input_replacement_uses_utf16_ranges_for_unicode() {
+        use crate::ui::input_line::SingleLineInputState;
+
+        let mut input = SingleLineInputState {
+            text: "a😀b".into(),
+            selection_anchor: 1,
+            selection_active: 5,
+            ..Default::default()
+        };
+        super::replace_provider_input_text(&mut input, Some(1..3), "X");
+        assert_eq!(input.text, "aXb");
+        assert_eq!(input.selection_anchor, 2);
+        assert_eq!(input.selection_active, 2);
+
+        let mut input = SingleLineInputState {
+            text: "a😀b".into(),
+            selection_anchor: 1,
+            selection_active: 3,
+            ..Default::default()
+        };
+        super::replace_provider_input_text(&mut input, Some(1..3), "🙂");
+        assert_eq!(input.text, "a🙂b");
+        assert_eq!(input.selection_anchor, 5);
+        assert_eq!(input.selection_active, 5);
     }
 }

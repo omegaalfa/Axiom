@@ -1127,6 +1127,15 @@ where
                 self.policy
                     .decide(ToolPolicyContext { run_id: run.id() }, &call)
             };
+            if approved_call && call.name == "update_file" {
+                tracing::info!(
+                    target: "axiom.ai_diag",
+                    event = "update_file_approval_resumed",
+                    run_id = run.id().value(),
+                    call_id_present = call.id.is_some(),
+                    "[AI-DIAG]"
+                );
+            }
             let outcome = match decision {
                 ToolPolicyDecision::Allow => {
                     if !continuation.tool_running {

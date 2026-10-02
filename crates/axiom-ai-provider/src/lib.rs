@@ -6,6 +6,13 @@ use std::{
     time::Duration,
 };
 
+mod remote;
+
+pub use remote::{
+    ProviderProtocol, provider_chat_stream_with_cancel, provider_protocol,
+    test_provider_connection,
+};
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProviderKind {
     Ollama,
@@ -94,6 +101,8 @@ impl ModelMetadata {
 pub struct ProviderConnectionRequest {
     pub kind: ProviderKind,
     pub base_url: String,
+    pub api_key: String,
+    pub model: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -591,9 +600,9 @@ impl ProviderError {
         match self {
             Self::ConnectionRefused => "Connection refused",
             Self::Timeout => "Connection timed out",
-            Self::InvalidResponse(_) => "Invalid Ollama response",
+            Self::InvalidResponse(_) => "Invalid provider response",
             Self::Authentication => "Authentication failed",
-            Self::Unavailable(_) => "Ollama unavailable",
+            Self::Unavailable(_) => "Provider unavailable",
         }
     }
 }
@@ -1107,6 +1116,8 @@ mod tests {
         ProviderConnectionRequest {
             kind: ProviderKind::Ollama,
             base_url: "http://localhost:11434".into(),
+            api_key: String::new(),
+            model: String::new(),
         }
     }
     #[test]
@@ -1443,7 +1454,7 @@ mod tests {
             format!("{error:?}"),
             "InvalidResponse(ToolMissingArguments)"
         );
-        assert_eq!(error.user_message(), "Invalid Ollama response");
+        assert_eq!(error.user_message(), "Invalid provider response");
     }
 
     #[test]
@@ -1495,7 +1506,7 @@ mod tests {
             error.invalid_response_category(),
             Some(InvalidResponseCategory::HttpStatus)
         );
-        assert_eq!(error.user_message(), "Invalid Ollama response");
+        assert_eq!(error.user_message(), "Invalid provider response");
     }
 
     #[test]

@@ -22,9 +22,22 @@ impl UpdateFileTool {
         expected_fingerprint: String,
         content: String,
     ) -> ToolResult {
-        let expected = match TextFileFingerprint::from_str(&expected_fingerprint) {
+        let parsed_expected = TextFileFingerprint::from_str(&expected_fingerprint);
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "update_file_fingerprint_parse",
+            parsed = parsed_expected.is_ok(),
+            "[AI-DIAG]"
+        );
+        let expected = match parsed_expected {
             Ok(expected) => expected,
             Err(_) => {
+                tracing::info!(
+                    target: "axiom.ai_diag",
+                    event = "update_file_result",
+                    category = "invalid_fingerprint",
+                    "[AI-DIAG]"
+                );
                 return ToolResult {
                     tool: ToolName::UpdateFile,
                     result: Err(ToolError::InvalidFingerprint),
@@ -48,10 +61,33 @@ impl UpdateFileTool {
                 },
             })
             .map_err(|error| map_error(error, requested_path));
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "update_file_result",
+            category = result_category(result.as_ref().err()),
+            "[AI-DIAG]"
+        );
         ToolResult {
             tool: ToolName::UpdateFile,
             result,
         }
+    }
+}
+
+fn result_category(error: Option<&ToolError>) -> &'static str {
+    match error {
+        None => "success",
+        Some(ToolError::InvalidFingerprint) => "invalid_fingerprint",
+        Some(ToolError::FingerprintMismatch) => "fingerprint_mismatch",
+        Some(ToolError::NotFound(_)) => "not_found",
+        Some(ToolError::InvalidPath(_)) => "invalid_path",
+        Some(ToolError::OutsideWorkspace(_)) => "outside_workspace",
+        Some(ToolError::SymlinkNotAllowed(_)) => "symlink_not_allowed",
+        Some(ToolError::TooLarge { .. }) => "content_too_large",
+        Some(ToolError::UnsupportedEncoding(_)) => "unsupported_encoding",
+        Some(ToolError::NotRegularFile(_)) => "not_regular_file",
+        Some(ToolError::CurrentFileTooLarge { .. }) => "current_file_too_large",
+        Some(_) => "io_or_controlled_error",
     }
 }
 

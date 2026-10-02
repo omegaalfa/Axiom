@@ -11,7 +11,8 @@ use axiom_agent::{
     ToolInfrastructureError, ToolOutcome, ToolPolicy,
 };
 use axiom_ai_provider::{
-    OllamaProvider, ProviderChatRequest, ProviderChatStreamEvent, ProviderError, ProviderToolCall,
+    ProviderChatRequest, ProviderChatStreamEvent, ProviderError, ProviderKind, ProviderToolCall,
+    provider_chat_stream_with_cancel,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -235,13 +236,22 @@ pub(crate) fn production_tool_definitions() -> Vec<axiom_ai_provider::ProviderTo
 }
 
 pub(crate) struct AgentProviderAdapter {
+    kind: ProviderKind,
+    api_key: String,
     base_url: String,
     cancellation: Cancellation,
 }
 
 impl AgentProviderAdapter {
-    pub(crate) fn new(base_url: String, cancellation: Cancellation) -> Self {
+    pub(crate) fn new(
+        kind: ProviderKind,
+        api_key: String,
+        base_url: String,
+        cancellation: Cancellation,
+    ) -> Self {
         Self {
+            kind,
+            api_key,
             base_url,
             cancellation,
         }
@@ -254,7 +264,9 @@ impl ProviderExecutor for AgentProviderAdapter {
         request: &ProviderChatRequest,
         emit: &mut dyn FnMut(ProviderChatStreamEvent),
     ) -> Result<(), ProviderError> {
-        OllamaProvider::default().chat_stream_with_cancel(
+        provider_chat_stream_with_cancel(
+            &self.kind,
+            &self.api_key,
             &self.base_url,
             request,
             || self.cancellation.is_cancelled(),
@@ -289,6 +301,20 @@ impl AgentToolAdapter {
 
 impl ToolExecutor for AgentToolAdapter {
     fn execute(&mut self, call: &ProviderToolCall) -> Result<ToolOutcome, ToolInfrastructureError> {
+        if call.name == "update_file" {
+            tracing::info!(
+                target: "axiom.ai_diag",
+                event = "update_file_adapter_entered",
+                call_id_present = call.id.is_some(),
+                arguments_object = call.arguments.is_object(),
+                expected_fingerprint_present = call
+                    .arguments
+                    .get("expected_fingerprint")
+                    .and_then(|value| value.as_str())
+                    .is_some(),
+                "[AI-DIAG]"
+            );
+        }
         let request = match provider_call_to_request(call) {
             Ok(request) => request,
             Err(error) => return Ok(ToolOutcome::ControlledError(error)),
@@ -476,13 +502,16 @@ fn tool_error_message(error: &ToolError) -> String {
 pub(crate) fn execute_agent_run(
     run: &mut AgentRun,
     request: ProviderChatRequest,
+    provider_kind: ProviderKind,
+    api_key: String,
     base_url: String,
     registry: Option<ToolRegistry>,
     bridge: &ApprovalBridge,
     queue: &AgentEventQueue,
 ) -> Result<axiom_agent::AgentExecutionResult, axiom_agent::AgentExecutionError> {
     let cancellation = run.cancellation();
-    let mut provider = AgentProviderAdapter::new(base_url, cancellation.clone());
+    let mut provider =
+        AgentProviderAdapter::new(provider_kind, api_key, base_url, cancellation.clone());
     let mut tools = match registry {
         Some(registry) => AgentToolAdapter::new(registry, cancellation),
         None => AgentToolAdapter::without_tools(cancellation),
@@ -879,6 +908,23 @@ mod approval_bridge_tests {
         )
     }
 
+    struct CountingUpdateToolAdapter {
+        inner: AgentToolAdapter,
+        update_calls: usize,
+    }
+
+    impl ToolExecutor for CountingUpdateToolAdapter {
+        fn execute(
+            &mut self,
+            call: &ProviderToolCall,
+        ) -> Result<ToolOutcome, ToolInfrastructureError> {
+            if call.name == "update_file" {
+                self.update_calls += 1;
+            }
+            self.inner.execute(call)
+        }
+    }
+
     fn approval(reason: &str) -> ToolPolicyDecision {
         ToolPolicyDecision::RequireApproval {
             reason: reason.into(),
@@ -1021,6 +1067,103 @@ mod approval_bridge_tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
             "Olá, atualização! 🚀"
+        );
+    }
+
+    #[test]
+    fn approved_update_rejects_external_replacement_on_production_path() {
+        let (dir, adapter) = update_adapter();
+        std::fs::write(dir.path().join("file.txt"), "STALE_A").unwrap();
+        let mut tools = CountingUpdateToolAdapter {
+            inner: adapter,
+            update_calls: 0,
+        };
+
+        let read = ProviderToolCall {
+            id: Some("read-stale".into()),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "file.txt"}),
+        };
+        let ToolOutcome::Success(read_result) = tools.inner.execute(&read).unwrap() else {
+            panic!("full production read_file failed");
+        };
+        let read_result: Value = serde_json::from_str(&read_result).unwrap();
+        let expected = read_result["metadata"]["fingerprint"]
+            .as_str()
+            .expect("full read exposes fingerprint")
+            .to_owned();
+        assert_eq!(
+            expected,
+            "sha256:510b84ef4f86f13670e89c549a5670aa30bbe51c0c8e6a3895960e1df4cf987d"
+        );
+
+        let update_call = ProviderToolCall {
+            id: Some("update-stale".into()),
+            name: "update_file".into(),
+            arguments: serde_json::json!({
+                "path": "file.txt",
+                "expected_fingerprint": expected,
+                "content": "STALE_AGENT",
+            }),
+        };
+        let mut provider = ScriptedProvider {
+            scripts: vec![
+                vec![
+                    ProviderChatStreamEvent::ToolCall(update_call.clone()),
+                    ProviderChatStreamEvent::Done,
+                ],
+                vec![
+                    ProviderChatStreamEvent::ContentDelta("done".into()),
+                    ProviderChatStreamEvent::Done,
+                ],
+            ],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            calls: 0,
+        };
+        let mut run = AgentRun::new(
+            AgentRunId::new(505),
+            axiom_agent::AgentBudget::new(2, 1),
+        );
+        assert_eq!(tools.update_calls, 0);
+        let mut executor = AgentExecutor::with_policy(
+            &mut provider,
+            &mut tools,
+            ProductionToolPolicy::default(),
+        );
+        let error = executor
+            .execute(&mut run, request(), &mut |_| {})
+            .unwrap_err();
+        let approval = match error {
+            AgentExecutionError::ApprovalRequired(approval) => approval,
+            other => panic!("expected update_file approval: {other:?}"),
+        };
+        assert_eq!(
+            update_call.arguments["expected_fingerprint"].as_str(),
+            Some(expected.as_str())
+        );
+        assert!(approval.arguments.contains(&expected));
+
+        std::fs::write(dir.path().join("file.txt"), "STALE_EXTERNAL").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "STALE_EXTERNAL"
+        );
+        assert_eq!(
+            update_call.arguments["expected_fingerprint"].as_str(),
+            Some(expected.as_str())
+        );
+
+        let result = executor
+            .approve(&mut run, approval.approval_id, &mut |_| {})
+            .unwrap();
+        assert_eq!(tools.update_calls, 1);
+        assert!(result.messages().iter().any(|message| {
+            message.content
+                == "file changed since it was read; refresh it and use the current fingerprint"
+        }));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "STALE_EXTERNAL"
         );
     }
 

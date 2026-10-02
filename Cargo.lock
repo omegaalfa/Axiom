@@ -492,6 +492,7 @@ dependencies = [
 name = "axiom-ai-provider"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
  "serde",
  "serde_json",
  "tracing",
@@ -579,6 +580,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

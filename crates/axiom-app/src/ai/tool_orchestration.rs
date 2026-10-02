@@ -1149,7 +1149,7 @@ mod tests {
                     axiom_ai_provider::InvalidResponseCategory::HttpStatus
                 )
             )),
-            "Invalid Ollama response"
+            "Invalid provider response"
         );
         assert_eq!(
             user_message(&ToolRoundTripError::Provider(

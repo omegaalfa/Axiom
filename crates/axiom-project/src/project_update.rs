@@ -200,6 +200,11 @@ impl ProjectUpdateCapability {
         expected_fingerprint: TextFileFingerprint,
         new_content: String,
     ) -> Result<PathBuf, ProjectUpdateError> {
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "project_update_entered",
+            "[AI-DIAG]"
+        );
         if new_content.len() > MAX_UPDATE_TEXT_BYTES {
             return Err(ProjectUpdateError::ContentTooLarge {
                 limit: MAX_UPDATE_TEXT_BYTES,
@@ -209,7 +214,22 @@ impl ProjectUpdateCapability {
 
         let (destination, parent) = self.resolve_destination(relative_path)?;
         let current = fingerprint_bytes(&self.read_existing_text(&destination, relative_path)?);
-        if current != expected_fingerprint {
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "project_update_current_fingerprint_recalculated",
+            check = 1,
+            "[AI-DIAG]"
+        );
+        let matches = current == expected_fingerprint;
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "project_update_comparison",
+            check = 1,
+            result = if matches { "MATCH" } else { "MISMATCH" },
+            persist_attempted = false,
+            "[AI-DIAG]"
+        );
+        if !matches {
             return Err(ProjectUpdateError::FingerprintMismatch {
                 expected: expected_fingerprint,
                 actual: current,
@@ -223,13 +243,34 @@ impl ProjectUpdateCapability {
         )?;
 
         let current = fingerprint_bytes(&self.read_existing_text(&destination, relative_path)?);
-        if current != expected_fingerprint {
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "project_update_current_fingerprint_recalculated",
+            check = 2,
+            "[AI-DIAG]"
+        );
+        let matches = current == expected_fingerprint;
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "project_update_comparison",
+            check = 2,
+            result = if matches { "MATCH" } else { "MISMATCH" },
+            persist_attempted = false,
+            "[AI-DIAG]"
+        );
+        if !matches {
             return Err(ProjectUpdateError::FingerprintMismatch {
                 expected: expected_fingerprint,
                 actual: current,
             });
         }
 
+        tracing::info!(
+            target: "axiom.ai_diag",
+            event = "project_update_persist",
+            persist_attempted = true,
+            "[AI-DIAG]"
+        );
         match temporary.persist(&destination) {
             Ok(file) => {
                 drop(file);
