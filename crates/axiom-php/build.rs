@@ -26,8 +26,8 @@ fn main() {
         "pub(crate) const EMBEDDED_STUB_ARTIFACT: &[u8] = include_bytes!({:?});\n",
         artifact_path.to_string_lossy()
     );
-    let output_path = Path::new(&env::var("OUT_DIR").expect("OUT_DIR not set"))
-        .join("embedded_stub_artifact.rs");
+    let output_path =
+        Path::new(&env::var("OUT_DIR").expect("OUT_DIR not set")).join("embedded_stub_artifact.rs");
     if fs::read_to_string(&output_path).ok().as_deref() != Some(generated.as_str()) {
         fs::write(&output_path, generated).expect("failed to write embedded stub artifact");
     }

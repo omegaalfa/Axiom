@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    EmbeddedStubArtifact, LoadReport, RuntimeSymbolIndex, StubProvider, StubProviderError,
-    STUB_PARSER_VERSION,
+    EmbeddedStubArtifact, LoadReport, RuntimeSymbolIndex, STUB_PARSER_VERSION, StubProvider,
+    StubProviderError,
 };
 
 mod generated {
@@ -29,7 +29,9 @@ pub enum EmbeddedStubError {
 impl fmt::Display for EmbeddedStubError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidArtifact(error) => write!(formatter, "invalid embedded stub artifact: {error}"),
+            Self::InvalidArtifact(error) => {
+                write!(formatter, "invalid embedded stub artifact: {error}")
+            }
             Self::UnsupportedSchema { expected, actual } => write!(
                 formatter,
                 "unsupported embedded stub schema {actual}; expected {expected}"
@@ -60,12 +62,10 @@ impl EmbeddedStubProvider {
         Self { artifact }
     }
 
-    pub fn load(
-        &self,
-    ) -> Result<(RuntimeSymbolIndex, LoadReport), EmbeddedStubError> {
+    pub fn load(&self) -> Result<(RuntimeSymbolIndex, LoadReport), EmbeddedStubError> {
         let started = Instant::now();
-        let artifact: EmbeddedStubArtifact =
-            bincode::deserialize(self.artifact).map_err(|error| EmbeddedStubError::InvalidArtifact(error.to_string()))?;
+        let artifact: EmbeddedStubArtifact = bincode::deserialize(self.artifact)
+            .map_err(|error| EmbeddedStubError::InvalidArtifact(error.to_string()))?;
         if artifact.schema_version != EMBEDDED_STUB_SCHEMA_VERSION {
             return Err(EmbeddedStubError::UnsupportedSchema {
                 expected: EMBEDDED_STUB_SCHEMA_VERSION,
@@ -193,27 +193,51 @@ mod tests {
     #[test]
     fn embedded_provider_indexes_symbols_without_a_filesystem_root() {
         let provider = EmbeddedStubProvider::bundled();
-        let (index, report) = provider.load().expect("embedded runtime artifact must load");
+        let (index, report) = provider
+            .load()
+            .expect("embedded runtime artifact must load");
 
         assert!(provider.load().is_ok());
         assert_eq!(report.files_discovered, 1);
         assert_eq!(report.files_parsed, 1);
-        assert!(report.symbols_indexed > 1, "real embedded dataset should contain multiple symbols");
-        assert!(index.find_class("DateTime").is_some(), "DateTime must be embedded");
+        assert!(
+            report.symbols_indexed > 1,
+            "real embedded dataset should contain multiple symbols"
+        );
+        assert!(
+            index.find_class("DateTime").is_some(),
+            "DateTime must be embedded"
+        );
         assert!(index.find_class("PDO").is_some(), "PDO must be embedded");
-        assert!(index.find_function("strlen").is_some(), "strlen must be embedded");
-        assert!(index.find_function("array_map").is_some(), "array_map must be embedded");
+        assert!(
+            index.find_function("strlen").is_some(),
+            "strlen must be embedded"
+        );
+        assert!(
+            index.find_function("array_map").is_some(),
+            "array_map must be embedded"
+        );
     }
 
     #[test]
     fn resident_index_supports_prefix_and_member_lookup_without_reloading_provider() {
-        let (index, _) = EmbeddedStubProvider::bundled().load().expect("embedded runtime artifact must load");
+        let (index, _) = EmbeddedStubProvider::bundled()
+            .load()
+            .expect("embedded runtime artifact must load");
         let resident = Arc::new(index);
 
-        assert!(resident.search_prefix_limited("DateTime", 16).iter().any(|symbol| {
-            symbol.name.starts_with("DateTime") || symbol.fqn.starts_with("DateTime")
-        }));
-        assert!(!resident.members_of("PDO").is_empty(), "PDO should have indexed members");
+        assert!(
+            resident
+                .search_prefix_limited("DateTime", 16)
+                .iter()
+                .any(|symbol| {
+                    symbol.name.starts_with("DateTime") || symbol.fqn.starts_with("DateTime")
+                })
+        );
+        assert!(
+            !resident.members_of("PDO").is_empty(),
+            "PDO should have indexed members"
+        );
     }
 
     #[test]
@@ -224,10 +248,8 @@ mod tests {
         );
         assert_eq!(axiom.root(), Some(Path::new("axiom-stubs")));
 
-        let ruststorm = RuntimeStubProvider::from_overrides(
-            None,
-            Some(OsString::from("ruststorm-stubs")),
-        );
+        let ruststorm =
+            RuntimeStubProvider::from_overrides(None, Some(OsString::from("ruststorm-stubs")));
         assert_eq!(ruststorm.root(), Some(Path::new("ruststorm-stubs")));
 
         let embedded = RuntimeStubProvider::from_overrides(None, None);
@@ -237,18 +259,27 @@ mod tests {
 
     #[test]
     fn compact_artifact_preserves_existing_symbol_model() {
-        let (index, _) = EmbeddedStubProvider::bundled().load().expect("embedded runtime artifact must load");
+        let (index, _) = EmbeddedStubProvider::bundled()
+            .load()
+            .expect("embedded runtime artifact must load");
         let method = index
             .methods_of("PDO")
             .find(|symbol| symbol.signature.is_some())
             .expect("PDO should contain a method with a signature");
-        let signature = method.signature.as_ref().expect("selected method signature");
+        let signature = method
+            .signature
+            .as_ref()
+            .expect("selected method signature");
 
         assert_eq!(method.kind, SymbolKind::Method);
         assert_eq!(method.origin, SymbolOrigin::PhpRuntime);
         assert!(!method.name.is_empty());
         assert!(method.location.file.to_string_lossy().ends_with(".php"));
-        assert!(signature.parameters.iter().all(|parameter| !parameter.name.is_empty()));
+        assert!(
+            signature
+                .parameters
+                .iter()
+                .all(|parameter| !parameter.name.is_empty())
+        );
     }
-
 }

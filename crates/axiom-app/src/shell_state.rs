@@ -41,6 +41,8 @@ pub struct UiSettings {
     pub provider_configs: Vec<ProviderPersisted>,
     #[serde(default)]
     pub thinking_preferences: Vec<(String, String, bool)>,
+    #[serde(default)]
+    pub thinking_level_preferences: Vec<(String, String, axiom_ai_provider::ThinkingLevel)>,
 }
 fn default_model_label() -> String {
     "Model".to_owned()
@@ -64,6 +66,7 @@ impl Default for UiSettings {
             model_label: default_model_label(),
             provider_configs: Vec::new(),
             thinking_preferences: Vec::new(),
+            thinking_level_preferences: Vec::new(),
         }
     }
 }

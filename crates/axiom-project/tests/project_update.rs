@@ -1,7 +1,7 @@
 use std::{fs, path::Path, str::FromStr};
 
 use axiom_project::project_update::{
-    ProjectUpdateCapability, ProjectUpdateError, TextFileFingerprint, MAX_UPDATE_TEXT_BYTES,
+    MAX_UPDATE_TEXT_BYTES, ProjectUpdateCapability, ProjectUpdateError, TextFileFingerprint,
 };
 use tempfile::tempdir;
 
@@ -18,10 +18,7 @@ fn names(path: &Path) -> Vec<String> {
 fn canonical_fingerprint_wire_round_trip_is_strict() {
     let fingerprint = TextFileFingerprint::from_bytes([0x2a; 32]);
     let wire = fingerprint.to_wire_string();
-    assert_eq!(
-        wire,
-        format!("sha256:{}", "2a".repeat(32))
-    );
+    assert_eq!(wire, format!("sha256:{}", "2a".repeat(32)));
     assert_eq!(TextFileFingerprint::from_str(&wire).unwrap(), fingerprint);
     for invalid in [
         String::new(),
@@ -175,7 +172,10 @@ fn rejects_symlink_escape_where_supported() {
         ),
         Err(ProjectUpdateError::SymlinkNotAllowed(_))
     ));
-    assert_eq!(fs::read_to_string(outside.path().join("outside.txt")).unwrap(), "outside");
+    assert_eq!(
+        fs::read_to_string(outside.path().join("outside.txt")).unwrap(),
+        "outside"
+    );
 }
 
 #[test]
@@ -187,11 +187,7 @@ fn rejects_oversized_new_content_and_leaves_original_unchanged() {
     let before = names(workspace.path());
 
     let error = capability
-        .update_text_file(
-            "file.txt",
-            expected,
-            "x".repeat(MAX_UPDATE_TEXT_BYTES + 1),
-        )
+        .update_text_file("file.txt", expected, "x".repeat(MAX_UPDATE_TEXT_BYTES + 1))
         .unwrap_err();
 
     assert!(matches!(

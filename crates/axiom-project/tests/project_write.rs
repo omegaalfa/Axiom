@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use axiom_project::project_write::{
-    ProjectWriteCapability, ProjectWriteError, MAX_CREATE_TEXT_BYTES,
+    MAX_CREATE_TEXT_BYTES, ProjectWriteCapability, ProjectWriteError,
 };
 use tempfile::tempdir;
 
@@ -117,10 +117,7 @@ fn enforces_content_size_limit() {
         Err(ProjectWriteError::ContentTooLarge { limit, actual })
             if limit == MAX_CREATE_TEXT_BYTES && actual == MAX_CREATE_TEXT_BYTES + 1
     ));
-    assert_eq!(
-        names(workspace.path()),
-        vec!["exact.txt".to_owned()]
-    );
+    assert_eq!(names(workspace.path()), vec!["exact.txt".to_owned()]);
 }
 
 #[test]

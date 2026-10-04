@@ -11,8 +11,9 @@ use std::{
 };
 
 use crate::{
-    FileContent, read_file_content,
+    FileContent,
     project_update::{TextFileFingerprint, fingerprint_bytes},
+    read_file_content,
 };
 
 pub const MAX_READ_FILE_BYTES: u64 = 1024 * 1024;

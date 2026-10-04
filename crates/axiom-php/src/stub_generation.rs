@@ -1,13 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    io,
+    fs, io,
     path::{Component, Path, PathBuf},
 };
 
 use serde::Serialize;
 
-use crate::{extract_symbols, EmbeddedStubArtifact, Symbol, SymbolKind};
+use crate::{EmbeddedStubArtifact, Symbol, SymbolKind, extract_symbols};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PhpStormStubsMap {
@@ -34,14 +33,26 @@ pub struct GenerationReport {
 
 #[derive(Debug)]
 pub enum StubGenerationError {
-    Io { path: PathBuf, source: io::Error },
-    InvalidMap { section: &'static str, message: String },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    InvalidMap {
+        section: &'static str,
+        message: String,
+    },
     InvalidStubPath(String),
     MissingStubFile(PathBuf),
-    ParseStub { path: PathBuf, message: String },
+    ParseStub {
+        path: PathBuf,
+        message: String,
+    },
     Serialize(serde_json::Error),
     BinarySerialize(String),
-    Write { path: PathBuf, source: io::Error },
+    Write {
+        path: PathBuf,
+        source: io::Error,
+    },
 }
 
 impl std::fmt::Display for StubGenerationError {
@@ -57,13 +68,22 @@ impl std::fmt::Display for StubGenerationError {
                 write!(formatter, "invalid phpstorm-stubs path: {path}")
             }
             Self::MissingStubFile(path) => {
-                write!(formatter, "phpstorm-stubs file is missing: {}", path.display())
+                write!(
+                    formatter,
+                    "phpstorm-stubs file is missing: {}",
+                    path.display()
+                )
             }
             Self::ParseStub { path, message } => {
                 write!(formatter, "failed to parse {}: {message}", path.display())
             }
-            Self::Serialize(error) => write!(formatter, "failed to serialize stub artifact: {error}"),
-            Self::BinarySerialize(error) => write!(formatter, "failed to serialize binary stub artifact: {error}"),
+            Self::Serialize(error) => {
+                write!(formatter, "failed to serialize stub artifact: {error}")
+            }
+            Self::BinarySerialize(error) => write!(
+                formatter,
+                "failed to serialize binary stub artifact: {error}"
+            ),
             Self::Write { path, source } => {
                 write!(formatter, "failed to write {}: {source}", path.display())
             }
@@ -150,11 +170,12 @@ pub fn generate_runtime_stub_artifact_bytes(
             .and_then(|component| component.as_os_str().to_str())
             .unwrap_or("Core")
             .to_owned();
-        let symbols = extract_symbols(&text, &relative, &extension)
-            .map_err(|message| StubGenerationError::ParseStub {
+        let symbols = extract_symbols(&text, &relative, &extension).map_err(|message| {
+            StubGenerationError::ParseStub {
                 path: full_path,
                 message,
-            })?;
+            }
+        })?;
         files_processed += 1;
         for symbol in symbols {
             symbols_seen += 1;
@@ -199,12 +220,13 @@ fn parse_map_section(
     section: &'static str,
 ) -> Result<BTreeMap<String, String>, StubGenerationError> {
     let marker = format!("const {section} = array (");
-    let start = content.find(&marker).ok_or_else(|| {
-        StubGenerationError::InvalidMap {
+    let start = content
+        .find(&marker)
+        .ok_or_else(|| StubGenerationError::InvalidMap {
             section,
             message: "section marker is missing".into(),
-        }
-    })? + marker.len();
+        })?
+        + marker.len();
     let mut entries = BTreeMap::new();
     for line in content[start..].lines() {
         let trimmed = line.trim();
@@ -234,7 +256,10 @@ fn parse_map_entry(line: &str) -> Option<(String, String)> {
     let (name, path) = trimmed.split_once(" => ")?;
     let name = name.trim().strip_prefix('\'')?.strip_suffix('\'')?;
     let path = path.trim().strip_prefix('\'')?.strip_suffix('\'')?;
-    Some((php_unescape_single_quoted(name), php_unescape_single_quoted(path)))
+    Some((
+        php_unescape_single_quoted(name),
+        php_unescape_single_quoted(path),
+    ))
 }
 
 fn php_unescape_single_quoted(value: &str) -> String {
@@ -420,18 +445,21 @@ mod tests {
             .chain(map.constants.values())
             .map(PathBuf::from)
             .collect::<BTreeSet<_>>();
-        assert_eq!(paths.into_iter().collect::<Vec<_>>(), vec![
-            PathBuf::from("a/A.php"),
-            PathBuf::from("c/C.php"),
-            PathBuf::from("z/B.php"),
-        ]);
+        assert_eq!(
+            paths.into_iter().collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("a/A.php"),
+                PathBuf::from("c/C.php"),
+                PathBuf::from("z/B.php"),
+            ]
+        );
     }
 
     #[test]
     fn generator_processes_only_files_referenced_by_map_and_rejects_missing_files() {
         let root = tempdir().unwrap();
-        fs::write(root.path().join("mapped.php"), "<?php class Mapped {}") .unwrap();
-        fs::write(root.path().join("unmapped.php"), "<?php class Unmapped {}") .unwrap();
+        fs::write(root.path().join("mapped.php"), "<?php class Mapped {}").unwrap();
+        fs::write(root.path().join("unmapped.php"), "<?php class Unmapped {}").unwrap();
         let map = parse_phpstorm_stubs_map(concat!(
             "const CLASSES = array (\n",
             "  'Mapped' => 'mapped.php',\n",
@@ -440,7 +468,8 @@ mod tests {
             ");\n",
             "const CONSTANTS = array (\n",
             ");\n",
-        )).unwrap();
+        ))
+        .unwrap();
         let (_, report) = generate_runtime_stub_artifact_bytes(root.path(), map).unwrap();
         assert_eq!(report.files_processed, 1);
         let invalid = parse_phpstorm_stubs_map(concat!(
@@ -451,7 +480,8 @@ mod tests {
             ");\n",
             "const CONSTANTS = array (\n",
             ");\n",
-        )).unwrap();
+        ))
+        .unwrap();
         assert!(matches!(
             generate_runtime_stub_artifact_bytes(root.path(), invalid),
             Err(StubGenerationError::MissingStubFile(_))
@@ -492,9 +522,11 @@ namespace {
 
         let extracted = crate::extract_symbols(pdo_source, Path::new("PDO/PDO.php"), "PDO")
             .expect("PDO fixture should extract");
-        assert!(extracted
-            .iter()
-            .any(|symbol| symbol.fqn == "PDO" && symbol.kind == SymbolKind::Class));
+        assert!(
+            extracted
+                .iter()
+                .any(|symbol| symbol.fqn == "PDO" && symbol.kind == SymbolKind::Class)
+        );
 
         let output = root.path().join("runtime-stubs.json");
         let report = generate_runtime_stub_artifact(
@@ -506,16 +538,20 @@ namespace {
         assert_eq!(report.files_processed, 1);
         let bytes = fs::read(&output).unwrap();
         let artifact: EmbeddedStubArtifact = serde_json::from_slice(&bytes).unwrap();
-        assert!(artifact
-            .symbols
-            .iter()
-            .any(|symbol| symbol.fqn == "PDO" && symbol.kind == SymbolKind::Class));
+        assert!(
+            artifact
+                .symbols
+                .iter()
+                .any(|symbol| symbol.fqn == "PDO" && symbol.kind == SymbolKind::Class)
+        );
 
         let round_trip = serde_json::from_slice::<EmbeddedStubArtifact>(&bytes).unwrap();
-        assert!(round_trip
-            .symbols
-            .iter()
-            .any(|symbol| symbol.fqn == "PDO" && symbol.kind == SymbolKind::Class));
+        assert!(
+            round_trip
+                .symbols
+                .iter()
+                .any(|symbol| symbol.fqn == "PDO" && symbol.kind == SymbolKind::Class)
+        );
     }
 
     #[test]

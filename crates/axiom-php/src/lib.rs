@@ -20,8 +20,8 @@ pub mod stub_generation;
 pub use artifact::EmbeddedStubArtifact;
 #[cfg(feature = "embedded-runtime")]
 pub use embedded::{
-    EmbeddedStubError, EmbeddedStubProvider, RuntimeStubLoadError, RuntimeStubProvider,
-    EMBEDDED_STUB_SCHEMA_VERSION,
+    EMBEDDED_STUB_SCHEMA_VERSION, EmbeddedStubError, EmbeddedStubProvider, RuntimeStubLoadError,
+    RuntimeStubProvider,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -988,9 +988,11 @@ namespace {
             .find(|symbol| symbol.name == "PDO" && symbol.kind == SymbolKind::Class)
             .expect("PDO class declaration must be extracted");
         assert_eq!(pdo.fqn, "PDO");
-        assert!(symbols.iter().any(|symbol| {
-            symbol.name == "PDOException" && symbol.kind == SymbolKind::Class
-        }));
+        assert!(
+            symbols.iter().any(|symbol| {
+                symbol.name == "PDOException" && symbol.kind == SymbolKind::Class
+            })
+        );
         assert!(symbols.iter().any(|symbol| {
             symbol.fqn == "PDO::__construct" && symbol.kind == SymbolKind::Method
         }));
@@ -1016,9 +1018,7 @@ namespace {
         let symbols = extract_symbols(source, Path::new("PDO/PDO.php"), "PDO").unwrap();
 
         assert!(symbols.iter().any(|symbol| {
-            symbol.name == "Mysql"
-                && symbol.fqn == "Pdo\\Mysql"
-                && symbol.kind == SymbolKind::Class
+            symbol.name == "Mysql" && symbol.fqn == "Pdo\\Mysql" && symbol.kind == SymbolKind::Class
         }));
         assert!(symbols.iter().any(|symbol| {
             symbol.name == "PDO" && symbol.fqn == "PDO" && symbol.kind == SymbolKind::Class

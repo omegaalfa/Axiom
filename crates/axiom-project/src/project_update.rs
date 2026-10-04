@@ -10,8 +10,8 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use crate::project_write::{
-    prepare_temporary_text_file, validate_relative_path, ProjectWriteCapability, ProjectWriteError,
-    MAX_CREATE_TEXT_BYTES,
+    MAX_CREATE_TEXT_BYTES, ProjectWriteCapability, ProjectWriteError, prepare_temporary_text_file,
+    validate_relative_path,
 };
 
 pub const MAX_UPDATE_TEXT_BYTES: usize = MAX_CREATE_TEXT_BYTES;
@@ -51,7 +51,11 @@ impl FromStr for TextFileFingerprint {
         let Some(hex) = value.strip_prefix("sha256:") else {
             return Err(TextFileFingerprintParseError);
         };
-        if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             return Err(TextFileFingerprintParseError);
         }
         let mut bytes = [0_u8; 32];
@@ -90,8 +94,14 @@ pub enum ProjectUpdateError {
     NotFound(String),
     NotRegularFile(String),
     UnsupportedEncoding(String),
-    CurrentFileTooLarge { limit: usize, actual: usize },
-    ContentTooLarge { limit: usize, actual: usize },
+    CurrentFileTooLarge {
+        limit: usize,
+        actual: usize,
+    },
+    ContentTooLarge {
+        limit: usize,
+        actual: usize,
+    },
     FingerprintMismatch {
         expected: TextFileFingerprint,
         actual: TextFileFingerprint,
@@ -236,11 +246,7 @@ impl ProjectUpdateCapability {
             });
         }
 
-        let temporary = prepare_temporary_text_file(
-            &parent,
-            &destination,
-            new_content.as_bytes(),
-        )?;
+        let temporary = prepare_temporary_text_file(&parent, &destination, new_content.as_bytes())?;
 
         let current = fingerprint_bytes(&self.read_existing_text(&destination, relative_path)?);
         tracing::info!(
@@ -317,9 +323,7 @@ impl ProjectUpdateCapability {
             ));
         }
         if !metadata.is_file() {
-            return Err(ProjectUpdateError::NotRegularFile(
-                display_path.to_owned(),
-            ));
+            return Err(ProjectUpdateError::NotRegularFile(display_path.to_owned()));
         }
 
         let file = fs::File::open(destination).map_err(|error| {
@@ -339,9 +343,7 @@ impl ProjectUpdateCapability {
             message: error.to_string(),
         })?;
         if !file_metadata.is_file() {
-            return Err(ProjectUpdateError::NotRegularFile(
-                display_path.to_owned(),
-            ));
+            return Err(ProjectUpdateError::NotRegularFile(display_path.to_owned()));
         }
         if file_metadata.len() > MAX_UPDATE_TEXT_BYTES as u64 {
             return Err(ProjectUpdateError::CurrentFileTooLarge {

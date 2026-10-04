@@ -18,7 +18,10 @@ pub enum ProjectWriteError {
     ParentNotDirectory(String),
     SymlinkNotAllowed(String),
     AlreadyExists(String),
-    ContentTooLarge { limit: usize, actual: usize },
+    ContentTooLarge {
+        limit: usize,
+        actual: usize,
+    },
     Io {
         operation: &'static str,
         path: String,
@@ -180,21 +183,26 @@ pub(crate) fn prepare_temporary_text_file(
         path: destination.display().to_string(),
         message: error.to_string(),
     })?;
-    temporary.write_all(content).map_err(|error| ProjectWriteError::Io {
-        operation: "write temporary file for",
-        path: destination.display().to_string(),
-        message: error.to_string(),
-    })?;
+    temporary
+        .write_all(content)
+        .map_err(|error| ProjectWriteError::Io {
+            operation: "write temporary file for",
+            path: destination.display().to_string(),
+            message: error.to_string(),
+        })?;
     temporary.flush().map_err(|error| ProjectWriteError::Io {
         operation: "flush temporary file for",
         path: destination.display().to_string(),
         message: error.to_string(),
     })?;
-    temporary.as_file().sync_all().map_err(|error| ProjectWriteError::Io {
-        operation: "sync temporary file for",
-        path: destination.display().to_string(),
-        message: error.to_string(),
-    })?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| ProjectWriteError::Io {
+            operation: "sync temporary file for",
+            path: destination.display().to_string(),
+            message: error.to_string(),
+        })?;
     Ok(temporary)
 }
 
@@ -209,7 +217,9 @@ pub(crate) fn validate_relative_path(input: &str) -> Result<PathBuf, ProjectWrit
     }
     let path = Path::new(input);
     if path.is_absolute()
-        || path.components().any(|component| !matches!(component, Component::Normal(_)))
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(ProjectWriteError::InvalidPath(input.to_owned()));
     }

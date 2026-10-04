@@ -143,6 +143,25 @@ impl Document {
     pub fn is_dirty(&self) -> bool {
         !self.buffer.is_pristine()
     }
+
+    /// Replaces a clean buffer with externally changed file contents without
+    /// creating a local edit or changing the document identity.
+    pub fn reload_external(&mut self, content: &str) {
+        let cursor = self.cursor_offset().min(content.len());
+        let selection = self.selection_offsets();
+        self.buffer = Buffer::new(Rope::from(content));
+        self.buffer
+            .set_line_ending(LineEnding::detect(content).backend());
+        self.buffer.set_pristine();
+        self.line_ending = LineEnding::detect(content);
+        self.revision = self.revision.saturating_add(1);
+        self.last_edit = None;
+        self.edit_batch_invalid = false;
+        self.move_cursor(cursor);
+        if let Some((start, end)) = selection {
+            self.set_selection(start.min(content.len()), end.min(content.len()));
+        }
+    }
     pub fn file_path(&self) -> Option<&Path> {
         self.file_path.as_deref()
     }
@@ -671,6 +690,45 @@ mod tests {
         assert!(document.is_dirty());
         assert!(document.undo());
         assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn external_reload_replaces_clean_content_and_preserves_document_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        std::fs::write(&path, "old").unwrap();
+        let mut document = Document::from_file(&path).unwrap();
+        let identity = document.file_path().unwrap().to_path_buf();
+        document.move_cursor(2);
+
+        document.reload_external("new content");
+
+        assert_eq!(document.content(), "new content");
+        assert!(!document.is_dirty());
+        assert_eq!(document.file_path(), Some(identity.as_path()));
+        assert_eq!(document.cursor_offset(), 2);
+    }
+
+    #[test]
+    fn external_reload_never_replaces_dirty_content() {
+        let mut document = Document::from_content("local");
+        document.insert_text(" edit");
+        let local = document.content();
+
+        // The editor-layer sync gate checks is_dirty before calling this
+        // operation; a dirty document must retain its local buffer.
+        assert!(document.is_dirty());
+        assert_eq!(document.content(), local);
+    }
+
+    #[test]
+    fn external_reload_is_pristine_and_does_not_create_a_save_loop() {
+        let mut document = Document::from_content("before");
+        document.reload_external("after");
+        assert!(!document.is_dirty());
+        document.reload_external("after");
+        assert!(!document.is_dirty());
+        assert_eq!(document.content(), "after");
     }
 
     #[test]

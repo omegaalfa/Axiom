@@ -1,7 +1,7 @@
 //! Production adapters and the small UI-facing bridge for one Agent run.
 
 use super::tool_orchestration::{
-    fetch_url_definition, list_directory_definition, read_file_definition,
+    delete_file_definition, fetch_url_definition, list_directory_definition, read_file_definition,
     update_file_definition, write_file_definition,
 };
 use super::tools::{ToolArguments, ToolError, ToolName, ToolRegistry, ToolRequest};
@@ -38,6 +38,7 @@ pub(crate) enum ApprovalBridgeError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ApprovalCommand {
     Approve,
+    AllowForRequest,
     Deny,
     Cancel,
 }
@@ -98,6 +99,14 @@ impl ApprovalBridge {
         approval_id: ApprovalId,
     ) -> Result<(), ApprovalBridgeError> {
         self.decide(run_id, approval_id, ApprovalCommand::Approve)
+    }
+
+    pub(crate) fn allow_for_request(
+        &self,
+        run_id: AgentRunId,
+        approval_id: ApprovalId,
+    ) -> Result<(), ApprovalBridgeError> {
+        self.decide(run_id, approval_id, ApprovalCommand::AllowForRequest)
     }
 
     pub(crate) fn deny(
@@ -232,6 +241,17 @@ pub(crate) fn production_tool_definitions() -> Vec<axiom_ai_provider::ProviderTo
         fetch_url_definition(),
         write_file_definition(),
         update_file_definition(),
+        delete_file_definition(),
+    ]
+}
+
+pub(crate) fn gemini_agent_tool_definitions() -> Vec<axiom_ai_provider::ProviderToolDefinition> {
+    vec![
+        read_file_definition(),
+        list_directory_definition(),
+        write_file_definition(),
+        update_file_definition(),
+        delete_file_definition(),
     ]
 }
 
@@ -431,10 +451,11 @@ fn provider_call_to_request(call: &ProviderToolCall) -> Result<ToolRequest, Stri
                 .get("path")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "path must be a string".to_owned())?;
-            let expected_fingerprint = object
-                .get("expected_fingerprint")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "expected_fingerprint must be a string".to_owned())?;
+            let expected_fingerprint =
+                object
+                    .get("expected_fingerprint")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "expected_fingerprint must be a string".to_owned())?;
             let content = object
                 .get("content")
                 .and_then(Value::as_str)
@@ -445,6 +466,24 @@ fn provider_call_to_request(call: &ProviderToolCall) -> Result<ToolRequest, Stri
                     path: path.into(),
                     expected_fingerprint: expected_fingerprint.into(),
                     content: content.into(),
+                },
+            })
+        }
+        "delete_file" => {
+            let path = object
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "path must be a string".to_owned())?;
+            let expected_fingerprint =
+                object
+                    .get("expected_fingerprint")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "expected_fingerprint must be a string".to_owned())?;
+            Ok(ToolRequest {
+                name: ToolName::DeleteFile,
+                arguments: ToolArguments::DeleteFile {
+                    path: path.into(),
+                    expected_fingerprint: expected_fingerprint.into(),
                 },
             })
         }
@@ -506,6 +545,7 @@ pub(crate) fn execute_agent_run(
     api_key: String,
     base_url: String,
     registry: Option<ToolRegistry>,
+    workspace_root: Option<std::path::PathBuf>,
     bridge: &ApprovalBridge,
     queue: &AgentEventQueue,
 ) -> Result<axiom_agent::AgentExecutionResult, axiom_agent::AgentExecutionError> {
@@ -521,7 +561,9 @@ pub(crate) fn execute_agent_run(
         request,
         &mut provider,
         &mut tools,
-        ProductionToolPolicy::default(),
+        workspace_root
+            .map(ProductionToolPolicy::with_workspace_root)
+            .unwrap_or_default(),
         bridge,
         queue,
     );
@@ -577,6 +619,11 @@ where
             ApprovalCommand::Approve => executor.approve(run, approval.approval_id, &mut |event| {
                 publish_event(&handle, queue, event);
             }),
+            ApprovalCommand::AllowForRequest => {
+                executor.allow_for_request(run, approval.approval_id, &mut |event| {
+                    publish_event(&handle, queue, event)
+                })
+            }
             ApprovalCommand::Deny => executor.deny(run, approval.approval_id, &mut |event| {
                 publish_event(&handle, queue, event);
             }),
@@ -650,7 +697,13 @@ mod tests {
 
     #[test]
     fn read_file_and_list_directory_use_the_existing_registry() {
-        let (_dir, mut adapter) = adapter();
+        let (dir, mut adapter) = adapter();
+        fs::create_dir(dir.path().join("App")).unwrap();
+        fs::write(
+            dir.path().join("App/ProductService.php"),
+            "<?php final class ProductService {}",
+        )
+        .unwrap();
         let read = ProviderToolCall {
             id: Some("read-1".into()),
             name: "read_file".into(),
@@ -667,6 +720,24 @@ mod tests {
         assert!(
             matches!(adapter.execute(&list), Ok(ToolOutcome::Success(content)) if content.contains("Cargo.toml"))
         );
+        let nested = ProviderToolCall {
+            id: Some("nested-1".into()),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "App/ProductService.php"}),
+        };
+        assert!(matches!(
+            adapter.execute(&nested),
+            Ok(ToolOutcome::Success(content)) if content.contains("ProductService")
+        ));
+        let traversal = ProviderToolCall {
+            id: Some("traversal-1".into()),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "../outside.php"}),
+        };
+        assert!(matches!(
+            adapter.execute(&traversal),
+            Ok(ToolOutcome::ControlledError(_))
+        ));
     }
 
     #[test]
@@ -728,7 +799,26 @@ mod tests {
                 "list_directory",
                 "fetch_url",
                 "write_file",
-                "update_file"
+                "update_file",
+                "delete_file"
+            ]
+        );
+    }
+
+    #[test]
+    fn gemini_agent_tool_set_contains_both_mutation_tools() {
+        let names: Vec<_> = gemini_agent_tool_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "read_file",
+                "list_directory",
+                "write_file",
+                "update_file",
+                "delete_file"
             ]
         );
     }
@@ -740,7 +830,8 @@ mod approval_bridge_tests {
     use axiom_agent::{ToolPolicyContext, ToolPolicyDecision};
     use axiom_ai_provider::{ChatRole, ProviderChatMessage, ProviderChatStreamEvent};
     use axiom_project::{
-        project_update::ProjectUpdateCapability, project_write::ProjectWriteCapability,
+        project_delete::ProjectDeleteCapability, project_update::ProjectUpdateCapability,
+        project_write::ProjectWriteCapability,
     };
     use std::{
         sync::{Arc, Mutex},
@@ -759,6 +850,7 @@ mod approval_bridge_tests {
                 tool_calls: Vec::new(),
             }],
             think: None,
+            thinking_level: None,
             tools: Some(Vec::new()),
         }
     }
@@ -869,8 +961,7 @@ mod approval_bridge_tests {
 
     fn write_adapter() -> (tempfile::TempDir, AgentToolAdapter) {
         let dir = tempfile::tempdir().unwrap();
-        let read =
-            axiom_project::project_read::ProjectReadCapability::new(dir.path()).unwrap();
+        let read = axiom_project::project_read::ProjectReadCapability::new(dir.path()).unwrap();
         let directory =
             axiom_project::project_directory::ProjectDirectoryCapability::new(dir.path()).unwrap();
         let write = ProjectWriteCapability::new(dir.path()).unwrap();
@@ -889,8 +980,7 @@ mod approval_bridge_tests {
     fn update_adapter() -> (tempfile::TempDir, AgentToolAdapter) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file.txt"), "old").unwrap();
-        let read =
-            axiom_project::project_read::ProjectReadCapability::new(dir.path()).unwrap();
+        let read = axiom_project::project_read::ProjectReadCapability::new(dir.path()).unwrap();
         let directory =
             axiom_project::project_directory::ProjectDirectoryCapability::new(dir.path()).unwrap();
         let write = ProjectWriteCapability::new(dir.path()).unwrap();
@@ -905,6 +995,34 @@ mod approval_bridge_tests {
         (
             dir,
             AgentToolAdapter::new(registry, Cancellation::default()),
+        )
+    }
+
+    fn delete_adapter() -> (tempfile::TempDir, AgentToolAdapter, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "remove").unwrap();
+        let read = axiom_project::project_read::ProjectReadCapability::new(dir.path()).unwrap();
+        let directory =
+            axiom_project::project_directory::ProjectDirectoryCapability::new(dir.path()).unwrap();
+        let write = ProjectWriteCapability::new(dir.path()).unwrap();
+        let update = ProjectUpdateCapability::new(dir.path()).unwrap();
+        let expected = update
+            .fingerprint_text_file("file.txt")
+            .unwrap()
+            .to_wire_string();
+        let delete = ProjectDeleteCapability::new(dir.path()).unwrap();
+        let registry = ToolRegistry::new_with_all_mutations(
+            read,
+            directory,
+            axiom_web::FetchUrlCapability::new(),
+            write,
+            update,
+            delete,
+        );
+        (
+            dir,
+            AgentToolAdapter::new(registry, Cancellation::default()),
+            expected,
         )
     }
 
@@ -959,15 +1077,9 @@ mod approval_bridge_tests {
             requests: Arc::new(Mutex::new(Vec::new())),
             calls: 0,
         };
-        let mut run = AgentRun::new(
-            AgentRunId::new(501),
-            axiom_agent::AgentBudget::new(2, 1),
-        );
-        let mut executor = AgentExecutor::with_policy(
-            &mut provider,
-            &mut tools,
-            ProductionToolPolicy::default(),
-        );
+        let mut run = AgentRun::new(AgentRunId::new(501), axiom_agent::AgentBudget::new(2, 1));
+        let mut executor =
+            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
         let error = executor
             .execute(&mut run, request(), &mut |_| {})
             .unwrap_err();
@@ -980,26 +1092,67 @@ mod approval_bridge_tests {
         let result = executor
             .approve(&mut run, approval.approval_id, &mut |_| {})
             .unwrap();
-        assert!(!result
-            .messages()
-            .iter()
-            .any(|message| message.content.contains("Olá, Axiom! 🚀")));
-        assert!(result
-            .messages()
-            .iter()
-            .all(|message| !message.content.contains("<tool_call")));
+        assert!(
+            !result
+                .messages()
+                .iter()
+                .any(|message| message.content.contains("Olá, Axiom! 🚀"))
+        );
+        assert!(
+            result
+                .messages()
+                .iter()
+                .all(|message| !message.content.contains("<tool_call"))
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
             "Olá, Axiom! 🚀"
         );
         assert!(matches!(
             executor.approve(&mut run, approval.approval_id, &mut |_| {}),
-            Err(AgentExecutionError::Approval(axiom_agent::ApprovalError::NotPending))
+            Err(AgentExecutionError::Approval(
+                axiom_agent::ApprovalError::NotPending
+            ))
         ));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
             "Olá, Axiom! 🚀"
         );
+    }
+
+    #[test]
+    fn approved_delete_revalidates_fingerprint_and_deletes_once() {
+        let (dir, mut tools, expected) = delete_adapter();
+        let mut provider = ScriptedProvider {
+            scripts: vec![vec![
+                ProviderChatStreamEvent::ToolCall(ProviderToolCall {
+                    id: Some("delete-1".into()),
+                    name: "delete_file".into(),
+                    arguments: serde_json::json!({
+                        "path": "file.txt",
+                        "expected_fingerprint": expected
+                    }),
+                }),
+                ProviderChatStreamEvent::Done,
+            ]],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            calls: 0,
+        };
+        let mut run = AgentRun::new(AgentRunId::new(503), axiom_agent::AgentBudget::new(1, 1));
+        let mut executor =
+            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
+        let error = executor
+            .execute(&mut run, request(), &mut |_| {})
+            .unwrap_err();
+        let approval = match error {
+            AgentExecutionError::ApprovalRequired(approval) => approval,
+            other => panic!("expected approval: {other:?}"),
+        };
+        assert!(dir.path().join("file.txt").exists());
+        executor
+            .approve(&mut run, approval.approval_id, &mut |_| {})
+            .unwrap();
+        assert!(!dir.path().join("file.txt").exists());
     }
 
     #[test]
@@ -1013,12 +1166,7 @@ mod approval_bridge_tests {
         let mut provider = ScriptedProvider {
             scripts: vec![
                 vec![
-                    update_tool_call(
-                        "update-1",
-                        "file.txt",
-                        &expected,
-                        "Olá, atualização! 🚀",
-                    ),
+                    update_tool_call("update-1", "file.txt", &expected, "Olá, atualização! 🚀"),
                     ProviderChatStreamEvent::Done,
                 ],
                 vec![
@@ -1029,15 +1177,9 @@ mod approval_bridge_tests {
             requests: Arc::new(Mutex::new(Vec::new())),
             calls: 0,
         };
-        let mut run = AgentRun::new(
-            AgentRunId::new(503),
-            axiom_agent::AgentBudget::new(2, 1),
-        );
-        let mut executor = AgentExecutor::with_policy(
-            &mut provider,
-            &mut tools,
-            ProductionToolPolicy::default(),
-        );
+        let mut run = AgentRun::new(AgentRunId::new(503), axiom_agent::AgentBudget::new(2, 1));
+        let mut executor =
+            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
         let error = executor
             .execute(&mut run, request(), &mut |_| {})
             .unwrap_err();
@@ -1056,13 +1198,17 @@ mod approval_bridge_tests {
             std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
             "Olá, atualização! 🚀"
         );
-        assert!(!result
-            .messages()
-            .iter()
-            .any(|message| message.content.contains("Olá, atualização! 🚀")));
+        assert!(
+            !result
+                .messages()
+                .iter()
+                .any(|message| message.content.contains("Olá, atualização! 🚀"))
+        );
         assert!(matches!(
             executor.approve(&mut run, approval.approval_id, &mut |_| {}),
-            Err(AgentExecutionError::Approval(axiom_agent::ApprovalError::NotPending))
+            Err(AgentExecutionError::Approval(
+                axiom_agent::ApprovalError::NotPending
+            ))
         ));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
@@ -1120,16 +1266,10 @@ mod approval_bridge_tests {
             requests: Arc::new(Mutex::new(Vec::new())),
             calls: 0,
         };
-        let mut run = AgentRun::new(
-            AgentRunId::new(505),
-            axiom_agent::AgentBudget::new(2, 1),
-        );
+        let mut run = AgentRun::new(AgentRunId::new(505), axiom_agent::AgentBudget::new(2, 1));
         assert_eq!(tools.update_calls, 0);
-        let mut executor = AgentExecutor::with_policy(
-            &mut provider,
-            &mut tools,
-            ProductionToolPolicy::default(),
-        );
+        let mut executor =
+            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
         let error = executor
             .execute(&mut run, request(), &mut |_| {})
             .unwrap_err();
@@ -1189,15 +1329,9 @@ mod approval_bridge_tests {
             requests: Arc::new(Mutex::new(Vec::new())),
             calls: 0,
         };
-        let mut run = AgentRun::new(
-            AgentRunId::new(504),
-            axiom_agent::AgentBudget::new(2, 1),
-        );
-        let mut executor = AgentExecutor::with_policy(
-            &mut provider,
-            &mut tools,
-            ProductionToolPolicy::default(),
-        );
+        let mut run = AgentRun::new(AgentRunId::new(504), axiom_agent::AgentBudget::new(2, 1));
+        let mut executor =
+            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
         let error = executor
             .execute(&mut run, request(), &mut |_| {})
             .unwrap_err();
@@ -1220,7 +1354,9 @@ mod approval_bridge_tests {
         );
         assert!(matches!(
             executor.approve(&mut run, approval.approval_id, &mut |_| {}),
-            Err(AgentExecutionError::Approval(axiom_agent::ApprovalError::NotPending))
+            Err(AgentExecutionError::Approval(
+                axiom_agent::ApprovalError::NotPending
+            ))
         ));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
@@ -1245,15 +1381,9 @@ mod approval_bridge_tests {
             requests: Arc::new(Mutex::new(Vec::new())),
             calls: 0,
         };
-        let mut run = AgentRun::new(
-            AgentRunId::new(502),
-            axiom_agent::AgentBudget::new(2, 1),
-        );
-        let mut executor = AgentExecutor::with_policy(
-            &mut provider,
-            &mut tools,
-            ProductionToolPolicy::default(),
-        );
+        let mut run = AgentRun::new(AgentRunId::new(502), axiom_agent::AgentBudget::new(2, 1));
+        let mut executor =
+            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
         let error = executor
             .execute(&mut run, request(), &mut |_| {})
             .unwrap_err();
@@ -1273,7 +1403,9 @@ mod approval_bridge_tests {
         assert!(!dir.path().join("blocked.txt").exists());
         assert!(matches!(
             executor.approve(&mut run, approval.approval_id, &mut |_| {}),
-            Err(AgentExecutionError::Approval(axiom_agent::ApprovalError::NotPending))
+            Err(AgentExecutionError::Approval(
+                axiom_agent::ApprovalError::NotPending
+            ))
         ));
         assert!(!dir.path().join("blocked.txt").exists());
     }

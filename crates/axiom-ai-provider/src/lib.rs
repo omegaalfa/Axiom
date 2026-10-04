@@ -9,8 +9,7 @@ use std::{
 mod remote;
 
 pub use remote::{
-    ProviderProtocol, provider_chat_stream_with_cancel, provider_protocol,
-    test_provider_connection,
+    ProviderProtocol, provider_chat_stream_with_cancel, provider_protocol, test_provider_connection,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -89,6 +88,82 @@ pub struct ModelMetadata {
     #[serde(default)]
     pub capabilities: Vec<String>,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThinkingLevel {
+    #[default]
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ThinkingLevel {
+    pub const fn as_google_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "MINIMAL",
+            Self::Low => "LOW",
+            Self::Medium => "MEDIUM",
+            Self::High => "HIGH",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Minimal => "Minimal",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThinkingCapability {
+    pub supported: bool,
+    pub levels: Vec<ThinkingLevel>,
+    pub default_level: Option<ThinkingLevel>,
+}
+
+impl ThinkingCapability {
+    pub fn supports_level(&self, level: ThinkingLevel) -> bool {
+        self.levels.contains(&level)
+    }
+}
+
+pub fn thinking_capability(
+    provider: &ProviderKind,
+    model: &str,
+    metadata: Option<&ModelMetadata>,
+) -> ThinkingCapability {
+    if matches!(provider, ProviderKind::Ollama) {
+        return ThinkingCapability {
+            supported: metadata.is_some_and(ModelMetadata::supports_thinking),
+            levels: Vec::new(),
+            default_level: None,
+        };
+    }
+    let is_google =
+        matches!(provider, ProviderKind::Other(name) if name == "Google" || name == "Gemini");
+    let normalized_model = model.strip_prefix("models/").unwrap_or(model);
+    if is_google && normalized_model.starts_with("gemini-3.") {
+        return ThinkingCapability {
+            supported: true,
+            levels: vec![
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+            ],
+            default_level: Some(ThinkingLevel::Minimal),
+        };
+    }
+    ThinkingCapability {
+        supported: is_google && metadata.is_some_and(ModelMetadata::supports_thinking),
+        levels: Vec::new(),
+        default_level: None,
+    }
+}
 impl ModelMetadata {
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|value| value == capability)
@@ -147,6 +222,8 @@ pub struct ProviderChatRequest {
     pub messages: Vec<ProviderChatMessage>,
     pub think: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<ThinkingLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ProviderToolDefinition>>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -165,7 +242,14 @@ pub enum ProviderChatStreamEvent {
     ReasoningDelta(String),
     ContentDelta(String),
     ToolCall(ProviderToolCall),
+    /// Opaque provider-local metadata. It is never user-visible.
+    ResponseMetadata(ProviderResponseMetadata),
     Done,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProviderResponseMetadata {
+    GoogleThoughtSignature(String),
 }
 
 fn emit_stream_event<F>(
@@ -258,6 +342,9 @@ pub enum InvalidResponseCategory {
     ToolMissingFunction,
     ToolMissingName,
     ToolMissingArguments,
+    ToolSchemaInvalid,
+    ResponseDecode,
+    NoUsableContent,
     Other,
 }
 
@@ -273,6 +360,9 @@ impl InvalidResponseCategory {
             Self::ToolMissingFunction => "tool_missing_function",
             Self::ToolMissingName => "tool_missing_name",
             Self::ToolMissingArguments => "tool_missing_arguments",
+            Self::ToolSchemaInvalid => "tool_schema_invalid",
+            Self::ResponseDecode => "response_decode",
+            Self::NoUsableContent => "no_usable_content",
             Self::Other => "other",
         }
     }
@@ -517,6 +607,8 @@ pub enum ProviderError {
     Timeout,
     InvalidResponse(InvalidResponseCategory),
     Authentication,
+    RateLimited,
+    TemporarilyUnavailable,
     Unavailable(String),
 }
 
@@ -602,6 +694,8 @@ impl ProviderError {
             Self::Timeout => "Connection timed out",
             Self::InvalidResponse(_) => "Invalid provider response",
             Self::Authentication => "Authentication failed",
+            Self::RateLimited => "Provider rate limited",
+            Self::TemporarilyUnavailable => "Provider temporarily unavailable",
             Self::Unavailable(_) => "Provider unavailable",
         }
     }
@@ -777,6 +871,8 @@ impl OllamaProvider {
                         ProviderError::ConnectionRefused => "connection_refused",
                         ProviderError::Timeout => "timeout",
                         ProviderError::Authentication => "authentication",
+                        ProviderError::RateLimited => "rate_limited",
+                        ProviderError::TemporarilyUnavailable => "temporarily_unavailable",
                         ProviderError::Unavailable(_) => "unavailable",
                         ProviderError::InvalidResponse(_) => "invalid_response",
                     },
@@ -1192,6 +1288,7 @@ mod tests {
                 tool_calls: Vec::new(),
             }],
             think: Some(true),
+            thinking_level: None,
             tools: None,
         };
         let value = serde_json::to_value(request).unwrap();
@@ -1199,6 +1296,19 @@ mod tests {
         assert_eq!(value["think"], true);
         assert_eq!(value["messages"][0]["content"], "hi");
         assert!(value.get("tools").is_none());
+    }
+
+    #[test]
+    fn gemini_thinking_capability_exposes_levels_and_minimal_default() {
+        let capability = thinking_capability(
+            &ProviderKind::Other("Google".into()),
+            "gemini-3.5-flash-lite",
+            None,
+        );
+        assert!(capability.supported);
+        assert_eq!(capability.default_level, Some(ThinkingLevel::Minimal));
+        assert_eq!(capability.levels.len(), 4);
+        assert!(capability.supports_level(ThinkingLevel::High));
     }
 
     #[test]
@@ -1364,6 +1474,7 @@ mod tests {
                 tool_calls: vec![call.clone()],
             }],
             think: None,
+            thinking_level: None,
             tools: Some(vec![definition.clone()]),
         };
         assert_eq!(request.tools.as_ref().unwrap()[0], definition);
@@ -1426,6 +1537,7 @@ mod tests {
                     ProviderChatStreamEvent::ToolCall(_) => {}
                     ProviderChatStreamEvent::ThinkingDelta(_) => {}
                     ProviderChatStreamEvent::ReasoningDelta(_) => {}
+                    ProviderChatStreamEvent::ResponseMetadata(_) => {}
                 }
                 Ok(())
             })

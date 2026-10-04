@@ -10,8 +10,11 @@ use std::{
 };
 
 use axiom_php::{
-    stub_generation::{generate_runtime_stub_artifact_binary, generate_runtime_stub_artifact_bytes, parse_phpstorm_stubs_map},
     EmbeddedStubArtifact, SymbolKind,
+    stub_generation::{
+        generate_runtime_stub_artifact_binary, generate_runtime_stub_artifact_bytes,
+        parse_phpstorm_stubs_map,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -95,11 +98,18 @@ fn update_bundled_dataset() -> Result<(), Box<dyn Error>> {
     let source_root = temporary.path().join("source");
     let generated_path = temporary.path().join("runtime-stubs.bin");
     fs::create_dir_all(&source_root).map_err(|error| {
-        io_context("create extraction directory", None, Some(&source_root), error)
+        io_context(
+            "create extraction directory",
+            None,
+            Some(&source_root),
+            error,
+        )
     })?;
 
-    let archive_url =
-        format!("https://github.com/{}/archive/{}.tar.gz", lock.repository, lock.commit);
+    let archive_url = format!(
+        "https://github.com/{}/archive/{}.tar.gz",
+        lock.repository, lock.commit
+    );
     download_archive(&archive_url, &archive_path)?;
     let actual_sha256 = file_sha256(&archive_path)?;
     if !actual_sha256.eq_ignore_ascii_case(&lock.archive_sha256) {
@@ -129,7 +139,12 @@ fn update_bundled_dataset() -> Result<(), Box<dyn Error>> {
     let (archive_root, map_path) = resolve_archive_root(&source_root, &lock.map_path)?;
     let report = generate_runtime_stub_artifact_binary(&archive_root, &map_path, &generated_path)?;
     let artifact_bytes = fs::read(&generated_path).map_err(|error| {
-        io_context("read generated artifact", Some(&generated_path), None, error)
+        io_context(
+            "read generated artifact",
+            Some(&generated_path),
+            None,
+            error,
+        )
     })?;
     let artifact: EmbeddedStubArtifact = bincode::deserialize(&artifact_bytes)?;
     validate_required_symbols(&artifact)?;
@@ -157,10 +172,20 @@ fn update_bundled_dataset() -> Result<(), Box<dyn Error>> {
         functions: counts.functions,
         global_constants: counts.global_constants,
         runtime_stubs_binary_bytes: fs::metadata(&output_path)
-            .map_err(|error| io_context("read installed artifact metadata", Some(&output_path), None, error))?
+            .map_err(|error| {
+                io_context(
+                    "read installed artifact metadata",
+                    Some(&output_path),
+                    None,
+                    error,
+                )
+            })?
             .len(),
         elapsed_seconds: started.elapsed().as_secs_f64(),
-        required_symbols: REQUIRED_SYMBOLS.iter().map(|name| (*name).to_owned()).collect(),
+        required_symbols: REQUIRED_SYMBOLS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
         required_symbols_valid: true,
     };
     println!("{}", serde_json::to_string_pretty(&dataset_report)?);
@@ -176,7 +201,11 @@ fn generate_from_external_source(arguments: &[String]) -> Result<(), Box<dyn Err
     }
     let map_path = source.join("AxiomStubsMap.php");
     if !map_path.is_file() {
-        return Err(format!("local stub source is missing canonical map: {}", map_path.display()).into());
+        return Err(format!(
+            "local stub source is missing canonical map: {}",
+            map_path.display()
+        )
+        .into());
     }
     let map_content = fs::read_to_string(&map_path).map_err(|error| {
         io_context("read local AxiomStubsMap.php", Some(&map_path), None, error)
@@ -195,23 +224,39 @@ fn generate_from_external_source(arguments: &[String]) -> Result<(), Box<dyn Err
     for relative in &map_files {
         let path = source.join(relative);
         if !path.is_file() {
-            return Err(format!("local AxiomStubsMap.php references missing PHP file: {}", path.display()).into());
+            return Err(format!(
+                "local AxiomStubsMap.php references missing PHP file: {}",
+                path.display()
+            )
+            .into());
         }
     }
     let files = enumerate_local_php_files(&source)?;
-    let unreferenced_php_files = files.iter().filter(|file| !map_files.contains(*file)).count();
+    let unreferenced_php_files = files
+        .iter()
+        .filter(|file| !map_files.contains(*file))
+        .count();
     let temporary = TemporaryDirectory::new()?;
     let generated_path = temporary.path().join("runtime-stubs.bin");
     let (artifact, report) = generate_runtime_stub_artifact_bytes(&source, map)?;
     let bytes = bincode::serialize(&artifact)?;
     fs::write(&generated_path, &bytes).map_err(|error| {
-        io_context("write locally generated artifact", None, Some(&generated_path), error)
+        io_context(
+            "write locally generated artifact",
+            None,
+            Some(&generated_path),
+            error,
+        )
     })?;
-    let artifact: EmbeddedStubArtifact = bincode::deserialize(
-        &fs::read(&generated_path).map_err(|error| {
-            io_context("read locally generated artifact", Some(&generated_path), None, error)
-        })?,
-    )?;
+    let artifact: EmbeddedStubArtifact =
+        bincode::deserialize(&fs::read(&generated_path).map_err(|error| {
+            io_context(
+                "read locally generated artifact",
+                Some(&generated_path),
+                None,
+                error,
+            )
+        })?)?;
     validate_required_symbols(&artifact)?;
     let output_path = crate_root.join("embedded/runtime-stubs.bin");
     install_atomically(&generated_path, &output_path)?;
@@ -240,7 +285,10 @@ fn generate_from_external_source(arguments: &[String]) -> Result<(), Box<dyn Err
             global_constants: counts.global_constants,
             runtime_stubs_binary_bytes: fs::metadata(&output_path)?.len(),
             elapsed_seconds: started.elapsed().as_secs_f64(),
-            required_symbols: REQUIRED_SYMBOLS.iter().map(|name| (*name).to_owned()).collect(),
+            required_symbols: REQUIRED_SYMBOLS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
             required_symbols_valid: true,
         })?
     );
@@ -255,11 +303,29 @@ fn enumerate_local_php_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>
     Ok(files)
 }
 
-fn collect_local_php_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+fn collect_local_php_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
     let mut entries = fs::read_dir(directory)
-        .map_err(|error| io_context("enumerate local stub directory", Some(directory), None, error))?
+        .map_err(|error| {
+            io_context(
+                "enumerate local stub directory",
+                Some(directory),
+                None,
+                error,
+            )
+        })?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| io_context("read local stub directory entry", Some(directory), None, error))?;
+        .map_err(|error| {
+            io_context(
+                "read local stub directory entry",
+                Some(directory),
+                None,
+                error,
+            )
+        })?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
@@ -269,7 +335,10 @@ fn collect_local_php_files(root: &Path, directory: &Path, files: &mut Vec<PathBu
         }
         if path.is_dir() {
             collect_local_php_files(root, &path, files)?;
-        } else if path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("php"))
+        } else if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("php"))
             && path.file_name().and_then(|name| name.to_str()) != Some("PhpStormStubsMap.php")
         {
             files.push(relative.to_path_buf());
@@ -292,14 +361,23 @@ fn generate_from_local_source(arguments: &[String]) -> Result<(), Box<dyn Error>
 }
 
 fn load_lock(path: &Path) -> Result<StubLock, Box<dyn Error>> {
-    let content = fs::read_to_string(path).map_err(|error| {
-        io_context("read stub lock", Some(path), None, error)
-    })?;
+    let content = fs::read_to_string(path)
+        .map_err(|error| io_context("read stub lock", Some(path), None, error))?;
     let lock: StubLock = serde_json::from_str(&content)?;
     if !valid_repository(&lock.repository) {
-        return Err(format!("invalid repository in {}: {}", path.display(), lock.repository).into());
+        return Err(format!(
+            "invalid repository in {}: {}",
+            path.display(),
+            lock.repository
+        )
+        .into());
     }
-    if !lock.commit.chars().all(|character| character.is_ascii_hexdigit()) || lock.commit.len() != 40 {
+    if !lock
+        .commit
+        .chars()
+        .all(|character| character.is_ascii_hexdigit())
+        || lock.commit.len() != 40
+    {
         return Err(format!("invalid commit in {}: {}", path.display(), lock.commit).into());
     }
     if lock.archive_sha256.len() != 64
@@ -325,9 +403,9 @@ fn valid_repository(repository: &str) -> bool {
     };
     [owner, name].iter().all(|part| {
         !part.is_empty()
-            && part
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+            && part.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
     })
 }
 
@@ -347,7 +425,13 @@ fn download_archive(url: &str, destination: &Path) -> Result<(), Box<dyn Error>>
         ],
         "download pinned phpstorm-stubs archive",
     )
-    .map_err(|error| format!("download archive destination={}: {error}", destination.display()).into())
+    .map_err(|error| {
+        format!(
+            "download archive destination={}: {error}",
+            destination.display()
+        )
+        .into()
+    })
 }
 
 fn file_sha256(path: &Path) -> Result<String, Box<dyn Error>> {
@@ -370,7 +454,11 @@ fn file_sha256(path: &Path) -> Result<String, Box<dyn Error>> {
                     .all(|character| character.is_ascii_hexdigit() || character.is_whitespace())
                     && line.chars().any(|character| character.is_ascii_hexdigit())
             })
-            .map(|line| line.chars().filter(|character| !character.is_whitespace()).collect())
+            .map(|line| {
+                line.chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect()
+            })
             .ok_or_else(|| -> Box<dyn Error> { "certutil returned no SHA-256 hash".into() })
     }
     #[cfg(not(windows))]
@@ -455,7 +543,11 @@ fn validate_required_symbols(artifact: &EmbeddedStubArtifact) -> Result<(), Box<
     if missing.is_empty() {
         Ok(())
     } else {
-        Err(format!("generated artifact is missing required symbols: {}", missing.join(", ")).into())
+        Err(format!(
+            "generated artifact is missing required symbols: {}",
+            missing.join(", ")
+        )
+        .into())
     }
 }
 
@@ -492,18 +584,25 @@ fn count_symbols(artifact: &EmbeddedStubArtifact) -> SymbolCounts {
 
 fn install_atomically(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
     let bytes = fs::read(source).map_err(|error| {
-        io_context("read generated artifact for atomic install", Some(source), None, error)
+        io_context(
+            "read generated artifact for atomic install",
+            Some(source),
+            None,
+            error,
+        )
     })?;
     let temporary = target.with_file_name(format!(
         ".{}.tmp-{}",
-        target.file_name()
+        target
+            .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("runtime-stubs.bin"),
         std::process::id()
     ));
     let backup = target.with_file_name(format!(
         ".{}.backup-{}",
-        target.file_name()
+        target
+            .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("runtime-stubs.bin"),
         std::process::id()
@@ -515,32 +614,67 @@ fn install_atomically(source: &Path, target: &Path) -> Result<(), Box<dyn Error>
             .truncate(true)
             .open(&temporary)
             .map_err(|error| {
-                io_context("create atomic-install temporary file", None, Some(&temporary), error)
+                io_context(
+                    "create atomic-install temporary file",
+                    None,
+                    Some(&temporary),
+                    error,
+                )
             })?;
         file.write_all(&bytes).map_err(|error| {
-            io_context("write atomic-install temporary file", None, Some(&temporary), error)
+            io_context(
+                "write atomic-install temporary file",
+                None,
+                Some(&temporary),
+                error,
+            )
         })?;
         file.flush().map_err(|error| {
-            io_context("flush atomic-install temporary file", Some(&temporary), None, error)
+            io_context(
+                "flush atomic-install temporary file",
+                Some(&temporary),
+                None,
+                error,
+            )
         })?;
         file.sync_all().map_err(|error| {
-            io_context("sync atomic-install temporary file", Some(&temporary), None, error)
+            io_context(
+                "sync atomic-install temporary file",
+                Some(&temporary),
+                None,
+                error,
+            )
         })?;
     }
     if target.exists() {
         fs::rename(target, &backup).map_err(|error| {
-            io_context("move existing artifact to atomic-install backup", Some(target), Some(&backup), error)
+            io_context(
+                "move existing artifact to atomic-install backup",
+                Some(target),
+                Some(&backup),
+                error,
+            )
         })?;
         if let Err(error) = fs::rename(&temporary, target) {
             let _ = fs::rename(&backup, target);
-            return Err(io_context("atomically replace embedded runtime stubs", Some(&temporary), Some(target), error));
+            return Err(io_context(
+                "atomically replace embedded runtime stubs",
+                Some(&temporary),
+                Some(target),
+                error,
+            ));
         }
         fs::remove_file(&backup).map_err(|error| {
             io_context("remove atomic-install backup", Some(&backup), None, error)
         })?;
     } else {
         fs::rename(&temporary, target).map_err(|error| {
-            io_context("atomically install embedded runtime stubs", Some(&temporary), Some(target), error)
+            io_context(
+                "atomically install embedded runtime stubs",
+                Some(&temporary),
+                Some(target),
+                error,
+            )
         })?;
     }
     Ok(())
@@ -568,7 +702,11 @@ where
     run_command_capture(program, arguments, action).map(|_| ())
 }
 
-fn run_command_capture<I, S>(program: &str, arguments: I, action: &str) -> Result<String, Box<dyn Error>>
+fn run_command_capture<I, S>(
+    program: &str,
+    arguments: I,
+    action: &str,
+) -> Result<String, Box<dyn Error>>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
@@ -638,7 +776,10 @@ mod tests {
     #[test]
     fn source_cli_requires_exact_path_value() {
         let arguments = vec!["--source".to_owned(), "E:/dev/axiom-stubs".to_owned()];
-        assert_eq!(required_value(&arguments, "--source").unwrap(), "E:/dev/axiom-stubs");
+        assert_eq!(
+            required_value(&arguments, "--source").unwrap(),
+            "E:/dev/axiom-stubs"
+        );
         assert!(required_value(&["--source".to_owned()], "--source").is_err());
         assert!(required_value(&["--other".to_owned(), "value".to_owned()], "--source").is_err());
     }
@@ -652,10 +793,12 @@ impl TemporaryDirectory {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = env::temp_dir().join(format!("axiom-php-stubs-{}-{timestamp}", std::process::id()));
-        fs::create_dir_all(&path).map_err(|error| {
-            io_context("create temporary directory", None, Some(&path), error)
-        })?;
+        let path = env::temp_dir().join(format!(
+            "axiom-php-stubs-{}-{timestamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path)
+            .map_err(|error| io_context("create temporary directory", None, Some(&path), error))?;
         Ok(Self(path))
     }
 

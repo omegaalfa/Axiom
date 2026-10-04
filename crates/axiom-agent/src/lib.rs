@@ -4,9 +4,13 @@
 //! only identity, state, budget, cancellation, and event semantics that a
 //! future execution adapter can use.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -203,7 +207,10 @@ impl ApprovalRequest {
 }
 
 fn safe_approval_arguments(call: &axiom_ai_provider::ProviderToolCall) -> String {
-    if !matches!(call.name.as_str(), "write_file" | "update_file") {
+    if !matches!(
+        call.name.as_str(),
+        "write_file" | "update_file" | "delete_file"
+    ) {
         return bounded_arguments(&call.arguments.to_string());
     }
     let arguments = call.arguments.as_object().cloned().unwrap_or_default();
@@ -222,7 +229,7 @@ fn safe_approval_arguments(call: &axiom_ai_provider::ProviderToolCall) -> String
         "path": path,
         "content_bytes": content_bytes,
     });
-    if call.name == "update_file" {
+    if matches!(call.name.as_str(), "update_file" | "delete_file") {
         preview["expected_fingerprint"] = arguments
             .get("expected_fingerprint")
             .and_then(serde_json::Value::as_str)
@@ -518,12 +525,93 @@ pub trait ToolPolicy {
         context: ToolPolicyContext,
         call: &axiom_ai_provider::ProviderToolCall,
     ) -> ToolPolicyDecision;
+
+    fn is_run_scoped_allowed(
+        &mut self,
+        _context: ToolPolicyContext,
+        _call: &axiom_ai_provider::ProviderToolCall,
+    ) -> bool {
+        false
+    }
+
+    fn grant_run_scoped(
+        &mut self,
+        _context: ToolPolicyContext,
+        _call: &axiom_ai_provider::ProviderToolCall,
+    ) {
+    }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReadOnlyToolPolicy;
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ApprovalScope {
+    pub run_id: AgentRunId,
+    pub tool_name: String,
+    pub canonical_workspace_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReadOnlyToolPolicy {
+    workspace_root: Option<PathBuf>,
+    run_scoped_approvals: HashSet<ApprovalScope>,
+}
+
+impl ReadOnlyToolPolicy {
+    pub fn with_workspace_root(root: PathBuf) -> Self {
+        Self {
+            workspace_root: Some(root),
+            run_scoped_approvals: HashSet::new(),
+        }
+    }
+
+    fn canonical_update_path(&self, call: &axiom_ai_provider::ProviderToolCall) -> Option<PathBuf> {
+        if call.name != "update_file" {
+            return None;
+        }
+        let path = call.arguments.get("path")?.as_str()?;
+        let root = self.workspace_root.as_deref()?;
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let canonical = std::fs::canonicalize(path).ok()?;
+        let canonical_root = std::fs::canonicalize(root).ok()?;
+        canonical.starts_with(&canonical_root).then_some(canonical)
+    }
+}
 
 impl ToolPolicy for ReadOnlyToolPolicy {
+    fn is_run_scoped_allowed(
+        &mut self,
+        context: ToolPolicyContext,
+        call: &axiom_ai_provider::ProviderToolCall,
+    ) -> bool {
+        let Some(path) = self.canonical_update_path(call) else {
+            return false;
+        };
+        self.run_scoped_approvals.contains(&ApprovalScope {
+            run_id: context.run_id,
+            tool_name: "update_file".into(),
+            canonical_workspace_path: path,
+        })
+    }
+
+    fn grant_run_scoped(
+        &mut self,
+        context: ToolPolicyContext,
+        call: &axiom_ai_provider::ProviderToolCall,
+    ) {
+        let Some(path) = self.canonical_update_path(call) else {
+            return;
+        };
+        self.run_scoped_approvals.insert(ApprovalScope {
+            run_id: context.run_id,
+            tool_name: "update_file".into(),
+            canonical_workspace_path: path,
+        });
+    }
+
     fn decide(
         &mut self,
         _context: ToolPolicyContext,
@@ -531,7 +619,7 @@ impl ToolPolicy for ReadOnlyToolPolicy {
     ) -> ToolPolicyDecision {
         match call.name.as_str() {
             "read_file" | "list_directory" | "fetch_url" => ToolPolicyDecision::Allow,
-            "write_file" | "update_file" => ToolPolicyDecision::RequireApproval {
+            "write_file" | "update_file" | "delete_file" => ToolPolicyDecision::RequireApproval {
                 reason: "file mutation requires approval".into(),
             },
             _ => ToolPolicyDecision::Deny {
@@ -801,7 +889,7 @@ where
     T: ToolExecutor,
 {
     pub fn new(provider: &'a mut P, tools: &'a mut T) -> Self {
-        Self::with_policy(provider, tools, ReadOnlyToolPolicy)
+        Self::with_policy(provider, tools, ReadOnlyToolPolicy::default())
     }
 }
 
@@ -883,6 +971,36 @@ where
             ));
         }
         self.drive(run, continuation, true, emit)
+    }
+
+    pub fn allow_for_request(
+        &mut self,
+        run: &mut AgentRun,
+        approval_id: ApprovalId,
+        emit: &mut dyn FnMut(AgentEvent),
+    ) -> Result<AgentExecutionResult, AgentExecutionError> {
+        let pending = run
+            .pending_approval
+            .as_ref()
+            .ok_or(AgentExecutionError::Approval(ApprovalError::NotPending))?;
+        if pending.approval_id != approval_id {
+            return Err(AgentExecutionError::Approval(
+                ApprovalError::UnknownApproval,
+            ));
+        }
+        let stored_call = pending.call.clone();
+        let continuation = self
+            .pending
+            .as_ref()
+            .ok_or(AgentExecutionError::Approval(ApprovalError::NotPending))?;
+        if continuation.calls.first() != Some(&stored_call) {
+            return Err(AgentExecutionError::Approval(
+                ApprovalError::UnknownApproval,
+            ));
+        }
+        self.policy
+            .grant_run_scoped(ToolPolicyContext { run_id: run.id() }, &stored_call);
+        self.approve(run, approval_id, emit)
     }
 
     pub fn deny(
@@ -974,9 +1092,27 @@ where
             }
 
             if let Err(error) = run.consume_provider_turn() {
+                if error.resource == BudgetResource::ProviderTurns {
+                    tracing::warn!(
+                        target: "axiom.ai_diag",
+                        event = "agent_tool_budget_exhausted",
+                        tool_rounds_used = run.usage().provider_turns,
+                        tool_round_limit = run.budget().max_provider_turns,
+                        "provider turn budget exhausted before another tool round",
+                    );
+                }
                 return self.failed(run, emit, AgentExecutionError::BudgetExceeded(error));
             }
             let finalization_turn = run.usage().provider_turns == run.budget().max_provider_turns;
+            if finalization_turn {
+                tracing::warn!(
+                    target: "axiom.ai_diag",
+                    event = "agent_tool_budget_exhausted",
+                    tool_rounds_used = run.usage().provider_turns.saturating_sub(1),
+                    tool_round_limit = run.budget().max_provider_turns.saturating_sub(1),
+                    "tool round budget exhausted; entering bounded finalization",
+                );
+            }
             let request_for_turn = if finalization_turn {
                 finalization_request(&continuation.request)
             } else {
@@ -1004,6 +1140,7 @@ where
             let mut calls = Vec::new();
             let mut final_content = String::new();
             let mut provider_reasoning = String::new();
+            let mut provider_thought_signature = None;
             self.provider
                 .execute(&request_for_turn, &mut |event| match event {
                     axiom_ai_provider::ProviderChatStreamEvent::ThinkingDelta(delta) => {
@@ -1027,7 +1164,26 @@ where
                             });
                         }
                     }
-                    axiom_ai_provider::ProviderChatStreamEvent::ToolCall(call) => calls.push(call),
+                    axiom_ai_provider::ProviderChatStreamEvent::ToolCall(call) => {
+                        tracing::info!(
+                            target: "axiom.ai_diag",
+                            event = "agent_provider_tool_call",
+                            round = run.usage().provider_turns,
+                            name = call.name.as_str(),
+                            call_id_present = call.id.is_some(),
+                            thought_signature_present = provider_thought_signature.is_some(),
+                            relative_path = call.arguments.get("path").and_then(|value| value.as_str()).unwrap_or(""),
+                            classification = "native_function_call",
+                            "[AI-DIAG]"
+                        );
+                        calls.push(call)
+                    }
+                    axiom_ai_provider::ProviderChatStreamEvent::ResponseMetadata(metadata) => {
+                        let axiom_ai_provider::ProviderResponseMetadata::GoogleThoughtSignature(
+                            signature,
+                        ) = metadata;
+                        provider_thought_signature = Some(signature);
+                    }
                     axiom_ai_provider::ProviderChatStreamEvent::Done => {}
                 })
                 .map_err(|error| self.fail_provider(run, emit, error))?;
@@ -1084,7 +1240,8 @@ where
             let assistant = axiom_ai_provider::ProviderChatMessage {
                 role: axiom_ai_provider::ChatRole::Assistant,
                 content: String::new(),
-                reasoning: (!provider_reasoning.is_empty()).then_some(provider_reasoning),
+                reasoning: provider_thought_signature
+                    .or_else(|| (!provider_reasoning.is_empty()).then_some(provider_reasoning)),
                 tool_call_id: None,
                 tool_calls: calls.clone(),
             };
@@ -1121,7 +1278,11 @@ where
                 }
                 emit(AgentEvent::ToolRequested { run_id: run.id() });
             }
-            let decision = if approved_call {
+            let decision = if approved_call
+                || self
+                    .policy
+                    .is_run_scoped_allowed(ToolPolicyContext { run_id: run.id() }, &call)
+            {
                 ToolPolicyDecision::Allow
             } else {
                 self.policy
@@ -1177,6 +1338,17 @@ where
             };
             match outcome {
                 ToolOutcome::Success(result) => {
+                    tracing::info!(
+                        target: "axiom.ai_diag",
+                        event = "agent_function_response",
+                        round = run.usage().provider_turns,
+                        name = call.name.as_str(),
+                        function_response_id_present = call.id.is_some(),
+                        function_response_id_matches = true,
+                        relative_path = call.arguments.get("path").and_then(|value| value.as_str()).unwrap_or(""),
+                        classification = "native_function_response",
+                        "[AI-DIAG]"
+                    );
                     continuation
                         .request
                         .messages
@@ -1187,6 +1359,17 @@ where
                     });
                 }
                 ToolOutcome::ControlledError(error) => {
+                    tracing::warn!(
+                        target: "axiom.ai_diag",
+                        event = "agent_function_response",
+                        round = run.usage().provider_turns,
+                        name = call.name.as_str(),
+                        function_response_id_present = call.id.is_some(),
+                        function_response_id_matches = true,
+                        relative_path = call.arguments.get("path").and_then(|value| value.as_str()).unwrap_or(""),
+                        classification = "controlled_tool_error",
+                        "[AI-DIAG]"
+                    );
                     continuation
                         .request
                         .messages
@@ -1264,7 +1447,12 @@ mod tests {
         ChatRole, ProviderChatMessage, ProviderChatRequest, ProviderChatStreamEvent, ProviderError,
         ProviderToolCall, ProviderToolDefinition,
     };
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    static APPROVAL_WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn budget() -> AgentBudget {
         AgentBudget::new(2, 2)
@@ -1281,6 +1469,7 @@ mod tests {
                 tool_calls: Vec::new(),
             }],
             think: None,
+            thinking_level: None,
             tools: Some(Vec::new()),
         }
     }
@@ -1330,6 +1519,7 @@ mod tests {
                 },
             ],
             think: Some(true),
+            thinking_level: None,
             tools: Some(Vec::new()),
         };
         let metadata = RequestMetadata::from_request(&request);
@@ -1355,6 +1545,7 @@ mod tests {
                 tool_result("call-1", "tool context"),
             ],
             think: None,
+            thinking_level: None,
             tools: Some(Vec::new()),
         };
 
@@ -1384,6 +1575,7 @@ mod tests {
             model: "fake".into(),
             messages: vec![tool_result("result-1", "tool context")],
             think: None,
+            thinking_level: None,
             tools: Some(Vec::new()),
         };
 
@@ -1417,6 +1609,7 @@ mod tests {
                 tool_result("call-2", "controlled error marker"),
             ],
             think: None,
+            thinking_level: None,
             tools: Some(Vec::new()),
         };
 
@@ -1456,6 +1649,7 @@ mod tests {
                 tool_result("call-1", "tool context"),
             ],
             think: None,
+            thinking_level: None,
             tools: Some(Vec::new()),
         };
         let projected = finalization_request(&request);
@@ -1584,6 +1778,31 @@ mod tests {
             name: name.into(),
             arguments: serde_json::json!({}),
         })
+    }
+
+    fn update_call(id: &str, path: &str) -> ProviderChatStreamEvent {
+        ProviderChatStreamEvent::ToolCall(ProviderToolCall {
+            id: Some(id.into()),
+            name: "update_file".into(),
+            arguments: serde_json::json!({
+                "path": path,
+                "expected_fingerprint": "sha256:old",
+                "content": "new",
+            }),
+        })
+    }
+
+    fn approval_workspace() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "axiom-agent-approval-{}-{}",
+            std::process::id(),
+            APPROVAL_WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("jogo.html"), "old").unwrap();
+        std::fs::write(root.join("config.php"), "old").unwrap();
+        root
     }
 
     #[test]
@@ -1726,6 +1945,11 @@ mod tests {
         let mut provider = FakeProvider {
             scripts: vec![
                 Ok(vec![
+                    ProviderChatStreamEvent::ResponseMetadata(
+                        axiom_ai_provider::ProviderResponseMetadata::GoogleThoughtSignature(
+                            "opaque-signature".into(),
+                        ),
+                    ),
                     tool_call("call-1", "read_file"),
                     ProviderChatStreamEvent::Done,
                 ]),
@@ -1751,6 +1975,10 @@ mod tests {
         assert_eq!(tools.calls, vec!["read_file"]);
         assert_eq!(result.messages().len(), 3);
         assert_eq!(result.messages()[1].role, ChatRole::Assistant);
+        assert_eq!(
+            result.messages()[1].reasoning.as_deref(),
+            Some("opaque-signature")
+        );
         assert_eq!(result.messages()[2].role, ChatRole::Tool);
         assert_eq!(result.messages()[2].content, "contents");
         assert!(matches!(events[2], AgentEvent::ToolRequested { .. }));
@@ -2641,6 +2869,15 @@ mod tests {
                 ToolPolicyContext {
                     run_id: AgentRunId::new(1)
                 },
+                &call("delete_file")
+            ),
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
+        assert!(matches!(
+            policy.decide(
+                ToolPolicyContext {
+                    run_id: AgentRunId::new(1)
+                },
                 &call("shell")
             ),
             ToolPolicyDecision::Deny { .. }
@@ -2674,6 +2911,122 @@ mod tests {
             preview["expected_fingerprint"],
             "sha256:0000000000000000000000000000000000000000000000000000000000000000"
         );
+    }
+
+    #[test]
+    fn delete_file_approval_preview_contains_only_safe_identity_fields() {
+        let call = ProviderToolCall {
+            id: Some("delete-1".into()),
+            name: "delete_file".into(),
+            arguments: serde_json::json!({
+                "path": "src/file.txt",
+                "expected_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            }),
+        };
+        let request = ApprovalRequest::from_call(
+            AgentRunId::new(1),
+            ApprovalId::new(1),
+            &call,
+            "file mutation requires approval",
+        );
+        let preview: serde_json::Value = serde_json::from_str(&request.arguments).unwrap();
+        assert_eq!(preview["tool"], "delete_file");
+        assert_eq!(preview["path"], "src/file.txt");
+        assert_eq!(
+            preview["expected_fingerprint"],
+            call.arguments["expected_fingerprint"]
+        );
+        assert!(preview.get("content").is_none());
+    }
+
+    #[test]
+    fn read_workflow_can_use_more_than_four_tool_rounds_before_finalization() {
+        let mut scripts = (0..6)
+            .map(|index| {
+                Ok(vec![
+                    tool_call(&format!("read-{index}"), "read_file"),
+                    ProviderChatStreamEvent::Done,
+                ])
+            })
+            .collect::<Vec<_>>();
+        scripts.push(Ok(vec![
+            ProviderChatStreamEvent::ContentDelta("final answer".into()),
+            ProviderChatStreamEvent::Done,
+        ]));
+        let mut provider = FakeProvider {
+            scripts,
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: (0..6)
+                .map(|index| Ok(ToolOutcome::Success(format!("file-{index}"))))
+                .collect(),
+            calls: Vec::new(),
+        };
+        let mut run = AgentRun::new(AgentRunId::new(51), AgentBudget::new(7, 16));
+
+        let result = AgentExecutor::new(&mut provider, &mut tools)
+            .execute(&mut run, request(), &mut |_| {})
+            .unwrap();
+
+        assert_eq!(result.content, "final answer");
+        assert_eq!(provider.calls, 7);
+        assert_eq!(run.usage().tool_calls, 6);
+        assert!(
+            provider.requests[..6]
+                .iter()
+                .all(|request| request.tools.is_some())
+        );
+        assert!(provider.requests[6].tools.is_none());
+    }
+
+    #[test]
+    fn endless_tool_loop_stays_bounded_and_finalization_cannot_reenable_tools() {
+        let mut provider = FakeProvider {
+            scripts: vec![
+                Ok(vec![
+                    tool_call("call-1", "read_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    tool_call("call-2", "read_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    tool_call("call-3", "read_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    tool_call("call-final", "read_file"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+            ],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: vec![
+                Ok(ToolOutcome::Success("one".into())),
+                Ok(ToolOutcome::Success("two".into())),
+                Ok(ToolOutcome::Success("three".into())),
+            ],
+            calls: Vec::new(),
+        };
+        let mut run = AgentRun::new(AgentRunId::new(52), AgentBudget::new(4, 16));
+
+        let result =
+            AgentExecutor::new(&mut provider, &mut tools).execute(&mut run, request(), &mut |_| {});
+
+        assert!(matches!(
+            result,
+            Err(AgentExecutionError::ProviderProtocol(
+                "provider emitted a tool call while tools were disabled"
+            ))
+        ));
+        assert_eq!(provider.calls, 4);
+        assert_eq!(tools.calls, vec!["read_file", "read_file", "read_file"]);
+        assert!(provider.requests[3].tools.is_none());
     }
 
     #[test]
@@ -3083,5 +3436,181 @@ mod tests {
         assert!(matches!(result, Err(AgentExecutionError::Cancelled)));
         assert_eq!(provider.calls, 1);
         assert_eq!(tools.calls, 1);
+    }
+
+    #[test]
+    fn run_scoped_update_approval_allows_same_path_but_not_second_approve_once() {
+        let root = approval_workspace();
+        let mut provider = FakeProvider {
+            scripts: vec![
+                Ok(vec![
+                    update_call("one", "jogo.html"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    update_call("two", "jogo.html"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ContentDelta("done".into()),
+                    ProviderChatStreamEvent::Done,
+                ]),
+            ],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: vec![
+                Ok(ToolOutcome::Success("updated".into())),
+                Ok(ToolOutcome::Success("updated".into())),
+            ],
+            calls: Vec::new(),
+        };
+        let mut run = AgentRun::new(AgentRunId::new(101), AgentBudget::new(3, 3));
+        let mut executor = AgentExecutor::with_policy(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::with_workspace_root(root.clone()),
+        );
+        let first = match executor
+            .execute(&mut run, request(), &mut |_| {})
+            .unwrap_err()
+        {
+            AgentExecutionError::ApprovalRequired(approval) => approval,
+            other => panic!("unexpected error: {other:?}"),
+        };
+        let second = match executor
+            .approve(&mut run, first.approval_id, &mut |_| {})
+            .unwrap_err()
+        {
+            AgentExecutionError::ApprovalRequired(approval) => approval,
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert!(
+            executor
+                .approve(&mut run, second.approval_id, &mut |_| {})
+                .is_ok()
+        );
+        drop(executor);
+        assert_eq!(tools.calls, vec!["update_file", "update_file"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn allow_for_request_covers_same_canonical_path_only() {
+        let root = approval_workspace();
+        let mut provider = FakeProvider {
+            scripts: vec![
+                Ok(vec![
+                    update_call("one", "sub/../jogo.html"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    update_call("two", "jogo.html"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ContentDelta("done".into()),
+                    ProviderChatStreamEvent::Done,
+                ]),
+            ],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: vec![
+                Ok(ToolOutcome::Success("updated".into())),
+                Ok(ToolOutcome::Success("updated".into())),
+            ],
+            calls: Vec::new(),
+        };
+        let mut run = AgentRun::new(AgentRunId::new(102), AgentBudget::new(3, 3));
+        let mut executor = AgentExecutor::with_policy(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::with_workspace_root(root.clone()),
+        );
+        let approval = match executor
+            .execute(&mut run, request(), &mut |_| {})
+            .unwrap_err()
+        {
+            AgentExecutionError::ApprovalRequired(approval) => approval,
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert!(
+            executor
+                .allow_for_request(&mut run, approval.approval_id, &mut |_| {})
+                .is_ok()
+        );
+        drop(executor);
+        assert_eq!(tools.calls, vec!["update_file", "update_file"]);
+
+        let mut policy = ReadOnlyToolPolicy::with_workspace_root(root.clone());
+        let run_id = AgentRunId::new(102);
+        let same_path = ProviderToolCall {
+            id: Some("x".into()),
+            name: "update_file".into(),
+            arguments: serde_json::json!({"path": "jogo.html"}),
+        };
+        let other_path = ProviderToolCall {
+            arguments: serde_json::json!({"path": "config.php"}),
+            ..same_path.clone()
+        };
+        let alias_path = ProviderToolCall {
+            arguments: serde_json::json!({"path": "sub/../jogo.html"}),
+            ..same_path.clone()
+        };
+        policy.grant_run_scoped(ToolPolicyContext { run_id }, &alias_path);
+        assert!(policy.is_run_scoped_allowed(ToolPolicyContext { run_id }, &same_path));
+        assert!(!policy.is_run_scoped_allowed(ToolPolicyContext { run_id }, &other_path));
+        assert!(!policy.is_run_scoped_allowed(
+            ToolPolicyContext {
+                run_id: AgentRunId::new(103)
+            },
+            &same_path
+        ));
+
+        for name in ["write_file", "delete_file"] {
+            let other_tool = ProviderToolCall {
+                name: name.into(),
+                ..same_path.clone()
+            };
+            assert!(!policy.is_run_scoped_allowed(ToolPolicyContext { run_id }, &other_tool));
+            assert!(matches!(
+                policy.decide(ToolPolicyContext { run_id }, &other_tool),
+                ToolPolicyDecision::RequireApproval { .. }
+            ));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancelled_or_denied_run_has_no_scoped_authorization() {
+        let root = approval_workspace();
+        let call = ProviderToolCall {
+            id: Some("x".into()),
+            name: "update_file".into(),
+            arguments: serde_json::json!({"path": "jogo.html"}),
+        };
+        let mut policy = ReadOnlyToolPolicy::with_workspace_root(root.clone());
+        let run_id = AgentRunId::new(104);
+        let context = ToolPolicyContext { run_id };
+        assert!(matches!(
+            policy.decide(context, &call),
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
+        assert!(!policy.is_run_scoped_allowed(context, &call));
+        policy.grant_run_scoped(context, &call);
+        assert!(policy.is_run_scoped_allowed(context, &call));
+        let mut run = AgentRun::new(run_id, AgentBudget::new(1, 1));
+        run.cancel();
+        assert!(run.cancellation().is_cancelled());
+        assert!(!policy.is_run_scoped_allowed(
+            ToolPolicyContext {
+                run_id: AgentRunId::new(105)
+            },
+            &call
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

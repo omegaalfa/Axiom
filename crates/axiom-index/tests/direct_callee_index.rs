@@ -26,10 +26,7 @@ fn names(snapshot: &SemanticSnapshot, symbols: &[SymbolId]) -> Vec<String> {
 fn direct_function_call_is_materialized() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("calls.php");
-    let snapshot = snapshot_from_text(
-        &path,
-        "<?php function b() {} function a() { b(); }",
-    );
+    let snapshot = snapshot_from_text(&path, "<?php function b() {} function a() { b(); }");
     let caller = symbol(&snapshot, "a");
     let callee = symbol(&snapshot, "b");
 
@@ -55,10 +52,7 @@ fn multiple_direct_callees_are_materialized() {
 fn repeated_direct_call_is_deduplicated() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("calls.php");
-    let snapshot = snapshot_from_text(
-        &path,
-        "<?php function b() {} function a() { b(); b(); }",
-    );
+    let snapshot = snapshot_from_text(&path, "<?php function b() {} function a() { b(); b(); }");
     let caller = symbol(&snapshot, "a");
     let callee = symbol(&snapshot, "b");
 
@@ -69,10 +63,7 @@ fn repeated_direct_call_is_deduplicated() {
 fn call_cycle_is_materialized_without_recursive_traversal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("calls.php");
-    let snapshot = snapshot_from_text(
-        &path,
-        "<?php function a() { b(); } function b() { a(); }",
-    );
+    let snapshot = snapshot_from_text(&path, "<?php function a() { b(); } function b() { a(); }");
     let a = symbol(&snapshot, "a");
     let b = symbol(&snapshot, "b");
 
@@ -106,8 +97,7 @@ function excluded() {
         .iter()
         .filter_map(|id| snapshot.reference(*id))
         .filter(|reference| {
-            reference.source_symbol == Some(caller)
-                && reference.role == ReferenceRole::FunctionCall
+            reference.source_symbol == Some(caller) && reference.role == ReferenceRole::FunctionCall
         })
         .collect();
     assert_eq!(references.len(), 4);

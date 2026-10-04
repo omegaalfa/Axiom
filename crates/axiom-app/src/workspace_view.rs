@@ -9,13 +9,14 @@ use std::{
         mpsc::{self, Receiver, TryRecvError},
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axiom_ai_provider::{
     ChatRole, ProviderChatMessage, ProviderChatRequest, ProviderChatStreamEvent,
     ProviderConnectionRequest, ProviderError, ProviderKind, ProviderUiState, RequestTracker,
-    provider_chat_stream_with_cancel, provider_protocol, test_provider_connection,
+    ThinkingCapability, ThinkingLevel, provider_chat_stream_with_cancel, provider_protocol,
+    test_provider_connection, thinking_capability,
 };
 use axiom_app::commands::Keymap;
 use axiom_app::shell_state::{
@@ -29,7 +30,7 @@ use axiom_index::{
     SemanticSnapshot, SnapshotBuilder, VendorSymbolIndex,
 };
 use axiom_lsp::{PositionCodec, ServerStatus, uri_to_path};
-use axiom_php::{RuntimeSymbolIndex, RuntimeStubProvider};
+use axiom_php::{RuntimeStubProvider, RuntimeSymbolIndex};
 use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_content};
 use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSession};
 use gpui::{
@@ -41,10 +42,7 @@ use gpui::{
 };
 
 use crate::{
-    ai::tool_orchestration::{
-        fetch_url_definition, list_directory_definition, read_file_definition,
-        run_read_file_round_trip,
-    },
+    ai::tool_orchestration::{chat_tool_definitions, run_read_file_round_trip},
     ai::{
         agent_bridge::{self, AgentEventQueue},
         context::{ContextMessage, ContextRole, ContextSnapshot, ContextSource, ContextSourceKind},
@@ -680,6 +678,66 @@ struct ExplorerItem {
     depth: usize,
 }
 
+fn explorer_items_from_snapshot(
+    root: &Path,
+    snapshot: &[ProjectEntry],
+    expanded: &HashSet<PathBuf>,
+) -> (Vec<ExplorerItem>, HashSet<PathBuf>) {
+    fn append_children(
+        parent: &Path,
+        depth: usize,
+        snapshot: &[ProjectEntry],
+        requested_expanded: &HashSet<PathBuf>,
+        valid_expanded: &mut HashSet<PathBuf>,
+        visible: &mut Vec<ExplorerItem>,
+    ) {
+        let mut children = snapshot
+            .iter()
+            .filter(|entry| entry.path.parent() == Some(parent))
+            .cloned()
+            .collect::<Vec<_>>();
+        children.sort_by(|left, right| {
+            right
+                .is_directory()
+                .cmp(&left.is_directory())
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        for entry in children {
+            let is_directory = entry.is_directory();
+            let path = entry.path.clone();
+            visible.push(ExplorerItem {
+                path: entry.path,
+                name: entry.name,
+                kind: entry.kind,
+                depth,
+            });
+            if is_directory && requested_expanded.contains(&path) {
+                valid_expanded.insert(path.clone());
+                append_children(
+                    &path,
+                    depth + 1,
+                    snapshot,
+                    requested_expanded,
+                    valid_expanded,
+                    visible,
+                );
+            }
+        }
+    }
+
+    let mut visible = Vec::new();
+    let mut valid_expanded = HashSet::new();
+    append_children(
+        root,
+        0,
+        snapshot,
+        expanded,
+        &mut valid_expanded,
+        &mut visible,
+    );
+    (visible, valid_expanded)
+}
+
 #[derive(Clone)]
 struct ExplorerContext {
     path: PathBuf,
@@ -1071,6 +1129,7 @@ impl AgentActivityIndicatorPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentApprovalDecision {
     Approve,
+    AllowForRequest,
     Deny,
 }
 
@@ -1143,10 +1202,7 @@ fn take_agent_approval_submission(
     Some(submission)
 }
 
-fn agent_approval_visible(
-    panel_mode: AiPanelMode,
-    pending: &Option<AgentApprovalUiState>,
-) -> bool {
+fn agent_approval_visible(panel_mode: AiPanelMode, pending: &Option<AgentApprovalUiState>) -> bool {
     panel_mode == AiPanelMode::Agent && pending.is_some()
 }
 
@@ -1286,6 +1342,8 @@ fn provider_error_message(error: &ProviderError) -> &'static str {
         ProviderError::ConnectionRefused => "Endpoint unreachable",
         ProviderError::Timeout => "Connection timed out",
         ProviderError::InvalidResponse(_) => "Invalid provider response",
+        ProviderError::RateLimited => "Provider rate limited",
+        ProviderError::TemporarilyUnavailable => "Provider temporarily unavailable",
         ProviderError::Unavailable(message) if message == "model unavailable" => {
             "Model unavailable"
         }
@@ -1334,6 +1392,7 @@ enum PendingOperation {
 
 type ProjectLoadPayload = (Project, Vec<ProjectEntry>, Arc<LspBridge>);
 type SemanticIndexPayload = (ProjectSymbolIndex, Arc<SemanticEngine>);
+type ExplorerStructureResult = (u64, Result<Vec<ProjectEntry>, String>);
 type RuntimeLoadResult = (
     u64,
     Result<(RuntimeStubStatus, Arc<RuntimeSymbolIndex>), String>,
@@ -1454,6 +1513,8 @@ pub struct WorkspaceView {
     chat_current_request_id: Option<axiom_ai_provider::ProviderRequestId>,
     chat_thinking_enabled: bool,
     thinking_preferences: HashMap<(String, String), bool>,
+    thinking_level_preferences: HashMap<(String, String), ThinkingLevel>,
+    thinking_level_picker_open: bool,
     thinking_expanded: HashSet<u64>,
     chat_stream_events: Arc<Mutex<Vec<ChatStreamEvent>>>,
     chat_cancel_token: Option<Arc<AtomicBool>>,
@@ -1544,6 +1605,11 @@ pub struct WorkspaceView {
     project_dialog_open: bool,
     project_load_generation: u64,
     project_load_results: Option<Receiver<(u64, Result<ProjectLoadPayload, String>)>>,
+    explorer_structure_snapshot: Option<Vec<ProjectEntry>>,
+    explorer_structure_generation: u64,
+    explorer_structure_last_scan: Instant,
+    explorer_structure_inflight: bool,
+    explorer_structure_results: Option<Receiver<ExplorerStructureResult>>,
     lsp_generations: HashMap<(lsp_types::Uri, LspRequestKind), u64>,
     explorer_fs_busy: bool,
     vendor_definition_inflight: HashSet<String>,
@@ -2541,6 +2607,12 @@ impl WorkspaceView {
                 .iter()
                 .map(|(provider, model, enabled)| ((provider.clone(), model.clone()), *enabled))
                 .collect(),
+            thinking_level_preferences: ui_settings
+                .thinking_level_preferences
+                .iter()
+                .map(|(provider, model, level)| ((provider.clone(), model.clone()), *level))
+                .collect(),
+            thinking_level_picker_open: false,
             thinking_expanded: HashSet::new(),
             chat_stream_events: Arc::new(Mutex::new(Vec::new())),
             chat_cancel_token: None,
@@ -2670,6 +2742,11 @@ impl WorkspaceView {
             project_dialog_open: false,
             project_load_generation: 0,
             project_load_results: None,
+            explorer_structure_snapshot: None,
+            explorer_structure_generation: 0,
+            explorer_structure_last_scan: Instant::now(),
+            explorer_structure_inflight: false,
+            explorer_structure_results: None,
             lsp_generations: HashMap::new(),
             explorer_fs_busy: false,
             vendor_definition_inflight: HashSet::new(),
@@ -2712,6 +2789,7 @@ impl WorkspaceView {
             })
             .copied()
             .unwrap_or(false);
+        workspace.normalize_selected_thinking_level();
         if workspace.active_provider.as_deref() == Some("Ollama") {
             workspace.provider_config_target = "Ollama".into();
             if let Some(config) = workspace
@@ -2807,6 +2885,7 @@ impl WorkspaceView {
                         let poll_started = Instant::now();
                         this.poll_runtime_watcher(cx);
                         let watcher_us = poll_started.elapsed().as_micros();
+                        this.poll_external_file_changes(cx);
                         let poll_started = Instant::now();
                         this.poll_semantic_updates(cx);
                         let semantic_us = poll_started.elapsed().as_micros();
@@ -3130,6 +3209,76 @@ impl WorkspaceView {
         if receiver.try_recv().is_ok() && self.runtime_load_results.is_none() {
             self.begin_runtime_stub_load(cx, true);
         }
+    }
+
+    fn poll_external_file_changes(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            tab.editor.update(cx, |editor, cx| {
+                editor.sync_external_file(cx);
+            });
+        }
+        self.poll_project_structure_sync(cx);
+    }
+
+    fn poll_project_structure_sync(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        if let Some(receiver) = self.explorer_structure_results.as_ref() {
+            match receiver.try_recv() {
+                Ok((generation, result)) => {
+                    self.explorer_structure_results = None;
+                    self.explorer_structure_inflight = false;
+                    if generation != self.explorer_structure_generation {
+                        return;
+                    }
+                    let Ok(snapshot) = result else {
+                        return;
+                    };
+                    if self.explorer_structure_snapshot.as_ref() == Some(&snapshot) {
+                        return;
+                    }
+                    let (visible, expanded) = explorer_items_from_snapshot(
+                        project.root_path(),
+                        &snapshot,
+                        &self.expanded,
+                    );
+                    self.explorer = visible;
+                    self.expanded = expanded;
+                    self.explorer_structure_snapshot = Some(snapshot);
+                    cx.notify();
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.explorer_structure_results = None;
+                    self.explorer_structure_inflight = false;
+                }
+            }
+        }
+        if self.explorer_structure_inflight
+            || self.explorer_structure_last_scan.elapsed() < Duration::from_millis(500)
+        {
+            return;
+        }
+        self.explorer_structure_last_scan = Instant::now();
+        self.explorer_structure_inflight = true;
+        self.explorer_structure_generation = self.explorer_structure_generation.wrapping_add(1);
+        let generation = self.explorer_structure_generation;
+        let (sender, receiver) = mpsc::channel();
+        self.explorer_structure_results = Some(receiver);
+        let workspace = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let result = gpui::background_executor()
+                .spawn(async move {
+                    project
+                        .read_tree_snapshot()
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = sender.send((generation, result));
+            let _ = workspace.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
     }
 
     fn begin_open_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -3634,6 +3783,10 @@ impl WorkspaceView {
         self.explorer_refresh_generation = self.explorer_refresh_generation.wrapping_add(1);
         self.project_load_generation = self.project_load_generation.wrapping_add(1);
         self.project_load_results = None;
+        self.explorer_structure_generation = self.explorer_structure_generation.wrapping_add(1);
+        self.explorer_structure_snapshot = None;
+        self.explorer_structure_results = None;
+        self.explorer_structure_inflight = false;
         self.project_semantic_generation = self.project_semantic_generation.wrapping_add(1);
         self.semantic_update_generation = 0;
         self.semantic_update_results = None;
@@ -5471,6 +5624,11 @@ impl WorkspaceView {
                     .iter()
                     .map(|((provider, model), enabled)| (provider.clone(), model.clone(), *enabled))
                     .collect(),
+                thinking_level_preferences: self
+                    .thinking_level_preferences
+                    .iter()
+                    .map(|((provider, model), level)| (provider.clone(), model.clone(), *level))
+                    .collect(),
             }
             .save(path);
         }
@@ -5597,6 +5755,7 @@ impl WorkspaceView {
                     }
                 }
                 ProviderChatStreamEvent::ReasoningDelta(_) => {}
+                ProviderChatStreamEvent::ResponseMetadata(_) => {}
                 ProviderChatStreamEvent::ContentDelta(delta) => {
                     if let Some(id) = self
                         .chat_messages
@@ -5807,6 +5966,15 @@ impl WorkspaceView {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn allow_agent_run_for_request(
+        &self,
+        run_id: axiom_agent::AgentRunId,
+        approval_id: axiom_agent::ApprovalId,
+    ) -> Result<(), agent_bridge::ApprovalBridgeError> {
+        self.approval_bridge.allow_for_request(run_id, approval_id)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn deny_agent_run(
         &self,
         run_id: axiom_agent::AgentRunId,
@@ -5834,6 +6002,9 @@ impl WorkspaceView {
             AgentApprovalDecision::Approve => {
                 self.approve_agent_run(submission.run_id, submission.approval_id)
             }
+            AgentApprovalDecision::AllowForRequest => {
+                self.allow_agent_run_for_request(submission.run_id, submission.approval_id)
+            }
             AgentApprovalDecision::Deny => {
                 self.deny_agent_run(submission.run_id, submission.approval_id)
             }
@@ -5851,9 +6022,7 @@ impl WorkspaceView {
         if content.is_empty() || matches!(self.agent_ui_state, AgentUiState::Running) {
             return;
         }
-        if self.model_label.trim().is_empty()
-            || self.model_label == "Model"
-        {
+        if self.model_label.trim().is_empty() || self.model_label == "Model" {
             self.agent_ui_state = AgentUiState::Failed;
             self.agent_status = Some("Provider/model unavailable".into());
             cx.notify();
@@ -5869,7 +6038,7 @@ impl WorkspaceView {
             cx.notify();
             return;
         };
-        let tools_enabled = self.selected_model_supports_tools();
+        let tools_enabled = self.selected_model_supports_agent_tools();
         let root = self
             .project
             .as_ref()
@@ -5902,24 +6071,35 @@ impl WorkspaceView {
                 cx.notify();
                 return;
             };
-            let Ok(update) = axiom_project::project_update::ProjectUpdateCapability::new(root) else {
+            let Ok(update) = axiom_project::project_update::ProjectUpdateCapability::new(root)
+            else {
                 self.agent_ui_state = AgentUiState::Failed;
                 self.agent_status = Some("Agent workspace is unavailable".into());
                 cx.notify();
                 return;
             };
-            Some(crate::ai::tools::ToolRegistry::new_with_mutations(
+            let Ok(delete) = axiom_project::project_delete::ProjectDeleteCapability::new(root)
+            else {
+                self.agent_ui_state = AgentUiState::Failed;
+                self.agent_status = Some("Agent workspace is unavailable".into());
+                cx.notify();
+                return;
+            };
+            Some(crate::ai::tools::ToolRegistry::new_with_all_mutations(
                 read,
                 directory,
                 axiom_web::FetchUrlCapability::new(),
                 write,
                 update,
+                delete,
             ))
         } else {
             None
         };
         let run_id = agent_bridge::next_agent_run_id();
-        let budget = axiom_agent::AgentBudget::new(5, 16);
+        // Twelve provider turns are available for native tool rounds; the
+        // executor reserves one additional bounded turn for finalization.
+        let budget = axiom_agent::AgentBudget::new(13, 16);
         let mut run = axiom_agent::AgentRun::new(run_id, budget);
         let cancellation = run.cancellation();
         self.agent_run_id = Some(run_id);
@@ -5949,17 +6129,26 @@ impl WorkspaceView {
             thinking: Some(String::new()),
         });
         self.ai_composer_text.clear();
-        let tools = tools_enabled.then(agent_bridge::production_tool_definitions);
+        let gemini_native_tools = matches!(provider.kind, ProviderKind::Other(ref name) if name == "Google" || name == "Gemini");
+        let tools = tools_enabled.then(|| {
+            if gemini_native_tools {
+                agent_bridge::gemini_agent_tool_definitions()
+            } else {
+                agent_bridge::production_tool_definitions()
+            }
+        });
         let request = ProviderChatRequest {
             model: self.model_label.clone(),
             messages: provider_messages_from_agent_session(&self.agent_messages),
             think: self
                 .selected_model_supports_thinking()
                 .then_some(self.chat_thinking_enabled),
+            thinking_level: self.selected_thinking_level(),
             tools,
         };
         let queue = self.agent_events.clone();
         let approval_bridge = self.approval_bridge.clone();
+        let workspace_root = root.clone();
         let entity = cx.entity();
         cx.spawn(async move |_, cx| {
             let result = gpui::background_executor()
@@ -5971,6 +6160,7 @@ impl WorkspaceView {
                         provider.api_key,
                         provider.base_url,
                         registry,
+                        workspace_root,
                         &approval_bridge,
                         &queue,
                     )
@@ -6010,9 +6200,7 @@ impl WorkspaceView {
         {
             return;
         }
-        if self.model_label.trim().is_empty()
-            || self.model_label == "Model"
-        {
+        if self.model_label.trim().is_empty() || self.model_label == "Model" {
             self.chat_request_state = ChatRequestState::Error("Provider/model unavailable".into());
             cx.notify();
             return;
@@ -6052,6 +6240,7 @@ impl WorkspaceView {
         let think = self
             .selected_model_supports_thinking()
             .then_some(self.chat_thinking_enabled);
+        let thinking_level = self.selected_thinking_level();
         let context = context_snapshot_from_chat_messages(&self.chat_messages)
             .with_sources(self.chat_context_sources.clone());
         let messages = provider_messages_from_context(context);
@@ -6061,6 +6250,7 @@ impl WorkspaceView {
             .iter()
             .find(|model| model.label == self.model_label)
             .and_then(|model| model.metadata.as_ref());
+        let thinking_capability = self.selected_thinking_capability();
         let protocol = provider_protocol(&provider_kind);
         tracing::info!(
             target: "axiom.ai_diag",
@@ -6079,7 +6269,8 @@ impl WorkspaceView {
             request = id.0,
             model = %self.model_label,
             tools = model_capabilities.is_some_and(|metadata| metadata.supports("tools")),
-            thinking = model_capabilities.is_some_and(axiom_ai_provider::ModelMetadata::supports_thinking),
+            thinking = thinking_capability.supported,
+            thinking_levels = thinking_capability.levels.len(),
             "[AI-DIAG]"
         );
         let tool_workspace_root = tools_enabled
@@ -6089,13 +6280,7 @@ impl WorkspaceView {
                     .map(|project| project.root_path().to_path_buf())
             })
             .flatten();
-        let tools = tools_enabled.then(|| {
-            vec![
-                read_file_definition(),
-                list_directory_definition(),
-                fetch_url_definition(),
-            ]
-        });
+        let tools = tools_enabled.then(chat_tool_definitions);
         let entity = cx.entity();
         let chat_events = self.chat_stream_events.clone();
         cx.spawn(async move |_, cx| {
@@ -6105,6 +6290,7 @@ impl WorkspaceView {
                         model,
                         messages,
                         think,
+                        thinking_level,
                         tools,
                     };
                     let diag_span = tracing::info_span!(
@@ -6573,7 +6759,10 @@ impl WorkspaceView {
                 let byte = self.provider_api_key.geometry.hit_test(event.position.x);
                 self.provider_api_key.drag_to(byte);
             } else if self.active_text_input == ActiveTextInput::ProviderModel {
-                let byte = self.provider_model_input.geometry.hit_test(event.position.x);
+                let byte = self
+                    .provider_model_input
+                    .geometry
+                    .hit_test(event.position.x);
                 self.provider_model_input.drag_to(byte);
             } else {
                 let byte = self.provider_base_url.geometry.hit_test(event.position.x);
@@ -6607,6 +6796,7 @@ impl WorkspaceView {
             .find(|(_, model)| model == label)
             .map(|(provider, _)| provider.clone());
         self.model_picker_open = false;
+        self.thinking_level_picker_open = false;
         self.chat_thinking_enabled = self
             .active_provider
             .as_ref()
@@ -6616,18 +6806,58 @@ impl WorkspaceView {
             })
             .copied()
             .unwrap_or(false);
+        self.normalize_selected_thinking_level();
         self.persist_ui_settings();
         cx.notify();
     }
 
+    fn selected_thinking_capability(&self) -> ThinkingCapability {
+        let Some(provider) = self.active_provider.as_deref() else {
+            return ThinkingCapability {
+                supported: false,
+                levels: Vec::new(),
+                default_level: None,
+            };
+        };
+        let metadata = self
+            .ollama_models
+            .iter()
+            .find(|model| model.label == self.model_label)
+            .and_then(|model| model.metadata.as_ref());
+        thinking_capability(&provider_kind(provider), &self.model_label, metadata)
+    }
+
+    fn selected_thinking_level(&self) -> Option<ThinkingLevel> {
+        let capability = self.selected_thinking_capability();
+        let provider = self.active_provider.as_deref()?;
+        self.thinking_level_preferences
+            .get(&(provider.to_owned(), self.model_label.clone()))
+            .copied()
+            .filter(|level| capability.supports_level(*level))
+            .or(capability.default_level)
+    }
+
+    fn normalize_selected_thinking_level(&mut self) {
+        let Some(provider) = self.active_provider.clone() else {
+            return;
+        };
+        let capability = self.selected_thinking_capability();
+        if let Some(level) = self
+            .thinking_level_preferences
+            .get(&(provider.clone(), self.model_label.clone()))
+            .copied()
+            && capability.supports_level(level)
+        {
+            return;
+        }
+        if let Some(level) = capability.default_level {
+            self.thinking_level_preferences
+                .insert((provider, self.model_label.clone()), level);
+        }
+    }
+
     fn selected_model_supports_thinking(&self) -> bool {
-        self.active_provider.as_deref() == Some("Ollama")
-            && self
-                .ollama_models
-                .iter()
-                .find(|model| model.label == self.model_label)
-                .and_then(|model| model.metadata.as_ref())
-                .is_some_and(axiom_ai_provider::ModelMetadata::supports_thinking)
+        self.selected_thinking_capability().supported
     }
 
     fn selected_model_supports_tools(&self) -> bool {
@@ -6638,6 +6868,18 @@ impl WorkspaceView {
                 .find(|model| model.label == self.model_label)
                 .and_then(|model| model.metadata.as_ref())
                 .is_some_and(|metadata| metadata.supports("tools"))
+    }
+
+    fn selected_model_supports_agent_tools(&self) -> bool {
+        if self.selected_model_supports_tools() {
+            return true;
+        }
+        matches!(self.active_provider.as_deref(), Some("Google" | "Gemini"))
+            && self
+                .model_label
+                .strip_prefix("models/")
+                .unwrap_or(&self.model_label)
+                .starts_with("gemini-3.5-flash-lite")
     }
 
     fn close_providers_modal(&mut self, cx: &mut Context<Self>) {
@@ -6701,10 +6943,13 @@ impl WorkspaceView {
                 ),
             )
         } else {
-            Some(remote_provider_model(saved_model, configured_model))
+            Some(remote_provider_model(
+                provider,
+                saved_model,
+                configured_model,
+            ))
         };
-        self.provider_model_input.text =
-            self.provider_default_model.clone().unwrap_or_default();
+        self.provider_model_input.text = self.provider_default_model.clone().unwrap_or_default();
         self.provider_model_input.selection_anchor = self.provider_model_input.text.len();
         self.provider_model_input.selection_active = self.provider_model_input.text.len();
         self.provider_model_picker_open = false;
@@ -6782,51 +7027,53 @@ impl WorkspaceView {
                         .cursor(CursorStyle::IBeam),
                     cx
                 )
-                    .track_focus(
-                        self.provider_api_key
-                            .focus
-                            .as_ref()
-                            .expect("provider api key focus"),
-                    )
-                    .h(px(34.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .bg(t.editor_background)
-                    .border_1()
-                    .border_color(if self.active_text_input == ActiveTextInput::ProviderApiKey {
+                .track_focus(
+                    self.provider_api_key
+                        .focus
+                        .as_ref()
+                        .expect("provider api key focus"),
+                )
+                .h(px(34.))
+                .px_2()
+                .flex()
+                .items_center()
+                .bg(t.editor_background)
+                .border_1()
+                .border_color(
+                    if self.active_text_input == ActiveTextInput::ProviderApiKey {
                         t.accent
                     } else {
                         t.border_subtle
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            this.active_text_input = ActiveTextInput::ProviderApiKey;
-                            this.provider_api_key.active = true;
-                            this.provider_model_input.active = false;
-                            this.provider_base_url.active = false;
-                            this.modal_caret_visible = true;
-                            this.modal_caret_activity = Instant::now();
-                            this.modal_caret_toggle = this.modal_caret_activity;
-                            let byte = this.provider_api_key.geometry.hit_test(event.position.x);
-                            this.provider_api_key.mouse_down(byte, event.click_count);
-                            if let Some(focus) = this.provider_api_key.focus.clone() {
-                                window.focus(&focus);
-                            }
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(Self::provider_base_url_drag_end),
-                    )
-                    .child(crate::ui::input_line::render_state_with_mode(
-                        cx.entity(),
-                        &self.provider_api_key,
-                        crate::ui::input_line::InputVisualMode::Plain,
-                    )),
+                    },
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        this.active_text_input = ActiveTextInput::ProviderApiKey;
+                        this.provider_api_key.active = true;
+                        this.provider_model_input.active = false;
+                        this.provider_base_url.active = false;
+                        this.modal_caret_visible = true;
+                        this.modal_caret_activity = Instant::now();
+                        this.modal_caret_toggle = this.modal_caret_activity;
+                        let byte = this.provider_api_key.geometry.hit_test(event.position.x);
+                        this.provider_api_key.mouse_down(byte, event.click_count);
+                        if let Some(focus) = this.provider_api_key.focus.clone() {
+                            window.focus(&focus);
+                        }
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(Self::provider_base_url_drag_end),
+                )
+                .child(crate::ui::input_line::render_state_with_mode(
+                    cx.entity(),
+                    &self.provider_api_key,
+                    crate::ui::input_line::InputVisualMode::Plain,
+                )),
             )
             .child(div().text_color(t.text_secondary).child("Default model"))
             .when(model_discovery, |d| {
@@ -6878,26 +7125,23 @@ impl WorkspaceView {
                                 .bg(t.window_background)
                                 .border_1()
                                 .border_color(t.border_subtle)
-                                .on_mouse_down_out(cx.listener(
-                                    |this, _, window, cx| {
-                                        if !this.provider_model_picker_open {
-                                            return;
-                                        }
-                                        let (selected, open, suppress_toggle) =
-                                            provider_model_picker_outside_click(
-                                                this.provider_default_model.clone(),
-                                            );
-                                        this.provider_default_model = selected;
-                                        this.provider_model_picker_open = open;
-                                        this.provider_model_picker_suppress_toggle =
-                                            suppress_toggle;
-                                        cx.defer_in(window, |this, _, cx| {
-                                            this.provider_model_picker_suppress_toggle = false;
-                                            cx.notify();
-                                        });
+                                .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                                    if !this.provider_model_picker_open {
+                                        return;
+                                    }
+                                    let (selected, open, suppress_toggle) =
+                                        provider_model_picker_outside_click(
+                                            this.provider_default_model.clone(),
+                                        );
+                                    this.provider_default_model = selected;
+                                    this.provider_model_picker_open = open;
+                                    this.provider_model_picker_suppress_toggle = suppress_toggle;
+                                    cx.defer_in(window, |this, _, cx| {
+                                        this.provider_model_picker_suppress_toggle = false;
                                         cx.notify();
-                                    },
-                                ))
+                                    });
+                                    cx.notify();
+                                }))
                                 .children(models.into_iter().map(|item| {
                                     let label = item.label.clone();
                                     let selected = self.provider_default_model.as_deref()
@@ -6913,9 +7157,7 @@ impl WorkspaceView {
                                         .when(selected, |row| {
                                             row.bg(t.hover).text_color(t.text_primary)
                                         })
-                                        .hover(|row| {
-                                            row.bg(t.hover).text_color(t.text_primary)
-                                        })
+                                        .hover(|row| row.bg(t.hover).text_color(t.text_primary))
                                         .child(div().flex_1().child(item.label))
                                         .when(selected, |row| row.child("✓"));
                                     row.on_mouse_down(
@@ -6960,13 +7202,13 @@ impl WorkspaceView {
                     .items_center()
                     .bg(t.editor_background)
                     .border_1()
-                    .border_color(if self.active_text_input
-                        == ActiveTextInput::ProviderModel
-                    {
-                        t.accent
-                    } else {
-                        t.border_subtle
-                    })
+                    .border_color(
+                        if self.active_text_input == ActiveTextInput::ProviderModel {
+                            t.accent
+                        } else {
+                            t.border_subtle
+                        },
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -6977,9 +7219,12 @@ impl WorkspaceView {
                             this.modal_caret_visible = true;
                             this.modal_caret_activity = Instant::now();
                             this.modal_caret_toggle = this.modal_caret_activity;
-                            let byte =
-                                this.provider_model_input.geometry.hit_test(event.position.x);
-                            this.provider_model_input.mouse_down(byte, event.click_count);
+                            let byte = this
+                                .provider_model_input
+                                .geometry
+                                .hit_test(event.position.x);
+                            this.provider_model_input
+                                .mouse_down(byte, event.click_count);
                             if let Some(focus) = this.provider_model_input.focus.clone() {
                                 window.focus(&focus);
                             }
@@ -7006,52 +7251,54 @@ impl WorkspaceView {
                         .cursor(CursorStyle::IBeam),
                     cx
                 )
-                    .track_focus(
-                        self.provider_base_url
-                            .focus
-                            .as_ref()
-                            .expect("provider base URL focus"),
-                    )
-                    .h(px(34.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .bg(t.editor_background)
-                    .border_1()
-                    .border_color(if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
+                .track_focus(
+                    self.provider_base_url
+                        .focus
+                        .as_ref()
+                        .expect("provider base URL focus"),
+                )
+                .h(px(34.))
+                .px_2()
+                .flex()
+                .items_center()
+                .bg(t.editor_background)
+                .border_1()
+                .border_color(
+                    if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
                         t.accent
                     } else {
                         t.border_subtle
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            this.provider_base_url_active = true;
-                            this.active_text_input = ActiveTextInput::ProviderBaseUrl;
-                            this.provider_base_url.active = true;
-                            this.provider_api_key.active = false;
-                            this.provider_model_input.active = false;
-                            this.modal_caret_visible = true;
-                            this.modal_caret_activity = Instant::now();
-                            this.modal_caret_toggle = this.modal_caret_activity;
-                            let byte = this.provider_base_url.geometry.hit_test(event.position.x);
-                            this.provider_base_url.mouse_down(byte, event.click_count);
-                            this.ai_composer_active = false;
-                            if let Some(focus) = this.provider_base_url.focus.clone() {
-                                window.focus(&focus);
-                            }
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(Self::provider_base_url_drag_end),
-                    )
-                    .child(crate::ui::input_line::render_state(
-                        cx.entity(),
-                        &self.provider_base_url,
-                    )),
+                    },
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        this.provider_base_url_active = true;
+                        this.active_text_input = ActiveTextInput::ProviderBaseUrl;
+                        this.provider_base_url.active = true;
+                        this.provider_api_key.active = false;
+                        this.provider_model_input.active = false;
+                        this.modal_caret_visible = true;
+                        this.modal_caret_activity = Instant::now();
+                        this.modal_caret_toggle = this.modal_caret_activity;
+                        let byte = this.provider_base_url.geometry.hit_test(event.position.x);
+                        this.provider_base_url.mouse_down(byte, event.click_count);
+                        this.ai_composer_active = false;
+                        if let Some(focus) = this.provider_base_url.focus.clone() {
+                            window.focus(&focus);
+                        }
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(Self::provider_base_url_drag_end),
+                )
+                .child(crate::ui::input_line::render_state(
+                    cx.entity(),
+                    &self.provider_base_url,
+                )),
             )
             .child(
                 div()
@@ -7389,47 +7636,48 @@ impl WorkspaceView {
                                     .cursor(CursorStyle::IBeam),
                                 cx
                             )
-                                .track_focus(
-                                    self.provider_catalog_input
-                                        .focus
-                                        .as_ref()
-                                        .expect("catalog search focus"),
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                        this.active_text_input =
-                                            ActiveTextInput::ProviderCatalogSearch;
-                                        this.provider_catalog_input.active = true;
-                                        let byte = this
-                                            .provider_catalog_input
-                                            .geometry
-                                            .hit_test(event.position.x);
-                                        this.provider_catalog_input
-                                            .mouse_down(byte, event.click_count);
-                                        if let Some(f) = this.provider_catalog_input.focus.clone() {
-                                            window.focus(&f);
-                                        }
-                                        cx.notify();
-                                    }),
-                                )
-                                .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::provider_base_url_drag_end),
-                                )
-                                .h(px(34.))
-                                .px_2()
-                                .flex()
-                                .items_center()
-                                .bg(t.editor_background)
-                                .border_1()
-                                .border_color(t.border_subtle)
-                                .text_color(t.text_muted)
-                                .child(crate::ui::input_line::render_state(
+                            .track_focus(
+                                self.provider_catalog_input
+                                    .focus
+                                    .as_ref()
+                                    .expect("catalog search focus"),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    this.active_text_input = ActiveTextInput::ProviderCatalogSearch;
+                                    this.provider_catalog_input.active = true;
+                                    let byte = this
+                                        .provider_catalog_input
+                                        .geometry
+                                        .hit_test(event.position.x);
+                                    this.provider_catalog_input
+                                        .mouse_down(byte, event.click_count);
+                                    if let Some(f) = this.provider_catalog_input.focus.clone() {
+                                        window.focus(&f);
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::provider_base_url_drag_end),
+                            )
+                            .h(px(34.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .bg(t.editor_background)
+                            .border_1()
+                            .border_color(t.border_subtle)
+                            .text_color(t.text_muted)
+                            .child(
+                                crate::ui::input_line::render_state(
                                     cx.entity(),
                                     &self.provider_catalog_input,
-                                )),
+                                ),
+                            ),
                         )
                         .children(
                             catalog
@@ -8107,6 +8355,7 @@ impl WorkspaceView {
                         .clone()
                         .expect("approval visibility checked");
                     let approve_approval_id = approval.approval_id;
+                    let allow_for_request_approval_id = approval.approval_id;
                     let deny_approval_id = approval.approval_id;
                     this.child(
                         div()
@@ -8187,16 +8436,14 @@ impl WorkspaceView {
                                             .border_color(t.border)
                                             .cursor(CursorStyle::PointingHand)
                                             .hover(move |s| s.bg(t.hover))
-                                            .on_click(cx.listener(
-                                                move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.submit_agent_approval(
-                                                        deny_approval_id,
-                                                        AgentApprovalDecision::Deny,
-                                                        cx,
-                                                    );
-                                                },
-                                            ))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.submit_agent_approval(
+                                                    deny_approval_id,
+                                                    AgentApprovalDecision::Deny,
+                                                    cx,
+                                                );
+                                            }))
                                             .child("Deny"),
                                     )
                                     .child(
@@ -8209,27 +8456,42 @@ impl WorkspaceView {
                                             .text_color(t.text_primary)
                                             .cursor(CursorStyle::PointingHand)
                                             .hover(move |s| s.bg(t.accent_hover))
-                                            .on_click(cx.listener(
-                                                move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.submit_agent_approval(
-                                                        approve_approval_id,
-                                                        AgentApprovalDecision::Approve,
-                                                        cx,
-                                                    );
-                                                },
-                                            ))
-                                            .child("Approve"),
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.submit_agent_approval(
+                                                    approve_approval_id,
+                                                    AgentApprovalDecision::Approve,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child("Approve once"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("ai-agent-approval-allow-for-request")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded(metrics().border_radius_small)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .cursor(CursorStyle::PointingHand)
+                                            .hover(move |s| s.bg(t.hover))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.submit_agent_approval(
+                                                    allow_for_request_approval_id,
+                                                    AgentApprovalDecision::AllowForRequest,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child("Allow for this request"),
                                     ),
                             ),
                     )
                 },
             )
             .when(
-                agent_activity_indicator_visible(
-                    self.agent_ui_state,
-                    &self.agent_pending_approval,
-                ),
+                agent_activity_indicator_visible(self.agent_ui_state, &self.agent_pending_approval),
                 |this| {
                     let dots = agent_activity_dots(self.agent_activity_animation_phase);
                     this.child(
@@ -8239,11 +8501,7 @@ impl WorkspaceView {
                             .items_center()
                             .gap_1()
                             .text_color(t.text_muted)
-                            .child(
-                                div()
-                                    .w(px(72.))
-                                    .child(self.agent_activity_phase.label()),
-                            )
+                            .child(div().w(px(72.)).child(self.agent_activity_phase.label()))
                             .child(div().w(px(36.)).child(dots)),
                     )
                 },
@@ -8284,6 +8542,57 @@ impl WorkspaceView {
         }
     }
 
+    fn render_thinking_level_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let levels = self.selected_thinking_capability().levels;
+        div()
+            .id("ai-thinking-level-picker")
+            .absolute()
+            .bottom(px(88.))
+            .right(px(72.))
+            .w(px(130.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .bg(t.popup_background)
+            .border_1()
+            .border_color(t.border)
+            .rounded(m.border_radius_medium)
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .children(levels.into_iter().enumerate().map(|(level_index, level)| {
+                let selected = self.selected_thinking_level() == Some(level);
+                div()
+                    .id(("ai-thinking-level-option", level_index))
+                    .px_2()
+                    .py_1()
+                    .cursor(CursorStyle::PointingHand)
+                    .text_color(if selected { t.accent } else { t.text_primary })
+                    .bg(if selected {
+                        t.inactive_selection
+                    } else {
+                        t.popup_background
+                    })
+                    .hover(move |style| style.bg(t.hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(provider) = this.active_provider.clone() {
+                                this.thinking_level_preferences
+                                    .insert((provider, this.model_label.clone()), level);
+                                this.persist_ui_settings();
+                            }
+                            this.thinking_level_picker_open = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(level.label())
+            }))
+    }
+
     fn render_ai_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
@@ -8293,6 +8602,15 @@ impl WorkspaceView {
         let context_is_active = active_context.is_some();
         div()
             .id("ai-panel")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.thinking_level_picker_open {
+                        this.thinking_level_picker_open = false;
+                        cx.notify();
+                    }
+                }),
+            )
             .relative()
             .w(ai_panel_width_for_viewport(
                 self.ai_panel_width,
@@ -8551,7 +8869,12 @@ impl WorkspaceView {
                 div()
                     .m_3()
                     .p_2()
-                    .h(px(82.))
+                    .when(self.ai_panel_mode == AiPanelMode::Chat, |this| {
+                        this.h(px(82.))
+                    })
+                    .when(self.ai_panel_mode == AiPanelMode::Agent, |this| {
+                        this.min_h(px(82.)).flex_shrink_0()
+                    })
                     .flex()
                     .flex_col()
                     .justify_between()
@@ -8559,6 +8882,32 @@ impl WorkspaceView {
                     .bg(t.editor_background)
                     .border_1()
                     .border_color(t.border_subtle)
+                    .when(context_is_active, |this| {
+                        this.child(
+                            div()
+                                .id("ai-agent-context")
+                                .w_full()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .px_2()
+                                .py_1()
+                                .cursor(CursorStyle::PointingHand)
+                                .text_color(t.accent)
+                                .hover(move |s| s.bg(t.hover))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.chat_context_sources.clear();
+                                    this.chat_context_feedback = None;
+                                    cx.notify();
+                                }))
+                                .when_some(context_full_label.clone(), |this, label| {
+                                    this.tooltip(move |_, cx| tooltip(label.clone(), cx))
+                                })
+                                .child(SharedString::from(format!(
+                                    "[ {} × ]",
+                                    context_label.clone().unwrap_or_default()
+                                ))),
+                        )
+                    })
                     .child(
                         div()
                             .id("ai-composer-input")
@@ -8686,43 +9035,6 @@ impl WorkspaceView {
                             .w_full()
                             .min_w_0()
                             .text_color(t.text_muted)
-                            .when(context_is_active, |this| {
-                                this.child(
-                                    div()
-                                        .id("ai-context-button")
-                                        .w_full()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .px_2()
-                                        .py_1()
-                                        .cursor(CursorStyle::PointingHand)
-                                        .text_color(if context_is_active {
-                                            t.accent
-                                        } else {
-                                            t.text_muted
-                                        })
-                                        .hover(move |s| s.bg(t.hover))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if this.chat_context_sources.is_empty() {
-                                                this.capture_active_editor_context(cx);
-                                            } else {
-                                                this.chat_context_sources.clear();
-                                                this.chat_context_feedback = None;
-                                                cx.notify();
-                                            }
-                                        }))
-                                        .when_some(context_full_label, |this, label| {
-                                            this.tooltip(move |_, cx| tooltip(label.clone(), cx))
-                                        })
-                                        .child(SharedString::from(if context_is_active {
-                                            format!("[ {} × ]", context_label.unwrap_or_default())
-                                        } else {
-                                            self.chat_context_feedback
-                                                .clone()
-                                                .unwrap_or_else(|| "+ Context".into())
-                                        })),
-                                )
-                            })
                             .child(
                                 div()
                                     .flex()
@@ -8735,6 +9047,7 @@ impl WorkspaceView {
                                         this.child(
                                             div()
                                                 .id("ai-context-button")
+                                                .flex_shrink_0()
                                                 .px_2()
                                                 .py_1()
                                                 .cursor(CursorStyle::PointingHand)
@@ -8753,6 +9066,7 @@ impl WorkspaceView {
                                         this.child(
                                             div()
                                                 .id("ai-thinking-toggle")
+                                                .flex_shrink_0()
                                                 .px_1()
                                                 .cursor(CursorStyle::PointingHand)
                                                 .text_color(if self.chat_thinking_enabled {
@@ -8782,19 +9096,59 @@ impl WorkspaceView {
                                                 }),
                                         )
                                     })
+                                    .when(
+                                        self.selected_thinking_capability().levels.len() > 1,
+                                        |this| {
+                                            let current = self
+                                                .selected_thinking_level()
+                                                .map(ThinkingLevel::label)
+                                                .unwrap_or("Level");
+                                            this.child(
+                                                div()
+                                                    .id("ai-thinking-level-button")
+                                                    .flex_shrink_0()
+                                                    .px_1()
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .text_color(if self.chat_thinking_enabled {
+                                                        t.text_primary
+                                                    } else {
+                                                        t.text_muted
+                                                    })
+                                                    .hover(move |s| s.bg(t.hover))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.thinking_level_picker_open =
+                                                                !this.thinking_level_picker_open;
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                                    .child(format!("{current} ▾")),
+                                            )
+                                        },
+                                    )
                                     .child(
                                         div()
                                             .id("ai-model-button")
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
                                             .px_1()
                                             .hover(move |s| s.bg(t.hover))
+                                            .tooltip({
+                                                let model_label = self.model_label.clone();
+                                                move |_, cx| tooltip(model_label.clone(), cx)
+                                            })
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.toggle_model_picker(cx)
                                             }))
-                                            .child(format!("{} ? ?", self.model_label)),
+                                            .child(self.model_label.clone()),
                                     )
                                     .child(
                                         div()
                                             .id("ai-send-button")
+                                            .flex_shrink_0()
                                             .px_2()
                                             .rounded(m.border_radius_small)
                                             .when(self.is_ai_generation_active(), |this| {
@@ -8830,6 +9184,9 @@ impl WorkspaceView {
             )
             .when(self.model_picker_open, |this| {
                 this.child(self.render_model_picker(cx))
+            })
+            .when(self.thinking_level_picker_open, |this| {
+                this.child(self.render_thinking_level_picker(cx))
             })
             .child(
                 div()
@@ -9024,6 +9381,8 @@ impl WorkspaceView {
         let root = project.root_path().to_path_buf();
         let expanded = self.expanded.clone();
         self.explorer_refresh_generation = self.explorer_refresh_generation.wrapping_add(1);
+        self.explorer_structure_generation = self.explorer_structure_generation.wrapping_add(1);
+        self.explorer_structure_snapshot = None;
         let refresh_generation = self.explorer_refresh_generation;
         let workspace = cx.entity().downgrade();
         self.status = "Refreshing Project Explorer...".into();
@@ -13956,10 +14315,17 @@ fn provider_model_selection(
 }
 
 fn remote_provider_model(
+    provider: &str,
     saved_model: Option<String>,
     configured_model: Option<String>,
 ) -> String {
-    saved_model.or(configured_model).unwrap_or_default()
+    saved_model.or(configured_model).unwrap_or_else(|| {
+        if matches!(provider, "Google" | "Gemini") {
+            "gemini-3.5-flash-lite".to_owned()
+        } else {
+            String::new()
+        }
+    })
 }
 
 fn provider_model_value(
@@ -13978,16 +14344,11 @@ fn select_provider_model(label: String) -> (Option<String>, bool) {
     (Some(label), false)
 }
 
-fn provider_model_picker_outside_click(
-    selection: Option<String>,
-) -> (Option<String>, bool, bool) {
+fn provider_model_picker_outside_click(selection: Option<String>) -> (Option<String>, bool, bool) {
     (selection, false, true)
 }
 
-fn next_provider_text_input(
-    active: ActiveTextInput,
-    model_is_text: bool,
-) -> ActiveTextInput {
+fn next_provider_text_input(active: ActiveTextInput, model_is_text: bool) -> ActiveTextInput {
     match active {
         ActiveTextInput::ProviderApiKey if model_is_text => ActiveTextInput::ProviderModel,
         ActiveTextInput::ProviderApiKey | ActiveTextInput::ProviderModel => {
@@ -13997,10 +14358,7 @@ fn next_provider_text_input(
     }
 }
 
-fn upsert_provider_config(
-    configs: &mut Vec<ProviderPersisted>,
-    config: ProviderPersisted,
-) {
+fn upsert_provider_config(configs: &mut Vec<ProviderPersisted>, config: ProviderPersisted) {
     if let Some(existing) = configs
         .iter_mut()
         .find(|existing| existing.provider == config.provider)
@@ -14328,6 +14686,7 @@ mod chat_history_tests {
             model: "test-model".into(),
             messages: provider_messages_from_context(context),
             think: None,
+            thinking_level: None,
             tools: None,
         };
         let payload = serde_json::to_string(&request).unwrap();
@@ -14652,7 +15011,7 @@ mod agent_activity_tests {
 #[cfg(test)]
 mod approval_ui_tests {
     use super::{
-        AiPanelMode, AgentApprovalDecision, AgentApprovalSubmission, AgentApprovalUiState,
+        AgentApprovalDecision, AgentApprovalSubmission, AgentApprovalUiState, AiPanelMode,
         WorkspaceView, agent_approval_visible, show_agent_approval, take_agent_approval_submission,
     };
     use axiom_agent::{AgentRunId, ApprovalId, ApprovalRequest, Cancellation};
@@ -14775,32 +15134,38 @@ mod approval_ui_tests {
     #[test]
     fn duplicate_decision_cannot_submit_again() {
         let mut pending = Some(request(1, 1).into());
-        assert!(take_agent_approval_submission(
-            &mut pending,
-            Some(AgentRunId::new(1)),
-            ApprovalId::new(1),
-            AgentApprovalDecision::Approve,
-        )
-        .is_some());
-        assert!(take_agent_approval_submission(
-            &mut pending,
-            Some(AgentRunId::new(1)),
-            ApprovalId::new(1),
-            AgentApprovalDecision::Approve,
-        )
-        .is_none());
+        assert!(
+            take_agent_approval_submission(
+                &mut pending,
+                Some(AgentRunId::new(1)),
+                ApprovalId::new(1),
+                AgentApprovalDecision::Approve,
+            )
+            .is_some()
+        );
+        assert!(
+            take_agent_approval_submission(
+                &mut pending,
+                Some(AgentRunId::new(1)),
+                ApprovalId::new(1),
+                AgentApprovalDecision::Approve,
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn new_request_replaces_resolved_approval() {
         let mut pending = Some(request(1, 1).into());
-        assert!(take_agent_approval_submission(
-            &mut pending,
-            Some(AgentRunId::new(1)),
-            ApprovalId::new(1),
-            AgentApprovalDecision::Deny,
-        )
-        .is_some());
+        assert!(
+            take_agent_approval_submission(
+                &mut pending,
+                Some(AgentRunId::new(1)),
+                ApprovalId::new(1),
+                AgentApprovalDecision::Deny,
+            )
+            .is_some()
+        );
         assert!(show_agent_approval(
             &mut pending,
             AgentRunId::new(1),
@@ -15859,7 +16224,7 @@ class Service { public function run(): void {} }
     fn remote_provider_models_round_trip_as_exact_arbitrary_strings() {
         let saved = Some("models/company:model-name@revision-v2".to_owned());
         let configured = Some("must-not-win".to_owned());
-        let editable = super::remote_provider_model(saved, configured);
+        let editable = super::remote_provider_model("Google", saved, configured);
         assert_eq!(editable, "models/company:model-name@revision-v2");
         assert_eq!(
             super::provider_model_value("Google", &editable, None),
@@ -15882,7 +16247,7 @@ class Service { public function run(): void {} }
             },
         );
         assert_eq!(
-            super::remote_provider_model(Some(configs[0].model.clone()), None),
+            super::remote_provider_model("Google", Some(configs[0].model.clone()), None),
             editable
         );
     }
@@ -15921,43 +16286,27 @@ class Service { public function run(): void {} }
         ];
 
         assert_eq!(
-            super::resident_provider_models(
-                "Ollama",
-                &ollama_models,
-                &configs,
-                &HashMap::new()
-            ),
+            super::resident_provider_models("Ollama", &ollama_models, &configs, &HashMap::new()),
             vec![super::ProviderModel {
                 id: "ollama-model".into(),
                 label: "Ollama Model".into(),
             }]
         );
         assert_eq!(
-            super::resident_provider_models(
-                "LM Studio",
-                &ollama_models,
-                &configs,
-                &HashMap::new()
-            ),
+            super::resident_provider_models("LM Studio", &ollama_models, &configs, &HashMap::new()),
             vec![super::ProviderModel {
                 id: "lm-model".into(),
                 label: "LM Studio Model".into(),
             }]
         );
-        assert!(super::resident_provider_models(
-            "Google",
-            &ollama_models,
-            &configs,
-            &HashMap::new()
-        )
-        .is_empty());
-        assert!(super::resident_provider_models(
-            "OpenAI",
-            &ollama_models,
-            &configs,
-            &HashMap::new()
-        )
-        .is_empty());
+        assert!(
+            super::resident_provider_models("Google", &ollama_models, &configs, &HashMap::new())
+                .is_empty()
+        );
+        assert!(
+            super::resident_provider_models("OpenAI", &ollama_models, &configs, &HashMap::new())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -15981,7 +16330,10 @@ class Service { public function run(): void {} }
         let resolved =
             super::resolve_provider_config(&configs, Some("Google"), "models/gemini-2.5-pro")
                 .unwrap();
-        assert_eq!(resolved.kind, axiom_ai_provider::ProviderKind::Other("Google".into()));
+        assert_eq!(
+            resolved.kind,
+            axiom_ai_provider::ProviderKind::Other("Google".into())
+        );
         assert_eq!(
             axiom_ai_provider::provider_protocol(&resolved.kind),
             axiom_ai_provider::ProviderProtocol::Google
@@ -16009,7 +16361,10 @@ class Service { public function run(): void {} }
             "https://unsaved.example",
             "unsaved-model",
         );
-        assert_eq!(request.kind, axiom_ai_provider::ProviderKind::Other("Google".into()));
+        assert_eq!(
+            request.kind,
+            axiom_ai_provider::ProviderKind::Other("Google".into())
+        );
         assert_eq!(request.api_key, "unsaved-key");
         assert_eq!(request.base_url, "https://unsaved.example");
         assert_eq!(request.model, "unsaved-model");

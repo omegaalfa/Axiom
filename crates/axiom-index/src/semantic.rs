@@ -2999,7 +2999,7 @@ impl SemanticSnapshot {
         })
     }
 
-pub fn lookup_binding(&self, mut scope: ScopeId, name: &str) -> Option<&VariableBinding> {
+    pub fn lookup_binding(&self, mut scope: ScopeId, name: &str) -> Option<&VariableBinding> {
         loop {
             let current = self.scope(scope)?;
             if let Some(binding) = current
@@ -3022,11 +3022,10 @@ pub fn lookup_binding(&self, mut scope: ScopeId, name: &str) -> Option<&Variable
     ) -> Option<&VariableBinding> {
         loop {
             let current = self.scope(scope)?;
-            if let Some(binding) = current
-                .bindings
-                .iter()
-                .rev()
-                .find(|binding| binding.name == name && binding.declaration_span.start <= offset)
+            if let Some(binding) =
+                current.bindings.iter().rev().find(|binding| {
+                    binding.name == name && binding.declaration_span.start <= offset
+                })
             {
                 return Some(binding);
             }
@@ -4886,105 +4885,101 @@ fn extract_assignments(
     }
     assignments.sort_by_key(|node| node.start_byte());
     for node in assignments {
-        let Some(left) = node.child_by_field_name("left") else { continue };
-        let Some(right) = node.child_by_field_name("right") else { continue };
+        let Some(left) = node.child_by_field_name("left") else {
+            continue;
+        };
+        let Some(right) = node.child_by_field_name("right") else {
+            continue;
+        };
         let name = node_text(left, text).trim();
         if left.kind() == "variable_name"
             && let Some(scope) = assignment_scope(builder, file, node.start_byte())
         {
             let right_text = node_text(right, text).trim();
             let raw_type = if right.kind() == "object_creation_expression" {
-                        right
-                            .child_by_field_name("class")
-                            .map(|class| node_text(class, text).trim().to_owned())
-                            .or_else(|| {
-                                right_text.strip_prefix("new ").map(|value| {
-                                    value.split('(').next().unwrap_or(value).trim().to_owned()
+                right
+                    .child_by_field_name("class")
+                    .map(|class| node_text(class, text).trim().to_owned())
+                    .or_else(|| {
+                        right_text
+                            .strip_prefix("new ")
+                            .map(|value| value.split('(').next().unwrap_or(value).trim().to_owned())
+                    })
+            } else if right.kind() == "variable_name" {
+                builder.scopes.records[scope.0 as usize]
+                    .bindings
+                    .iter()
+                    .rev()
+                    .find(|binding| binding.name == right_text)
+                    .and_then(|binding| match &binding.declared_type {
+                        Some(DeclaredType::Named { written, .. }) => Some(written.clone()),
+                        _ => None,
+                    })
+            } else if right.kind() == "function_call_expression" {
+                right
+                    .child_by_field_name("function")
+                    .map(|function| node_text(function, text).trim().to_owned())
+                    .and_then(|function| {
+                        let resolved =
+                            resolve_builder_name(builder, scope, &function, ImportKind::Function);
+                        builder.symbols.by_fqn.get(&resolved).and_then(|ids| {
+                            ids.iter()
+                                .find_map(|id| builder.symbols.records.get(id.0 as usize))
+                                .and_then(|symbol| symbol.return_type.clone())
+                        })
+                    })
+            } else if matches!(
+                right.kind(),
+                "member_call_expression" | "nullsafe_member_call_expression"
+            ) {
+                right.child_by_field_name("object").and_then(|object| {
+                    let receiver = node_text(object, text).trim();
+                    builder.scopes.records[scope.0 as usize]
+                        .bindings
+                        .iter()
+                        .rev()
+                        .find(|binding| binding.name == receiver)
+                        .and_then(|binding| match &binding.declared_type {
+                            Some(DeclaredType::Named { resolved, .. }) => Some(resolved),
+                            _ => None,
+                        })
+                        .and_then(|receiver_type| {
+                            let owner_ids = builder.symbols.by_fqn.get(receiver_type)?;
+                            let method = right.child_by_field_name("name")?;
+                            let method_name = node_text(method, text).trim();
+                            let mut return_types = owner_ids
+                                .iter()
+                                .flat_map(|owner| {
+                                    builder
+                                        .declarations
+                                        .members_by_owner_name
+                                        .get(&(
+                                            *owner,
+                                            method_name.to_owned(),
+                                            ProjectSymbolKind::Method,
+                                        ))
+                                        .into_iter()
+                                        .flatten()
                                 })
-                            })
-                    } else if right.kind() == "variable_name" {
-                        builder.scopes.records[scope.0 as usize]
-                            .bindings
-                            .iter()
-                            .rev()
-                            .find(|binding| binding.name == right_text)
-                            .and_then(|binding| match &binding.declared_type {
-                                Some(DeclaredType::Named { written, .. }) => Some(written.clone()),
-                                _ => None,
-                            })
-                    } else if right.kind() == "function_call_expression" {
-                        right
-                            .child_by_field_name("function")
-                            .map(|function| node_text(function, text).trim().to_owned())
-                            .and_then(|function| {
-                                let resolved = resolve_builder_name(
-                                    builder,
-                                    scope,
-                                    &function,
-                                    ImportKind::Function,
-                                );
-                                builder.symbols.by_fqn.get(&resolved).and_then(|ids| {
-                                    ids.iter()
-                                        .find_map(|id| builder.symbols.records.get(id.0 as usize))
-                                        .and_then(|symbol| symbol.return_type.clone())
-                                })
-                            })
-                    } else if matches!(
-                        right.kind(),
-                        "member_call_expression" | "nullsafe_member_call_expression"
-                    ) {
-                        right
-                            .child_by_field_name("object")
-                            .and_then(|object| {
-                                let receiver = node_text(object, text).trim();
-                                builder.scopes.records[scope.0 as usize]
-                                    .bindings
-                                    .iter()
-                                    .rev()
-                                    .find(|binding| binding.name == receiver)
-                                    .and_then(|binding| match &binding.declared_type {
-                                        Some(DeclaredType::Named { resolved, .. }) => {
-                                            Some(resolved)
-                                        }
-                                        _ => None,
-                                    })
-                                    .and_then(|receiver_type| {
-                                        let owner_ids = builder.symbols.by_fqn.get(receiver_type)?;
-                                        let method = right.child_by_field_name("name")?;
-                                        let method_name = node_text(method, text).trim();
-                                        let mut return_types = owner_ids
-                                            .iter()
-                                            .flat_map(|owner| {
-                                                builder
-                                                    .declarations
-                                                    .members_by_owner_name
-                                                    .get(&(
-                                                        *owner,
-                                                        method_name.to_owned(),
-                                                        ProjectSymbolKind::Method,
-                                                    ))
-                                                    .into_iter()
-                                                    .flatten()
-                                            })
-                                            .filter_map(|id| {
-                                                builder.symbols.records.get(id.0 as usize)
-                                            })
-                                            .filter_map(|symbol| symbol.return_type.clone())
-                                            .collect::<Vec<_>>();
-                                        return_types.sort();
-                                        return_types.dedup();
-                                        (return_types.len() == 1).then(|| return_types.pop().unwrap())
-                                    })
-                            })
-                    } else {
-                        None
-                    };
+                                .filter_map(|id| builder.symbols.records.get(id.0 as usize))
+                                .filter_map(|symbol| symbol.return_type.clone())
+                                .collect::<Vec<_>>();
+                            return_types.sort();
+                            return_types.dedup();
+                            (return_types.len() == 1).then(|| return_types.pop().unwrap())
+                        })
+                })
+            } else {
+                None
+            };
             let binding = VariableBinding {
                 name: name.to_owned(),
                 declaration_span: left.byte_range(),
                 declared_type: raw_type.map(|raw| declared_type(&raw, builder, scope)),
             };
-            builder.scopes.records[scope.0 as usize].bindings.push(binding);
+            builder.scopes.records[scope.0 as usize]
+                .bindings
+                .push(binding);
         }
     }
 }

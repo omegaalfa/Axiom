@@ -40,7 +40,9 @@ pub fn expand(source: &str) -> SnippetExpansion {
             let Some((index, default)) = body.split_once(':') else {
                 continue;
             };
-            let Ok(index) = index.parse::<u32>() else { continue };
+            let Ok(index) = index.parse::<u32>() else {
+                continue;
+            };
             text.push_str(default);
             placeholders.push(SnippetPlaceholder {
                 index,
@@ -50,7 +52,10 @@ pub fn expand(source: &str) -> SnippetExpansion {
             let start = offset;
             let mut end = start + 1;
             while chars.peek().is_some_and(|(_, next)| next.is_ascii_digit()) {
-                end = chars.next().map(|(at, next)| at + next.len_utf8()).unwrap_or(end);
+                end = chars
+                    .next()
+                    .map(|(at, next)| at + next.len_utf8())
+                    .unwrap_or(end);
             }
             let index = source[start + 1..end].parse::<u32>().ok();
             if let Some(0) = index {
@@ -68,11 +73,16 @@ pub fn expand(source: &str) -> SnippetExpansion {
 impl SnippetSession {
     pub fn new(mut placeholders: Vec<SnippetPlaceholder>) -> Option<Self> {
         placeholders.sort_by_key(|placeholder| (placeholder.index == 0, placeholder.index));
-        (!placeholders.is_empty()).then_some(Self { placeholders, current: 0 })
+        (!placeholders.is_empty()).then_some(Self {
+            placeholders,
+            current: 0,
+        })
     }
 
     pub fn active_range(&self) -> Option<Range<usize>> {
-        self.placeholders.get(self.current).map(|placeholder| placeholder.range.clone())
+        self.placeholders
+            .get(self.current)
+            .map(|placeholder| placeholder.range.clone())
     }
 
     pub fn next(&mut self) -> Option<Range<usize>> {
@@ -85,7 +95,9 @@ impl SnippetSession {
     }
 
     pub fn previous(&mut self) -> Option<Range<usize>> {
-        if self.current == 0 { return self.active_range(); }
+        if self.current == 0 {
+            return self.active_range();
+        }
         self.current -= 1;
         self.active_range()
     }
@@ -99,7 +111,14 @@ mod tests {
     fn expands_supported_placeholders() {
         let result = expand("foreach (${1:$items} as ${2:$item}) {\n$0\n}");
         assert_eq!(result.text, "foreach ($items as $item) {\n\n}");
-        assert_eq!(result.placeholders.iter().map(|p| p.index).collect::<Vec<_>>(), vec![1, 2, 0]);
+        assert_eq!(
+            result
+                .placeholders
+                .iter()
+                .map(|p| p.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
     }
 
     #[test]

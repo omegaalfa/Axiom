@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Symbol, STUB_PARSER_VERSION};
+use crate::{STUB_PARSER_VERSION, Symbol};
 
 pub const EMBEDDED_STUB_SCHEMA_VERSION: u32 = 1;
 

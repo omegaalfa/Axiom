@@ -801,8 +801,7 @@ pub fn apply_text_edits_with_offsets(
             && result.is_char_boundary(edit.end)
         {
             let previous_len = result.len();
-            let updated_len =
-                previous_len - (edit.end - edit.start) + edit.replacement.len();
+            let updated_len = previous_len - (edit.end - edit.start) + edit.replacement.len();
             let old_text = &result[edit.start..edit.end];
             for offset in &mut mapped_offsets {
                 *offset = map_text_edit_offset(
@@ -981,12 +980,8 @@ mod tests {
             range: lsp_types::Range::new(Position::new(0, 1), Position::new(0, 4)),
             new_text: "X".into(),
         };
-        let (_, offsets) = apply_text_edits_with_offsets(
-            "abcdef",
-            &[edit],
-            PositionEncoding::Utf16,
-            &[2, 4],
-        );
+        let (_, offsets) =
+            apply_text_edits_with_offsets("abcdef", &[edit], PositionEncoding::Utf16, &[2, 4]);
         assert_eq!(offsets, vec![1, 2]);
 
         let (text, offsets) = apply_text_edits_with_offsets(
@@ -1011,12 +1006,8 @@ mod tests {
                 new_text: "x".into(),
             },
         ];
-        let (text, offsets) = apply_text_edits_with_offsets(
-            "abcDEFghi",
-            &edits,
-            PositionEncoding::Utf16,
-            &[2, 7, 9],
-        );
+        let (text, offsets) =
+            apply_text_edits_with_offsets("abcDEFghi", &edits, PositionEncoding::Utf16, &[2, 7, 9]);
         assert_eq!(text, "111bcDEFx");
         assert_eq!(offsets, vec![4, 8, 9]);
         let (_, forward) =
@@ -1039,12 +1030,8 @@ mod tests {
                 new_text: "YY".into(),
             },
         ];
-        let (text, offsets) = apply_text_edits_with_offsets(
-            "a🙂b🙂c",
-            &edits,
-            PositionEncoding::Utf16,
-            &[1, 6, 10],
-        );
+        let (text, offsets) =
+            apply_text_edits_with_offsets("a🙂b🙂c", &edits, PositionEncoding::Utf16, &[1, 6, 10]);
         assert_eq!(text, "aXbYYc");
         assert_eq!(offsets, vec![1, 3, 5]);
 

@@ -72,7 +72,9 @@ class Repo {
     let file = snapshot
         .file_id(&PersistentFileKey::workspace(&path))
         .unwrap();
-    let save = snapshot.symbol(snapshot.symbols_for_fqn("Repo::save")[0]).unwrap();
+    let save = snapshot
+        .symbol(snapshot.symbols_for_fqn("Repo::save")[0])
+        .unwrap();
     let save_docblock = save.docblock_range.clone().unwrap();
 
     assert_eq!(
@@ -97,7 +99,12 @@ fn derived_docblock_lookup_survives_snapshot_json_round_trip() {
         .file_id(&PersistentFileKey::workspace(&path))
         .unwrap();
     let symbol_id = restored.symbols_for_fqn("persist")[0];
-    let docblock_range = restored.symbol(symbol_id).unwrap().docblock_range.clone().unwrap();
+    let docblock_range = restored
+        .symbol(symbol_id)
+        .unwrap()
+        .docblock_range
+        .clone()
+        .unwrap();
 
     assert_eq!(
         restored.callable_for_docblock(file, &docblock_range),

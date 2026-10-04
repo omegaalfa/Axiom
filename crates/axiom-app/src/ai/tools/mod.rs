@@ -1,11 +1,13 @@
 //! Minimal, provider-independent Agent tool layer.
 
+mod delete_file;
 mod fetch_url;
 mod list_directory;
 mod read_file;
 mod update_file;
 mod write_file;
 
+use axiom_project::project_delete::ProjectDeleteCapability;
 use axiom_project::project_directory::ProjectDirectoryCapability;
 use axiom_project::project_read::{ProjectReadCapability, ReadFileRange};
 use axiom_project::project_update::{ProjectUpdateCapability, TextFileFingerprint};
@@ -17,6 +19,7 @@ pub(crate) use fetch_url::FetchUrlTool;
 /// network and capability output limits because model context is smaller than
 /// a safe HTTP response buffer.
 pub(crate) const MAX_TOOL_CONTENT_BYTES: usize = 24 * 1024;
+pub(crate) use delete_file::DeleteFileTool;
 pub(crate) use list_directory::ListDirectoryTool;
 pub(crate) use read_file::ReadFileTool;
 pub(crate) use update_file::UpdateFileTool;
@@ -29,6 +32,7 @@ pub(crate) enum ToolName {
     FetchUrl,
     WriteFile,
     UpdateFile,
+    DeleteFile,
     Unknown(String),
 }
 
@@ -58,6 +62,10 @@ pub(crate) enum ToolArguments {
         path: String,
         expected_fingerprint: String,
         content: String,
+    },
+    DeleteFile {
+        path: String,
+        expected_fingerprint: String,
     },
 }
 
@@ -124,7 +132,11 @@ pub(crate) enum ToolError {
     InvalidFingerprint,
     FingerprintMismatch,
     NotRegularFile(String),
-    CurrentFileTooLarge { path: String, limit: usize, actual: usize },
+    CurrentFileTooLarge {
+        path: String,
+        limit: usize,
+        actual: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,6 +152,7 @@ pub(crate) struct ToolRegistry {
     fetch_url: FetchUrlTool,
     write_file: Option<WriteFileTool>,
     update_file: Option<UpdateFileTool>,
+    delete_file: Option<DeleteFileTool>,
 }
 
 impl ToolRegistry {
@@ -166,9 +179,11 @@ impl ToolRegistry {
             fetch_url: FetchUrlTool::new(fetch_url_capability),
             write_file: None,
             update_file: None,
+            delete_file: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_write_file(
         read_capability: ProjectReadCapability,
         directory_capability: ProjectDirectoryCapability,
@@ -181,6 +196,7 @@ impl ToolRegistry {
             fetch_url: FetchUrlTool::new(fetch_url_capability),
             write_file: Some(WriteFileTool::new(write_capability)),
             update_file: None,
+            delete_file: None,
         }
     }
 
@@ -197,7 +213,27 @@ impl ToolRegistry {
             fetch_url: FetchUrlTool::new(fetch_url_capability),
             write_file: Some(WriteFileTool::new(write_capability)),
             update_file: Some(UpdateFileTool::new(update_capability)),
+            delete_file: None,
         }
+    }
+
+    pub(crate) fn new_with_all_mutations(
+        read_capability: ProjectReadCapability,
+        directory_capability: ProjectDirectoryCapability,
+        fetch_url_capability: axiom_web::FetchUrlCapability,
+        write_capability: ProjectWriteCapability,
+        update_capability: ProjectUpdateCapability,
+        delete_capability: ProjectDeleteCapability,
+    ) -> Self {
+        let mut registry = Self::new_with_mutations(
+            read_capability,
+            directory_capability,
+            fetch_url_capability,
+            write_capability,
+            update_capability,
+        );
+        registry.delete_file = Some(DeleteFileTool::new(delete_capability));
+        registry
     }
 
     pub(crate) fn kind(&self, name: &ToolName) -> Option<ToolKind> {
@@ -207,6 +243,7 @@ impl ToolRegistry {
             }
             ToolName::WriteFile => self.write_file.is_some().then_some(ToolKind::Mutating),
             ToolName::UpdateFile => self.update_file.is_some().then_some(ToolKind::Mutating),
+            ToolName::DeleteFile => self.delete_file.is_some().then_some(ToolKind::Mutating),
             ToolName::Unknown(_) => None,
         }
     }
@@ -266,12 +303,32 @@ impl ToolRegistry {
                     };
                 }
                 match self.update_file.as_ref() {
-                    Some(update_file) => {
-                        update_file.execute(path, expected_fingerprint, content)
-                    }
+                    Some(update_file) => update_file.execute(path, expected_fingerprint, content),
                     None => ToolResult {
                         tool: ToolName::UpdateFile,
                         result: Err(ToolError::UnknownTool("update_file".into())),
+                    },
+                }
+            }
+            ToolRequest {
+                name: ToolName::DeleteFile,
+                arguments:
+                    ToolArguments::DeleteFile {
+                        path,
+                        expected_fingerprint,
+                    },
+            } => {
+                if cancelled() {
+                    return ToolResult {
+                        tool: ToolName::DeleteFile,
+                        result: Err(ToolError::Cancelled),
+                    };
+                }
+                match self.delete_file.as_ref() {
+                    Some(delete_file) => delete_file.execute(path, expected_fingerprint),
+                    None => ToolResult {
+                        tool: ToolName::DeleteFile,
+                        result: Err(ToolError::UnknownTool("delete_file".into())),
                     },
                 }
             }
@@ -483,16 +540,17 @@ mod tests {
             "newer"
         );
 
-        let missing = registry.execute(ToolRequest {
-            name: ToolName::UpdateFile,
-            arguments: ToolArguments::UpdateFile {
-                path: "missing.txt".into(),
-                expected_fingerprint:
-                    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                        .into(),
-                content: "must not be created".into(),
-            },
-        });
+        let missing =
+            registry.execute(ToolRequest {
+                name: ToolName::UpdateFile,
+                arguments: ToolArguments::UpdateFile {
+                    path: "missing.txt".into(),
+                    expected_fingerprint:
+                        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                            .into(),
+                    content: "must not be created".into(),
+                },
+            });
         assert!(matches!(missing.result, Err(ToolError::NotFound(_))));
         assert!(!dir.path().join("missing.txt").exists());
     }

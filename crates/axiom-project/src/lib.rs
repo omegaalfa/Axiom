@@ -8,6 +8,7 @@ use std::{
 
 use serde::Deserialize;
 
+pub mod project_delete;
 pub mod project_directory;
 pub mod project_read;
 pub mod project_update;
@@ -215,6 +216,30 @@ impl Project {
                 .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
         });
         Ok(entries)
+    }
+
+    /// Reads the complete visible project tree without reading file contents.
+    /// Callers should perform this traversal off the UI thread.
+    pub fn read_tree_snapshot(&self) -> Result<Vec<ProjectEntry>, ProjectError> {
+        fn visit(
+            project: &Project,
+            directory: &Path,
+            snapshot: &mut Vec<ProjectEntry>,
+        ) -> Result<(), ProjectError> {
+            let entries = project.read_directory(directory)?;
+            for entry in entries {
+                if entry.is_directory() {
+                    visit(project, &entry.path, snapshot)?;
+                }
+                snapshot.push(entry);
+            }
+            Ok(())
+        }
+
+        let mut snapshot = Vec::new();
+        visit(self, &self.root_path, &mut snapshot)?;
+        snapshot.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(snapshot)
     }
 
     pub fn create_file(&self, directory: &Path, name: &str) -> Result<PathBuf, ProjectError> {
@@ -687,6 +712,51 @@ mod tests {
         assert!(directory.join("nested.txt").is_file());
         project.delete(&directory).unwrap();
         assert!(!directory.exists());
+    }
+
+    #[test]
+    fn read_tree_snapshot_tracks_nested_structure_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("App")).unwrap();
+        fs::write(directory.path().join("App/old.txt"), "old").unwrap();
+        let project = Project::open(directory.path()).unwrap();
+
+        let initial = project.read_tree_snapshot().unwrap();
+        assert!(
+            initial
+                .iter()
+                .any(|entry| entry.path.ends_with("App/old.txt"))
+        );
+
+        fs::rename(
+            directory.path().join("App/old.txt"),
+            directory.path().join("App/new.txt"),
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("Lib")).unwrap();
+        fs::write(directory.path().join("Lib/created.txt"), "created").unwrap();
+
+        let updated = project.read_tree_snapshot().unwrap();
+        assert!(
+            !updated
+                .iter()
+                .any(|entry| entry.path.ends_with("App/old.txt"))
+        );
+        assert!(
+            updated
+                .iter()
+                .any(|entry| entry.path.ends_with("App/new.txt"))
+        );
+        assert!(updated.iter().any(|entry| entry.path.ends_with("Lib")));
+        assert!(
+            updated
+                .iter()
+                .any(|entry| entry.path.ends_with("Lib/created.txt"))
+        );
+
+        fs::remove_dir_all(directory.path().join("App")).unwrap();
+        let deleted = project.read_tree_snapshot().unwrap();
+        assert!(!deleted.iter().any(|entry| entry.path.ends_with("App")));
     }
 
     #[test]

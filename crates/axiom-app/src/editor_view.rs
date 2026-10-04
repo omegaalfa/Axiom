@@ -1,3 +1,4 @@
+use crate::snippet::{self, SnippetSession};
 use crate::{
     lsp_bridge::LspBridge,
     syntax_theme::styled_segment,
@@ -9,7 +10,6 @@ use crate::{
     },
 };
 use axiom_editor::{Document, DocumentEdit};
-use crate::snippet::{self, SnippetSession};
 use axiom_index::{
     DeclaredType, DefinitionSyntaxContext, MemberAccess, MemberResolution, PersistentFileKey,
     ProjectSymbolIndex, ProjectSymbolKind, SemanticEngine, SemanticSnapshot, SymbolId,
@@ -124,32 +124,31 @@ const PHPDOC_TAGS: [&str; 15] = [
     "@implements",
 ];
 const PHPDOC_CALLABLE_TAGS: [&str; 7] = [
-    "@param", "@return", "@throws", "@deprecated", "@see", "@since", "@template",
+    "@param",
+    "@return",
+    "@throws",
+    "@deprecated",
+    "@see",
+    "@since",
+    "@template",
 ];
 const PHPDOC_PROPERTY_TAGS: [&str; 4] = ["@var", "@deprecated", "@see", "@since"];
 const PHPDOC_TYPE_TAGS: [&str; 10] = [
-    "@deprecated", "@see", "@since", "@template", "@extends", "@implements", "@method",
-    "@property", "@property-read", "@property-write",
+    "@deprecated",
+    "@see",
+    "@since",
+    "@template",
+    "@extends",
+    "@implements",
+    "@method",
+    "@property",
+    "@property-read",
+    "@property-write",
 ];
 
 const PHP_NATIVE_TYPES: [&str; 17] = [
-    "string",
-    "int",
-    "float",
-    "bool",
-    "array",
-    "object",
-    "callable",
-    "iterable",
-    "mixed",
-    "void",
-    "never",
-    "null",
-    "false",
-    "true",
-    "self",
-    "static",
-    "parent",
+    "string", "int", "float", "bool", "array", "object", "callable", "iterable", "mixed", "void",
+    "never", "null", "false", "true", "self", "static", "parent",
 ];
 
 struct CachedLineLayout {
@@ -189,6 +188,26 @@ struct GeneratedDocblock {
 struct PhpSyntaxStamp {
     buffer_revision: u64,
     fingerprint: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExternalFileStamp {
+    modified_ns: u128,
+    length: u64,
+}
+
+fn external_file_stamp(path: &Path) -> Option<ExternalFileStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_ns = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(ExternalFileStamp {
+        modified_ns,
+        length: metadata.len(),
+    })
 }
 
 pub fn key_bindings() -> Vec<KeyBinding> {
@@ -401,6 +420,9 @@ pub struct EditorView {
     last_rendered_edit_generation: u64,
     last_render_at: Option<Instant>,
     last_notify_at: Option<(u64, Instant)>,
+    external_file_stamp: Option<ExternalFileStamp>,
+    external_sync_generation: u64,
+    external_sync_inflight: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1366,6 +1388,9 @@ impl EditorView {
             last_rendered_edit_generation: 0,
             last_render_at: None,
             last_notify_at: None,
+            external_file_stamp: None,
+            external_sync_generation: 0,
+            external_sync_inflight: false,
         };
         let inspections_started = std::time::Instant::now();
         view.sync_syntax();
@@ -1410,6 +1435,84 @@ impl EditorView {
 
     pub fn document_content(&self) -> String {
         self.document.content()
+    }
+
+    /// Starts an asynchronous check for an externally changed backing file.
+    /// The document identity remains resident while the disk read happens.
+    pub fn sync_external_file(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.document.file_path().map(Path::to_path_buf) else {
+            return;
+        };
+        if self.external_sync_inflight {
+            return;
+        }
+        self.external_sync_inflight = true;
+        self.external_sync_generation = self.external_sync_generation.wrapping_add(1);
+        let generation = self.external_sync_generation;
+        let session = self.document_session;
+        let revision = self.document.buffer_revision();
+        let dirty = self.document.is_dirty();
+        let previous_stamp = self.external_file_stamp;
+        let read_path = path.clone();
+        cx.spawn(async move |this, cx| {
+            let result = gpui::background_executor()
+                .spawn(async move {
+                    let current_stamp = external_file_stamp(&read_path)
+                        .ok_or_else(|| "backing file unavailable".to_owned())?;
+                    if previous_stamp.is_none() || previous_stamp == Some(current_stamp) {
+                        return Ok::<_, String>((None, current_stamp, false));
+                    }
+                    let content = if dirty {
+                        None
+                    } else {
+                        Some(fs::read_to_string(&read_path).map_err(|error| error.to_string())?)
+                    };
+                    let stamp_after = external_file_stamp(&read_path)
+                        .ok_or_else(|| "backing file unavailable".to_owned())?;
+                    if !dirty && stamp_after != current_stamp {
+                        return Err("backing file changed during reload".to_owned());
+                    }
+                    Ok::<_, String>((content, stamp_after, true))
+                })
+                .await;
+            let _ = this.update(cx, |editor, cx| {
+                if editor.document_session != session
+                    || editor.external_sync_generation != generation
+                {
+                    return;
+                }
+                editor.external_sync_inflight = false;
+                let Ok((content, stamp_after, changed)) = result else {
+                    return;
+                };
+                if !changed {
+                    editor.external_file_stamp = Some(stamp_after);
+                    return;
+                };
+                editor.external_file_stamp = Some(stamp_after);
+                if dirty {
+                    editor.status =
+                        Some("Arquivo alterado externamente; alterações locais preservadas".into());
+                    cx.notify();
+                    return;
+                }
+                if editor.document.is_dirty()
+                    || editor.document.buffer_revision() != revision
+                    || content.is_none()
+                {
+                    return;
+                }
+                let content = content.expect("checked above");
+                editor.document.reload_external(&content);
+                editor.sync_syntax();
+                editor.sync_lsp();
+                editor.schedule_native_inspections("external file reload", cx);
+                editor.schedule_incremental_index_update(editor.document.content());
+                editor.status = Some(format!("{} atualizado externamente", editor.title()).into());
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -1930,6 +2033,9 @@ impl EditorView {
             self.document.save_as(&self.file_path)
         };
         result.map_err(|error| error.to_string())?;
+        // The next background sync establishes the post-save disk stamp;
+        // this avoids treating Axiom's own atomic save as an external edit.
+        self.external_file_stamp = None;
         if let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) {
             lsp.with_server(|server| {
                 if let Err(error) = server.did_save(uri.clone(), None) {
@@ -2358,8 +2464,7 @@ impl EditorView {
                 continue;
             }
             let trimmed = text.trim_start();
-            if trimmed.trim_end() == "*/"
-                || (trimmed.starts_with("/**") && trimmed.ends_with("*/"))
+            if trimmed.trim_end() == "*/" || (trimmed.starts_with("/**") && trimmed.ends_with("*/"))
             {
                 return None;
             }
@@ -2409,8 +2514,7 @@ impl EditorView {
         let insertion = format!("{}{prefix}", self.document.line_ending().as_str());
         let insertion_start = self.document.cursor_offset();
         self.document.insert_text(&insertion);
-        self.document
-            .move_cursor(insertion_start + insertion.len());
+        self.document.move_cursor(insertion_start + insertion.len());
         true
     }
 
@@ -2480,7 +2584,8 @@ impl EditorView {
                 self.document.set_selection(range.start, range.end);
             } else {
                 self.snippet_session = None;
-                self.document.set_selection(self.document.cursor_offset(), self.document.cursor_offset());
+                self.document
+                    .set_selection(self.document.cursor_offset(), self.document.cursor_offset());
             }
             cx.notify();
             return;
@@ -3109,9 +3214,9 @@ impl EditorView {
     #[allow(dead_code)]
     fn syntax_is_current_for(&self, buffer_revision: u64) -> bool {
         self.syntax.is_some()
-            && self.syntax_stamp.is_some_and(|stamp| {
-                stamp.buffer_revision == buffer_revision
-            })
+            && self
+                .syntax_stamp
+                .is_some_and(|stamp| stamp.buffer_revision == buffer_revision)
     }
 
     fn invalidate_syntax_stamp(&mut self) {
@@ -3148,12 +3253,7 @@ impl EditorView {
         self.sync_syntax_text(&text, None, buffer_revision);
     }
 
-    fn sync_syntax_text(
-        &mut self,
-        text: &str,
-        edit: Option<&DocumentEdit>,
-        buffer_revision: u64,
-    ) {
+    fn sync_syntax_text(&mut self, text: &str, edit: Option<&DocumentEdit>, buffer_revision: u64) {
         let mut sync_succeeded = false;
         if let Some(syntax) = &mut self.syntax {
             let result = match edit {
@@ -3299,14 +3399,15 @@ impl EditorView {
         if let Some(tag_range) = phpdoc_tag_token(text, cursor) {
             let prefix = &text[tag_range.clone()];
             let target = self.phpdoc_completion_target(text, cursor);
-            let allowed = self.phpdoc_completion_tags(text, cursor).unwrap_or(&PHPDOC_TAGS);
+            let allowed = self
+                .phpdoc_completion_tags(text, cursor)
+                .unwrap_or(&PHPDOC_TAGS);
             let present = phpdoc_tags_before_cursor(text, cursor);
             let mut items = PHPDOC_TAGS
                 .iter()
                 .filter(|tag| allowed.contains(tag))
                 .filter(|tag| {
-                    !phpdoc_singleton(*tag)
-                        || !present.iter().any(|present| present == *tag)
+                    !phpdoc_singleton(*tag) || !present.iter().any(|present| present == *tag)
                 })
                 .filter(|tag| {
                     !matches!(**tag, "@param" | "@return")
@@ -3321,7 +3422,12 @@ impl EditorView {
                     ..Default::default()
                 })
                 .collect::<Vec<_>>();
-            if let Some(DocblockTarget::Callable { parameters, return_type, .. }) = target {
+            if let Some(DocblockTarget::Callable {
+                parameters,
+                return_type,
+                ..
+            }) = target
+            {
                 let documented_params = phpdoc_documented_param_names(text, cursor);
                 if allowed.contains(&"@param") {
                     for parameter in parameters {
@@ -3389,7 +3495,8 @@ impl EditorView {
                 new_prefix: Some(tag_range),
             };
         }
-        if let Some((template_range, template_items)) = php_live_template_completions(text, cursor) {
+        if let Some((template_range, template_items)) = php_live_template_completions(text, cursor)
+        {
             return NativeCompletionBatch {
                 items: template_items,
                 new_prefix: Some(template_range),
@@ -3432,8 +3539,7 @@ impl EditorView {
                     .map_or(cursor, |(index, _)| index)
             });
         let prefix = &text[start..cursor];
-        let preceded_by_new =
-            type_site.is_none() && before[..start].trim_end().ends_with("new");
+        let preceded_by_new = type_site.is_none() && before[..start].trim_end().ends_with("new");
         let type_context = type_site
             .as_ref()
             .map(|site| site.context)
@@ -3568,14 +3674,11 @@ impl EditorView {
             if !is_static && let Some(engine) = &self.semantic_engine {
                 let snapshot = engine.snapshot();
                 let file_key = PersistentFileKey::workspace_lexical(&self.file_path);
-                if let Some(scope) = snapshot.scope_id_at(&file_key, cursor.saturating_sub(1))
-                {
+                if let Some(scope) = snapshot.scope_id_at(&file_key, cursor.saturating_sub(1)) {
                     snapshot_binding_checked = owner_expression.starts_with('$');
-                    if let Some(binding) = snapshot.lookup_binding_at(
-                        scope,
-                        &owner_expression,
-                        owner_end,
-                    ) {
+                    if let Some(binding) =
+                        snapshot.lookup_binding_at(scope, &owner_expression, owner_end)
+                    {
                         snapshot_receiver_type = binding.declared_type.as_ref().and_then(|ty| {
                             if let DeclaredType::Named { resolved, .. } = ty {
                                 Some(resolved.clone())
@@ -3583,12 +3686,14 @@ impl EditorView {
                                 None
                             }
                         });
-                        let ids = snapshot.member_resolver().completion_methods_for_binding_at(
-                            scope,
-                            &owner_expression,
-                            prefix,
-                            owner_end,
-                        );
+                        let ids = snapshot
+                            .member_resolver()
+                            .completion_methods_for_binding_at(
+                                scope,
+                                &owner_expression,
+                                prefix,
+                                owner_end,
+                            );
                         let members = ids
                             .into_iter()
                             .filter_map(|id| snapshot.symbol(id))
@@ -3626,9 +3731,8 @@ impl EditorView {
                 };
             }
 
-            if let Some(class_fqn) = snapshot_receiver_type.or_else(|| {
-                self.resolve_receiver_type(&owner_expression, &text[..owner_end])
-            })
+            if let Some(class_fqn) = snapshot_receiver_type
+                .or_else(|| self.resolve_receiver_type(&owner_expression, &text[..owner_end]))
             {
                 let mut members = Vec::new();
                 if let Some(index) = &self.project_symbols
@@ -3752,72 +3856,72 @@ impl EditorView {
             self.runtime_symbols
                 .as_ref()
                 .map(|index| {
-                index
-                    .search_prefix(prefix)
-                    .into_iter()
-                    .filter(|symbol| {
-                        type_site
-                            .as_ref()
-                            .map(|site| runtime_type_kind_for_site(site, symbol.kind))
-                            .unwrap_or_else(|| {
-                                if type_context != TypeCompletionContext::GenericType {
-                                    runtime_type_kind_allowed(type_context, symbol.kind)
-                                } else {
-                                    runtime_global_kind_allowed(
-                                        before,
-                                        text[cursor..].starts_with("::"),
-                                        prefix,
-                                        start,
-                                        preceded_by_new,
-                                        member_operator.is_some(),
-                                        symbol.kind,
-                                    )
-                                }
-                            })
-                    })
-                    .take(40)
-                    .map(|symbol| {
-                        let import = matches!(
-                            symbol.kind,
-                            RuntimeKind::Class
-                                | RuntimeKind::Interface
-                                | RuntimeKind::Trait
-                                | RuntimeKind::Enum
-                        )
-                        .then(|| {
-                            self.composer_import_edit(
-                                text,
-                                &symbol.fqn,
-                                self.document.cursor_offset(),
-                            )
+                    index
+                        .search_prefix(prefix)
+                        .into_iter()
+                        .filter(|symbol| {
+                            type_site
+                                .as_ref()
+                                .map(|site| runtime_type_kind_for_site(site, symbol.kind))
+                                .unwrap_or_else(|| {
+                                    if type_context != TypeCompletionContext::GenericType {
+                                        runtime_type_kind_allowed(type_context, symbol.kind)
+                                    } else {
+                                        runtime_global_kind_allowed(
+                                            before,
+                                            text[cursor..].starts_with("::"),
+                                            prefix,
+                                            start,
+                                            preceded_by_new,
+                                            member_operator.is_some(),
+                                            symbol.kind,
+                                        )
+                                    }
+                                })
                         })
-                        .flatten();
-                        CompletionItem {
-                            label: symbol.name.clone(),
-                            detail: Some(
-                                if matches!(
-                                    symbol.kind,
-                                    RuntimeKind::Function | RuntimeKind::Method
-                                ) {
-                                    runtime_signature_detail(symbol)
-                                } else {
-                                    format!("{:?} • PHP Runtime", symbol.kind)
-                                },
-                            ),
-                            kind: Some(match symbol.kind {
-                                RuntimeKind::Function => CompletionItemKind::FUNCTION,
-                                RuntimeKind::Class => CompletionItemKind::CLASS,
-                                RuntimeKind::Interface => CompletionItemKind::INTERFACE,
-                                RuntimeKind::Trait => CompletionItemKind::CLASS,
-                                RuntimeKind::Enum => CompletionItemKind::ENUM,
-                                _ => CompletionItemKind::VALUE,
-                            }),
-                            insert_text: runtime_call_insert_text(symbol),
-                            additional_text_edits: import.map(|edit| vec![edit]),
-                            ..Default::default()
-                        }
-                    })
-                    .collect::<Vec<_>>()
+                        .take(40)
+                        .map(|symbol| {
+                            let import = matches!(
+                                symbol.kind,
+                                RuntimeKind::Class
+                                    | RuntimeKind::Interface
+                                    | RuntimeKind::Trait
+                                    | RuntimeKind::Enum
+                            )
+                            .then(|| {
+                                self.composer_import_edit(
+                                    text,
+                                    &symbol.fqn,
+                                    self.document.cursor_offset(),
+                                )
+                            })
+                            .flatten();
+                            CompletionItem {
+                                label: symbol.name.clone(),
+                                detail: Some(
+                                    if matches!(
+                                        symbol.kind,
+                                        RuntimeKind::Function | RuntimeKind::Method
+                                    ) {
+                                        runtime_signature_detail(symbol)
+                                    } else {
+                                        format!("{:?} • PHP Runtime", symbol.kind)
+                                    },
+                                ),
+                                kind: Some(match symbol.kind {
+                                    RuntimeKind::Function => CompletionItemKind::FUNCTION,
+                                    RuntimeKind::Class => CompletionItemKind::CLASS,
+                                    RuntimeKind::Interface => CompletionItemKind::INTERFACE,
+                                    RuntimeKind::Trait => CompletionItemKind::CLASS,
+                                    RuntimeKind::Enum => CompletionItemKind::ENUM,
+                                    _ => CompletionItemKind::VALUE,
+                                }),
+                                insert_text: runtime_call_insert_text(symbol),
+                                additional_text_edits: import.map(|edit| vec![edit]),
+                                ..Default::default()
+                            }
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .unwrap_or_default(),
         );
@@ -3873,8 +3977,7 @@ impl EditorView {
                                     ProjectSymbolKind::Enum => CompletionItemKind::ENUM,
                                     _ => CompletionItemKind::VALUE,
                                 }),
-                                insert_text: (current_namespace(text)
-                                    .is_empty()
+                                insert_text: (current_namespace(text).is_empty()
                                     && matches!(
                                         symbol.kind,
                                         ProjectSymbolKind::Class
@@ -3981,11 +4084,7 @@ impl EditorView {
         }
     }
 
-    fn phpdoc_completion_tags(
-        &self,
-        text: &str,
-        cursor: usize,
-    ) -> Option<&'static [&'static str]> {
+    fn phpdoc_completion_tags(&self, text: &str, cursor: usize) -> Option<&'static [&'static str]> {
         let target = self.phpdoc_completion_target(text, cursor)?;
         Some(match target {
             DocblockTarget::Callable { .. } => &PHPDOC_CALLABLE_TAGS,
@@ -4041,18 +4140,27 @@ impl EditorView {
     }
 
     fn explicit_throws_for_docblock(&self, text: &str, cursor: usize) -> Vec<String> {
-        let Some(syntax) = &self.syntax else { return Vec::new() };
-        let Some(close_offset) = text[cursor..].find("*/") else { return Vec::new() };
+        let Some(syntax) = &self.syntax else {
+            return Vec::new();
+        };
+        let Some(close_offset) = text[cursor..].find("*/") else {
+            return Vec::new();
+        };
         let closing = cursor + close_offset + 2;
         let Some(declaration_start) = text[closing..]
             .char_indices()
             .find(|(_, character)| !character.is_whitespace())
             .map(|(offset, _)| closing + offset)
-        else { return Vec::new() };
-        let Some(mut node) = syntax.tree().root_node().descendant_for_byte_range(
-            declaration_start,
-            declaration_start + 1,
-        ) else { return Vec::new() };
+        else {
+            return Vec::new();
+        };
+        let Some(mut node) = syntax
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(declaration_start, declaration_start + 1)
+        else {
+            return Vec::new();
+        };
         let mut callable = None;
         loop {
             let current = node;
@@ -4060,7 +4168,9 @@ impl EditorView {
                 callable = Some(current);
                 break;
             }
-            let Some(parent) = current.parent() else { break };
+            let Some(parent) = current.parent() else {
+                break;
+            };
             node = parent;
         }
         let Some(body) = callable.and_then(|node| node.child_by_field_name("body")) else {
@@ -4875,12 +4985,8 @@ impl EditorView {
             |region| (region.start, region.end),
         );
         let text = self.document.content();
-        let (formatted, mapped_offsets) = axiom_lsp::apply_text_edits_with_offsets(
-            &text,
-            edits,
-            encoding,
-            &[anchor, active],
-        );
+        let (formatted, mapped_offsets) =
+            axiom_lsp::apply_text_edits_with_offsets(&text, edits, encoding, &[anchor, active]);
         self.document.select_all();
         self.document.insert_text(&formatted);
         self.document
@@ -4920,12 +5026,10 @@ impl EditorView {
                 Self::lsp_range_to_bytes_in(&content, edit.range, encoding),
                 edit.new_text,
             ),
-            Some(CompletionTextEdit::InsertAndReplace(edit)) => {
-                (
-                    Self::lsp_range_to_bytes_in(&content, edit.replace, encoding),
-                    edit.new_text,
-                )
-            }
+            Some(CompletionTextEdit::InsertAndReplace(edit)) => (
+                Self::lsp_range_to_bytes_in(&content, edit.replace, encoding),
+                edit.new_text,
+            ),
             None => (
                 self.completion_replacement_range(&content),
                 item.insert_text.unwrap_or_else(|| item.label.clone()),
@@ -4938,7 +5042,9 @@ impl EditorView {
                 .additional_text_edits
                 .as_ref()
                 .is_none_or(|edits| edits.is_empty());
-        if let Some(expansion) = &snippet_expansion { text = expansion.text.clone(); }
+        if let Some(expansion) = &snippet_expansion {
+            text = expansion.text.clone();
+        }
         let call_like = matches!(
             item.kind,
             Some(CompletionItemKind::FUNCTION)
@@ -4966,12 +5072,8 @@ impl EditorView {
             new_text: text,
         });
         let plain_insertion_without_additional_edits = range.start == range.end && edits.len() == 1;
-        let (updated, mapped_offsets) = axiom_lsp::apply_text_edits_with_offsets(
-            &content,
-            &edits,
-            encoding,
-            &[range.end],
-        );
+        let (updated, mapped_offsets) =
+            axiom_lsp::apply_text_edits_with_offsets(&content, &edits, encoding, &[range.end]);
         self.suppress_completion_refresh_once = true;
         let mut caret = if plain_insertion_without_additional_edits {
             range.start.saturating_add(inserted_len).min(updated.len())
@@ -5770,7 +5872,8 @@ struct PhpTypeCompletionSite {
 
 fn php_type_completion_site(text: &str, cursor: usize) -> Option<PhpTypeCompletionSite> {
     let cursor = cursor.min(text.len());
-    if !text.is_char_boundary(cursor) || php_lexical_state(&text[..cursor]) != PhpLexicalState::Code {
+    if !text.is_char_boundary(cursor) || php_lexical_state(&text[..cursor]) != PhpLexicalState::Code
+    {
         return None;
     }
     let range = php_type_token_range(text, cursor);
@@ -5814,9 +5917,7 @@ fn php_type_token_range(text: &str, cursor: usize) -> Range<usize> {
     let start = text[..cursor]
         .char_indices()
         .rev()
-        .take_while(|(_, character)| {
-            character.is_alphanumeric() || matches!(character, '_' | '\\')
-        })
+        .take_while(|(_, character)| character.is_alphanumeric() || matches!(character, '_' | '\\'))
         .last()
         .map_or(cursor, |(offset, _)| offset);
     start..cursor
@@ -5863,7 +5964,10 @@ fn property_type_context(text: &str, cursor: usize) -> bool {
     if !is_inside_class_body(before) {
         return false;
     }
-    let line_after = text[cursor..].split(['\n', '\r']).next().unwrap_or_default();
+    let line_after = text[cursor..]
+        .split(['\n', '\r'])
+        .next()
+        .unwrap_or_default();
     let Some(variable) = line_after.find('$') else {
         return false;
     };
@@ -5894,8 +5998,7 @@ fn property_type_prefix(line: &str) -> Option<&str> {
         modifier_count += 1;
         remaining = remaining[word_end..].trim_start();
     }
-    (modifier_count > 0 && !remaining.contains(['=', '(', ')', '{', '}', ';']))
-        .then_some(remaining)
+    (modifier_count > 0 && !remaining.contains(['=', '(', ')', '{', '}', ';'])).then_some(remaining)
 }
 
 fn parameter_type_start(text: &str, start: usize, end: usize) -> Option<usize> {
@@ -5996,9 +6099,7 @@ fn is_partial_type_name_segment(value: &str) -> bool {
     };
     (first == '_' || first.is_alphabetic() || !first.is_ascii())
         && characters.all(|character| {
-            character == '_'
-                || character.is_alphanumeric()
-                || !character.is_ascii()
+            character == '_' || character.is_alphanumeric() || !character.is_ascii()
         })
 }
 
@@ -6036,9 +6137,7 @@ fn callable_keyword_before_paren(text: &str, open: usize) -> bool {
     let name_start = head
         .char_indices()
         .rev()
-        .take_while(|(_, character)| {
-            character.is_alphanumeric() || matches!(character, '_' | '\\')
-        })
+        .take_while(|(_, character)| character.is_alphanumeric() || matches!(character, '_' | '\\'))
         .last()
         .map_or(head.len(), |(offset, _)| offset);
     let declaration = head[..name_start].trim_end();
@@ -6049,9 +6148,10 @@ fn ends_with_word(text: &str, word: &str) -> bool {
     let Some(offset) = text.strip_suffix(word).map(|value| value.len()) else {
         return false;
     };
-    text[..offset].chars().next_back().is_none_or(|character| {
-        !character.is_alphanumeric() && !matches!(character, '_' | '\\')
-    })
+    text[..offset]
+        .chars()
+        .next_back()
+        .is_none_or(|character| !character.is_alphanumeric() && !matches!(character, '_' | '\\'))
 }
 
 fn is_double_colon(text: &str, offset: usize) -> bool {
@@ -6075,9 +6175,8 @@ fn is_inside_class_body(text: &str) -> bool {
     ["class", "interface", "trait", "enum"]
         .into_iter()
         .any(|keyword| {
-            declaration_keyword_start(head, keyword).is_some_and(|offset| {
-                !head[offset + keyword.len()..].contains('(')
-            })
+            declaration_keyword_start(head, keyword)
+                .is_some_and(|offset| !head[offset + keyword.len()..].contains('('))
         })
 }
 
@@ -6098,9 +6197,7 @@ fn last_unclosed_brace(text: &str) -> Option<usize> {
 fn php_native_type_allowed(site: &PhpTypeCompletionSite, type_name: &str) -> bool {
     let standalone = !site.nullable && site.connector.is_none();
     match type_name {
-        "void" | "never" => {
-            site.context == TypeCompletionContext::ReturnType && standalone
-        }
+        "void" | "never" => site.context == TypeCompletionContext::ReturnType && standalone,
         "mixed" => standalone,
         "callable" => {
             site.connector.is_none()
@@ -6111,9 +6208,7 @@ fn php_native_type_allowed(site: &PhpTypeCompletionSite, type_name: &str) -> boo
         }
         "iterable" => site.connector.is_none(),
         "null" | "false" | "true" => site.connector != Some(TypeConnector::Intersection),
-        "static" => {
-            site.context == TypeCompletionContext::ReturnType && site.connector.is_none()
-        }
+        "static" => site.context == TypeCompletionContext::ReturnType && site.connector.is_none(),
         "self" | "parent" => site.class_scope,
         _ => site.connector != Some(TypeConnector::Intersection),
     }
@@ -6155,9 +6250,7 @@ pub(crate) fn type_kind_allowed(context: TypeCompletionContext, kind: ProjectSym
         | TypeCompletionContext::ParameterType
         | TypeCompletionContext::PropertyType => matches!(
             kind,
-            ProjectSymbolKind::Class
-                | ProjectSymbolKind::Interface
-                | ProjectSymbolKind::Enum
+            ProjectSymbolKind::Class | ProjectSymbolKind::Interface | ProjectSymbolKind::Enum
         ),
         TypeCompletionContext::GenericType => true,
     }
@@ -6196,19 +6289,24 @@ fn runtime_global_kind_allowed(
     if followed_by_static_operator {
         return matches!(
             kind,
-            RuntimeKind::Class
-                | RuntimeKind::Interface
-                | RuntimeKind::Trait
-                | RuntimeKind::Enum
+            RuntimeKind::Class | RuntimeKind::Interface | RuntimeKind::Trait | RuntimeKind::Enum
         );
     }
     let head = before[..start].trim_end();
-    if head.ends_with('$') || head.ends_with('.')
+    if head.ends_with('$')
+        || head.ends_with('.')
         || head.ends_with("->")
         || head.ends_with("::")
         || [
-            "function", "class", "interface", "trait", "enum", "extends", "implements",
-            "use", "const",
+            "function",
+            "class",
+            "interface",
+            "trait",
+            "enum",
+            "extends",
+            "implements",
+            "use",
+            "const",
         ]
         .iter()
         .any(|keyword| head.ends_with(keyword))
@@ -8270,29 +8368,40 @@ fn phpdoc_tag_token(text: &str, cursor: usize) -> Option<Range<usize>> {
 
 fn phpdoc_tags_before_cursor(text: &str, cursor: usize) -> Vec<&str> {
     let opening = text[..cursor].rfind("/**").unwrap_or(0);
-    let line_start = text[..cursor].rfind('\n').map_or(opening, |offset| offset + 1);
+    let line_start = text[..cursor]
+        .rfind('\n')
+        .map_or(opening, |offset| offset + 1);
     text[opening..line_start]
         .split_whitespace()
         .filter(|token| token.starts_with('@'))
-        .map(|token| token.trim_matches(|character: char| {
-            !character.is_ascii_alphanumeric() && character != '@' && character != '-'
-        }))
+        .map(|token| {
+            token.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && character != '@' && character != '-'
+            })
+        })
         .collect()
 }
 
 fn phpdoc_documented_param_names(text: &str, cursor: usize) -> std::collections::HashSet<String> {
     let opening = text[..cursor].rfind("/**").unwrap_or(0);
-    let line_start = text[..cursor].rfind('\n').map_or(opening, |offset| offset + 1);
+    let line_start = text[..cursor]
+        .rfind('\n')
+        .map_or(opening, |offset| offset + 1);
     let mut names = std::collections::HashSet::new();
     for line in text[opening..line_start].lines() {
         let mut words = line.split_whitespace();
-        if words.next().is_some_and(|word| word == "*" || word.is_empty())
+        if words
+            .next()
+            .is_some_and(|word| word == "*" || word.is_empty())
             && words.next() == Some("@param")
         {
             if let Some(name) = words.find(|word| word.starts_with('$')) {
-                names.insert(name.trim_end_matches(|character: char| {
-                    !character.is_ascii_alphanumeric() && character != '$' && character != '_'
-                }).to_owned());
+                names.insert(
+                    name.trim_end_matches(|character: char| {
+                        !character.is_ascii_alphanumeric() && character != '$' && character != '_'
+                    })
+                    .to_owned(),
+                );
             }
         }
     }
@@ -8301,15 +8410,19 @@ fn phpdoc_documented_param_names(text: &str, cursor: usize) -> std::collections:
 
 fn phpdoc_documented_throws(text: &str, cursor: usize) -> Vec<String> {
     let opening = text[..cursor].rfind("/**").unwrap_or(0);
-    let line_start = text[..cursor].rfind('\n').map_or(opening, |offset| offset + 1);
+    let line_start = text[..cursor]
+        .rfind('\n')
+        .map_or(opening, |offset| offset + 1);
     text[opening..line_start]
         .lines()
         .filter_map(|line| {
             let mut words = line.split_whitespace();
-            (words.next().is_some_and(|word| word == "*" || word.is_empty())
+            (words
+                .next()
+                .is_some_and(|word| word == "*" || word.is_empty())
                 && words.next() == Some("@throws"))
-                .then(|| words.next().map(str::to_owned))
-                .flatten()
+            .then(|| words.next().map(str::to_owned))
+            .flatten()
         })
         .collect()
 }
@@ -8319,17 +8432,24 @@ fn phpdoc_semantic_tag_available(
     tag: &str,
     present: &[&str],
 ) -> bool {
-    let Some(DocblockTarget::Callable { parameters, return_type, .. }) = target else {
+    let Some(DocblockTarget::Callable {
+        parameters,
+        return_type,
+        ..
+    }) = target
+    else {
         return false;
     };
     match tag {
-        "@param" => parameters.iter().any(|parameter| {
-            parameter.declared_type.is_some()
-        }),
-        "@return" => return_type
-            .as_deref()
-            .is_some_and(|value| value.trim() != "void")
-            && !present.contains(&"@return"),
+        "@param" => parameters
+            .iter()
+            .any(|parameter| parameter.declared_type.is_some()),
+        "@return" => {
+            return_type
+                .as_deref()
+                .is_some_and(|value| value.trim() != "void")
+                && !present.contains(&"@return")
+        }
         _ => false,
     }
 }
@@ -8499,12 +8619,9 @@ fn declaration_keyword_start(text: &str, keyword: &str) -> Option<usize> {
                 !character.is_alphanumeric() && character != '_'
             });
         let after = offset + keyword.len();
-        let after_is_boundary = text[after..]
-            .chars()
-            .next()
-            .map_or(true, |character| {
-                !character.is_alphanumeric() && character != '_'
-            });
+        let after_is_boundary = text[after..].chars().next().map_or(true, |character| {
+            !character.is_alphanumeric() && character != '_'
+        });
         (before_is_boundary && after_is_boundary).then_some(offset)
     })
 }
@@ -8601,12 +8718,7 @@ fn source_docblock_parameter(parameter: &str) -> Option<DocblockParameter> {
     let prefix = prefix.strip_suffix('&').unwrap_or(prefix).trim();
     let declared_type = prefix
         .split_whitespace()
-        .filter(|word| {
-            !matches!(
-                *word,
-                "private" | "protected" | "public" | "readonly"
-            )
-        })
+        .filter(|word| !matches!(*word, "private" | "protected" | "public" | "readonly"))
         .collect::<Vec<_>>()
         .join(" ");
     Some(DocblockParameter {
@@ -8664,13 +8776,13 @@ fn collect_docblock_parameters(
         pending.extend(node.named_children(&mut node.walk()));
     }
     collected.sort_by_key(|(start, _)| *start);
-    collected.into_iter().map(|(_, parameter)| parameter).collect()
+    collected
+        .into_iter()
+        .map(|(_, parameter)| parameter)
+        .collect()
 }
 
-fn docblock_parameter(
-    node: tree_sitter::Node<'_>,
-    text: &str,
-) -> Option<DocblockParameter> {
+fn docblock_parameter(node: tree_sitter::Node<'_>, text: &str) -> Option<DocblockParameter> {
     let name = node.child_by_field_name("name")?;
     let declared_type = node
         .child_by_field_name("type")
@@ -8747,10 +8859,7 @@ fn generate_docblock(target: &DocblockTarget, eol: &str) -> GeneratedDocblock {
     text.push_str(eol);
     text.push_str(indent);
     text.push_str(" */");
-    GeneratedDocblock {
-        text,
-        caret_offset,
-    }
+    GeneratedDocblock { text, caret_offset }
 }
 
 fn is_useful_return_type(return_type: &str) -> bool {
@@ -8964,14 +9073,15 @@ fn php_live_template_completions(
     if !statement_start {
         return None;
     }
-    let indent = line.chars().take_while(|ch| ch.is_whitespace()).collect::<String>();
+    let indent = line
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .collect::<String>();
     let body_indent = format!("{indent}    ");
     let templates = [
         (
             "foreach",
-            format!(
-                "foreach (${{1:$items}} as ${{2:$item}}) {{\n{body_indent}$0\n{indent}}}"
-            ),
+            format!("foreach (${{1:$items}} as ${{2:$item}}) {{\n{body_indent}$0\n{indent}}}"),
         ),
         (
             "if",
@@ -9033,7 +9143,10 @@ mod php_live_template_tests {
             assert_eq!(&source[range], trigger);
             assert!(items.iter().all(|item| {
                 item.insert_text_format == Some(InsertTextFormat::SNIPPET)
-                    && item.insert_text.as_deref().is_some_and(|text| text.contains("${1:"))
+                    && item
+                        .insert_text
+                        .as_deref()
+                        .is_some_and(|text| text.contains("${1:"))
             }));
         }
         for source in [
@@ -9043,7 +9156,10 @@ mod php_live_template_tests {
             "<?php\nValue::fore",
             "<?php\n/** fore",
         ] {
-            assert!(php_live_template_completions(source, source.len()).is_none(), "{source}");
+            assert!(
+                php_live_template_completions(source, source.len()).is_none(),
+                "{source}"
+            );
         }
         let source = "<?php\n";
         let (_, items) = php_live_template_completions(&format!("{source}wh"), source.len() + 2)
@@ -9127,19 +9243,49 @@ mod completion_ranking_tests {
     #[test]
     fn runtime_global_completion_contexts_are_separated() {
         assert!(runtime_global_kind_allowed(
-            "", false, "strl", 0, false, false, RuntimeKind::Function
+            "",
+            false,
+            "strl",
+            0,
+            false,
+            false,
+            RuntimeKind::Function
         ));
         assert!(runtime_global_kind_allowed(
-            "", false, "array_ma", 0, false, false, RuntimeKind::Function
+            "",
+            false,
+            "array_ma",
+            0,
+            false,
+            false,
+            RuntimeKind::Function
         ));
         assert!(runtime_global_kind_allowed(
-            "", false, "PHP_VER", 0, false, false, RuntimeKind::GlobalConstant
+            "",
+            false,
+            "PHP_VER",
+            0,
+            false,
+            false,
+            RuntimeKind::GlobalConstant
         ));
         assert!(runtime_global_kind_allowed(
-            "", true, "DateT", 0, false, false, RuntimeKind::Class
+            "",
+            true,
+            "DateT",
+            0,
+            false,
+            false,
+            RuntimeKind::Class
         ));
         assert!(!runtime_global_kind_allowed(
-            "$object", false, "me", 7, false, true, RuntimeKind::Function
+            "$object",
+            false,
+            "me",
+            7,
+            false,
+            true,
+            RuntimeKind::Function
         ));
     }
 
@@ -9317,9 +9463,7 @@ mod type_completion_tests {
     }
 
     #[gpui::test]
-    fn return_type_completion_ranks_void_and_maps_plain_text_caret(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn return_type_completion_ranks_void_and_maps_plain_text_caret(cx: &mut gpui::TestAppContext) {
         for source in ["<?php\nfunction f(): ", "<?php\nfunction f(): vo"] {
             let cursor = source.len();
             let (view, cx) = cx.add_window_view(|_, cx| {
@@ -9334,14 +9478,20 @@ mod type_completion_tests {
             });
             view.update(cx, |editor, cx| {
                 let batch = editor.native_completions_impl(source);
-                assert_eq!(batch.items.first().map(|item| item.label.as_str()), Some("void"));
+                assert_eq!(
+                    batch.items.first().map(|item| item.label.as_str()),
+                    Some("void")
+                );
                 if source.ends_with(' ') {
                     assert!(batch.items.iter().any(|item| item.label == "never"));
                 }
                 editor.set_completions(batch.items, cx);
                 editor.accept_completion(cx);
                 assert_eq!(editor.document.content(), "<?php\nfunction f(): void");
-                assert_eq!(editor.document.cursor_offset(), "<?php\nfunction f(): void".len());
+                assert_eq!(
+                    editor.document.cursor_offset(),
+                    "<?php\nfunction f(): void".len()
+                );
             });
         }
     }
@@ -9369,9 +9519,7 @@ mod type_completion_tests {
     }
 
     #[gpui::test]
-    fn completion_refreshes_when_entity_input_changes_prefix(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn completion_refreshes_when_entity_input_changes_prefix(cx: &mut gpui::TestAppContext) {
         let source = "<?php\nfunction f(): ";
         let cursor = source.len();
         let view = cx.add_window(|_, cx| {
@@ -9386,7 +9534,10 @@ mod type_completion_tests {
         });
         let _ = view.update(cx, |editor, window, cx| {
             let batch = editor.native_completions_impl(source);
-            assert_eq!(batch.items.first().map(|item| item.label.as_str()), Some("void"));
+            assert_eq!(
+                batch.items.first().map(|item| item.label.as_str()),
+                Some("void")
+            );
             editor.set_completions(batch.items, cx);
             editor.replace_and_mark_text_in_range(None, "o", None, window, cx);
             assert_eq!(editor.document.content(), "<?php\nfunction f(): o");
@@ -9398,7 +9549,10 @@ mod type_completion_tests {
                     .map(|item| item.label.as_str()),
                 Some("object")
             );
-            assert_eq!(editor.completions.first().map(|item| item.label.as_str()), Some("object"));
+            assert_eq!(
+                editor.completions.first().map(|item| item.label.as_str()),
+                Some("object")
+            );
         });
     }
 
@@ -9444,9 +9598,7 @@ mod type_completion_tests {
             "<?php namespace App;\nclass UserDto {}\ninterface UserContract {}\nclass Foo {}\nclass Bar {}",
         )
         .unwrap();
-        index
-            .index_project(project_dir.path())
-            .unwrap();
+        index.index_project(project_dir.path()).unwrap();
         let index = Arc::new(RwLock::new(index));
 
         let cases = [
@@ -9482,7 +9634,10 @@ mod type_completion_tests {
             if expected.is_empty() {
                 assert!(labels.is_empty(), "{source}: {labels:?}");
             } else {
-                assert!(labels.contains(&expected.to_owned()), "{source}: {labels:?}");
+                assert!(
+                    labels.contains(&expected.to_owned()),
+                    "{source}: {labels:?}"
+                );
             }
         }
 
@@ -9520,11 +9675,7 @@ mod type_completion_tests {
                 "string|in",
                 "string|int",
             ),
-            (
-                "<?php\nfunction foo(Foo&Ba $value)",
-                "Foo&Ba",
-                "Foo&Bar",
-            ),
+            ("<?php\nfunction foo(Foo&Ba $value)", "Foo&Ba", "Foo&Bar"),
         ] {
             let cursor = source.find(expected).unwrap() + expected.len();
             let (view, cx) = cx.add_window_view(|_, cx| {
@@ -9566,9 +9717,7 @@ mod type_completion_tests {
     }
 
     #[gpui::test]
-    fn runtime_typed_members_complete_from_parameter_and_direct_new(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn runtime_typed_members_complete_from_parameter_and_direct_new(cx: &mut gpui::TestAppContext) {
         for source in [
             "<?php\nfunction f(DateTime $date) { $date->for }",
             "<?php\n$date = new DateTime(); $date->for",
@@ -9578,13 +9727,12 @@ mod type_completion_tests {
             std::fs::write(&path, source).unwrap();
             let mut project = ProjectSymbolIndex::new();
             project.index_project(directory.path()).unwrap();
-            let snapshot = SemanticSnapshot::from_project_index(
-                &project,
-                axiom_index::SemanticRevision(1),
-            );
+            let snapshot =
+                SemanticSnapshot::from_project_index(&project, axiom_index::SemanticRevision(1));
             let runtime = axiom_php::EmbeddedStubProvider::bundled()
                 .load()
-                .expect("embedded runtime artifact").0;
+                .expect("embedded runtime artifact")
+                .0;
             let cursor = source
                 .find("$date->for")
                 .map(|start| start + "$date->for".len())
@@ -9604,10 +9752,19 @@ mod type_completion_tests {
             });
             let (labels, range) = view.update(cx, |editor, _| {
                 let batch = editor.native_completions_impl(source);
-                (batch.items.iter().map(|item| item.label.clone()).collect::<Vec<_>>(),
-                 editor.completion_replacement_range(source))
+                (
+                    batch
+                        .items
+                        .iter()
+                        .map(|item| item.label.clone())
+                        .collect::<Vec<_>>(),
+                    editor.completion_replacement_range(source),
+                )
             });
-            assert!(labels.iter().any(|label| label == "format"), "{source}: {labels:?}");
+            assert!(
+                labels.iter().any(|label| label == "format"),
+                "{source}: {labels:?}"
+            );
             assert_eq!(range, cursor - 3..cursor);
         }
     }
@@ -9642,11 +9799,11 @@ mod type_completion_tests {
             let path = directory.path().join("runtime-assignment.php");
             std::fs::write(&path, source).expect("write test source");
             let mut project = ProjectSymbolIndex::new();
-            project.index_project(directory.path()).expect("index test source");
-            let snapshot = SemanticSnapshot::from_project_index(
-                &project,
-                axiom_index::SemanticRevision(1),
-            );
+            project
+                .index_project(directory.path())
+                .expect("index test source");
+            let snapshot =
+                SemanticSnapshot::from_project_index(&project, axiom_index::SemanticRevision(1));
             let runtime = axiom_php::EmbeddedStubProvider::bundled()
                 .load()
                 .expect("embedded runtime artifact")
@@ -9668,19 +9825,24 @@ mod type_completion_tests {
             let (labels, range) = view.update(cx, |editor, _| {
                 let batch = editor.native_completions_impl(source);
                 (
-                    batch.items.iter().map(|item| item.label.clone()).collect::<Vec<_>>(),
+                    batch
+                        .items
+                        .iter()
+                        .map(|item| item.label.clone())
+                        .collect::<Vec<_>>(),
                     editor.completion_replacement_range(source),
                 )
             });
-            assert!(labels.iter().any(|label| label == expected), "{source}: {labels:?}");
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "{source}: {labels:?}"
+            );
             assert_eq!(range, cursor - 3..cursor, "{source}");
         }
     }
 
     #[gpui::test]
-    fn typed_members_propagate_explicit_function_and_method_returns(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn typed_members_propagate_explicit_function_and_method_returns(cx: &mut gpui::TestAppContext) {
         for (source, needle, expected) in [
             (
                 "<?php\nfunction makeDate(): DateTime { return new DateTime(); }\n$date = makeDate();\n$date->for",
@@ -9697,11 +9859,11 @@ mod type_completion_tests {
             let path = directory.path().join("return-type.php");
             std::fs::write(&path, source).expect("write test source");
             let mut project = ProjectSymbolIndex::new();
-            project.index_project(directory.path()).expect("index test source");
-            let snapshot = SemanticSnapshot::from_project_index(
-                &project,
-                axiom_index::SemanticRevision(1),
-            );
+            project
+                .index_project(directory.path())
+                .expect("index test source");
+            let snapshot =
+                SemanticSnapshot::from_project_index(&project, axiom_index::SemanticRevision(1));
             let runtime = axiom_php::EmbeddedStubProvider::bundled()
                 .load()
                 .expect("embedded runtime artifact")
@@ -9723,11 +9885,18 @@ mod type_completion_tests {
             let (labels, range) = view.update(cx, |editor, _| {
                 let batch = editor.native_completions_impl(source);
                 (
-                    batch.items.iter().map(|item| item.label.clone()).collect::<Vec<_>>(),
+                    batch
+                        .items
+                        .iter()
+                        .map(|item| item.label.clone())
+                        .collect::<Vec<_>>(),
                     editor.completion_replacement_range(source),
                 )
             });
-            assert!(labels.iter().any(|label| label == expected), "{source}: {labels:?}");
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "{source}: {labels:?}"
+            );
             assert_eq!(range, cursor - 3..cursor, "{source}");
         }
     }
@@ -9767,11 +9936,11 @@ mod type_completion_tests {
             let path = directory.path().join("propagation-robustness.php");
             std::fs::write(&path, source).expect("write test source");
             let mut project = ProjectSymbolIndex::new();
-            project.index_project(directory.path()).expect("index test source");
-            let snapshot = SemanticSnapshot::from_project_index(
-                &project,
-                axiom_index::SemanticRevision(1),
-            );
+            project
+                .index_project(directory.path())
+                .expect("index test source");
+            let snapshot =
+                SemanticSnapshot::from_project_index(&project, axiom_index::SemanticRevision(1));
             let runtime = axiom_php::EmbeddedStubProvider::bundled()
                 .load()
                 .expect("embedded runtime artifact")
@@ -9799,16 +9968,17 @@ mod type_completion_tests {
                     .collect::<Vec<_>>()
             });
             match expected {
-                Some(label) => assert!(labels.iter().any(|item| item == label), "{source}: {labels:?}"),
+                Some(label) => assert!(
+                    labels.iter().any(|item| item == label),
+                    "{source}: {labels:?}"
+                ),
                 None => assert!(labels.is_empty(), "{source}: {labels:?}"),
             }
         }
     }
 
     #[gpui::test]
-    fn accepting_type_completion_preserves_nullable_and_connectors(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn accepting_type_completion_preserves_nullable_and_connectors(cx: &mut gpui::TestAppContext) {
         for (source, typed, label, expected) in [
             (
                 "<?php\nclass Foo {\n    private ?str $name;\n}",
@@ -9869,17 +10039,10 @@ mod formatter_tests {
         boundary_failures: &mut Vec<String>,
         midpoint_failures: &mut Vec<String>,
     ) {
-        let path = std::path::PathBuf::from(format!(
-            "mouse-offset-diagnostic-{}.php",
-            source.len()
-        ));
+        let path =
+            std::path::PathBuf::from(format!("mouse-offset-diagnostic-{}.php", source.len()));
         let (view, cx) = cx.add_window_view(|_, cx| {
-            EditorView::from_document(
-                path,
-                axiom_editor::Document::from_content(source),
-                None,
-                cx,
-            )
+            EditorView::from_document(path, axiom_editor::Document::from_content(source), None, cx)
         });
         view.update_in(cx, |editor, window, _| {
             editor
@@ -10011,10 +10174,7 @@ mod formatter_tests {
 
         let mut failures = Vec::new();
         if !boundary_failures.is_empty() {
-            failures.push(format!(
-                "without scroll:\n{}",
-                boundary_failures.join("\n")
-            ));
+            failures.push(format!("without scroll:\n{}", boundary_failures.join("\n")));
         }
         if !midpoint_failures.is_empty() {
             failures.push(format!("midpoints:\n{}", midpoint_failures.join("\n")));
@@ -10301,7 +10461,10 @@ mod formatter_tests {
                     "{source}"
                 );
                 if !expected.is_empty() {
-                    assert_eq!(editor.completion_replacement_range(source), cursor - 4..cursor);
+                    assert_eq!(
+                        editor.completion_replacement_range(source),
+                        cursor - 4..cursor
+                    );
                     editor.set_completions(batch.items, cx);
                     editor.accept_completion(cx);
                     let mut result = source.to_owned();
@@ -10333,7 +10496,16 @@ mod formatter_tests {
 
     #[gpui::test]
     fn completion_caret_maps_main_and_additional_edits(cx: &mut gpui::TestAppContext) {
-        for (case, source, main_start, main_end, import_at, import_text, expected, expected_caret) in [
+        for (
+            case,
+            source,
+            main_start,
+            main_end,
+            import_at,
+            import_text,
+            expected,
+            expected_caret,
+        ) in [
             (
                 "import before repeated completion",
                 "<?php\nrun();\nru",
@@ -10462,7 +10634,10 @@ mod formatter_tests {
             };
             editor.set_completions(vec![item], cx);
             editor.accept_completion(cx);
-            assert_eq!(editor.document.content(), "<?php\nfunction execute(int): ster");
+            assert_eq!(
+                editor.document.content(),
+                "<?php\nfunction execute(int): ster"
+            );
             assert_eq!(editor.document.cursor_offset(), cursor + 1);
             assert!(editor.document.selection_offsets().is_none());
             assert!(editor.completions.is_empty());
@@ -10773,8 +10948,14 @@ mod formatter_tests {
                     "{case}"
                 );
                 assert_eq!(editor.document.cursor_offset(), expected_active, "{case}");
-                assert!(editor.document.content().is_char_boundary(region.start), "{case}");
-                assert!(editor.document.content().is_char_boundary(region.end), "{case}");
+                assert!(
+                    editor.document.content().is_char_boundary(region.start),
+                    "{case}"
+                );
+                assert!(
+                    editor.document.content().is_char_boundary(region.end),
+                    "{case}"
+                );
             });
         }
     }
@@ -10830,15 +11011,7 @@ mod formatter_tests {
 
     #[gpui::test]
     fn replace_current_revalidates_next_match_ranges(cx: &mut gpui::TestAppContext) {
-        for (
-            case,
-            source,
-            replacement,
-            current,
-            expected_text,
-            expected_range,
-            expected_current,
-        ) in [
+        for (case, source, replacement, current, expected_text, expected_range, expected_current) in [
             (
                 "larger replacement",
                 "foo foo",
@@ -10884,15 +11057,7 @@ mod formatter_tests {
                 Some((12, 15)),
                 Some(0),
             ),
-            (
-                "no remaining match",
-                "foo",
-                "x",
-                0,
-                "x",
-                None,
-                None,
-            ),
+            ("no remaining match", "foo", "x", 0, "x", None, None),
         ] {
             let (editor, cx) = cx.add_window_view(|window, cx| {
                 let mut editor = EditorView::from_document(
@@ -10919,7 +11084,10 @@ mod formatter_tests {
                 assert_eq!(content, expected_text, "{case}");
                 assert_eq!(editor.find.current, expected_current, "{case}");
                 assert_eq!(
-                    editor.find.current_match().map(|range| (range.start, range.end)),
+                    editor
+                        .find
+                        .current_match()
+                        .map(|range| (range.start, range.end)),
                     expected_range,
                     "{case}"
                 );
@@ -11948,11 +12116,7 @@ mod width_cache_tests {
 mod docblock_tests {
     use super::{EditorView, Enter};
 
-    fn enter_at(
-        cx: &mut gpui::TestAppContext,
-        source: &str,
-        cursor: usize,
-    ) -> (String, usize) {
+    fn enter_at(cx: &mut gpui::TestAppContext, source: &str, cursor: usize) -> (String, usize) {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let mut editor = EditorView::from_document(
                 "docblock-tests.php".into(),
@@ -11969,11 +12133,7 @@ mod docblock_tests {
         })
     }
 
-    fn tag_items_at(
-        cx: &mut gpui::TestAppContext,
-        source: &str,
-        cursor: usize,
-    ) -> Vec<String> {
+    fn tag_items_at(cx: &mut gpui::TestAppContext, source: &str, cursor: usize) -> Vec<String> {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let mut editor = EditorView::from_document(
                 "docblock-tests.php".into(),
@@ -12027,17 +12187,10 @@ mod docblock_tests {
         })
     }
 
-    fn assert_expansion(
-        cx: &mut gpui::TestAppContext,
-        source: &str,
-        expected: &str,
-    ) {
+    fn assert_expansion(cx: &mut gpui::TestAppContext, source: &str, expected: &str) {
         let cursor = source.find("/**").expect("docblock marker") + 3;
         let (actual, actual_caret) = enter_at(cx, source, cursor);
-        let expected_caret = expected
-            .rfind(" * \n")
-            .expect("description prefix")
-            + 3;
+        let expected_caret = expected.rfind(" * \n").expect("description prefix") + 3;
         assert_eq!(actual, expected);
         assert_eq!(actual_caret, expected_caret);
     }
@@ -12081,13 +12234,14 @@ mod docblock_tests {
             let indent_text = &content[line_start..marker_start];
             $view.update_in($cx, |editor, window, cx| {
                 editor.document.move_cursor(marker_start);
-                editor
-                    .document
-                    .insert_text(&format!("/**\n{indent_text}"));
+                editor.document.insert_text(&format!("/**\n{indent_text}"));
                 editor.after_edit(cx);
                 editor.document.move_cursor(marker_start + 3);
                 let document_text = editor.document.content();
-                assert_eq!(editor.syntax.as_ref().unwrap().text(), document_text.as_str());
+                assert_eq!(
+                    editor.syntax.as_ref().unwrap().text(),
+                    document_text.as_str()
+                );
                 editor.enter(&Enter, window, cx);
             });
         }};
@@ -12108,9 +12262,7 @@ mod docblock_tests {
     }
 
     #[gpui::test]
-    fn expands_callable_parameters_and_return_in_signature_order(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn expands_callable_parameters_and_return_in_signature_order(cx: &mut gpui::TestAppContext) {
         let source = "<?php\n/**\nfunction foo(string $name, int $count): bool {}";
         let expected = "<?php\n/**\n * \n *\n * @param string $name\n * @param int $count\n * @return bool\n */\nfunction foo(string $name, int $count): bool {}";
         assert_expansion(cx, source, expected);
@@ -12161,9 +12313,7 @@ mod docblock_tests {
     }
 
     #[gpui::test]
-    fn enter_on_empty_line_without_declaration_uses_normal_enter(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn enter_on_empty_line_without_declaration_uses_normal_enter(cx: &mut gpui::TestAppContext) {
         let source = "<?php\n\n$value = 1;";
         let cursor = source.find('\n').unwrap() + 1;
         let (actual, _) = enter_at(cx, source, cursor);
@@ -12172,9 +12322,7 @@ mod docblock_tests {
     }
 
     #[gpui::test]
-    fn callable_docblock_has_one_description_and_one_separator(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn callable_docblock_has_one_description_and_one_separator(cx: &mut gpui::TestAppContext) {
         assert_expansion(
             cx,
             "<?php\nclass Foo {\n/**\npublic function run(string $name): bool { return true; }",
@@ -12271,10 +12419,7 @@ mod docblock_tests {
             } else {
                 vec![tag.to_owned()]
             };
-            assert_eq!(
-                tag_items_at(cx, &source, source.len()),
-                expected
-            );
+            assert_eq!(tag_items_at(cx, &source, source.len()), expected);
         }
     }
 
@@ -12292,7 +12437,11 @@ mod docblock_tests {
             ),
         ] {
             let source = format!("<?php\n/**\n * {prefix}");
-            assert_eq!(tag_items_at(cx, &source, source.len()), expected, "{prefix}");
+            assert_eq!(
+                tag_items_at(cx, &source, source.len()),
+                expected,
+                "{prefix}"
+            );
         }
 
         for (typed, tag) in [
@@ -12317,7 +12466,9 @@ mod docblock_tests {
         let callable = "<?php\n/**\n * @\n */\nfunction run(string $name): void {}";
         let callable_items = tag_items_at(cx, callable, callable.find(" * @\n").unwrap() + 4);
         assert!(
-            callable_items.iter().any(|item| item == "@param string $name"),
+            callable_items
+                .iter()
+                .any(|item| item == "@param string $name"),
             "{callable_items:?}"
         );
         assert!(callable_items.contains(&"@return".to_owned()));
@@ -12341,13 +12492,29 @@ mod docblock_tests {
         assert!(duplicate_items.contains(&"@param".to_owned()));
 
         let repeated_param = "<?php\n/**\n * @param string $first\n * @\n */\nfunction pair(string $first, string $second): void {}";
-        let repeated_items = tag_items_at(cx, repeated_param, repeated_param.find(" * @\n").unwrap() + 4);
-        assert!(repeated_items.iter().any(|item| item == "@param string $second"));
+        let repeated_items = tag_items_at(
+            cx,
+            repeated_param,
+            repeated_param.find(" * @\n").unwrap() + 4,
+        );
+        assert!(
+            repeated_items
+                .iter()
+                .any(|item| item == "@param string $second")
+        );
 
         let signature = "<?php\n/**\n * @param UserId $id\n * @\n */\nfunction find(UserId $id, int $limit): ?User {}";
         let signature_items = tag_items_at(cx, signature, signature.find(" * @\n").unwrap() + 4);
-        assert!(signature_items.iter().any(|item| item == "@param int $limit"));
-        assert!(!signature_items.iter().any(|item| item == "@param UserId $id"));
+        assert!(
+            signature_items
+                .iter()
+                .any(|item| item == "@param int $limit")
+        );
+        assert!(
+            !signature_items
+                .iter()
+                .any(|item| item == "@param UserId $id")
+        );
 
         let return_only = "<?php\n/**\n * @\n */\nfunction find(): ?User {}";
         let return_items = tag_items_at(cx, return_only, return_only.find(" * @\n").unwrap() + 4);
@@ -12384,9 +12551,7 @@ mod docblock_tests {
     }
 
     #[gpui::test]
-    fn phpdoc_tag_completion_preserves_indentation_and_utf8(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn phpdoc_tag_completion_preserves_indentation_and_utf8(cx: &mut gpui::TestAppContext) {
         let source = "<?php\n// José\n/**\n * comentário @pa|";
         let expected = "<?php\n// José\n/**\n * comentário @param ";
         let (actual, caret) = accept_tag_at(cx, source, "@param");
@@ -12401,9 +12566,7 @@ mod docblock_tests {
     }
 
     #[gpui::test]
-    fn phpdoc_tag_completion_is_scoped_to_active_doccomment(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn phpdoc_tag_completion_is_scoped_to_active_doccomment(cx: &mut gpui::TestAppContext) {
         for source in [
             "<?php\n@pa",
             "<?php\n// @pa",
@@ -12420,9 +12583,7 @@ mod docblock_tests {
     }
 
     #[gpui::test]
-    fn invalid_or_incompatible_context_uses_normal_enter(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn invalid_or_incompatible_context_uses_normal_enter(cx: &mut gpui::TestAppContext) {
         for source in [
             "<?php\n/**\n$notADeclaration = 1;",
             "<?php\n/**\nreturn 1;\nclass Foo",
@@ -12448,9 +12609,7 @@ mod docblock_tests {
     }
 
     #[gpui::test]
-    fn sequential_expansion_bottom_to_top_keeps_upper_signature(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn sequential_expansion_bottom_to_top_keeps_upper_signature(cx: &mut gpui::TestAppContext) {
         let source = "<?php\nclass Example {\n    public function save(string $name): void\n    {\n    }\n\n    public function process(string $name, int $count): bool\n    {\n        return true;\n    }\n}\n";
         let (view, cx) = cx.add_window_view(|_, cx| {
             EditorView::from_document(
@@ -12471,9 +12630,7 @@ mod docblock_tests {
     }
 
     #[gpui::test]
-    fn sequential_expansion_top_to_bottom_keeps_signatures(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn sequential_expansion_top_to_bottom_keeps_signatures(cx: &mut gpui::TestAppContext) {
         let source = "<?php\nclass Example {\n    public function save(string $name): void\n    {\n    }\n\n    public function process(string $name, int $count): bool\n    {\n        return true;\n    }\n}\n";
         let (view, cx) = cx.add_window_view(|_, cx| {
             EditorView::from_document(
@@ -12489,7 +12646,9 @@ mod docblock_tests {
 
         let actual = view.update(cx, |editor, _| editor.document.content());
         assert!(actual.contains("* @param string $name\n     */\n    public function save"));
-        assert!(actual.contains("* @param int $count\n     * @return bool\n     */\n    public function process"));
+        assert!(actual.contains(
+            "* @param int $count\n     * @return bool\n     */\n    public function process"
+        ));
         assert!(!actual.contains("@return void"));
     }
 
@@ -12513,8 +12672,12 @@ mod docblock_tests {
 
         let actual = view.update(cx, |editor, _| editor.document.content());
         assert!(actual.contains("* @param string $first\n     */\n    public function alpha"));
-        assert!(actual.contains("* @param int $count\n     * @return bool\n     */\n    public function beta"));
-        assert!(actual.contains("* @param ?string $value\n     * @return string\n     */\n    public function gamma"));
+        assert!(actual.contains(
+            "* @param int $count\n     * @return bool\n     */\n    public function beta"
+        ));
+        assert!(actual.contains(
+            "* @param ?string $value\n     * @return string\n     */\n    public function gamma"
+        ));
         assert_eq!(actual.matches("@param").count(), 3);
     }
 }
@@ -12522,9 +12685,7 @@ mod docblock_tests {
 #[cfg(test)]
 mod resident_phpdoc_context_tests {
     use super::EditorView;
-    use axiom_index::{
-        ProjectSymbolIndex, SemanticEngine, SemanticRevision, SemanticSnapshot,
-    };
+    use axiom_index::{ProjectSymbolIndex, SemanticEngine, SemanticRevision, SemanticSnapshot};
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -12630,9 +12791,7 @@ class Repo {
     }
 
     #[gpui::test]
-    fn resident_context_fails_soft_on_snapshot_fingerprint_mismatch(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn resident_context_fails_soft_on_snapshot_fingerprint_mismatch(cx: &mut gpui::TestAppContext) {
         let source = r#"<?php
 class Repo {
     /** @throws \App\StorageException */
@@ -12648,10 +12807,7 @@ class Repo {
         let (view, _, _, _) = resident_fixture(cx, source, snapshot_source);
         view.update(cx, |editor, _| {
             let cursor = source.find("/**").unwrap() + 4;
-            assert_eq!(
-                editor.resident_phpdoc_callable_symbol_id(cursor),
-                None
-            );
+            assert_eq!(editor.resident_phpdoc_callable_symbol_id(cursor), None);
         });
     }
 

@@ -64,6 +64,14 @@ pub(crate) fn list_directory_definition() -> ProviderToolDefinition {
     }
 }
 
+pub(crate) fn chat_tool_definitions() -> Vec<ProviderToolDefinition> {
+    vec![
+        read_file_definition(),
+        list_directory_definition(),
+        fetch_url_definition(),
+    ]
+}
+
 pub(crate) fn fetch_url_definition() -> ProviderToolDefinition {
     ProviderToolDefinition {
         name: "fetch_url".into(),
@@ -125,6 +133,22 @@ pub(crate) fn update_file_definition() -> ProviderToolDefinition {
                 }
             },
             "required": ["path", "expected_fingerprint", "content"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn delete_file_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: "delete_file".into(),
+        description: "Delete one existing regular workspace file only when its current SHA-256 fingerprint matches expected_fingerprint. This operation requires approval and never deletes directories.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative existing file path." },
+                "expected_fingerprint": { "type": "string", "description": "Canonical sha256:<64 lowercase hex> fingerprint returned by full read_file." }
+            },
+            "required": ["path", "expected_fingerprint"],
             "additionalProperties": false
         }),
     }
@@ -562,6 +586,7 @@ mod tests {
                 tool_calls: Vec::new(),
             }],
             think: None,
+            thinking_level: None,
             tools: Some(vec![read_file_definition()]),
         }
     }
@@ -573,6 +598,18 @@ mod tests {
         assert_eq!(definition.parameters["required"], json!(["url"]));
         assert_eq!(definition.parameters["additionalProperties"], json!(false));
         assert!(definition.description.contains("Does not search"));
+    }
+
+    #[test]
+    fn chat_tool_set_contains_no_mutation_tools() {
+        let names: Vec<_> = chat_tool_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert_eq!(names, vec!["read_file", "list_directory", "fetch_url"]);
+        assert!(!names.iter().any(|name| {
+            name == "write_file" || name == "update_file" || name == "delete_file"
+        }));
     }
 
     #[test]
