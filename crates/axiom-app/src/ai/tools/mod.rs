@@ -1,15 +1,20 @@
 //! Minimal, provider-independent Agent tool layer.
 
 mod delete_file;
+mod find_files;
+mod find_symbol;
+mod find_references;
 mod fetch_url;
 mod list_directory;
 mod read_file;
+mod search_text;
 mod update_file;
 mod write_file;
 
 use axiom_project::project_delete::ProjectDeleteCapability;
 use axiom_project::project_directory::ProjectDirectoryCapability;
 use axiom_project::project_read::{ProjectReadCapability, ReadFileRange};
+use axiom_project::project_search::ProjectSearchCapability;
 use axiom_project::project_update::{ProjectUpdateCapability, TextFileFingerprint};
 use axiom_project::project_write::ProjectWriteCapability;
 
@@ -20,8 +25,12 @@ pub(crate) use fetch_url::FetchUrlTool;
 /// a safe HTTP response buffer.
 pub(crate) const MAX_TOOL_CONTENT_BYTES: usize = 24 * 1024;
 pub(crate) use delete_file::DeleteFileTool;
+pub(crate) use find_files::FindFilesTool;
+pub(crate) use find_symbol::FindSymbolTool;
+pub(crate) use find_references::FindReferencesTool;
 pub(crate) use list_directory::ListDirectoryTool;
 pub(crate) use read_file::ReadFileTool;
+pub(crate) use search_text::SearchTextTool;
 pub(crate) use update_file::UpdateFileTool;
 pub(crate) use write_file::WriteFileTool;
 
@@ -29,6 +38,10 @@ pub(crate) use write_file::WriteFileTool;
 pub(crate) enum ToolName {
     ReadFile,
     ListDirectory,
+    SearchText,
+    FindFiles,
+    FindSymbol,
+    FindReferences,
     FetchUrl,
     WriteFile,
     UpdateFile,
@@ -50,6 +63,24 @@ pub(crate) enum ToolArguments {
     },
     ListDirectory {
         path: String,
+    },
+    SearchText {
+        query: String,
+        path: Option<String>,
+        file_pattern: Option<String>,
+    },
+    FindFiles {
+        pattern: String,
+    },
+    FindSymbol {
+        query: String,
+        kind: Option<String>,
+        limit: Option<usize>,
+    },
+    FindReferences {
+        query: String,
+        kind: Option<String>,
+        limit: Option<usize>,
     },
     FetchUrl {
         url: String,
@@ -149,6 +180,10 @@ pub(crate) struct ToolResult {
 pub(crate) struct ToolRegistry {
     read_file: ReadFileTool,
     list_directory: ListDirectoryTool,
+    search_text: SearchTextTool,
+    find_files: FindFilesTool,
+    find_symbol: FindSymbolTool,
+    find_references: FindReferencesTool,
     fetch_url: FetchUrlTool,
     write_file: Option<WriteFileTool>,
     update_file: Option<UpdateFileTool>,
@@ -173,14 +208,43 @@ impl ToolRegistry {
         directory_capability: ProjectDirectoryCapability,
         fetch_url_capability: axiom_web::FetchUrlCapability,
     ) -> Self {
+        let workspace_root = read_capability.workspace_root().to_path_buf();
+        let search = ProjectSearchCapability::new(read_capability.workspace_root())
+            .expect("read capability workspace root must remain valid");
+        let find_files = axiom_project::project_find_files::ProjectFindFilesCapability::new(
+            read_capability.workspace_root(),
+        )
+        .expect("read capability workspace root must remain valid");
         Self {
             read_file: ReadFileTool::new(read_capability),
             list_directory: ListDirectoryTool::new(directory_capability),
+            search_text: SearchTextTool::new(search),
+            find_files: FindFilesTool::new(find_files),
+            find_symbol: FindSymbolTool::new(workspace_root.clone(), None),
+            find_references: FindReferencesTool::new(workspace_root.clone(), None, None),
             fetch_url: FetchUrlTool::new(fetch_url_capability),
             write_file: None,
             update_file: None,
             delete_file: None,
         }
+    }
+
+    pub(crate) fn with_symbol_index(
+        mut self,
+        workspace_root: std::path::PathBuf,
+        index: Option<std::sync::Arc<std::sync::RwLock<axiom_index::ProjectSymbolIndex>>>,
+    ) -> Self {
+        self.find_symbol = FindSymbolTool::new(workspace_root.clone(), index.clone());
+        self.find_references = FindReferencesTool::new(workspace_root, index, None);
+        self
+    }
+
+    pub(crate) fn with_semantic_engine(
+        mut self,
+        engine: Option<std::sync::Arc<axiom_index::SemanticEngine>>,
+    ) -> Self {
+        self.find_references = self.find_references.with_semantic_engine(engine);
+        self
     }
 
     #[cfg(test)]
@@ -190,9 +254,20 @@ impl ToolRegistry {
         fetch_url_capability: axiom_web::FetchUrlCapability,
         write_capability: ProjectWriteCapability,
     ) -> Self {
+        let workspace_root = read_capability.workspace_root().to_path_buf();
+        let search = ProjectSearchCapability::new(read_capability.workspace_root())
+            .expect("read capability workspace root must remain valid");
+        let find_files = axiom_project::project_find_files::ProjectFindFilesCapability::new(
+            read_capability.workspace_root(),
+        )
+        .expect("read capability workspace root must remain valid");
         Self {
             read_file: ReadFileTool::new(read_capability),
             list_directory: ListDirectoryTool::new(directory_capability),
+            search_text: SearchTextTool::new(search),
+            find_files: FindFilesTool::new(find_files),
+            find_symbol: FindSymbolTool::new(workspace_root.clone(), None),
+            find_references: FindReferencesTool::new(workspace_root.clone(), None, None),
             fetch_url: FetchUrlTool::new(fetch_url_capability),
             write_file: Some(WriteFileTool::new(write_capability)),
             update_file: None,
@@ -207,9 +282,20 @@ impl ToolRegistry {
         write_capability: ProjectWriteCapability,
         update_capability: ProjectUpdateCapability,
     ) -> Self {
+        let workspace_root = read_capability.workspace_root().to_path_buf();
+        let search = ProjectSearchCapability::new(read_capability.workspace_root())
+            .expect("read capability workspace root must remain valid");
+        let find_files = axiom_project::project_find_files::ProjectFindFilesCapability::new(
+            read_capability.workspace_root(),
+        )
+        .expect("read capability workspace root must remain valid");
         Self {
             read_file: ReadFileTool::new(read_capability),
             list_directory: ListDirectoryTool::new(directory_capability),
+            search_text: SearchTextTool::new(search),
+            find_files: FindFilesTool::new(find_files),
+            find_symbol: FindSymbolTool::new(workspace_root.clone(), None),
+            find_references: FindReferencesTool::new(workspace_root.clone(), None, None),
             fetch_url: FetchUrlTool::new(fetch_url_capability),
             write_file: Some(WriteFileTool::new(write_capability)),
             update_file: Some(UpdateFileTool::new(update_capability)),
@@ -238,9 +324,12 @@ impl ToolRegistry {
 
     pub(crate) fn kind(&self, name: &ToolName) -> Option<ToolKind> {
         match name {
-            ToolName::ReadFile | ToolName::ListDirectory | ToolName::FetchUrl => {
+            ToolName::ReadFile | ToolName::ListDirectory | ToolName::SearchText | ToolName::FetchUrl => {
                 Some(ToolKind::ReadOnly)
             }
+            ToolName::FindFiles => Some(ToolKind::ReadOnly),
+            ToolName::FindSymbol => Some(ToolKind::ReadOnly),
+            ToolName::FindReferences => Some(ToolKind::ReadOnly),
             ToolName::WriteFile => self.write_file.is_some().then_some(ToolKind::Mutating),
             ToolName::UpdateFile => self.update_file.is_some().then_some(ToolKind::Mutating),
             ToolName::DeleteFile => self.delete_file.is_some().then_some(ToolKind::Mutating),
@@ -265,6 +354,22 @@ impl ToolRegistry {
                 name: ToolName::ListDirectory,
                 arguments: ToolArguments::ListDirectory { path },
             } => self.list_directory.execute(path),
+            ToolRequest {
+                name: ToolName::SearchText,
+                arguments: ToolArguments::SearchText { query, path, file_pattern },
+            } => self.search_text.execute(query, path, file_pattern, cancelled),
+            ToolRequest {
+                name: ToolName::FindFiles,
+                arguments: ToolArguments::FindFiles { pattern },
+            } => self.find_files.execute(pattern, cancelled),
+            ToolRequest {
+                name: ToolName::FindSymbol,
+                arguments: ToolArguments::FindSymbol { query, kind, limit },
+            } => self.find_symbol.execute(query, kind, limit),
+            ToolRequest {
+                name: ToolName::FindReferences,
+                arguments: ToolArguments::FindReferences { query, kind, limit },
+            } => self.find_references.execute(query, kind, limit),
             ToolRequest {
                 name: ToolName::FetchUrl,
                 arguments: ToolArguments::FetchUrl { url },

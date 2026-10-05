@@ -111,6 +111,10 @@ impl ProjectReadCapability {
         Ok(Self { workspace_root })
     }
 
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     pub fn read_file(&self, request: ReadFileRequest) -> Result<ReadFileOutput, ReadFileError> {
         let resolved = self.resolve_inside_workspace(&request.path)?;
         let metadata = match fs::metadata(&resolved) {

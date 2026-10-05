@@ -25,6 +25,10 @@ use axiom_app::shell_state::{
     runtime_stubs_cache_path, runtime_stubs_default_path, ui_settings_path, unix_timestamp_now,
 };
 use axiom_editor::Document;
+use axiom_git::{
+    GitChangeState, GitDiffLineKind, GitDiffTarget, GitError, GitFileDiff,
+    GitRepositoryService, GitRepositoryState,
+};
 use axiom_index::{
     FindUsagesOptions, ProjectSymbolIndex, ReferenceRole, SemanticEngine, SemanticRevision,
     SemanticSnapshot, SnapshotBuilder, VendorSymbolIndex,
@@ -37,8 +41,8 @@ use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
     LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollHandle, SharedString, Style, Timer, UTF16Selection, Window, actions, div, prelude::*, px,
-    relative,
+    ScrollHandle, SharedString, Style, Timer, UTF16Selection, UniformListScrollHandle, Window,
+    actions, div, prelude::*, px, relative,
 };
 
 use crate::{
@@ -326,6 +330,266 @@ fn ai_panel_width_for_viewport(
 ) -> Pixels {
     let available = (viewport.width - fixed_left - px(160.)).max(px(0.));
     requested.min(px(520.)).min(available).max(px(0.))
+}
+
+#[derive(Clone)]
+struct GitDiffDisplayRow {
+    hunk_header: bool,
+    text: String,
+    kind: GitDiffLineKind,
+}
+
+const GIT_DIFF_ROW_HEIGHT_PX: f32 = 22.;
+
+fn git_diff_display_rows(diff: Option<&GitFileDiff>) -> Vec<GitDiffDisplayRow> {
+    let mut rows = Vec::new();
+    for hunk in diff.map(|diff| &diff.hunks).into_iter().flatten() {
+        rows.push(GitDiffDisplayRow {
+            hunk_header: true,
+            text: format!(
+                "@@ -{},{} +{},{} @@",
+                hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+            ),
+            kind: GitDiffLineKind::Context,
+        });
+        rows.extend(hunk.lines.iter().map(|line| {
+            let prefix = match line.kind {
+                GitDiffLineKind::Context => ' ',
+                GitDiffLineKind::Addition => '+',
+                GitDiffLineKind::Deletion => '-',
+            };
+            let old_line = line.old_line.map(|line| line.to_string()).unwrap_or_default();
+            let new_line = line.new_line.map(|line| line.to_string()).unwrap_or_default();
+            GitDiffDisplayRow {
+                hunk_header: false,
+                text: format!("{old_line:>4} {new_line:>4} {prefix} {}", line.text),
+                kind: line.kind,
+            }
+        }));
+    }
+    rows
+}
+
+fn git_diff_uniform_item_count(diff: Option<&GitFileDiff>) -> usize {
+    diff.map(|diff| {
+        diff.hunks
+            .len()
+            .saturating_add(diff.hunks.iter().map(|hunk| hunk.lines.len()).sum())
+    })
+    .unwrap_or(0)
+}
+
+fn git_diff_show_no_textual_changes(
+    diff: Option<&GitFileDiff>,
+    rows: &[GitDiffDisplayRow],
+) -> bool {
+    diff.is_some()
+        && !diff.is_some_and(|diff| diff.binary)
+        && rows.is_empty()
+}
+
+fn reset_git_diff_scroll(handle: &UniformListScrollHandle) {
+    handle
+        .0
+        .borrow_mut()
+        .base_handle
+        .set_offset(Point::default());
+    handle.scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+}
+
+#[cfg(test)]
+mod git_changes_tests {
+    use super::*;
+    use axiom_git::{GitDiffHunk, GitDiffLine};
+
+    fn file(index: GitChangeState, worktree: GitChangeState) -> axiom_git::GitFileStatus {
+        axiom_git::GitFileStatus {
+            path: "App/Service.php".into(),
+            old_path: None,
+            index,
+            worktree,
+        }
+    }
+
+    #[test]
+    fn status_markers_cover_all_change_kinds() {
+        assert_eq!(git_status_marker_for_state(GitChangeState::Modified), "M");
+        assert_eq!(git_status_marker_for_state(GitChangeState::Added), "A");
+        assert_eq!(git_status_marker_for_state(GitChangeState::Deleted), "D");
+        assert_eq!(git_status_marker_for_state(GitChangeState::Renamed), "R");
+        assert_eq!(git_status_marker_for_state(GitChangeState::Untracked), "?");
+        assert_eq!(git_status_marker_for_state(GitChangeState::Conflicted), "!");
+    }
+
+    #[test]
+    fn clean_files_are_not_presented_as_changes() {
+        let state = GitRepositoryState {
+            repository_root: "/workspace".into(),
+            worktree_root: "/workspace".into(),
+            head: Some("head".into()),
+            branch: Some("main".into()),
+            detached: false,
+            files: vec![
+                file(GitChangeState::Unmodified, GitChangeState::Unmodified),
+                file(GitChangeState::Added, GitChangeState::Unmodified),
+            ],
+            remotes: Vec::new(),
+        };
+        assert_eq!(git_staged_indices(&state).len(), 1);
+    }
+
+    #[test]
+    fn staged_and_unstaged_sections_keep_a_file_in_both_when_needed() {
+        let state = GitRepositoryState {
+            repository_root: "/workspace".into(),
+            worktree_root: "/workspace".into(),
+            head: Some("head".into()),
+            branch: Some("main".into()),
+            detached: false,
+            files: vec![
+                file(GitChangeState::Modified, GitChangeState::Modified),
+                file(GitChangeState::Added, GitChangeState::Unmodified),
+                file(GitChangeState::Unmodified, GitChangeState::Untracked),
+            ],
+            remotes: Vec::new(),
+        };
+        assert_eq!(git_staged_indices(&state), vec![0, 1]);
+        assert_eq!(git_unstaged_indices(&state), vec![0, 2]);
+        assert_eq!(git_status_marker_for_state(GitChangeState::Untracked), "?");
+    }
+
+    #[test]
+    fn grouped_rows_preserve_section_identity_and_all_changes() {
+        let files = (0..64)
+            .map(|index| axiom_git::GitFileStatus {
+                path: format!("src/File{index}.php").into(),
+                old_path: None,
+                index: GitChangeState::Unmodified,
+                worktree: GitChangeState::Modified,
+            })
+            .collect();
+        let state = GitRepositoryState {
+            repository_root: "/workspace".into(),
+            worktree_root: "/workspace".into(),
+            head: Some("head".into()),
+            branch: Some("main".into()),
+            detached: false,
+            files,
+            remotes: Vec::new(),
+        };
+        let rows = git_section_rows(&state);
+        assert_eq!(git_unstaged_indices(&state).len(), 64);
+        assert_eq!(rows.len(), 65);
+
+        let both = GitRepositoryState {
+            files: vec![file(GitChangeState::Modified, GitChangeState::Modified)],
+            ..state
+        };
+        let rows = git_section_rows(&both);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, GitSectionRow::File { .. }))
+                .count(),
+            2
+        );
+        assert_ne!(
+            rows[1],
+            rows[3],
+            "the same path must have distinct semantic section row identities"
+        );
+    }
+
+    #[test]
+    fn stale_git_refresh_results_are_rejected() {
+        assert!(git_refresh_matches(7, 7));
+        assert!(!git_refresh_matches(8, 7));
+    }
+
+    #[test]
+    fn refresh_is_event_driven_with_a_slow_fallback() {
+        assert!(git_refresh_due(true, Duration::from_millis(1)));
+        assert!(!git_refresh_due(false, Duration::from_secs(1)));
+        assert!(git_refresh_due(false, Duration::from_secs(5)));
+    }
+    fn diff(hunks: Vec<GitDiffHunk>) -> GitFileDiff {
+        GitFileDiff {
+            path: "test.php".into(),
+            old_path: None,
+            target: GitDiffTarget::IndexToWorktree,
+            index: GitChangeState::Unmodified,
+            worktree: GitChangeState::Modified,
+            hunks,
+            binary: false,
+            truncated: false,
+        }
+    }
+
+    fn line(kind: GitDiffLineKind, text: &str) -> GitDiffLine {
+        GitDiffLine {
+            kind,
+            old_line: Some(1),
+            new_line: Some(1),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn non_empty_diff_builds_visible_virtualized_rows() {
+        let diff = diff(vec![GitDiffHunk {
+            old_start: 1,
+            old_lines: 3,
+            new_start: 1,
+            new_lines: 3,
+            lines: vec![
+                line(GitDiffLineKind::Context, "context"),
+                line(GitDiffLineKind::Deletion, "old"),
+                line(GitDiffLineKind::Addition, "new"),
+            ],
+        }]);
+        let rows = git_diff_display_rows(Some(&diff));
+
+        assert_eq!(rows.len(), 4);
+        assert_eq!(git_diff_uniform_item_count(Some(&diff)), 4);
+        assert_eq!(rows.iter().filter(|row| row.hunk_header).count(), 1);
+        assert!(rows.iter().any(|row| row.kind == GitDiffLineKind::Context));
+        assert!(rows.iter().any(|row| row.kind == GitDiffLineKind::Deletion));
+        assert!(rows.iter().any(|row| row.kind == GitDiffLineKind::Addition));
+        assert!(!git_diff_show_no_textual_changes(Some(&diff), &rows));
+        assert!(rows[0].hunk_header && rows[0].text.starts_with("@@ "));
+    }
+
+    #[test]
+    fn zero_hunk_diff_selects_no_textual_changes() {
+        let diff = diff(Vec::new());
+        let rows = git_diff_display_rows(Some(&diff));
+
+        assert!(rows.is_empty());
+        assert_eq!(git_diff_uniform_item_count(Some(&diff)), 0);
+        assert!(git_diff_show_no_textual_changes(Some(&diff), &rows));
+    }
+
+    #[test]
+    fn new_diff_resets_stale_scroll_and_starts_at_row_zero() {
+        let handle = UniformListScrollHandle::new();
+        handle
+            .0
+            .borrow_mut()
+            .base_handle
+            .set_offset(point(px(0.), px(-10_000.)));
+
+        reset_git_diff_scroll(&handle);
+
+        assert_eq!(handle.0.borrow().base_handle.offset(), Point::default());
+        let diff = diff(vec![GitDiffHunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 1,
+            lines: vec![line(GitDiffLineKind::Context, "context")],
+        }]);
+        assert_eq!(git_diff_uniform_item_count(Some(&diff)), 2);
+        assert!(git_diff_display_rows(Some(&diff))[0].hunk_header);
+    }
 }
 
 #[cfg(test)]
@@ -1390,9 +1654,18 @@ enum PendingOperation {
     Exit,
 }
 
-type ProjectLoadPayload = (Project, Vec<ProjectEntry>, Arc<LspBridge>);
+type ProjectLoadPayload = (Project, Vec<ProjectEntry>, Arc<LspBridge>, Option<GitRepositoryState>);
 type SemanticIndexPayload = (ProjectSymbolIndex, Arc<SemanticEngine>);
 type ExplorerStructureResult = (u64, Result<Vec<ProjectEntry>, String>);
+type GitRefreshResult = (u64, Result<Option<GitRepositoryState>, String>);
+type GitDiffResult = (u64, PathBuf, GitDiffTarget, Result<GitFileDiff, String>);
+type GitMutationResult = (u64, PathBuf, GitIndexMutation, Result<(), String>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GitIndexMutation {
+    Stage,
+    Unstage,
+}
 type RuntimeLoadResult = (
     u64,
     Result<(RuntimeStubStatus, Arc<RuntimeSymbolIndex>), String>,
@@ -1403,6 +1676,110 @@ fn semantic_update_matches(
     update_project_generation: u64,
 ) -> bool {
     current_project_generation == update_project_generation
+}
+
+fn load_git_state(
+    root: &Path,
+    inflight: &AtomicBool,
+) -> Result<Option<GitRepositoryState>, ()> {
+    if inflight.swap(true, Ordering::AcqRel) {
+        return Err(());
+    }
+    let result = match GitRepositoryService.load(root) {
+        Ok(state) => Some(state),
+        Err(GitError::NotRepository) => None,
+        Err(GitError::RepositoryError(error)) => {
+            tracing::warn!(%error, "Git repository state unavailable");
+            None
+        }
+    };
+    inflight.store(false, Ordering::Release);
+    Ok(result)
+}
+
+fn git_status_marker_for_state(state: GitChangeState) -> &'static str {
+    match state {
+        GitChangeState::Modified => "M",
+        GitChangeState::Added => "A",
+        GitChangeState::Deleted => "D",
+        GitChangeState::Renamed => "R",
+        GitChangeState::Untracked => "?",
+        GitChangeState::Conflicted => "!",
+        GitChangeState::Unmodified => " ",
+    }
+}
+
+fn git_staged_indices(state: &GitRepositoryState) -> Vec<usize> {
+    state
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| (file.index != GitChangeState::Unmodified).then_some(index))
+        .collect()
+}
+
+fn git_unstaged_indices(state: &GitRepositoryState) -> Vec<usize> {
+    state
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| (file.worktree != GitChangeState::Unmodified).then_some(index))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GitSection {
+    Staged,
+    Changes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitSectionRow {
+    Header(GitSection),
+    File { section: GitSection, file_index: usize },
+}
+
+fn git_section_rows(state: &GitRepositoryState) -> Vec<GitSectionRow> {
+    let mut rows = Vec::new();
+    let staged = git_staged_indices(state);
+    if !staged.is_empty() {
+        rows.push(GitSectionRow::Header(GitSection::Staged));
+        rows.extend(staged.into_iter().map(|file_index| GitSectionRow::File {
+            section: GitSection::Staged,
+            file_index,
+        }));
+    }
+    let changes = git_unstaged_indices(state);
+    if !changes.is_empty() {
+        rows.push(GitSectionRow::Header(GitSection::Changes));
+        rows.extend(changes.into_iter().map(|file_index| GitSectionRow::File {
+            section: GitSection::Changes,
+            file_index,
+        }));
+    }
+    rows
+}
+
+fn git_refresh_matches(current_generation: u64, result_generation: u64) -> bool {
+    current_generation == result_generation
+}
+
+fn git_refresh_due(requested: bool, elapsed: Duration) -> bool {
+    requested || elapsed >= Duration::from_secs(5)
+}
+
+fn git_mutation_error_message(operation: GitIndexMutation, detail: &str) -> SharedString {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("lock") || detail.contains("locked") {
+        return "Git index is busy".into();
+    }
+    if detail.contains("changed") || detail.contains("concurrent") {
+        return "Git index changed externally".into();
+    }
+    match operation {
+        GitIndexMutation::Stage => "Unable to stage file".into(),
+        GitIndexMutation::Unstage => "Unable to unstage file".into(),
+    }
 }
 
 impl RuntimeStubStatus {
@@ -1478,6 +1855,7 @@ pub struct WorkspaceView {
     delete_focus_pending: bool,
     explorer_selection: UTF16Selection,
     explorer_scroll: ScrollHandle,
+    version_control_scroll: UniformListScrollHandle,
     explorer_scroll_dragging: bool,
     explorer_scroll_drag_start_y: f32,
     explorer_scroll_drag_start_offset: f32,
@@ -1490,6 +1868,7 @@ pub struct WorkspaceView {
     pending_delete: Option<PathBuf>,
     pending_delete_is_directory: bool,
     project_panel_visible: bool,
+    version_control_visible: bool,
     ai_panel_visible: bool,
     ai_panel_width: Pixels,
     ai_panel_resizing: bool,
@@ -1605,6 +1984,26 @@ pub struct WorkspaceView {
     project_dialog_open: bool,
     project_load_generation: u64,
     project_load_results: Option<Receiver<(u64, Result<ProjectLoadPayload, String>)>>,
+    git_state: Option<GitRepositoryState>,
+    git_scan_inflight: Arc<AtomicBool>,
+    git_refresh_generation: u64,
+    git_refresh_last_scan: Instant,
+    git_refresh_requested: bool,
+    git_refresh_inflight: bool,
+    git_refresh_results: Option<Receiver<GitRefreshResult>>,
+    git_diff_generation: u64,
+    git_diff_path: Option<PathBuf>,
+    git_diff_target: GitDiffTarget,
+    git_diff_status: Option<(GitChangeState, GitChangeState)>,
+    git_diff: Option<GitFileDiff>,
+    git_diff_loading: bool,
+    git_diff_error: Option<String>,
+    git_diff_results: Option<Receiver<GitDiffResult>>,
+    git_diff_scroll: UniformListScrollHandle,
+    git_mutation_generation: u64,
+    git_mutation_inflight: bool,
+    git_mutation_pending: Option<(PathBuf, GitIndexMutation)>,
+    git_mutation_results: Option<Receiver<GitMutationResult>>,
     explorer_structure_snapshot: Option<Vec<ProjectEntry>>,
     explorer_structure_generation: u64,
     explorer_structure_last_scan: Instant,
@@ -2562,6 +2961,7 @@ impl WorkspaceView {
                 reversed: false,
             },
             explorer_scroll: ScrollHandle::new(),
+            version_control_scroll: UniformListScrollHandle::new(),
             explorer_scroll_dragging: false,
             explorer_scroll_drag_start_y: 0.0,
             explorer_scroll_drag_start_offset: 0.0,
@@ -2574,6 +2974,7 @@ impl WorkspaceView {
             pending_delete: None,
             pending_delete_is_directory: false,
             project_panel_visible: true,
+            version_control_visible: false,
             ai_panel_visible: ui_settings.ai_panel_visible,
             ai_panel_width: px(ui_settings.ai_panel_width.clamp(280.0, 520.0)),
             ai_panel_resizing: false,
@@ -2742,6 +3143,26 @@ impl WorkspaceView {
             project_dialog_open: false,
             project_load_generation: 0,
             project_load_results: None,
+            git_state: None,
+            git_scan_inflight: Arc::new(AtomicBool::new(false)),
+            git_refresh_generation: 0,
+            git_refresh_last_scan: Instant::now(),
+            git_refresh_requested: false,
+            git_refresh_inflight: false,
+            git_refresh_results: None,
+            git_diff_generation: 0,
+            git_diff_path: None,
+            git_diff_target: GitDiffTarget::IndexToWorktree,
+            git_diff_status: None,
+            git_diff: None,
+            git_diff_loading: false,
+            git_diff_error: None,
+            git_diff_results: None,
+            git_diff_scroll: UniformListScrollHandle::new(),
+            git_mutation_generation: 0,
+            git_mutation_inflight: false,
+            git_mutation_pending: None,
+            git_mutation_results: None,
             explorer_structure_snapshot: None,
             explorer_structure_generation: 0,
             explorer_structure_last_scan: Instant::now(),
@@ -3050,53 +3471,6 @@ impl WorkspaceView {
         workspace
     }
 
-    #[allow(dead_code)]
-    fn load_runtime_stubs() -> (
-        RuntimeStubStatus,
-        Option<std::sync::Arc<RuntimeSymbolIndex>>,
-    ) {
-        let provider = RuntimeStubProvider::from_env_or_embedded();
-        let configured_path = provider
-            .root()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("<embedded>"));
-        if let Some(path) = provider.root() {
-            let _ = fs::create_dir_all(path);
-        }
-        let cache = runtime_stubs_cache_path();
-        let result = cache
-            .as_deref()
-            .map_or_else(|| provider.load(), |cache| provider.load_incremental(cache));
-        match result {
-            Ok((index, report)) => {
-                if debug_stubs_enabled() {
-                    tracing::info!(
-                        configured_path = %configured_path.display(),
-                        exists = configured_path.is_dir(),
-                        files = report.files_parsed,
-                        symbols = report.symbols_indexed,
-                        load_errors = report.errors.len(),
-                        "[RUNTIME STUBS]"
-                    );
-                }
-                (
-                    RuntimeStubStatus::Loaded {
-                        files: report.files_discovered,
-                        symbols: report.symbols_indexed,
-                    },
-                    Some(std::sync::Arc::new(index)),
-                )
-            }
-            Err(error) => {
-                if debug_stubs_enabled() {
-                    tracing::info!(configured_path = %configured_path.display(), exists = configured_path.is_dir(), files = 0, symbols = 0, load_errors = 1, "[RUNTIME STUBS]");
-                }
-                tracing::warn!(%error, "PHP runtime stubs unavailable");
-                (RuntimeStubStatus::NotFound, None)
-            }
-        }
-    }
-
     fn runtime_stub_path() -> PathBuf {
         if let Some(path) =
             std::env::var_os("AXIOM_PHP_STUBS").or_else(|| std::env::var_os("RUSTSTORM_PHP_STUBS"))
@@ -3218,6 +3592,351 @@ impl WorkspaceView {
             });
         }
         self.poll_project_structure_sync(cx);
+        self.poll_git_refresh(cx);
+        self.poll_git_diff(cx);
+        self.poll_git_mutation(cx);
+    }
+
+    fn poll_git_refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        if let Some(receiver) = self.git_refresh_results.as_ref() {
+            match receiver.try_recv() {
+                Ok((generation, result)) => {
+                    self.git_refresh_results = None;
+                    self.git_refresh_inflight = false;
+                    if !git_refresh_matches(self.git_refresh_generation, generation) {
+                        return;
+                    }
+                    match result {
+                        Ok(state) => {
+                            self.git_state = state;
+                            if let Some(state) = self.git_state.as_ref() {
+                                tracing::debug!(
+                                    target: "axiom.git_ui_diag",
+                                    event = "git_sections_state",
+                                    total_status_entries = state.files.len(),
+                                    staged_row_count = git_staged_indices(state).len(),
+                                    unstaged_row_count = git_unstaged_indices(state).len(),
+                                    rows = git_section_rows(state).len(),
+                                );
+                                if let Some(relative) = self.git_diff_path.as_ref()
+                                    && let Some(file) = state.files.iter().find(|file| &file.path == relative)
+                                    && self.git_diff_target == GitDiffTarget::IndexToWorktree
+                                {
+                                    tracing::debug!(
+                                        target: "axiom.git_ui_diag",
+                                        event = "unstage_refresh_applied",
+                                        path = %relative.display(),
+                                        index = ?file.index,
+                                        worktree = ?file.worktree,
+                                    );
+                                }
+                            }
+                            self.reconcile_git_diff_selection();
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "Git refresh failed");
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.git_refresh_results = None;
+                    self.git_refresh_inflight = false;
+                }
+            }
+        }
+        if self.git_refresh_inflight
+            || !git_refresh_due(self.git_refresh_requested, self.git_refresh_last_scan.elapsed())
+        {
+            return;
+        }
+        self.git_refresh_last_scan = Instant::now();
+        self.git_refresh_requested = false;
+        self.git_refresh_inflight = true;
+        self.git_refresh_generation = self.git_refresh_generation.wrapping_add(1);
+        let generation = self.git_refresh_generation;
+        let root = project.root_path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        self.git_refresh_results = Some(receiver);
+        thread::spawn(move || {
+            let result = match GitRepositoryService.load(&root) {
+                Ok(state) => Ok(Some(state)),
+                Err(GitError::NotRepository) => Ok(None),
+                Err(GitError::RepositoryError(error)) => Err(error),
+            };
+            let _ = sender.send((generation, result));
+        });
+    }
+
+    fn request_git_refresh(&mut self) {
+        self.git_refresh_requested = true;
+    }
+
+    fn reconcile_git_diff_selection(&mut self) {
+        let Some(relative) = self.git_diff_path.clone() else {
+            return;
+        };
+        let Some(file) = self
+            .git_state
+            .as_ref()
+            .and_then(|state| state.files.iter().find(|file| file.path == relative))
+        else {
+            self.git_diff_path = None;
+            self.git_diff = None;
+            self.git_diff_loading = false;
+            self.git_diff_status = None;
+            return;
+        };
+        let valid = |target| match target {
+            GitDiffTarget::HeadToIndex => file.index != GitChangeState::Unmodified,
+            GitDiffTarget::IndexToWorktree => file.worktree != GitChangeState::Unmodified,
+        };
+        if !valid(self.git_diff_target) {
+            let other = match self.git_diff_target {
+                GitDiffTarget::HeadToIndex => GitDiffTarget::IndexToWorktree,
+                GitDiffTarget::IndexToWorktree => GitDiffTarget::HeadToIndex,
+            };
+            if valid(other) {
+                self.request_git_diff(relative, other);
+            } else {
+                self.git_diff_path = None;
+                self.git_diff = None;
+                self.git_diff_loading = false;
+                self.git_diff_status = None;
+            }
+        } else if self.git_diff_status != Some((file.index, file.worktree)) {
+            self.request_git_diff(relative, self.git_diff_target);
+        }
+    }
+
+    fn request_git_mutation(&mut self, relative: PathBuf, operation: GitIndexMutation) {
+        if self.git_mutation_inflight {
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        self.git_mutation_inflight = true;
+        self.git_mutation_pending = Some((relative.clone(), operation));
+        self.git_mutation_generation = self.git_mutation_generation.wrapping_add(1);
+        let generation = self.git_mutation_generation;
+        if operation == GitIndexMutation::Unstage {
+            tracing::debug!(
+                target: "axiom.git_ui_diag",
+                event = "unstage_request_created",
+                generation,
+                path = %relative.display(),
+            );
+        }
+        self.git_diff_generation = self.git_diff_generation.wrapping_add(1);
+        self.git_diff = None;
+        self.git_diff_loading = false;
+        self.git_diff_results = None;
+        let root = project.root_path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        self.git_mutation_results = Some(receiver);
+        let spawn_result = thread::Builder::new()
+            .name("axiom-git-index-mutation".into())
+            .spawn(move || {
+                if operation == GitIndexMutation::Unstage {
+                    tracing::debug!(
+                        target: "axiom.git_ui_diag",
+                        event = "unstage_worker_started",
+                        generation,
+                        path = %relative.display(),
+                    );
+                }
+                let result = match operation {
+                    GitIndexMutation::Stage => GitRepositoryService::default().stage_file(&root, &relative),
+                    GitIndexMutation::Unstage => GitRepositoryService::default().unstage_file(&root, &relative),
+                }
+                .map_err(|error| format!("{error:?}"));
+                if operation == GitIndexMutation::Unstage {
+                    tracing::debug!(
+                        target: "axiom.git_ui_diag",
+                        event = "unstage_worker_result",
+                        generation,
+                        path = %relative.display(),
+                        result = if result.is_ok() { "ok" } else { "err" },
+                    );
+                }
+                let _ = sender.send((generation, relative, operation, result));
+            });
+        if spawn_result.is_err() {
+            self.git_mutation_inflight = false;
+            self.git_mutation_pending = None;
+            self.git_mutation_results = None;
+            self.git_diff_error = Some("Unable to update Git index".into());
+        }
+    }
+
+    fn poll_git_mutation(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = self.git_mutation_results.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((generation, relative, operation, result)) => {
+                self.git_mutation_results = None;
+                self.git_mutation_inflight = false;
+                self.git_mutation_pending = None;
+                if generation != self.git_mutation_generation {
+                    return;
+                }
+                if let Err(error) = result {
+                    tracing::warn!(operation = ?operation, path = %relative.display(), %error, "Git index mutation failed");
+                    self.git_diff_error = Some(git_mutation_error_message(operation, &error).to_string());
+                    cx.notify();
+                    return;
+                }
+                self.git_diff_error = None;
+                self.git_refresh_generation = self.git_refresh_generation.wrapping_add(1);
+                self.git_refresh_requested = true;
+                if operation == GitIndexMutation::Unstage {
+                    tracing::debug!(
+                        target: "axiom.git_ui_diag",
+                        event = "unstage_refresh_requested",
+                        generation,
+                        path = %relative.display(),
+                    );
+                }
+                self.git_refresh_last_scan = Instant::now() - Duration::from_secs(5);
+                cx.notify();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.git_mutation_results = None;
+                self.git_mutation_inflight = false;
+                self.git_mutation_pending = None;
+                self.git_diff_error = Some("Unable to update Git index".into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn request_git_diff(&mut self, relative: PathBuf, target: GitDiffTarget) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        self.git_diff_generation = self.git_diff_generation.wrapping_add(1);
+        let generation = self.git_diff_generation;
+        tracing::debug!(generation, path = %relative.display(), "git diff request started");
+        self.git_diff_path = Some(relative.clone());
+        self.git_diff_target = target;
+        self.git_diff_status = self
+            .git_state
+            .as_ref()
+            .and_then(|state| state.files.iter().find(|file| file.path == relative))
+            .map(|file| (file.index, file.worktree));
+        self.git_diff = None;
+        self.git_diff_loading = true;
+        self.git_diff_error = None;
+        let root = project.root_path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        self.git_diff_results = Some(receiver);
+        let spawn_result = thread::Builder::new().name("axiom-git-diff".into()).spawn(move || {
+            tracing::debug!(generation, path = %relative.display(), "git diff worker entered");
+            let result = GitRepositoryService
+                .diff_file_with_target(&root, &relative, target)
+                .map_err(|error| format!("{error:?}"));
+            let (hunks, lines) = result
+                .as_ref()
+                .map(|diff| {
+                    (
+                        diff.hunks.len(),
+                        diff.hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>(),
+                    )
+                })
+                .unwrap_or((0, 0));
+            tracing::debug!(
+                target: "axiom.git_ui_diag",
+                generation,
+                path = %relative.display(),
+                ok = result.is_ok(),
+                backend_hunks = hunks,
+                backend_lines = lines,
+                "git diff worker completed"
+            );
+            let _ = sender.send((generation, relative, target, result));
+        });
+        if spawn_result.is_err() {
+            self.git_diff_results = None;
+            self.git_diff_loading = false;
+            self.git_diff_error = Some("Unable to load diff".into());
+        }
+    }
+
+    fn poll_git_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = self.git_diff_results.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((generation, relative, target, result)) => {
+                let (received_hunks, received_lines) = result
+                    .as_ref()
+                    .map(|diff| {
+                        (
+                            diff.hunks.len(),
+                            diff.hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>(),
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                tracing::debug!(
+                    target: "axiom.git_ui_diag",
+                    generation,
+                    path = %relative.display(),
+                    received_hunks,
+                    received_lines,
+                    "git diff result received"
+                );
+                self.git_diff_results = None;
+                if generation != self.git_diff_generation
+                    || self.git_diff_path.as_ref() != Some(&relative)
+                    || self.git_diff_target != target
+                {
+                    return;
+                }
+                self.git_diff_loading = false;
+                match result {
+                    Ok(diff) => {
+                        let ready_hunks = diff.hunks.len();
+                        let ready_lines = diff
+                            .hunks
+                            .iter()
+                            .map(|hunk| hunk.lines.len())
+                            .sum::<usize>();
+                        let display_rows = ready_hunks.saturating_add(ready_lines);
+                        tracing::debug!(
+                            target: "axiom.git_ui_diag",
+                            generation,
+                            path = %relative.display(),
+                            ready_hunks,
+                            ready_lines,
+                            display_rows,
+                            uniform_items = display_rows,
+                            "git diff ready applied"
+                        );
+                        reset_git_diff_scroll(&self.git_diff_scroll);
+                        self.git_diff = Some(diff);
+                    }
+                    Err(error) => {
+                        self.git_diff = None;
+                        self.git_diff_error = Some(format!("Unable to load diff: {error}"));
+                    }
+                }
+                cx.notify();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.git_diff_results = None;
+                self.git_diff_loading = false;
+                self.git_diff_error = Some("Unable to load diff".into());
+                cx.notify();
+            }
+        }
     }
 
     fn poll_project_structure_sync(&mut self, cx: &mut Context<Self>) {
@@ -3246,6 +3965,7 @@ impl WorkspaceView {
                     self.explorer = visible;
                     self.expanded = expanded;
                     self.explorer_structure_snapshot = Some(snapshot);
+                    self.request_git_refresh();
                     cx.notify();
                 }
                 Err(TryRecvError::Empty) => {}
@@ -3291,6 +4011,7 @@ impl WorkspaceView {
             tracing::info!(path = %path.display(), generation, "[PROJECT] open path");
             tracing::info!(name = "load_project_shell", "[PROJECT STEP START]");
         }
+        let git_scan_inflight = self.git_scan_inflight.clone();
         thread::spawn(move || {
             let started = Instant::now();
             let result = (|| {
@@ -3300,7 +4021,8 @@ impl WorkspaceView {
                     .read_directory(&root)
                     .map_err(|error| error.to_string())?;
                 let lsp = LspBridge::start(project.root_path());
-                Ok((project, entries, lsp))
+                let git_state = load_git_state(project.root_path(), &git_scan_inflight).unwrap_or(None);
+                Ok((project, entries, lsp, git_state))
             })();
             if debug_input_enabled() {
                 tracing::info!(
@@ -3334,9 +4056,9 @@ impl WorkspaceView {
             return;
         }
         match result {
-            Ok((project, entries, lsp)) => {
+            Ok((project, entries, lsp, git_state)) => {
                 let started = Instant::now();
-                self.finish_project_load(project, entries, lsp, cx);
+                self.finish_project_load(project, entries, lsp, git_state, cx);
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 if debug_input_enabled() && elapsed_ms > 50 {
                     tracing::warn!(
@@ -3364,6 +4086,7 @@ impl WorkspaceView {
         project: Project,
         entries: Vec<ProjectEntry>,
         lsp: Arc<LspBridge>,
+        git_state: Option<GitRepositoryState>,
         cx: &mut Context<Self>,
     ) {
         self.navigation_back.clear();
@@ -3424,6 +4147,19 @@ impl WorkspaceView {
         self.expanded.clear();
         self.status = "Project opened — indexing...".into();
         self.project = Some(project);
+        self.git_refresh_generation = self.git_refresh_generation.wrapping_add(1);
+        self.git_refresh_last_scan = Instant::now();
+        self.git_refresh_requested = true;
+        self.git_refresh_inflight = false;
+        self.git_refresh_results = None;
+        self.git_state = git_state;
+        self.git_diff_generation = self.git_diff_generation.wrapping_add(1);
+        self.git_diff_path = None;
+        self.git_diff_status = None;
+        self.git_diff = None;
+        self.git_diff_loading = false;
+        self.git_diff_error = None;
+        self.git_diff_results = None;
         self.recent_projects.add(&root, unix_timestamp_now());
         if let Some(path) = &self.recent_path
             && let Err(error) = self.recent_projects.save(path)
@@ -3815,6 +4551,18 @@ impl WorkspaceView {
         self.context_menu_selected = 0;
         self.context_submenu_selected = 0;
         self.project = None;
+        self.git_state = None;
+        self.git_refresh_requested = false;
+        self.version_control_visible = false;
+        self.git_refresh_inflight = false;
+        self.git_refresh_results = None;
+        self.git_diff_generation = self.git_diff_generation.wrapping_add(1);
+        self.git_diff_path = None;
+        self.git_diff_status = None;
+        self.git_diff = None;
+        self.git_diff_loading = false;
+        self.git_diff_error = None;
+        self.git_diff_results = None;
         self.project_index = None;
         self.semantic_engine = None;
         self.lsp = None;
@@ -3976,6 +4724,7 @@ impl WorkspaceView {
         } else {
             format!("Save All failed: {}", errors.join("; ")).into()
         };
+        self.request_git_refresh();
         self.definition_cache.clear();
         cx.notify();
         errors.is_empty()
@@ -5173,37 +5922,6 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    #[allow(dead_code)]
-    fn reload_runtime_stubs_sync(&mut self, cx: &mut Context<Self>) {
-        self.status = "Runtime Stubs: Updating...".into();
-        let provider = RuntimeStubProvider::from_env_or_embedded();
-        if let Some(path) = provider.root() {
-            let _ = fs::create_dir_all(path);
-        }
-        let result = self
-            .runtime_stub_cache_path
-            .as_deref()
-            .map_or_else(|| provider.load(), |cache| provider.load_incremental(cache));
-        match result {
-            Ok((index, report)) => {
-                self.runtime_stubs = RuntimeStubStatus::Loaded {
-                    files: report.files_discovered,
-                    symbols: report.symbols_indexed,
-                };
-                let shared = Arc::new(index);
-                self._runtime_symbols = Some(shared.clone());
-                for tab in &self.tabs {
-                    tab.editor
-                        .update(cx, |editor, _| editor.set_runtime_symbols(shared.clone()));
-                }
-                self.status =
-                    format!("Runtime Stubs: Ready ({} symbols)", report.symbols_indexed).into();
-            }
-            Err(error) => self.status = format!("Runtime Stubs: Error — {error}").into(),
-        }
-        cx.notify();
-    }
-
     fn reload_runtime_stubs(&mut self, cx: &mut Context<Self>) {
         let _ = fs::create_dir_all(&self.runtime_stub_path);
         self.begin_runtime_stub_load(cx, true);
@@ -5333,6 +6051,28 @@ impl WorkspaceView {
             return;
         }
         let key = event.keystroke.key.to_ascii_lowercase();
+        if self.version_control_visible && key == "enter" {
+            if let (Some(relative), Some(project)) =
+                (self.git_diff_path.clone(), self.project.clone())
+            {
+                let can_open = self
+                    .git_state
+                    .as_ref()
+                    .and_then(|state| {
+                        state.files.iter().find(|file| {
+                            file.path == relative
+                                && file.index != GitChangeState::Deleted
+                                && file.worktree != GitChangeState::Deleted
+                        })
+                    })
+                    .is_some();
+                if can_open {
+                    self.open_file(project.root_path().join(relative), window, cx);
+                    window.prevent_default();
+                    return;
+                }
+            }
+        }
         if self.providers_modal_visible
             && key == "tab"
             && matches!(
@@ -5597,6 +6337,7 @@ impl WorkspaceView {
 
     fn toggle_project(&mut self, _: &ToggleProject, _: &mut Window, cx: &mut Context<Self>) {
         self.open_menu = None;
+        self.version_control_visible = false;
         let before = self.project_panel_visible;
         self.project_panel_visible = !self.project_panel_visible;
         if debug_input_enabled() {
@@ -5606,6 +6347,13 @@ impl WorkspaceView {
                 "[PROJECT PANEL]"
             );
         }
+        cx.notify();
+    }
+
+    fn toggle_version_control(&mut self, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        self.project_panel_visible = true;
+        self.version_control_visible = !self.version_control_visible;
         cx.notify();
     }
 
@@ -6092,7 +6840,8 @@ impl WorkspaceView {
                 write,
                 update,
                 delete,
-            ))
+            ).with_symbol_index(root.clone(), self.project_index.clone())
+                .with_semantic_engine(self.semantic_engine.clone()))
         } else {
             None
         };
@@ -7744,67 +8493,6 @@ impl WorkspaceView {
                         ),
                 );
         }
-        if false && self.provider_modal_view == ProviderModalView::AddProvider {
-            return div()
-                .id("providers-modal-overlay")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(t.window_background)
-                .child(
-                    div()
-                        .w(px(520.))
-                        .p_5()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .bg(t.panel_background)
-                        .border_1()
-                        .border_color(t.border)
-                        .rounded(m.border_radius_medium)
-                        .child(div().text_size(px(16.)).child("Add Provider"))
-                        .child(
-                            div()
-                                .p_3()
-                                .border_1()
-                                .border_color(t.border_subtle)
-                                .child("OpenAI")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.configure_provider("OpenAI", cx)
-                                    }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .p_3()
-                                .border_1()
-                                .border_color(t.border_subtle)
-                                .child("Anthropic")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.configure_provider("Anthropic", cx)
-                                    }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_color(t.text_secondary)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.provider_modal_view = ProviderModalView::ProvidersList;
-                                        cx.notify();
-                                    }),
-                                )
-                                .child("Back"),
-                        ),
-                );
-        }
         if matches!(
             self.provider_modal_view,
             ProviderModalView::ConfigureOpenAI | ProviderModalView::ConfigureAnthropic
@@ -9384,6 +10072,7 @@ impl WorkspaceView {
         self.explorer_structure_generation = self.explorer_structure_generation.wrapping_add(1);
         self.explorer_structure_snapshot = None;
         let refresh_generation = self.explorer_refresh_generation;
+        let git_scan_inflight = self.git_scan_inflight.clone();
         let workspace = cx.entity().downgrade();
         self.status = "Refreshing Project Explorer...".into();
         self.explorer_context = None;
@@ -9427,16 +10116,20 @@ impl WorkspaceView {
                     visible.splice(insert_at..insert_at, child_items);
                     valid_expanded.insert(directory);
                 }
-                Ok::<_, String>((visible, valid_expanded))
+                let git_state = load_git_state(&root, &git_scan_inflight);
+                Ok::<_, String>((visible, valid_expanded, git_state))
             })();
             let _ = workspace.update(cx, |this, cx| {
                 if this.explorer_refresh_generation != refresh_generation {
                     return;
                 }
                 match result {
-                    Ok((items, expanded)) => {
+                    Ok((items, expanded, git_state)) => {
                         this.explorer = items;
                         this.expanded = expanded;
+                        if let Ok(git_state) = git_state {
+                            this.git_state = git_state;
+                        }
                         this.status = "Project Explorer refreshed".into();
                     }
                     Err(error) => {
@@ -11198,6 +11891,7 @@ impl WorkspaceView {
                     .hover(move |style| style.bg(t.hover))
                     .on_click(move |_, _, cx| {
                         project_workspace.update(cx, |this, cx| {
+                            this.version_control_visible = false;
                             let before = this.project_panel_visible;
                             this.project_panel_visible = !this.project_panel_visible;
                             if debug_input_enabled() {
@@ -11230,6 +11924,38 @@ impl WorkspaceView {
                         },
                     )),
             )
+            .child({
+                let workspace = workspace.clone();
+                let active = self.version_control_visible;
+                div()
+                    .id("activity-version-control")
+                    .relative()
+                    .w(m.activity_bar_width)
+                    .h(px(36.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(|_, cx| tooltip("Version Control", cx))
+                    .hover(move |style| style.bg(t.hover))
+                    .on_click(move |_, _, cx| {
+                        workspace.update(cx, |this, cx| this.toggle_version_control(cx));
+                    })
+                    .when(active, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .left(px(0.))
+                                .h(px(20.))
+                                .w(px(2.))
+                                .rounded_r(m.border_radius_small)
+                                .bg(t.accent),
+                        )
+                    })
+                    .child(activity_icon(
+                        ActivityIcon::VersionControl,
+                        if active { t.accent } else { t.text_muted },
+                    ))
+            })
             .child(
                 div()
                     .id("activity-search-disabled")
@@ -11563,6 +12289,351 @@ impl WorkspaceView {
     ) {
         self.project_panel_resizing = false;
         cx.notify();
+    }
+
+    fn render_git_diff_view(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = theme();
+        let path = self
+            .git_diff_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Diff".to_owned());
+        let title = match self.git_diff_target {
+            GitDiffTarget::HeadToIndex => format!("{path} — Staged Changes"),
+            GitDiffTarget::IndexToWorktree => format!("{path} — Changes"),
+        };
+        let rows = git_diff_display_rows(self.git_diff.as_ref());
+        let row_count = git_diff_uniform_item_count(self.git_diff.as_ref());
+        div()
+            .id("git-diff-view")
+            .h_full()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .bg(t.editor_background)
+            .child(
+                div()
+                    .h(metrics().panel_header_height)
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(t.border_subtle)
+                    .text_color(t.text_secondary)
+                    .child(title),
+            )
+            .when(self.git_diff_loading, |this| {
+                this.child(div().p_3().text_color(t.text_muted).child("Loading diff…"))
+            })
+            .when_some(self.git_diff_error.clone(), |this, error| {
+                this.child(div().p_3().text_color(t.error).child(error))
+            })
+            .when(self.git_diff.as_ref().is_some_and(|diff| diff.binary), |this| {
+                this.child(div().p_3().text_color(t.text_muted).child("Binary file; content is not rendered"))
+            })
+            .when(self.git_diff.as_ref().is_some_and(|diff| diff.truncated), |this| {
+                this.child(div().p_3().text_color(t.text_muted).child("Diff truncated by safety limits"))
+            })
+            .when(
+                git_diff_show_no_textual_changes(self.git_diff.as_ref(), &rows)
+                    && !self.git_diff_loading
+                    && self.git_diff_error.is_none(),
+                |this| {
+                    this.child(
+                        div()
+                            .p_3()
+                            .text_color(t.text_muted)
+                            .child("No textual changes"),
+                    )
+                },
+            )
+            .when(row_count > 0, |this| {
+                let rows = rows.clone();
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .min_w(px(0.))
+                        .child(
+                            gpui::uniform_list(
+                                "git-diff-lines",
+                                row_count,
+                                cx.processor(move |_, range: std::ops::Range<usize>, _, _| {
+                                    range
+                                        .filter_map(|index| {
+                                            let row = rows.get(index)?.clone();
+                                            let color = if row.hunk_header
+                                                || row.kind == GitDiffLineKind::Context
+                                            {
+                                                t.text_primary
+                                            } else if row.kind == GitDiffLineKind::Addition {
+                                                t.success
+                                            } else {
+                                                t.error
+                                            };
+                                            let text = row.text;
+                                            Some(
+                                                div()
+                                                    .h(px(GIT_DIFF_ROW_HEIGHT_PX))
+                                                    .px_3()
+                                                    .text_size(px(12.))
+                                                    .text_color(color)
+                                                    .child(text),
+                                            )
+                                        })
+                                        .collect()
+                                }),
+                            )
+                            .h_full()
+                            .track_scroll(self.git_diff_scroll.clone()),
+                        ),
+                )
+            })
+    }
+
+    fn render_version_control_grouped(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let rows = self
+            .git_state
+            .as_ref()
+            .map(git_section_rows)
+            .unwrap_or_default();
+        let row_count = rows.len();
+        let total = self
+            .git_state
+            .as_ref()
+            .map(|state| git_staged_indices(state).len() + git_unstaged_indices(state).len())
+            .unwrap_or_default();
+        let branch = self.git_state.as_ref().map(|state| {
+            state.branch.clone().unwrap_or_else(|| "DETACHED".to_owned())
+        });
+        let root = self.project.as_ref().map(|project| project.root_path().to_path_buf());
+        let selected_path = self.git_diff_path.clone();
+        let selected_target = self.git_diff_target;
+        let pending = self.git_mutation_pending.clone();
+        let workspace = cx.entity().clone();
+        div()
+            .id("version-control-sidebar")
+            .w(self.project_panel_width)
+            .min_w(px(180.))
+            .h_full()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .bg(t.sidebar_background)
+            .border_r_1()
+            .border_color(t.border_subtle)
+            .child(
+                div()
+                    .h(m.panel_header_height)
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(m.ui_font_size)
+                    .text_color(t.text_secondary)
+                    .child("VERSION CONTROL")
+                    .child(branch.unwrap_or_else(|| "No repository".into())),
+            )
+            .child(
+                div()
+                    .h(m.toolbar_height)
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .text_color(t.text_primary)
+                    .child(format!("Changes ({total})")),
+            )
+            .child(
+                div()
+                    .id("version-control-scroll")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .min_w(px(0.))
+                    .when(self.git_state.is_none(), |this| {
+                        this.child(div().px_3().py_2().text_color(t.text_muted).child("No Git repository"))
+                    })
+                    .when(self.git_state.is_some() && row_count == 0, |this| {
+                        this.child(div().px_3().py_2().text_color(t.text_muted).child("No changes"))
+                    })
+                    .when(row_count > 0, |this| {
+                        this.child(
+                            gpui::uniform_list(
+                                "version-control-files-grouped",
+                                row_count,
+                                cx.processor(move |this, range: std::ops::Range<usize>, _, _cx| {
+                                    range
+                                        .filter_map(|display_index| {
+                                            let row = *rows.get(display_index)?;
+                                            if let GitSectionRow::Header(section) = row {
+                                                let label = match section {
+                                                    GitSection::Staged => "STAGED CHANGES",
+                                                    GitSection::Changes => "CHANGES",
+                                                };
+                                                if display_index < 2 {
+                                                    tracing::debug!(
+                                                        target: "axiom.git_ui_diag",
+                                                        event = "git_vcs_row_callback",
+                                                        index = display_index,
+                                                        kind = "section_header",
+                                                        callback_reached = true,
+                                                    );
+                                                }
+                                                return Some(
+                                                    div()
+                                                        .id(("git-section-header", display_index))
+                                                        .w_full()
+                                                        .h(px(26.))
+                                                        .px_3()
+                                                        .flex()
+                                                        .items_center()
+                                                        .text_size(px(11.))
+                                                        .text_color(theme().text_secondary)
+                                                        .child(label),
+                                                );
+                                            }
+                                            let GitSectionRow::File { section, file_index } = row else {
+                                                return None;
+                                            };
+                                            let file = this.git_state.as_ref()?.files.get(file_index).cloned()?;
+                                            let relative = file.path.clone();
+                                            let path = root.as_ref().map(|root| root.join(&relative));
+                                            let path_for_open = path.clone();
+                                            let target = match section {
+                                                GitSection::Staged => GitDiffTarget::HeadToIndex,
+                                                GitSection::Changes => GitDiffTarget::IndexToWorktree,
+                                            };
+                                            let operation = match section {
+                                                GitSection::Staged => GitIndexMutation::Unstage,
+                                                GitSection::Changes => GitIndexMutation::Stage,
+                                            };
+                                            let state = match section {
+                                                GitSection::Staged => file.index,
+                                                GitSection::Changes => file.worktree,
+                                            };
+                                            let is_selected = selected_target == target
+                                                && selected_path.as_ref() == Some(&relative);
+                                            let can_open = file.worktree != GitChangeState::Deleted;
+                                            let filename = relative
+                                                .file_name()
+                                                .and_then(|name| name.to_str())
+                                                .unwrap_or("(unknown)")
+                                                .to_owned();
+                                            let parent = relative
+                                                .parent()
+                                                .filter(|parent| !parent.as_os_str().is_empty())
+                                                .map(|parent| parent.display().to_string());
+                                            let pending_row = pending.as_ref() == Some(&(relative.clone(), operation));
+                                            let row_workspace = workspace.clone();
+                                            let action_workspace = workspace.clone();
+                                            let action_relative = relative.clone();
+                                            let action_pending = pending.clone();
+                                            let action_label = match operation {
+                                                GitIndexMutation::Stage => "Stage",
+                                                GitIndexMutation::Unstage => "Unstage",
+                                            };
+                                            if display_index < 2 {
+                                                tracing::debug!(
+                                                    target: "axiom.git_ui_diag",
+                                                    event = "git_vcs_row_callback",
+                                                    index = display_index,
+                                                    kind = "file",
+                                                    callback_reached = true,
+                                                );
+                                            }
+                                            Some(
+                                                div()
+                                                    .id(("git-file-row", display_index))
+                                                    .w_full()
+                                                    .min_h(px(34.))
+                                                    .px_2()
+                                                    .py(px(3.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .text_size(metrics().ui_font_size)
+                                                    .text_color(theme().text_primary)
+                                                    .bg(if is_selected { theme().pressed } else { theme().sidebar_background })
+                                                    .hover(|style| style.bg(theme().hover))
+                                                    .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                                                        row_workspace.update(cx, |this, cx| {
+                                                            if let Some(path) = path_for_open.clone() {
+                                                                this.selected_path = Some(path.clone());
+                                                                this.request_git_diff(relative.clone(), target);
+                                                                if event.click_count >= 2 && can_open {
+                                                                    this.open_file(path, window, cx);
+                                                                }
+                                                            }
+                                                            cx.notify();
+                                                        });
+                                                    })
+                                                    .child(div().w(px(18.)).text_color(theme().accent).child(git_status_marker_for_state(state)))
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(0.))
+                                                            .flex()
+                                                            .flex_col()
+                                                            .overflow_hidden()
+                                                            .child(filename)
+                                                            .when_some(parent, |this, parent| {
+                                                                this.text_size(px(11.)).text_color(theme().text_muted).child(parent)
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id(("git-file-action", display_index))
+                                                            .px_2()
+                                                            .py(px(2.))
+                                                            .text_size(px(11.))
+                                                            .text_color(if pending_row { theme().text_muted } else { theme().accent })
+                                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                                cx.stop_propagation();
+                                                            })
+                                                            .on_click(move |_, _, cx| {
+                                                                if action_pending.is_none() {
+                                                                    if operation == GitIndexMutation::Unstage {
+                                                                        tracing::debug!(
+                                                                            target: "axiom.git_ui_diag",
+                                                                            event = "unstage_click",
+                                                                            path = %action_relative.display(),
+                                                                        );
+                                                                    }
+                                                                    action_workspace.update(cx, |this, cx| {
+                                                                        this.request_git_mutation(action_relative.clone(), operation);
+                                                                        cx.notify();
+                                                                    });
+                                                                }
+                                                            })
+                                                            .child(if pending_row { "…" } else { action_label }),
+                                                    ),
+                                            )
+                                        })
+                                        .collect()
+                                }),
+                            )
+                            .h_full()
+                            .min_h(px(0.))
+                            .track_scroll(self.version_control_scroll.clone()),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("version-control-resize-divider")
+                    .absolute()
+                    .right(px(-2.))
+                    .top(px(0.))
+                    .bottom(px(0.))
+                    .w(px(4.))
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .hover(|style| style.bg(theme().accent))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::project_panel_resize_start)),
+            )
     }
 
     fn render_explorer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -13398,6 +14469,8 @@ impl Render for WorkspaceView {
             .active
             .and_then(|index| self.tabs.get(index))
             .map(|tab| tab.editor.clone());
+        let diff_visible = self.version_control_visible
+            && (self.git_diff_path.is_some() || self.git_diff_loading);
         if self.focus_active_editor {
             if let Some(editor) = active_editor.as_ref() {
                 let handle = editor.read(cx).focus_handle(cx);
@@ -13465,6 +14538,12 @@ impl Render for WorkspaceView {
             Some(ServerStatus::NotFound) | None => "Not Found",
         };
         let runtime_stub_status = self.runtime_stubs.label();
+        let git_status = self.git_state.as_ref().map(|state| {
+            state
+                .branch
+                .clone()
+                .unwrap_or_else(|| "DETACHED".to_owned())
+        });
         let definition_loading_message = format!(
             "Loading definition{}",
             ".".repeat(usize::from(self.definition_loading_tick))
@@ -13573,7 +14652,10 @@ impl Render for WorkspaceView {
                         }
                     })
                     .child(self.render_activity_bar(cx))
-                    .when(self.project_panel_visible, |this| {
+                    .when(self.project_panel_visible && self.version_control_visible, |this| {
+                        this.child(self.render_version_control_grouped(cx))
+                    })
+                    .when(self.project_panel_visible && !self.version_control_visible, |this| {
                         this.child(self.render_explorer(cx))
                     })
                     .child(
@@ -13586,6 +14668,12 @@ impl Render for WorkspaceView {
                         .child(
                             div()
                                 .flex_1()
+                                .min_h(px(0.))
+                                .when(diff_visible, |this| {
+                                    this.child(self.render_git_diff_view(cx))
+                                })
+                                .when(!diff_visible, |this| {
+                                    this
                                 .when_some(active_editor, |this, editor| this.child(editor))
                                 .when(self.active.is_none(), |this| {
                                     this.flex()
@@ -13594,6 +14682,7 @@ impl Render for WorkspaceView {
                                         .bg(t.editor_background)
                                         .text_color(t.text_muted)
                                         .child("Selecione um arquivo no Project Explorer")
+                                })
                                 }),
                         )
                         .when(self.terminal_visible, |this| {
@@ -13616,7 +14705,8 @@ impl Render for WorkspaceView {
                     .text_color(t.text_secondary)
                     .child(self.status.clone())
                     .child(format!(
-                        "PHP  ·  Intelephense: {lsp_status}  ·  Runtime Stubs: {runtime_stub_status}  ·  UTF-8"
+                        "{}PHP  ·  Intelephense: {lsp_status}  ·  Runtime Stubs: {runtime_stub_status}  ·  UTF-8",
+                        git_status.map(|branch| format!("Git: {branch}  ·  ")).unwrap_or_default()
                     )),
             ))
             .when(self.open_menu.is_some(), |this| {

@@ -12,6 +12,7 @@ members = [
     "crates/axiom-web",
     "crates/axiom-index",
     "crates/axiom-agent",
+    "crates/axiom-git",
 ]
 
 [workspace.package]
@@ -34,6 +35,7 @@ lsp-types = "0.97"
 url = "2.5"
 portable-pty = "0.9"
 vt100 = "0.16.2"
+gix = { version = "0.88.0", default-features = false, features = ["status", "sha1", "parallel"] }
 
 [profile.release]
 opt-level = 3

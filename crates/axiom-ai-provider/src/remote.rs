@@ -856,8 +856,13 @@ fn message_role(role: &crate::ChatRole) -> &'static str {
     }
 }
 
-fn gemini_schema(value: &serde_json::Value) -> Result<serde_json::Value, ProviderError> {
+fn gemini_schema(
+    value: &serde_json::Value,
+    schema_path: &str,
+    tool_name: &str,
+) -> Result<serde_json::Value, ProviderError> {
     let object = value.as_object().ok_or_else(|| {
+        log_tool_schema_invalid(tool_name, schema_path, "schema must be an object");
         ProviderError::invalid_response(InvalidResponseCategory::ToolSchemaInvalid)
     })?;
     let mut normalized = serde_json::Map::new();
@@ -865,6 +870,7 @@ fn gemini_schema(value: &serde_json::Value) -> Result<serde_json::Value, Provide
         match key.as_str() {
             "type" => {
                 let Some(schema_type) = value.as_str() else {
+                    log_tool_schema_invalid(tool_name, schema_path, "type must be a string");
                     return Err(ProviderError::invalid_response(
                         InvalidResponseCategory::ToolSchemaInvalid,
                     ));
@@ -873,6 +879,7 @@ fn gemini_schema(value: &serde_json::Value) -> Result<serde_json::Value, Provide
                     schema_type,
                     "object" | "string" | "integer" | "number" | "boolean" | "array"
                 ) {
+                    log_tool_schema_invalid(tool_name, schema_path, "unsupported type");
                     return Err(ProviderError::invalid_response(
                         InvalidResponseCategory::ToolSchemaInvalid,
                     ));
@@ -881,6 +888,7 @@ fn gemini_schema(value: &serde_json::Value) -> Result<serde_json::Value, Provide
             }
             "description" | "format" => {
                 if !value.is_string() {
+                    log_tool_schema_invalid(tool_name, &format!("{schema_path}.{key}"), "value must be a string");
                     return Err(ProviderError::invalid_response(
                         InvalidResponseCategory::ToolSchemaInvalid,
                     ));
@@ -889,6 +897,7 @@ fn gemini_schema(value: &serde_json::Value) -> Result<serde_json::Value, Provide
             }
             "nullable" => {
                 if !value.is_boolean() {
+                    log_tool_schema_invalid(tool_name, &format!("{schema_path}.{key}"), "value must be a boolean");
                     return Err(ProviderError::invalid_response(
                         InvalidResponseCategory::ToolSchemaInvalid,
                     ));
@@ -897,13 +906,21 @@ fn gemini_schema(value: &serde_json::Value) -> Result<serde_json::Value, Provide
             }
             "properties" => {
                 let Some(properties) = value.as_object() else {
+                    log_tool_schema_invalid(tool_name, &format!("{schema_path}.properties"), "value must be an object");
                     return Err(ProviderError::invalid_response(
                         InvalidResponseCategory::ToolSchemaInvalid,
                     ));
                 };
                 let mut normalized_properties = serde_json::Map::new();
                 for (name, schema) in properties {
-                    normalized_properties.insert(name.clone(), gemini_schema(schema)?);
+                    normalized_properties.insert(
+                        name.clone(),
+                        gemini_schema(
+                            schema,
+                            &format!("{schema_path}.properties.{name}"),
+                            tool_name,
+                        )?,
+                    );
                 }
                 normalized.insert(
                     key.clone(),
@@ -912,11 +929,13 @@ fn gemini_schema(value: &serde_json::Value) -> Result<serde_json::Value, Provide
             }
             "required" => {
                 let Some(required) = value.as_array() else {
+                    log_tool_schema_invalid(tool_name, &format!("{schema_path}.required"), "value must be an array");
                     return Err(ProviderError::invalid_response(
                         InvalidResponseCategory::ToolSchemaInvalid,
                     ));
                 };
                 if !required.iter().all(serde_json::Value::is_string) {
+                    log_tool_schema_invalid(tool_name, &format!("{schema_path}.required"), "items must be strings");
                     return Err(ProviderError::invalid_response(
                         InvalidResponseCategory::ToolSchemaInvalid,
                     ));
@@ -924,10 +943,14 @@ fn gemini_schema(value: &serde_json::Value) -> Result<serde_json::Value, Provide
                 normalized.insert(key.clone(), value.clone());
             }
             "items" => {
-                normalized.insert(key.clone(), gemini_schema(value)?);
+                normalized.insert(
+                    key.clone(),
+                    gemini_schema(value, &format!("{schema_path}.items"), tool_name)?,
+                );
             }
             "enum" => {
                 if !value.is_array() {
+                    log_tool_schema_invalid(tool_name, &format!("{schema_path}.enum"), "value must be an array");
                     return Err(ProviderError::invalid_response(
                         InvalidResponseCategory::ToolSchemaInvalid,
                     ));
@@ -935,9 +958,15 @@ fn gemini_schema(value: &serde_json::Value) -> Result<serde_json::Value, Provide
                 normalized.insert(key.clone(), value.clone());
             }
             "additionalProperties" if value == &serde_json::Value::Bool(false) => {}
+            "minimum" | "maximum" => {}
             // OpenAPI-only fields such as additionalProperties are not part
             // of Gemini's function declaration Schema subset.
             _ => {
+                log_tool_schema_invalid(
+                    tool_name,
+                    &format!("{schema_path}.{key}"),
+                    "unsupported Gemini schema keyword",
+                );
                 return Err(ProviderError::invalid_response(
                     InvalidResponseCategory::ToolSchemaInvalid,
                 ));
@@ -945,11 +974,23 @@ fn gemini_schema(value: &serde_json::Value) -> Result<serde_json::Value, Provide
         }
     }
     if !normalized.contains_key("type") {
+        log_tool_schema_invalid(tool_name, schema_path, "missing type");
         return Err(ProviderError::invalid_response(
             InvalidResponseCategory::ToolSchemaInvalid,
         ));
     }
     Ok(serde_json::Value::Object(normalized))
+}
+
+fn log_tool_schema_invalid(tool_name: &str, schema_path: &str, reason: &str) {
+    tracing::warn!(
+        target: "axiom.ai_diag",
+        event = "tool_schema_invalid",
+        tool = tool_name,
+        schema_path,
+        reason,
+        "Gemini tool schema rejected locally"
+    );
 }
 
 fn gemini_function_declaration(
@@ -958,7 +999,7 @@ fn gemini_function_declaration(
     Ok(serde_json::json!({
         "name": tool.name,
         "description": tool.description,
-        "parameters": gemini_schema(&tool.parameters)?,
+        "parameters": gemini_schema(&tool.parameters, "parameters", &tool.name)?,
     }))
 }
 
@@ -1313,6 +1354,220 @@ fn parse_google_chat_content(
 mod tests {
     use super::*;
     use crate::{ProviderChatMessage, ProviderToolDefinition};
+
+    fn agent_tool_definition_set(include_find_symbol: bool) -> Vec<ProviderToolDefinition> {
+        let mut definitions = vec![
+            ProviderToolDefinition {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "start_line": {"type": "integer"},
+                        "end_line": {"type": "integer"}
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ProviderToolDefinition {
+                name: "list_directory".into(),
+                description: "List a directory".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+            },
+            ProviderToolDefinition {
+                name: "find_files".into(),
+                description: "Find files".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"pattern": {"type": "string"}},
+                    "required": ["pattern"],
+                    "additionalProperties": false
+                }),
+            },
+            ProviderToolDefinition {
+                name: "search_text".into(),
+                description: "Search text".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "path": {"type": "string"},
+                        "file_pattern": {"type": "string"}
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            },
+            ProviderToolDefinition {
+                name: "write_file".into(),
+                description: "Create a file".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                }),
+            },
+            ProviderToolDefinition {
+                name: "update_file".into(),
+                description: "Update a file".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "expected_fingerprint": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "expected_fingerprint", "content"],
+                    "additionalProperties": false
+                }),
+            },
+            ProviderToolDefinition {
+                name: "delete_file".into(),
+                description: "Delete a file".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "expected_fingerprint": {"type": "string"}
+                    },
+                    "required": ["path", "expected_fingerprint"],
+                    "additionalProperties": false
+                }),
+            },
+        ];
+        if include_find_symbol {
+            definitions.insert(
+                4,
+                ProviderToolDefinition {
+                    name: "find_symbol".into(),
+                    description: "Find symbols".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "kind": {"type": "string"},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+                        },
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }),
+                },
+            );
+            definitions.insert(
+                5,
+                ProviderToolDefinition {
+                    name: "find_references".into(),
+                    description: "Find semantic references".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "kind": {"type": "string"},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+                        },
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }),
+                },
+            );
+        }
+        definitions
+    }
+
+    fn google_declarations(
+        definitions: Vec<ProviderToolDefinition>,
+    ) -> Result<Vec<serde_json::Value>, ProviderError> {
+        let request = ProviderChatRequest {
+            model: "gemini-3.5-flash-lite".into(),
+            messages: Vec::new(),
+            think: None,
+            thinking_level: None,
+            tools: Some(definitions),
+        };
+        let (_, body) = chat_request(
+            ProviderProtocol::Google,
+            "https://generativelanguage.googleapis.com",
+            &request,
+        )?;
+        Ok(body["tools"][0]["functionDeclarations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    #[test]
+    fn google_agent_declarations_without_find_symbol_are_valid() {
+        let declarations = google_declarations(agent_tool_definition_set(false)).unwrap();
+        assert_eq!(declarations.len(), 7);
+        assert!(!declarations.iter().any(|declaration| declaration["name"] == "find_symbol"));
+    }
+
+    #[test]
+    fn google_find_symbol_declaration_is_valid_and_normalized() {
+        let find_symbol = agent_tool_definition_set(true)
+            .into_iter()
+            .find(|definition| definition.name == "find_symbol")
+            .unwrap();
+        let declaration = gemini_function_declaration(&find_symbol).unwrap();
+        assert_eq!(declaration["name"], "find_symbol");
+        assert_eq!(
+            declaration["parameters"]["properties"]["limit"]["type"],
+            "integer"
+        );
+        assert!(declaration["parameters"]["properties"]["limit"]
+            .get("minimum")
+            .is_none());
+        assert!(declaration["parameters"]["properties"]["limit"]
+            .get("maximum")
+            .is_none());
+    }
+
+    #[test]
+    fn complete_nine_tool_gemini_agent_set_is_valid() {
+        let declarations = google_declarations(agent_tool_definition_set(true)).unwrap();
+        assert_eq!(declarations.len(), 9);
+        let names = declarations
+            .iter()
+            .map(|declaration| declaration["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "read_file",
+                "list_directory",
+                "find_files",
+                "search_text",
+                "find_symbol",
+                "find_references",
+                "write_file",
+                "update_file",
+                "delete_file"
+            ]
+        );
+        assert!(declarations.iter().all(|declaration| {
+            declaration["parameters"].get("additionalProperties").is_none()
+        }));
+        assert!(declarations
+            .iter()
+            .find(|declaration| declaration["name"] == "find_symbol")
+            .is_some_and(|declaration| {
+                declaration["parameters"]["properties"]["limit"]
+                    .get("minimum")
+                    .is_none()
+                    && declaration["parameters"]["properties"]["limit"]
+                        .get("maximum")
+                        .is_none()
+            }));
+    }
 
     #[test]
     fn google_maps_read_tools_to_function_declarations_and_responses() {

@@ -10,7 +10,9 @@ use serde::Deserialize;
 
 pub mod project_delete;
 pub mod project_directory;
+pub mod project_find_files;
 pub mod project_read;
+pub mod project_search;
 pub mod project_update;
 pub mod project_write;
 

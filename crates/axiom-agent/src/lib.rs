@@ -618,7 +618,9 @@ impl ToolPolicy for ReadOnlyToolPolicy {
         call: &axiom_ai_provider::ProviderToolCall,
     ) -> ToolPolicyDecision {
         match call.name.as_str() {
-            "read_file" | "list_directory" | "fetch_url" => ToolPolicyDecision::Allow,
+            "read_file" | "list_directory" | "find_files" | "find_symbol" | "find_references" | "fetch_url" | "search_text" => {
+                ToolPolicyDecision::Allow
+            }
             "write_file" | "update_file" | "delete_file" => ToolPolicyDecision::RequireApproval {
                 reason: "file mutation requires approval".into(),
             },
@@ -2835,7 +2837,7 @@ mod tests {
             arguments: serde_json::json!({}),
         };
 
-        for name in ["read_file", "list_directory", "fetch_url"] {
+        for name in ["read_file", "list_directory", "find_symbol", "fetch_url"] {
             assert_eq!(
                 policy.decide(
                     ToolPolicyContext {

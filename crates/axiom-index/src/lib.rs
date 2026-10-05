@@ -66,6 +66,10 @@ pub struct ProjectSymbol {
     pub kind: ProjectSymbolKind,
     pub file: PathBuf,
     pub range: std::ops::Range<usize>,
+    /// 0-based line/column of the indexed identifier. This remains available
+    /// when a symbol is restored from the metadata cache without file text.
+    #[serde(default)]
+    pub name_position: Option<(usize, usize)>,
     pub namespace: String,
     pub visibility: Visibility,
     pub modifiers: Vec<String>,
@@ -107,7 +111,7 @@ pub struct ProjectSymbolIndex {
 
 // Bumped when symbol FQNs/owner indexing change so stale caches cannot keep
 // invalid member names (for example the old `\\Base::save` global FQN).
-const PROJECT_CACHE_SCHEMA: u32 = 4;
+const PROJECT_CACHE_SCHEMA: u32 = 5;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ProjectCacheFile {
@@ -506,6 +510,7 @@ impl VendorSymbolIndex {
                             kind,
                             file: path.clone(),
                             range: start..start + name.len(),
+                            name_position: None,
                             namespace: namespace.clone(),
                             visibility: Visibility::Unknown,
                             modifiers: vec!["composer".into()],
@@ -540,6 +545,7 @@ impl VendorSymbolIndex {
                         kind: ProjectSymbolKind::Method,
                         file: path.clone(),
                         range: start..start + name.len(),
+                        name_position: None,
                         namespace: namespace.clone(),
                         visibility: Visibility::Public,
                         modifiers: if trimmed[..pos].contains("static") {
@@ -583,6 +589,7 @@ impl VendorSymbolIndex {
                             kind: ProjectSymbolKind::Property,
                             file: path.clone(),
                             range: start..start + name.len(),
+                            name_position: None,
                             namespace: namespace.clone(),
                             visibility: if trimmed.contains("private") {
                                 Visibility::Private
@@ -1334,6 +1341,25 @@ impl ProjectSymbolIndex {
             .collect()
     }
 
+    /// Returns the 1-based source location for an indexed symbol without
+    /// rereading or reparsing its file.
+    pub fn symbol_location(&self, symbol: &ProjectSymbol) -> Option<(usize, usize)> {
+        if let Some((line, column)) = symbol.name_position {
+            return Some((line + 1, column + 1));
+        }
+        let text = self.files.get(&symbol.file)?;
+        let offset = symbol.range.start.min(text.len());
+        let prefix = &text[..offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix
+            .rsplit_once('\n')
+            .map_or(prefix, |(_, line)| line)
+            .chars()
+            .count()
+            + 1;
+        Some((line, column))
+    }
+
     fn rebuild_prefix_index(&mut self) {
         self.prefix_names.clear();
         self.prefix_fqns.clear();
@@ -1576,6 +1602,10 @@ fn walk(
                 kind,
                 file: file.to_path_buf(),
                 range: name_node.byte_range(),
+                name_position: Some((
+                    name_node.start_position().row,
+                    name_node.start_position().column,
+                )),
                 namespace: namespace.to_owned(),
                 visibility,
                 modifiers,
@@ -1792,6 +1822,35 @@ mod tests {
 
         index.remove_file(&path);
         assert!(index.search_prefix("Beta").is_empty());
+    }
+
+    #[test]
+    fn cached_symbols_preserve_identifier_locations_without_source_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("App/Services.php");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "<?php\ndeclare(strict_types=1);\n\nnamespace App;\n\nclass ProductService {}\n\nclass RedisCache implements Cache\n{\n    public function get(string $key): mixed {}\n}\n",
+        )
+        .unwrap();
+        let cache = dir.path().join("symbols.json");
+        let mut initial = ProjectSymbolIndex::new();
+        initial.index_project_cached(dir.path(), &cache).unwrap();
+
+        let mut restored = ProjectSymbolIndex::new();
+        restored.index_project_cached(dir.path(), &cache).unwrap();
+        assert!(restored.files.values().all(|text| text.is_empty()));
+
+        let product = restored.search_prefix("ProductService")[0];
+        let redis = restored.search_prefix("RedisCache")[0];
+        let get = restored.search_prefix("get")[0];
+        assert_eq!(product.name_position, Some((5, 6)));
+        assert_eq!(redis.name_position, Some((7, 6)));
+        assert_eq!(get.name_position, Some((9, 20)));
+        assert_eq!(restored.symbol_location(product), Some((6, 7)));
+        assert_eq!(restored.symbol_location(redis), Some((8, 7)));
+        assert_eq!(restored.symbol_location(get), Some((10, 21)));
     }
 
     #[test]

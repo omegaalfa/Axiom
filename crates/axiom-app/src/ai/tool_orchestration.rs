@@ -64,6 +64,70 @@ pub(crate) fn list_directory_definition() -> ProviderToolDefinition {
     }
 }
 
+pub(crate) fn search_text_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: "search_text".into(),
+        description: "Search literal UTF-8 text inside the current workspace; results are bounded and never return whole files.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "path": { "type": "string" },
+                "file_pattern": { "type": "string" }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn find_files_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: "find_files".into(),
+        description: "Find workspace-relative regular files by glob-style path or name pattern. Results are bounded and contain paths only.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": { "pattern": { "type": "string" } },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn find_symbol_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: "find_symbol".into(),
+        description: "Find symbols from the existing indexed project intelligence by exact or prefix name. Results are bounded and contain locations only.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "kind": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn find_references_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: "find_references".into(),
+        description: "Find bounded semantic references to an indexed symbol. Results contain workspace-relative locations only.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "kind": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 pub(crate) fn chat_tool_definitions() -> Vec<ProviderToolDefinition> {
     vec![
         read_file_definition(),
@@ -610,6 +674,19 @@ mod tests {
         assert!(!names.iter().any(|name| {
             name == "write_file" || name == "update_file" || name == "delete_file"
         }));
+    }
+
+    #[test]
+    fn find_symbol_provider_contract_keeps_optional_kind_and_bounded_limit() {
+        let definition = find_symbol_definition();
+        assert_eq!(definition.name, "find_symbol");
+        assert_eq!(definition.parameters["required"], json!(["query"]));
+        assert_eq!(definition.parameters["properties"]["query"]["type"], "string");
+        assert_eq!(definition.parameters["properties"]["kind"]["type"], "string");
+        assert_eq!(definition.parameters["properties"]["limit"]["type"], "integer");
+        assert_eq!(definition.parameters["properties"]["limit"]["minimum"], 1);
+        assert_eq!(definition.parameters["properties"]["limit"]["maximum"], 100);
+        assert_eq!(definition.parameters["additionalProperties"], false);
     }
 
     #[test]

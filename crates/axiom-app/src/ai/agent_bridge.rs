@@ -1,8 +1,9 @@
 //! Production adapters and the small UI-facing bridge for one Agent run.
 
 use super::tool_orchestration::{
-    delete_file_definition, fetch_url_definition, list_directory_definition, read_file_definition,
-    update_file_definition, write_file_definition,
+    delete_file_definition, fetch_url_definition, find_files_definition,
+    find_references_definition, find_symbol_definition, list_directory_definition, read_file_definition,
+    search_text_definition, update_file_definition, write_file_definition,
 };
 use super::tools::{ToolArguments, ToolError, ToolName, ToolRegistry, ToolRequest};
 use axiom_agent::{
@@ -238,6 +239,10 @@ pub(crate) fn production_tool_definitions() -> Vec<axiom_ai_provider::ProviderTo
     vec![
         read_file_definition(),
         list_directory_definition(),
+        find_files_definition(),
+        search_text_definition(),
+        find_symbol_definition(),
+        find_references_definition(),
         fetch_url_definition(),
         write_file_definition(),
         update_file_definition(),
@@ -249,6 +254,10 @@ pub(crate) fn gemini_agent_tool_definitions() -> Vec<axiom_ai_provider::Provider
     vec![
         read_file_definition(),
         list_directory_definition(),
+        find_files_definition(),
+        search_text_definition(),
+        find_symbol_definition(),
+        find_references_definition(),
         write_file_definition(),
         update_file_definition(),
         delete_file_definition(),
@@ -417,6 +426,90 @@ fn provider_call_to_request(call: &ProviderToolCall) -> Result<ToolRequest, Stri
             Ok(ToolRequest {
                 name: ToolName::ListDirectory,
                 arguments: ToolArguments::ListDirectory { path: path.into() },
+            })
+        }
+        "search_text" => {
+            let query = object
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "query must be a string".to_owned())?;
+            let optional_string = |name: &str| -> Result<Option<String>, String> {
+                match object.get(name) {
+                    None => Ok(None),
+                    Some(value) => value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("{name} must be a string"))
+                        .map(Some),
+                }
+            };
+            Ok(ToolRequest {
+                name: ToolName::SearchText,
+                arguments: ToolArguments::SearchText {
+                    query: query.into(),
+                    path: optional_string("path")?,
+                    file_pattern: optional_string("file_pattern")?,
+                },
+            })
+        }
+        "find_files" => {
+            let pattern = object
+                .get("pattern")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "pattern must be a string".to_owned())?;
+            Ok(ToolRequest {
+                name: ToolName::FindFiles,
+                arguments: ToolArguments::FindFiles { pattern: pattern.into() },
+            })
+        }
+        "find_symbol" => {
+            let query = object
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "query must be a string".to_owned())?;
+            let kind = match object.get("kind") {
+                None => None,
+                Some(value) => Some(value.as_str().ok_or_else(|| "kind must be a string".to_owned())?.to_owned()),
+            };
+            let limit = match object.get("limit") {
+                None => None,
+                Some(value) => Some(value.as_u64()
+                    .filter(|limit| *limit > 0)
+                    .and_then(|limit| usize::try_from(limit).ok())
+                    .ok_or_else(|| "limit must be a positive integer".to_owned())?),
+            };
+            Ok(ToolRequest {
+                name: ToolName::FindSymbol,
+                arguments: ToolArguments::FindSymbol {
+                    query: query.into(),
+                    kind,
+                    limit,
+                },
+            })
+        }
+        "find_references" => {
+            let query = object
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "query must be a string".to_owned())?;
+            let kind = match object.get("kind") {
+                None => None,
+                Some(value) => Some(value.as_str().ok_or_else(|| "kind must be a string".to_owned())?.to_owned()),
+            };
+            let limit = match object.get("limit") {
+                None => None,
+                Some(value) => Some(value.as_u64()
+                    .filter(|limit| *limit > 0)
+                    .and_then(|limit| usize::try_from(limit).ok())
+                    .ok_or_else(|| "limit must be a positive integer".to_owned())?),
+            };
+            Ok(ToolRequest {
+                name: ToolName::FindReferences,
+                arguments: ToolArguments::FindReferences {
+                    query: query.into(),
+                    kind,
+                    limit,
+                },
             })
         }
         "fetch_url" => {
@@ -797,6 +890,9 @@ mod tests {
             vec![
                 "read_file",
                 "list_directory",
+                "find_files",
+                "search_text",
+                "find_symbol",
                 "fetch_url",
                 "write_file",
                 "update_file",
@@ -816,6 +912,10 @@ mod tests {
             vec![
                 "read_file",
                 "list_directory",
+                "find_files",
+                "search_text",
+                "find_symbol",
+                "find_references",
                 "write_file",
                 "update_file",
                 "delete_file"

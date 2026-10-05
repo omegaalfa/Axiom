@@ -8,6 +8,7 @@ const PROJECT_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 const SEARCH_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 4.5 4.5"/></svg>"#;
 const PROBLEMS_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 21 20H3z"/><path d="M12 9v5"/><path d="M12 17.2v.1"/></svg>"#;
 const TERMINAL_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6 6 6-6 6"/><path d="M13 18h7"/></svg>"#;
+const VERSION_CONTROL_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.5 6h3a4 4 0 0 1 4 4v5.5"/><path d="M8.5 18H11a4 4 0 0 0 4-4v-1"/></svg>"#;
 const ARROW_DOWN_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v16"/><path d="m6 14 6 6 6-6"/></svg>"#;
 const STOP_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>"#;
 const USER_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c.8-3.4 3.2-5 7-5s6.2 1.6 7 5"/></svg>"#;
@@ -22,6 +23,7 @@ impl AssetSource for AxiomAssets {
             "icons/activity-search.svg" => SEARCH_ICON,
             "icons/activity-problems.svg" => PROBLEMS_ICON,
             "icons/activity-terminal.svg" => TERMINAL_ICON,
+            "icons/activity-version-control.svg" => VERSION_CONTROL_ICON,
             "icons/arrow-down.svg" => ARROW_DOWN_ICON,
             "icons/stop.svg" => STOP_ICON,
             "icons/user.svg" => USER_ICON,
@@ -38,6 +40,7 @@ impl AssetSource for AxiomAssets {
                 "activity-search.svg".into(),
                 "activity-problems.svg".into(),
                 "activity-terminal.svg".into(),
+                "activity-version-control.svg".into(),
                 "arrow-down.svg".into(),
                 "stop.svg".into(),
                 "user.svg".into(),
@@ -83,6 +86,7 @@ pub enum ActivityIcon {
     Search,
     Problems,
     Terminal,
+    VersionControl,
 }
 
 pub fn activity_icon(icon: ActivityIcon, color: Rgba) -> Svg {
@@ -91,6 +95,7 @@ pub fn activity_icon(icon: ActivityIcon, color: Rgba) -> Svg {
         ActivityIcon::Search => "icons/activity-search.svg",
         ActivityIcon::Problems => "icons/activity-problems.svg",
         ActivityIcon::Terminal => "icons/activity-terminal.svg",
+        ActivityIcon::VersionControl => "icons/activity-version-control.svg",
     };
     svg().path(path).size(metrics().icon_size).text_color(color)
 }
