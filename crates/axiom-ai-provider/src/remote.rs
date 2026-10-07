@@ -43,6 +43,13 @@ pub fn provider_protocol(kind: &ProviderKind) -> ProviderProtocol {
     }
 }
 
+/// Whether this adapter currently transports provider-neutral tools as native
+/// declarations and parses native calls. This is protocol capability, not a
+/// model-name allowlist.
+pub const fn supports_native_tools(protocol: ProviderProtocol) -> bool {
+    matches!(protocol, ProviderProtocol::Ollama | ProviderProtocol::Google)
+}
+
 pub fn test_provider_connection(
     request: &ProviderConnectionRequest,
 ) -> Result<Vec<ProviderModel>, ProviderError> {
@@ -176,6 +183,7 @@ fn error_category(error: &ProviderError) -> &'static str {
         ProviderError::RateLimited => "rate_limited",
         ProviderError::TemporarilyUnavailable => "temporarily_unavailable",
         ProviderError::Unavailable(_) => "unavailable",
+        ProviderError::RequestRejected(_) => "request_rejected",
     }
 }
 
@@ -197,7 +205,10 @@ fn sanitize_google_error_text(value: &serde_json::Value) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
-fn log_google_http_error(http_status: u16, response: &mut reqwest::blocking::Response) {
+fn log_google_http_error(
+    http_status: u16,
+    response: &mut reqwest::blocking::Response,
+) -> Option<String> {
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -239,6 +250,7 @@ fn log_google_http_error(http_status: u16, response: &mut reqwest::blocking::Res
         provider_error_reason = reason.as_deref().unwrap_or("<unknown>"),
         "Google provider request failed",
     );
+    message
 }
 
 struct RemoteProvider;
@@ -359,7 +371,7 @@ impl RemoteProvider {
         F: FnMut(usize) -> Result<(u16, T), ProviderError>,
         C: FnMut() -> bool,
     {
-        Self::with_http_retry_diagnostics(protocol, send, is_cancelled, |_, _| {})
+        Self::with_http_retry_diagnostics(protocol, send, is_cancelled, |_, _| None)
     }
 
     fn with_http_retry_diagnostics<T, F, C, D>(
@@ -371,7 +383,7 @@ impl RemoteProvider {
     where
         F: FnMut(usize) -> Result<(u16, T), ProviderError>,
         C: FnMut() -> bool,
-        D: FnMut(u16, &mut T),
+        D: FnMut(u16, &mut T) -> Option<ProviderError>,
     {
         for attempt in 1..=3 {
             if is_cancelled() {
@@ -393,7 +405,9 @@ impl RemoteProvider {
             if (200..300).contains(&status) {
                 return Ok(Some(response));
             }
-            on_error(status, &mut response);
+            if let Some(error) = on_error(status, &mut response) {
+                return Err(error);
+            }
             if retry && !Self::wait_for_retry(Self::retry_delay(attempt), &mut is_cancelled) {
                 return Ok(None);
             }
@@ -529,8 +543,12 @@ impl RemoteProvider {
             &mut is_cancelled,
             |status, response| {
                 if protocol == ProviderProtocol::Google {
-                    log_google_http_error(status, response);
+                    let message = log_google_http_error(status, response);
+                    if status == 400 {
+                        return message.map(ProviderError::RequestRejected);
+                    }
                 }
+                None
             },
         )?
         else {
@@ -1014,6 +1032,21 @@ fn chat_request(
                 .model
                 .strip_prefix("models/")
                 .unwrap_or(&request.model);
+            let google_kind = crate::ProviderKind::Other("Google".to_owned());
+            let capability = crate::thinking_capability(&google_kind, model, None);
+            let thinking_level = if request.think == Some(true) {
+                if let Some(level) = request.thinking_level
+                    && !capability.supports_level(level)
+                {
+                    return Err(ProviderError::RequestRejected(format!(
+                        "thinking level {} is not supported for this model",
+                        level.label()
+                    )));
+                }
+                request.thinking_level
+            } else {
+                None
+            };
             let mut url = RemoteProvider::google_endpoint(
                 base_url,
                 &format!("models/{model}:streamGenerateContent"),
@@ -1113,7 +1146,7 @@ fn chat_request(
                     "functionDeclarations": declarations
                 }]);
             }
-            if let Some(level) = request.thinking_level {
+            if let Some(level) = thinking_level {
                 let mut thinking_config = serde_json::json!({
                     "thinkingLevel": level.as_google_str(),
                 });
@@ -1484,10 +1517,11 @@ mod tests {
     }
 
     fn google_declarations(
+        model: &str,
         definitions: Vec<ProviderToolDefinition>,
     ) -> Result<Vec<serde_json::Value>, ProviderError> {
         let request = ProviderChatRequest {
-            model: "gemini-3.5-flash-lite".into(),
+            model: model.into(),
             messages: Vec::new(),
             think: None,
             thinking_level: None,
@@ -1506,7 +1540,7 @@ mod tests {
 
     #[test]
     fn google_agent_declarations_without_find_symbol_are_valid() {
-        let declarations = google_declarations(agent_tool_definition_set(false)).unwrap();
+        let declarations = google_declarations("gemini-3.5-flash-lite", agent_tool_definition_set(false)).unwrap();
         assert_eq!(declarations.len(), 7);
         assert!(!declarations.iter().any(|declaration| declaration["name"] == "find_symbol"));
     }
@@ -1533,7 +1567,7 @@ mod tests {
 
     #[test]
     fn complete_nine_tool_gemini_agent_set_is_valid() {
-        let declarations = google_declarations(agent_tool_definition_set(true)).unwrap();
+        let declarations = google_declarations("gemini-3.5-flash-lite", agent_tool_definition_set(true)).unwrap();
         assert_eq!(declarations.len(), 9);
         let names = declarations
             .iter()
@@ -1567,6 +1601,15 @@ mod tests {
                         .get("maximum")
                         .is_none()
             }));
+    }
+
+    #[test]
+    fn switching_between_google_models_does_not_remove_agent_tools() {
+        let definitions = agent_tool_definition_set(true);
+        for model in ["gemini-3.5-flash-lite", "gemini-3.7-flash"] {
+            let declarations = google_declarations(model, definitions.clone()).unwrap();
+            assert_eq!(declarations.len(), 9, "tools disappeared for {model}");
+        }
     }
 
     #[test]
@@ -2088,19 +2131,71 @@ mod tests {
                     &request,
                 )
                 .unwrap();
-                assert_eq!(
-                    body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-                    expected
-                );
-                assert_eq!(
-                    body["generationConfig"]["thinkingConfig"]
-                        .get("includeThoughts")
-                        .is_some(),
-                    include_thoughts
-                );
+                if think == Some(true) {
+                    assert_eq!(
+                        body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                        expected
+                    );
+                    assert_eq!(
+                        body["generationConfig"]["thinkingConfig"]
+                            .get("includeThoughts")
+                            .is_some(),
+                        include_thoughts
+                    );
+                } else {
+                    assert!(body.get("generationConfig").is_none());
+                    assert!(body.to_string().find("MINIMAL").is_none());
+                }
                 assert!(body.to_string().find("thinkingBudget").is_none());
             }
         }
+    }
+
+    #[test]
+    fn gemini_37_serializes_low_medium_and_high_only() {
+        for (level, expected) in [
+            (crate::ThinkingLevel::Low, "LOW"),
+            (crate::ThinkingLevel::Medium, "MEDIUM"),
+            (crate::ThinkingLevel::High, "HIGH"),
+        ] {
+            let request = ProviderChatRequest {
+                model: "gemini-3.7-flash".into(),
+                messages: Vec::new(),
+                think: Some(true),
+                thinking_level: Some(level),
+                tools: None,
+            };
+            let (_, body) = chat_request(
+                ProviderProtocol::Google,
+                "https://generativelanguage.googleapis.com/v1beta",
+                &request,
+            )
+            .unwrap();
+            assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], expected);
+            assert_eq!(body["generationConfig"]["thinkingConfig"]["includeThoughts"], true);
+        }
+    }
+
+    #[test]
+    fn gemini_37_minimal_is_rejected_before_http() {
+        let request = ProviderChatRequest {
+            model: "gemini-3.7-flash".into(),
+            messages: Vec::new(),
+            think: Some(true),
+            thinking_level: Some(crate::ThinkingLevel::Minimal),
+            tools: None,
+        };
+        assert_eq!(
+            chat_request(
+                ProviderProtocol::Google,
+                "https://generativelanguage.googleapis.com/v1beta",
+                &request,
+            )
+            .unwrap_err(),
+            ProviderError::RequestRejected(
+                "thinking level Minimal is not supported for this model".into()
+            )
+        );
     }
 
     #[test]

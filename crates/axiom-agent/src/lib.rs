@@ -672,7 +672,7 @@ impl AgentExecutionError {
         match self {
             Self::Provider(error) => AgentFailureDiagnostic {
                 kind: AgentFailureKind::Provider,
-                message: error.user_message().into(),
+                message: error.detailed_user_message(),
             },
             Self::ProviderProtocol(message) => AgentFailureDiagnostic {
                 kind: AgentFailureKind::Provider,
@@ -885,6 +885,34 @@ pub struct AgentExecutor<'a, P, T, Policy = ReadOnlyToolPolicy> {
     pending: Option<ExecutionContinuation>,
 }
 
+/// Permanent, provider-neutral behavioral contract for every Agent run.
+/// Dynamic task context and visible conversation messages remain caller-owned.
+pub fn agent_system_instruction() -> &'static str {
+    "You are Axiom Agent with access to native project tools. When a request depends on the current project, workspace, code, architecture, files, symbols, references, implementation, or project-specific errors, proactively inspect the workspace with the available tools before answering. Do not ask the user to paste project information that the tools can access. Prefer deterministic/native project tools and use the minimum number of tool calls necessary. For broad requests, perform a bounded initial inspection of the top-level structure, relevant manifests, and a small representative set of files or symbols, then summarize; do not recursively inspect the entire repository. Read-only requests must remain read-only: do not mutate merely to analyze, explain, or review. General conversation and questions independent of the workspace should not trigger unnecessary project inspection. The current deterministic project state is authoritative over model assumptions."
+}
+
+fn with_agent_system_instruction(
+    mut request: axiom_ai_provider::ProviderChatRequest,
+) -> axiom_ai_provider::ProviderChatRequest {
+    let already_present = request.messages.iter().any(|message| {
+        message.role == axiom_ai_provider::ChatRole::System
+            && message.content == agent_system_instruction()
+    });
+    if !already_present {
+        request.messages.insert(
+            0,
+            axiom_ai_provider::ProviderChatMessage {
+                role: axiom_ai_provider::ChatRole::System,
+                content: agent_system_instruction().into(),
+                reasoning: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+        );
+    }
+    request
+}
+
 impl<'a, P, T> AgentExecutor<'a, P, T, ReadOnlyToolPolicy>
 where
     P: ProviderExecutor,
@@ -924,7 +952,7 @@ where
         self.drive(
             run,
             ExecutionContinuation {
-                request,
+                request: with_agent_system_instruction(request),
                 content: String::new(),
                 thinking: String::new(),
                 calls: Vec::new(),
@@ -1476,6 +1504,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn normal_agent_request_receives_one_central_system_instruction() {
+        let request = with_agent_system_instruction(request());
+        let request = with_agent_system_instruction(request);
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|message| message.content == agent_system_instruction())
+                .count(),
+            1
+        );
+        assert_eq!(request.messages[0].role, ChatRole::System);
+        assert_eq!(request.messages[1].role, ChatRole::User);
+        assert_eq!(request.messages[1].content, "hello");
+    }
+
+    #[test]
+    fn finalization_keeps_permanent_instruction_and_adds_temporary_context() {
+        let request = with_agent_system_instruction(request());
+        let projected = finalization_request(&request);
+        assert!(projected.tools.is_none());
+        assert_eq!(projected.messages[0].role, ChatRole::System);
+        assert!(projected.messages[0].content.contains("Tool results/context"));
+        assert!(projected
+            .messages
+            .iter()
+            .any(|message| message.content == agent_system_instruction()));
+    }
+
     fn message(role: ChatRole, content: &str) -> ProviderChatMessage {
         ProviderChatMessage {
             role,
@@ -1975,14 +2033,14 @@ mod tests {
         assert_eq!(result.content, "done");
         assert_eq!(provider.calls, 2);
         assert_eq!(tools.calls, vec!["read_file"]);
-        assert_eq!(result.messages().len(), 3);
-        assert_eq!(result.messages()[1].role, ChatRole::Assistant);
+        assert_eq!(result.messages().len(), 4);
+        assert_eq!(result.messages()[2].role, ChatRole::Assistant);
         assert_eq!(
-            result.messages()[1].reasoning.as_deref(),
+            result.messages()[2].reasoning.as_deref(),
             Some("opaque-signature")
         );
-        assert_eq!(result.messages()[2].role, ChatRole::Tool);
-        assert_eq!(result.messages()[2].content, "contents");
+        assert_eq!(result.messages()[3].role, ChatRole::Tool);
+        assert_eq!(result.messages()[3].content, "contents");
         assert!(matches!(events[2], AgentEvent::ToolRequested { .. }));
         assert!(matches!(events[3], AgentEvent::ToolStarted { .. }));
         assert!(matches!(
@@ -2045,22 +2103,22 @@ mod tests {
                 if delta.contains("reasoning")
         )));
         assert_eq!(
-            provider.requests[1].messages[1].reasoning.as_deref(),
+            provider.requests[1].messages[2].reasoning.as_deref(),
             Some("reasoning-a")
         );
         assert_eq!(
-            provider.requests[1].messages[1].tool_calls[0].id.as_deref(),
+            provider.requests[1].messages[2].tool_calls[0].id.as_deref(),
             Some("call-1")
         );
         assert_eq!(
-            result.messages()[1].reasoning.as_deref(),
+            result.messages()[2].reasoning.as_deref(),
             Some("reasoning-a")
         );
         assert_eq!(
-            result.messages()[3].reasoning.as_deref(),
+            result.messages()[4].reasoning.as_deref(),
             Some("reasoning-b")
         );
-        assert_eq!(result.messages()[1].content, "");
+        assert_eq!(result.messages()[2].content, "");
         assert!(provider.requests[2].tools.is_none());
         assert!(
             provider.requests[2]
@@ -2126,15 +2184,15 @@ mod tests {
                 if delta.contains("reasoning")
         )));
         assert_eq!(
-            provider.requests[1].messages[1].reasoning.as_deref(),
+            provider.requests[1].messages[2].reasoning.as_deref(),
             Some("reasoning-a")
         );
         assert_eq!(
-            provider.requests[2].messages[1].reasoning.as_deref(),
+            provider.requests[2].messages[2].reasoning.as_deref(),
             Some("reasoning-a")
         );
         assert_eq!(
-            provider.requests[2].messages[3].reasoning.as_deref(),
+            provider.requests[2].messages[4].reasoning.as_deref(),
             Some("reasoning-b")
         );
         assert_eq!(
@@ -2207,11 +2265,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            result_a.messages()[1].reasoning.as_deref(),
+            result_a.messages()[2].reasoning.as_deref(),
             Some("run-a reasoning")
         );
         assert_eq!(
-            result_b.messages()[1].reasoning.as_deref(),
+            result_b.messages()[2].reasoning.as_deref(),
             Some("run-b reasoning")
         );
         assert!(
@@ -2261,8 +2319,8 @@ mod tests {
             .execute(&mut run, request(), &mut |event| events.push(event))
             .unwrap();
         assert_eq!(tools.calls, vec!["read_file", "read_file"]);
-        assert_eq!(result.messages()[2].content, "A");
-        assert_eq!(result.messages()[3].content, "B");
+        assert_eq!(result.messages()[3].content, "A");
+        assert_eq!(result.messages()[4].content, "B");
         assert_eq!(run.usage().tool_calls, 2);
         assert!(matches!(events[2], AgentEvent::ToolRequested { .. }));
         assert!(matches!(events[7], AgentEvent::ToolCompleted { .. }));
@@ -2469,15 +2527,15 @@ mod tests {
         assert_eq!(tools.calls, vec!["fetch_url"]);
         assert_eq!(provider.calls, 3);
         assert_eq!(
-            provider.requests[1].messages[1].reasoning.as_deref(),
+            provider.requests[1].messages[2].reasoning.as_deref(),
             Some("approval reasoning")
         );
         assert_eq!(
-            provider.requests[1].messages[1].tool_calls[0].id.as_deref(),
+            provider.requests[1].messages[2].tool_calls[0].id.as_deref(),
             Some("approval-1")
         );
         assert_eq!(
-            result.messages()[3].reasoning.as_deref(),
+            result.messages()[4].reasoning.as_deref(),
             Some("continuation reasoning")
         );
         assert_eq!(run.usage().provider_turns, 3);
@@ -2573,11 +2631,11 @@ mod tests {
                 && message.content.contains("denied by approval decision")
         }));
         assert_eq!(
-            provider.requests[1].messages[1].reasoning.as_deref(),
+            provider.requests[1].messages[2].reasoning.as_deref(),
             Some("deny reasoning")
         );
         assert_eq!(
-            result.messages()[3].reasoning.as_deref(),
+            result.messages()[4].reasoning.as_deref(),
             Some("continuation reasoning")
         );
         assert!(provider.requests[2].tools.is_none());
@@ -3092,7 +3150,7 @@ mod tests {
                 .iter()
                 .map(|message| message.role.clone())
                 .collect::<Vec<_>>(),
-            vec![ChatRole::System, ChatRole::User, ChatRole::User]
+            vec![ChatRole::System, ChatRole::System, ChatRole::User, ChatRole::User]
         );
         let context = &provider.requests[4].messages[0].content;
         assert_eq!(occurrence_count(context, "[tool result call-0]"), 1);
@@ -3257,7 +3315,7 @@ mod tests {
                 .iter()
                 .map(|message| message.role.clone())
                 .collect::<Vec<_>>(),
-            vec![ChatRole::System, ChatRole::User, ChatRole::User]
+            vec![ChatRole::System, ChatRole::System, ChatRole::User, ChatRole::User]
         );
         assert_eq!(
             provider.requests[1]

@@ -9,7 +9,8 @@ use std::{
 mod remote;
 
 pub use remote::{
-    ProviderProtocol, provider_chat_stream_with_cancel, provider_protocol, test_provider_connection,
+    ProviderProtocol, provider_chat_stream_with_cancel, provider_protocol,
+    supports_native_tools, test_provider_connection,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -146,7 +147,7 @@ pub fn thinking_capability(
     let is_google =
         matches!(provider, ProviderKind::Other(name) if name == "Google" || name == "Gemini");
     let normalized_model = model.strip_prefix("models/").unwrap_or(model);
-    if is_google && normalized_model.starts_with("gemini-3.") {
+    if is_google && normalized_model.starts_with("gemini-3.5-flash-lite") {
         return ThinkingCapability {
             supported: true,
             levels: vec![
@@ -158,12 +159,24 @@ pub fn thinking_capability(
             default_level: Some(ThinkingLevel::Minimal),
         };
     }
+    if is_google && normalized_model.starts_with("gemini-3.7-flash") {
+        return ThinkingCapability {
+            supported: true,
+            levels: vec![
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+            ],
+            default_level: Some(ThinkingLevel::Medium),
+        };
+    }
     ThinkingCapability {
         supported: is_google && metadata.is_some_and(ModelMetadata::supports_thinking),
         levels: Vec::new(),
         default_level: None,
     }
 }
+
 impl ModelMetadata {
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|value| value == capability)
@@ -610,6 +623,7 @@ pub enum ProviderError {
     RateLimited,
     TemporarilyUnavailable,
     Unavailable(String),
+    RequestRejected(String),
 }
 
 impl ProviderError {
@@ -697,6 +711,14 @@ impl ProviderError {
             Self::RateLimited => "Provider rate limited",
             Self::TemporarilyUnavailable => "Provider temporarily unavailable",
             Self::Unavailable(_) => "Provider unavailable",
+            Self::RequestRejected(_) => "Provider rejected the request",
+        }
+    }
+
+    pub fn detailed_user_message(&self) -> String {
+        match self {
+            Self::RequestRejected(message) => format!("Provider rejected the request: {message}"),
+            _ => self.user_message().to_owned(),
         }
     }
 }
@@ -874,6 +896,7 @@ impl OllamaProvider {
                         ProviderError::RateLimited => "rate_limited",
                         ProviderError::TemporarilyUnavailable => "temporarily_unavailable",
                         ProviderError::Unavailable(_) => "unavailable",
+                        ProviderError::RequestRejected(_) => "request_rejected",
                         ProviderError::InvalidResponse(_) => "invalid_response",
                     },
                     "[AI-DIAG]"
@@ -1310,6 +1333,20 @@ mod tests {
         assert_eq!(capability.levels.len(), 4);
         assert!(capability.supports_level(ThinkingLevel::High));
     }
+
+    #[test]
+    fn gemini_37_thinking_capability_excludes_minimal() {
+        let capability = thinking_capability(
+            &ProviderKind::Other("Google".into()),
+            "gemini-3.7-flash",
+            None,
+        );
+        assert!(capability.supported);
+        assert_eq!(capability.levels, vec![ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High]);
+        assert_eq!(capability.default_level, Some(ThinkingLevel::Medium));
+        assert!(!capability.supports_level(ThinkingLevel::Minimal));
+    }
+
 
     #[test]
     fn provider_reasoning_is_optional_and_stays_on_provider_message() {

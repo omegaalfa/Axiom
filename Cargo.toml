@@ -37,6 +37,9 @@ portable-pty = "0.9"
 vt100 = "0.16.2"
 gix = { version = "0.88.0", default-features = false, features = ["status", "sha1", "parallel"] }
 
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -22,6 +22,20 @@ pub struct GitRepositoryState {
     pub detached: bool,
     pub files: Vec<GitFileStatus>,
     pub remotes: Vec<GitRemote>,
+    pub identity: GitIdentity,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitIdentity {
+    pub name: Option<String>,
+    pub email: Option<String>,
+}
+
+impl GitIdentity {
+    pub fn is_configured(&self) -> bool {
+        self.name.as_deref().is_some_and(|value| !value.trim().is_empty())
+            && self.email.as_deref().is_some_and(|value| !value.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +147,7 @@ impl GitRepositoryService {
         let head = head.id().map(|id| id.to_string());
         let files = status(&repo)?;
         let remotes = remotes(&repo);
+        let identity = local_identity(&repo);
         Ok(GitRepositoryState {
             repository_root: repo
                 .common_dir()
@@ -145,7 +160,48 @@ impl GitRepositoryService {
             detached,
             files,
             remotes,
+            identity,
         })
+    }
+
+    pub fn read_identity(&self, workspace: impl AsRef<Path>) -> Result<GitIdentity, GitError> {
+        let repo = discover_repository(workspace.as_ref())?;
+        Ok(local_identity(&repo))
+    }
+
+    pub fn write_identity(
+        &self,
+        workspace: impl AsRef<Path>,
+        name: impl AsRef<str>,
+        email: impl AsRef<str>,
+    ) -> Result<GitIdentity, GitError> {
+        let name = name.as_ref().trim();
+        let email = email.as_ref().trim();
+        if name.is_empty() {
+            return Err(GitError::RepositoryError("Git identity name is required".into()));
+        }
+        if email.is_empty() {
+            return Err(GitError::RepositoryError("Git identity email is required".into()));
+        }
+        let mut repo = discover_repository(workspace.as_ref())?;
+        let config_path = repo
+            .config_path(gix::config::Source::Local)
+            .map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        let mut config = repo
+            .config_file_mut(config_path)
+            .map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        config
+            .set_raw_value("user.name", name)
+            .map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        config
+            .set_raw_value("user.email", email)
+            .map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        config
+            .commit()
+            .map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        repo.reload()
+            .map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        Ok(local_identity(&repo))
     }
 
     pub fn diff_file(
@@ -335,6 +391,79 @@ impl GitRepositoryService {
         result
     }
 
+    pub fn commit(
+        &self,
+        workspace: impl AsRef<Path>,
+        message: impl AsRef<str>,
+    ) -> Result<GitCommitResult, GitError> {
+        let message = message.as_ref().trim();
+        if message.is_empty() {
+            return Err(GitError::RepositoryError("Commit message is required".into()));
+        }
+        let repo = discover_repository(workspace.as_ref())?;
+        let mutation_lock = index_mutation_lock(&repo);
+        let _guard = mutation_lock.lock().map_err(|_| {
+            GitError::RepositoryError("index mutation lock poisoned".into())
+        })?;
+        let head = repo
+            .head()
+            .map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        let branch = head
+            .referent_name()
+            .ok_or_else(|| GitError::RepositoryError("detached HEAD is not supported".into()))?
+            .to_string();
+        let parents = head.id().map(|id| id.detach()).into_iter().collect::<Vec<_>>();
+        let files = status(&repo)?;
+        if !files.iter().any(|file| file.index != GitChangeState::Unmodified) {
+            return Err(GitError::RepositoryError("No staged changes".into()));
+        }
+        let index = mutable_index(&repo)?;
+        let mut editor = repo
+            .empty_tree()
+            .edit()
+            .map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        for (path, id, kind) in index.entries_with_paths_by_filter_map(|path, entry| {
+            Some((
+                path.to_owned(),
+                entry.id,
+                gix::object::tree::EntryKind::from(entry.mode.to_tree_entry_mode()?),
+            ))
+        })
+        .map(|(_, value)| value)
+        {
+            editor
+                .upsert(path.as_bstr(), kind, id)
+                .map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        }
+        let tree = editor
+            .write()
+            .map_err(|error| GitError::RepositoryError(error.to_string()))?
+            .detach();
+        let commit = repo
+            .commit("HEAD", message, tree, parents)
+            .map_err(|error| {
+                let text = error.to_string();
+                if text.to_ascii_lowercase().contains("identity") {
+                    GitError::RepositoryError("Git user.name/user.email not configured".into())
+                } else if text.to_ascii_lowercase().contains("lock")
+                    || text.to_ascii_lowercase().contains("changed")
+                {
+                    GitError::RepositoryError("Repository changed externally".into())
+                } else {
+                    GitError::RepositoryError(text)
+                }
+            })?;
+        Ok(GitCommitResult {
+            oid: commit.to_string(),
+            branch,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCommitResult {
+    pub oid: String,
+    pub branch: String,
 }
 
 fn discover_repository(workspace: &Path) -> Result<gix::Repository, GitError> {
@@ -345,6 +474,21 @@ fn discover_repository(workspace: &Path) -> Result<gix::Repository, GitError> {
             GitError::RepositoryError(error.to_string())
         }
     })
+}
+
+fn local_identity(repo: &gix::Repository) -> GitIdentity {
+    let config = repo.config_snapshot();
+    let is_local = |metadata: &gix::config::file::Metadata| {
+        metadata.source == gix::config::Source::Local
+    };
+    GitIdentity {
+        name: config
+            .string_filter("user.name", is_local)
+            .map(|value| value.to_string()),
+        email: config
+            .string_filter("user.email", is_local)
+            .map(|value| value.to_string()),
+    }
 }
 
 fn repository_relative_path(path: &Path) -> Result<PathBuf, GitError> {
@@ -728,6 +872,20 @@ mod tests {
         let (dir, repo) = initialized_repo();
         fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
         commit_entries(&repo, &[("tracked.txt", b"one\n")]);
+        let head = fs::read_to_string(dir.path().join(".git/HEAD")).unwrap();
+        fs::create_dir_all(dir.path().join(".git/refs/heads")).unwrap();
+        fs::write(
+            dir.path().join(".git/refs/heads/main"),
+            head.trim().as_bytes(),
+        )
+        .unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(".git/config"))
+            .unwrap()
+            .write_all(b"\n[user]\n\tname = Axiom Test\n\temail = axiom@example.test\n")
+            .unwrap();
         add_index_entry(&repo, b"tracked.txt", b"one\n");
         dir
     }
@@ -900,6 +1058,38 @@ mod tests {
     }
 
     #[test]
+    fn reads_and_writes_repository_local_identity() {
+        let (dir, _) = initialized_repo();
+        let service = GitRepositoryService;
+
+        assert!(!service.read_identity(dir.path()).unwrap().is_configured());
+        let identity = service
+            .write_identity(dir.path(), "Axiom User", "axiom@example.test")
+            .unwrap();
+
+        assert_eq!(identity.name.as_deref(), Some("Axiom User"));
+        assert_eq!(identity.email.as_deref(), Some("axiom@example.test"));
+        assert_eq!(service.read_identity(dir.path()).unwrap(), identity);
+        let config = fs::read_to_string(dir.path().join(".git/config")).unwrap();
+        assert!(config.contains("name = Axiom User"));
+        assert!(config.contains("email = axiom@example.test"));
+    }
+
+    #[test]
+    fn rejects_empty_repository_local_identity_fields() {
+        let (dir, _) = initialized_repo();
+        let service = GitRepositoryService;
+        assert_eq!(
+            service.write_identity(dir.path(), "", "user@example.test"),
+            Err(GitError::RepositoryError("Git identity name is required".into()))
+        );
+        assert_eq!(
+            service.write_identity(dir.path(), "Axiom User", " "),
+            Err(GitError::RepositoryError("Git identity email is required".into()))
+        );
+    }
+
+    #[test]
     fn stage_changes_only_the_index_for_modified_and_untracked_files() {
         let dir = committed_tracked_repo();
         fs::write(dir.path().join("tracked.txt"), "two\n").unwrap();
@@ -992,6 +1182,83 @@ mod tests {
         assert_eq!(file.index, GitChangeState::Deleted);
         assert_eq!(file.worktree, GitChangeState::Unmodified);
         assert!(!dir.path().join("tracked.txt").exists());
+    }
+
+    #[test]
+    fn commit_creates_a_commit_from_the_staged_index_only() {
+        let dir = committed_tracked_repo();
+        fs::write(dir.path().join("tracked.txt"), "two\n").unwrap();
+        let service = GitRepositoryService;
+        service.stage_file(dir.path(), "tracked.txt").unwrap();
+        fs::write(dir.path().join("tracked.txt"), "three\n").unwrap();
+
+        let result = service.commit(dir.path(), "Update tracked file").unwrap();
+
+        assert_eq!(result.branch, "refs/heads/main");
+        assert_eq!(head_bytes(&gix::open(dir.path()).unwrap(), Path::new("tracked.txt")).unwrap(), Some(b"two\n".to_vec()));
+        let file = service
+            .load(dir.path())
+            .unwrap()
+            .files
+            .into_iter()
+            .find(|file| file.path == Path::new("tracked.txt"))
+            .unwrap();
+        assert_eq!(file.index, GitChangeState::Unmodified);
+        assert_eq!(file.worktree, GitChangeState::Modified);
+    }
+
+    #[test]
+    fn commit_handles_staged_addition_and_deletion() {
+        let dir = committed_tracked_repo();
+        fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+        fs::remove_file(dir.path().join("tracked.txt")).unwrap();
+        let service = GitRepositoryService;
+        service.stage_file(dir.path(), "new.txt").unwrap();
+        service.stage_file(dir.path(), "tracked.txt").unwrap();
+
+        service.commit(dir.path(), "Add and remove files").unwrap();
+
+        let repo = gix::open(dir.path()).unwrap();
+        assert_eq!(head_bytes(&repo, Path::new("new.txt")).unwrap(), Some(b"new\n".to_vec()));
+        assert_eq!(head_bytes(&repo, Path::new("tracked.txt")).unwrap(), None);
+    }
+
+    #[test]
+    fn commit_requires_staged_changes_and_a_message() {
+        let dir = committed_tracked_repo();
+        let service = GitRepositoryService;
+        assert_eq!(
+            service.commit(dir.path(), "").unwrap_err(),
+            GitError::RepositoryError("Commit message is required".into())
+        );
+        assert_eq!(
+            service.commit(dir.path(), "Nothing staged").unwrap_err(),
+            GitError::RepositoryError("No staged changes".into())
+        );
+    }
+
+    #[test]
+    fn commit_rejects_detached_head_and_preserves_index() {
+        let dir = committed_tracked_repo();
+        fs::write(dir.path().join("tracked.txt"), "two\n").unwrap();
+        let service = GitRepositoryService;
+        service.stage_file(dir.path(), "tracked.txt").unwrap();
+        let repo = gix::open(dir.path()).unwrap();
+        let head = repo.head().unwrap().id().unwrap().detach();
+        fs::write(dir.path().join(".git/HEAD"), format!("{head}\n")).unwrap();
+
+        assert_eq!(
+            service.commit(dir.path(), "Detached").unwrap_err(),
+            GitError::RepositoryError("detached HEAD is not supported".into())
+        );
+        let file = service
+            .load(dir.path())
+            .unwrap()
+            .files
+            .into_iter()
+            .find(|file| file.path == Path::new("tracked.txt"))
+            .unwrap();
+        assert_eq!(file.index, GitChangeState::Modified);
     }
 
     #[test]

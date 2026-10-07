@@ -26,7 +26,7 @@ pub(crate) enum ToolRoundTripError {
 
 pub(crate) fn user_message(error: &ToolRoundTripError) -> String {
     match error {
-        ToolRoundTripError::Provider(error) => error.user_message().to_owned(),
+        ToolRoundTripError::Provider(error) => error.detailed_user_message(),
         ToolRoundTripError::Cancelled => "Generation cancelled".into(),
         ToolRoundTripError::Tool(_) => "Tool request failed".into(),
         ToolRoundTripError::ToolRoundLimit => "Tool round limit reached".into(),

@@ -434,6 +434,7 @@ mod git_changes_tests {
                 file(GitChangeState::Added, GitChangeState::Unmodified),
             ],
             remotes: Vec::new(),
+            identity: Default::default(),
         };
         assert_eq!(git_staged_indices(&state).len(), 1);
     }
@@ -452,6 +453,7 @@ mod git_changes_tests {
                 file(GitChangeState::Unmodified, GitChangeState::Untracked),
             ],
             remotes: Vec::new(),
+            identity: Default::default(),
         };
         assert_eq!(git_staged_indices(&state), vec![0, 1]);
         assert_eq!(git_unstaged_indices(&state), vec![0, 2]);
@@ -476,6 +478,7 @@ mod git_changes_tests {
             detached: false,
             files,
             remotes: Vec::new(),
+            identity: Default::default(),
         };
         let rows = git_section_rows(&state);
         assert_eq!(git_unstaged_indices(&state).len(), 64);
@@ -1039,6 +1042,9 @@ enum ActiveTextInput {
     ProviderCatalogSearch,
     ModalInput,
     AiHistoryRename,
+    GitCommitMessage,
+    GitIdentityName,
+    GitIdentityEmail,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1608,6 +1614,7 @@ fn provider_error_message(error: &ProviderError) -> &'static str {
         ProviderError::InvalidResponse(_) => "Invalid provider response",
         ProviderError::RateLimited => "Provider rate limited",
         ProviderError::TemporarilyUnavailable => "Provider temporarily unavailable",
+        ProviderError::RequestRejected(_) => "Provider rejected the request",
         ProviderError::Unavailable(message) if message == "model unavailable" => {
             "Model unavailable"
         }
@@ -1660,6 +1667,7 @@ type ExplorerStructureResult = (u64, Result<Vec<ProjectEntry>, String>);
 type GitRefreshResult = (u64, Result<Option<GitRepositoryState>, String>);
 type GitDiffResult = (u64, PathBuf, GitDiffTarget, Result<GitFileDiff, String>);
 type GitMutationResult = (u64, PathBuf, GitIndexMutation, Result<(), String>);
+type GitCommitUiResult = (u64, Result<axiom_git::GitCommitResult, String>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum GitIndexMutation {
@@ -1778,7 +1786,22 @@ fn git_mutation_error_message(operation: GitIndexMutation, detail: &str) -> Shar
     }
     match operation {
         GitIndexMutation::Stage => "Unable to stage file".into(),
-        GitIndexMutation::Unstage => "Unable to unstage file".into(),
+    GitIndexMutation::Unstage => "Unable to unstage file".into(),
+    }
+}
+
+fn commit_error_message(detail: &str) -> &'static str {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("message is required") {
+        "Commit message is required"
+    } else if detail.contains("no staged changes") {
+        "No staged changes"
+    } else if detail.contains("user.name/user.email") || detail.contains("identity") {
+        "Git user.name/user.email not configured"
+    } else if detail.contains("externally") || detail.contains("changed") || detail.contains("lock") {
+        "Repository changed externally"
+    } else {
+        "Unable to create commit"
     }
 }
 
@@ -1931,6 +1954,9 @@ pub struct WorkspaceView {
     provider_api_key: crate::ui::input_line::SingleLineInputState,
     provider_base_url: crate::ui::input_line::SingleLineInputState,
     provider_model_input: crate::ui::input_line::SingleLineInputState,
+    git_commit_message: crate::ui::input_line::SingleLineInputState,
+    git_identity_name: crate::ui::input_line::SingleLineInputState,
+    git_identity_email: crate::ui::input_line::SingleLineInputState,
     provider_base_url_active: bool,
     active_text_input: ActiveTextInput,
     configured_providers: Vec<(String, String)>,
@@ -2004,6 +2030,15 @@ pub struct WorkspaceView {
     git_mutation_inflight: bool,
     git_mutation_pending: Option<(PathBuf, GitIndexMutation)>,
     git_mutation_results: Option<Receiver<GitMutationResult>>,
+    git_mutation_started_at: Option<Instant>,
+    git_stage_refresh_started_at: Option<Instant>,
+    git_commit_generation: u64,
+    git_commit_inflight: bool,
+    git_commit_results: Option<Receiver<GitCommitUiResult>>,
+    git_identity_generation: u64,
+    git_identity_save_inflight: bool,
+    git_identity_results: Option<Receiver<(u64, Result<axiom_git::GitIdentity, String>)>>,
+    git_commit_error: Option<String>,
     explorer_structure_snapshot: Option<Vec<ProjectEntry>>,
     explorer_structure_generation: u64,
     explorer_structure_last_scan: Instant,
@@ -3068,6 +3103,18 @@ impl WorkspaceView {
                 focus: Some(cx.focus_handle()),
                 ..Default::default()
             },
+            git_commit_message: crate::ui::input_line::SingleLineInputState {
+                focus: Some(cx.focus_handle()),
+                ..Default::default()
+            },
+            git_identity_name: crate::ui::input_line::SingleLineInputState {
+                focus: Some(cx.focus_handle()),
+                ..Default::default()
+            },
+            git_identity_email: crate::ui::input_line::SingleLineInputState {
+                focus: Some(cx.focus_handle()),
+                ..Default::default()
+            },
             provider_base_url_active: false,
             active_text_input: ActiveTextInput::None,
             configured_providers: ui_settings.configured_providers.clone(),
@@ -3163,6 +3210,15 @@ impl WorkspaceView {
             git_mutation_inflight: false,
             git_mutation_pending: None,
             git_mutation_results: None,
+            git_mutation_started_at: None,
+            git_stage_refresh_started_at: None,
+            git_commit_generation: 0,
+            git_commit_inflight: false,
+            git_commit_results: None,
+            git_identity_generation: 0,
+            git_identity_save_inflight: false,
+            git_identity_results: None,
+            git_commit_error: None,
             explorer_structure_snapshot: None,
             explorer_structure_generation: 0,
             explorer_structure_last_scan: Instant::now(),
@@ -3243,7 +3299,10 @@ impl WorkspaceView {
                                 ActiveTextInput::AiComposer
                                     | ActiveTextInput::ProviderBaseUrl
                                     | ActiveTextInput::ProviderApiKey
-                                    | ActiveTextInput::ProviderModel
+                                | ActiveTextInput::ProviderModel
+                                | ActiveTextInput::GitCommitMessage
+                                | ActiveTextInput::GitIdentityName
+                                | ActiveTextInput::GitIdentityEmail
                             ))
                             && crate::ui::input_line::blink_due(
                                 cycle_started,
@@ -3595,6 +3654,8 @@ impl WorkspaceView {
         self.poll_git_refresh(cx);
         self.poll_git_diff(cx);
         self.poll_git_mutation(cx);
+        self.poll_git_commit(cx);
+        self.poll_git_identity(cx);
     }
 
     fn poll_git_refresh(&mut self, cx: &mut Context<Self>) {
@@ -3611,8 +3672,32 @@ impl WorkspaceView {
                     }
                     match result {
                         Ok(state) => {
+                            let stage_refresh_started = self.git_stage_refresh_started_at.take();
+                            if let Some(started) = stage_refresh_started {
+                                tracing::debug!(
+                                    target: "axiom.git_ui_diag",
+                                    event = "stage_refresh_done",
+                                    duration_ms = started.elapsed().as_millis(),
+                                );
+                            }
                             self.git_state = state;
                             if let Some(state) = self.git_state.as_ref() {
+                                if self.git_identity_name.text.is_empty() {
+                                    self.git_identity_name.text =
+                                        state.identity.name.clone().unwrap_or_default();
+                                    self.git_identity_name.selection_anchor =
+                                        self.git_identity_name.text.len();
+                                    self.git_identity_name.selection_active =
+                                        self.git_identity_name.text.len();
+                                }
+                                if self.git_identity_email.text.is_empty() {
+                                    self.git_identity_email.text =
+                                        state.identity.email.clone().unwrap_or_default();
+                                    self.git_identity_email.selection_anchor =
+                                        self.git_identity_email.text.len();
+                                    self.git_identity_email.selection_active =
+                                        self.git_identity_email.text.len();
+                                }
                                 tracing::debug!(
                                     target: "axiom.git_ui_diag",
                                     event = "git_sections_state",
@@ -3635,9 +3720,17 @@ impl WorkspaceView {
                                 }
                             }
                             self.reconcile_git_diff_selection();
+                            if let Some(started) = stage_refresh_started {
+                                tracing::debug!(
+                                    target: "axiom.git_ui_diag",
+                                    event = "stage_ui_applied",
+                                    duration_ms = started.elapsed().as_millis(),
+                                );
+                            }
                             cx.notify();
                         }
                         Err(error) => {
+                            self.git_stage_refresh_started_at = None;
                             tracing::warn!(%error, "Git refresh failed");
                         }
                     }
@@ -3646,6 +3739,7 @@ impl WorkspaceView {
                 Err(TryRecvError::Disconnected) => {
                     self.git_refresh_results = None;
                     self.git_refresh_inflight = false;
+                    self.git_stage_refresh_started_at = None;
                 }
             }
         }
@@ -3662,6 +3756,13 @@ impl WorkspaceView {
         let root = project.root_path().to_path_buf();
         let (sender, receiver) = mpsc::channel();
         self.git_refresh_results = Some(receiver);
+        if let Some(started) = self.git_stage_refresh_started_at {
+            tracing::debug!(
+                target: "axiom.git_ui_diag",
+                event = "stage_refresh_started",
+                duration_ms = started.elapsed().as_millis(),
+            );
+        }
         thread::spawn(move || {
             let result = match GitRepositoryService.load(&root) {
                 Ok(state) => Ok(Some(state)),
@@ -3714,16 +3815,25 @@ impl WorkspaceView {
     }
 
     fn request_git_mutation(&mut self, relative: PathBuf, operation: GitIndexMutation) {
-        if self.git_mutation_inflight {
+        if self.git_mutation_inflight || self.git_commit_inflight {
             return;
         }
         let Some(project) = self.project.clone() else {
             return;
         };
+        let click_started_at = Instant::now();
         self.git_mutation_inflight = true;
         self.git_mutation_pending = Some((relative.clone(), operation));
+        self.git_mutation_started_at = Some(click_started_at);
         self.git_mutation_generation = self.git_mutation_generation.wrapping_add(1);
         let generation = self.git_mutation_generation;
+        if operation == GitIndexMutation::Stage {
+            tracing::debug!(
+                target: "axiom.git_ui_diag",
+                event = "stage_click",
+                duration_ms = 0_u128,
+            );
+        }
         if operation == GitIndexMutation::Unstage {
             tracing::debug!(
                 target: "axiom.git_ui_diag",
@@ -3742,6 +3852,13 @@ impl WorkspaceView {
         let spawn_result = thread::Builder::new()
             .name("axiom-git-index-mutation".into())
             .spawn(move || {
+                if operation == GitIndexMutation::Stage {
+                    tracing::debug!(
+                        target: "axiom.git_ui_diag",
+                        event = "stage_worker_started",
+                        duration_ms = click_started_at.elapsed().as_millis(),
+                    );
+                }
                 if operation == GitIndexMutation::Unstage {
                     tracing::debug!(
                         target: "axiom.git_ui_diag",
@@ -3770,6 +3887,7 @@ impl WorkspaceView {
             self.git_mutation_inflight = false;
             self.git_mutation_pending = None;
             self.git_mutation_results = None;
+            self.git_mutation_started_at = None;
             self.git_diff_error = Some("Unable to update Git index".into());
         }
     }
@@ -3783,6 +3901,10 @@ impl WorkspaceView {
                 self.git_mutation_results = None;
                 self.git_mutation_inflight = false;
                 self.git_mutation_pending = None;
+                let mutation_duration = self
+                    .git_mutation_started_at
+                    .take()
+                    .map(|started| started.elapsed().as_millis());
                 if generation != self.git_mutation_generation {
                     return;
                 }
@@ -3791,6 +3913,14 @@ impl WorkspaceView {
                     self.git_diff_error = Some(git_mutation_error_message(operation, &error).to_string());
                     cx.notify();
                     return;
+                }
+                if operation == GitIndexMutation::Stage {
+                    tracing::debug!(
+                        target: "axiom.git_ui_diag",
+                        event = "stage_backend_done",
+                        duration_ms = mutation_duration.unwrap_or_default(),
+                    );
+                    self.git_stage_refresh_started_at = Some(Instant::now());
                 }
                 self.git_diff_error = None;
                 self.git_refresh_generation = self.git_refresh_generation.wrapping_add(1);
@@ -3811,7 +3941,165 @@ impl WorkspaceView {
                 self.git_mutation_results = None;
                 self.git_mutation_inflight = false;
                 self.git_mutation_pending = None;
+                self.git_mutation_started_at = None;
                 self.git_diff_error = Some("Unable to update Git index".into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn request_git_commit(&mut self, message: String) {
+        if self.git_mutation_inflight || self.git_commit_inflight {
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let message = message.trim().to_owned();
+        if message.is_empty() {
+            self.git_commit_error = Some("Commit message is required".into());
+            return;
+        }
+        self.git_commit_inflight = true;
+        self.git_commit_generation = self.git_commit_generation.wrapping_add(1);
+        let generation = self.git_commit_generation;
+        self.git_diff_generation = self.git_diff_generation.wrapping_add(1);
+        self.git_diff = None;
+        self.git_diff_loading = false;
+        self.git_diff_results = None;
+        let root = project.root_path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        self.git_commit_results = Some(receiver);
+        if thread::Builder::new()
+            .name("axiom-git-commit".into())
+            .spawn(move || {
+                let result = GitRepositoryService::default()
+                    .commit(&root, message)
+                    .map_err(|error| format!("{error:?}"));
+                let _ = sender.send((generation, result));
+            })
+            .is_err()
+        {
+            self.git_commit_inflight = false;
+            self.git_commit_results = None;
+            self.git_commit_error = Some("Unable to create commit".into());
+        }
+    }
+
+    fn poll_git_commit(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = self.git_commit_results.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((generation, result)) => {
+                self.git_commit_results = None;
+                self.git_commit_inflight = false;
+                if generation != self.git_commit_generation {
+                    return;
+                }
+                match result {
+                    Ok(commit) => {
+                        self.git_commit_message.text.clear();
+                        self.git_commit_message.selection_anchor = 0;
+                        self.git_commit_message.selection_active = 0;
+                        self.git_commit_error = None;
+                        self.git_refresh_generation = self.git_refresh_generation.wrapping_add(1);
+                        self.git_refresh_requested = true;
+                        self.git_refresh_last_scan = Instant::now() - Duration::from_secs(5);
+                        tracing::debug!(
+                            target: "axiom.git_ui_diag",
+                            event = "git_commit_applied",
+                            generation,
+                            oid = %commit.oid,
+                            branch = %commit.branch,
+                        );
+                    }
+                    Err(error) => {
+                        self.git_commit_error = Some(commit_error_message(&error).into());
+                    }
+                }
+                cx.notify();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.git_commit_results = None;
+                self.git_commit_inflight = false;
+                self.git_commit_error = Some("Unable to create commit".into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn request_git_identity_save(&mut self) {
+        if self.git_identity_save_inflight || self.git_mutation_inflight || self.git_commit_inflight {
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let name = self.git_identity_name.text.trim().to_owned();
+        let email = self.git_identity_email.text.trim().to_owned();
+        if name.is_empty() {
+            self.git_commit_error = Some("Git identity name is required".into());
+            return;
+        }
+        if email.is_empty() {
+            self.git_commit_error = Some("Git identity email is required".into());
+            return;
+        }
+        self.git_identity_save_inflight = true;
+        self.git_identity_generation = self.git_identity_generation.wrapping_add(1);
+        let generation = self.git_identity_generation;
+        let root = project.root_path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        self.git_identity_results = Some(receiver);
+        if thread::Builder::new()
+            .name("axiom-git-identity".into())
+            .spawn(move || {
+                let result = GitRepositoryService::default()
+                    .write_identity(&root, name, email)
+                    .map_err(|error| format!("{error:?}"));
+                let _ = sender.send((generation, result));
+            })
+            .is_err()
+        {
+            self.git_identity_save_inflight = false;
+            self.git_identity_results = None;
+            self.git_commit_error = Some("Unable to save Git identity".into());
+        }
+    }
+
+    fn poll_git_identity(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = self.git_identity_results.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((generation, result)) => {
+                self.git_identity_results = None;
+                self.git_identity_save_inflight = false;
+                if generation != self.git_identity_generation {
+                    return;
+                }
+                match result {
+                    Ok(identity) => {
+                        if let Some(state) = self.git_state.as_mut() {
+                            state.identity = identity;
+                        }
+                        self.git_commit_error = None;
+                        self.request_git_refresh();
+                    }
+                    Err(error) => {
+                        self.git_commit_error = Some("Unable to save Git identity".into());
+                        tracing::warn!(%error, "Git identity save failed");
+                    }
+                }
+                cx.notify();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.git_identity_results = None;
+                self.git_identity_save_inflight = false;
+                self.git_commit_error = Some("Unable to save Git identity".into());
                 cx.notify();
             }
         }
@@ -6786,11 +7074,14 @@ impl WorkspaceView {
             cx.notify();
             return;
         };
-        let tools_enabled = self.selected_model_supports_agent_tools();
         let root = self
             .project
             .as_ref()
             .map(|project| project.root_path().to_path_buf());
+        // Agent tools are workspace capabilities, not model capabilities.
+        // Provider adapters decide how to serialize the provider-neutral
+        // declarations; the Agent must not hide them based on model metadata.
+        let tools_enabled = root.is_some();
         if tools_enabled && root.is_none() {
             self.agent_ui_state = AgentUiState::Failed;
             self.agent_status = Some("Open a project before using Agent tools".into());
@@ -6878,9 +7169,11 @@ impl WorkspaceView {
             thinking: Some(String::new()),
         });
         self.ai_composer_text.clear();
-        let gemini_native_tools = matches!(provider.kind, ProviderKind::Other(ref name) if name == "Google" || name == "Gemini");
-        let tools = tools_enabled.then(|| {
-            if gemini_native_tools {
+        let provider_protocol = axiom_ai_provider::provider_protocol(&provider.kind);
+        let tools = (tools_enabled
+            && axiom_ai_provider::supports_native_tools(provider_protocol))
+        .then(|| {
+            if provider_protocol == axiom_ai_provider::ProviderProtocol::Google {
                 agent_bridge::gemini_agent_tool_definitions()
             } else {
                 agent_bridge::production_tool_definitions()
@@ -6892,7 +7185,10 @@ impl WorkspaceView {
             think: self
                 .selected_model_supports_thinking()
                 .then_some(self.chat_thinking_enabled),
-            thinking_level: self.selected_thinking_level(),
+            thinking_level: self
+                .chat_thinking_enabled
+                .then(|| self.selected_thinking_level())
+                .flatten(),
             tools,
         };
         let queue = self.agent_events.clone();
@@ -6989,7 +7285,10 @@ impl WorkspaceView {
         let think = self
             .selected_model_supports_thinking()
             .then_some(self.chat_thinking_enabled);
-        let thinking_level = self.selected_thinking_level();
+        let thinking_level = self
+            .chat_thinking_enabled
+            .then(|| self.selected_thinking_level())
+            .flatten();
         let context = context_snapshot_from_chat_messages(&self.chat_messages)
             .with_sources(self.chat_context_sources.clone());
         let messages = provider_messages_from_context(context);
@@ -7126,7 +7425,7 @@ impl WorkspaceView {
                                     },
                                 )
                             })
-                            .map_err(|error| error.user_message().to_owned())
+                            .map_err(|error| error.detailed_user_message())
                     }
                 })
                 .await;
@@ -7252,6 +7551,9 @@ impl WorkspaceView {
             ActiveTextInput::ProviderApiKey => Some(&mut self.provider_api_key),
             ActiveTextInput::ProviderModel => Some(&mut self.provider_model_input),
             ActiveTextInput::ProviderCatalogSearch => Some(&mut self.provider_catalog_input),
+            ActiveTextInput::GitCommitMessage => Some(&mut self.git_commit_message),
+            ActiveTextInput::GitIdentityName => Some(&mut self.git_identity_name),
+            ActiveTextInput::GitIdentityEmail => Some(&mut self.git_identity_email),
             _ => None,
         }
     }
@@ -7477,6 +7779,11 @@ impl WorkspaceView {
             self.commit_chat_rename(cx);
             return;
         }
+        if self.active_text_input == ActiveTextInput::GitCommitMessage {
+            let message = self.git_commit_message.text.clone();
+            self.request_git_commit(message);
+            return;
+        }
         if should_send_ai_on_enter(
             self.active_text_input,
             &self.ai_composer_text,
@@ -7489,6 +7796,15 @@ impl WorkspaceView {
     fn input_escape(&mut self, _: &InputEscape, _: &mut Window, cx: &mut Context<Self>) {
         if self.active_text_input == ActiveTextInput::AiHistoryRename {
             self.cancel_chat_rename(cx);
+        } else if self.active_text_input == ActiveTextInput::GitCommitMessage {
+            self.active_text_input = ActiveTextInput::None;
+            cx.notify();
+        } else if matches!(
+            self.active_text_input,
+            ActiveTextInput::GitIdentityName | ActiveTextInput::GitIdentityEmail
+        ) {
+            self.active_text_input = ActiveTextInput::None;
+            cx.notify();
         }
     }
     fn provider_base_url_drag_move(
@@ -7502,6 +7818,9 @@ impl WorkspaceView {
             ActiveTextInput::ProviderBaseUrl
                 | ActiveTextInput::ProviderApiKey
                 | ActiveTextInput::ProviderModel
+                | ActiveTextInput::GitCommitMessage
+                | ActiveTextInput::GitIdentityName
+                | ActiveTextInput::GitIdentityEmail
         ) && event.dragging()
         {
             if self.active_text_input == ActiveTextInput::ProviderApiKey {
@@ -7513,6 +7832,15 @@ impl WorkspaceView {
                     .geometry
                     .hit_test(event.position.x);
                 self.provider_model_input.drag_to(byte);
+            } else if self.active_text_input == ActiveTextInput::GitCommitMessage {
+                let byte = self.git_commit_message.geometry.hit_test(event.position.x);
+                self.git_commit_message.drag_to(byte);
+            } else if self.active_text_input == ActiveTextInput::GitIdentityName {
+                let byte = self.git_identity_name.geometry.hit_test(event.position.x);
+                self.git_identity_name.drag_to(byte);
+            } else if self.active_text_input == ActiveTextInput::GitIdentityEmail {
+                let byte = self.git_identity_email.geometry.hit_test(event.position.x);
+                self.git_identity_email.drag_to(byte);
             } else {
                 let byte = self.provider_base_url.geometry.hit_test(event.position.x);
                 self.provider_base_url.drag_to(byte);
@@ -7531,6 +7859,12 @@ impl WorkspaceView {
             self.provider_api_key.end_drag();
         } else if self.active_text_input == ActiveTextInput::ProviderModel {
             self.provider_model_input.end_drag();
+        } else if self.active_text_input == ActiveTextInput::GitCommitMessage {
+            self.git_commit_message.end_drag();
+        } else if self.active_text_input == ActiveTextInput::GitIdentityName {
+            self.git_identity_name.end_drag();
+        } else if self.active_text_input == ActiveTextInput::GitIdentityEmail {
+            self.git_identity_email.end_drag();
         } else {
             self.provider_base_url.end_drag();
         }
@@ -7591,17 +7925,19 @@ impl WorkspaceView {
             return;
         };
         let capability = self.selected_thinking_capability();
-        if let Some(level) = self
+        let key = (provider.clone(), self.model_label.clone());
+        if self
             .thinking_level_preferences
-            .get(&(provider.clone(), self.model_label.clone()))
+            .get(&key)
             .copied()
-            && capability.supports_level(level)
+            .is_some_and(|level| capability.supports_level(level))
         {
             return;
         }
         if let Some(level) = capability.default_level {
-            self.thinking_level_preferences
-                .insert((provider, self.model_label.clone()), level);
+            self.thinking_level_preferences.insert(key, level);
+        } else {
+            self.thinking_level_preferences.remove(&key);
         }
     }
 
@@ -7617,18 +7953,6 @@ impl WorkspaceView {
                 .find(|model| model.label == self.model_label)
                 .and_then(|model| model.metadata.as_ref())
                 .is_some_and(|metadata| metadata.supports("tools"))
-    }
-
-    fn selected_model_supports_agent_tools(&self) -> bool {
-        if self.selected_model_supports_tools() {
-            return true;
-        }
-        matches!(self.active_provider.as_deref(), Some("Google" | "Gemini"))
-            && self
-                .model_label
-                .strip_prefix("models/")
-                .unwrap_or(&self.model_label)
-                .starts_with("gemini-3.5-flash-lite")
     }
 
     fn close_providers_modal(&mut self, cx: &mut Context<Self>) {
@@ -12403,6 +12727,16 @@ impl WorkspaceView {
             .map(git_section_rows)
             .unwrap_or_default();
         let row_count = rows.len();
+        let staged_count = self
+            .git_state
+            .as_ref()
+            .map(|state| git_staged_indices(state).len())
+            .unwrap_or_default();
+        let changes_count = self
+            .git_state
+            .as_ref()
+            .map(|state| git_unstaged_indices(state).len())
+            .unwrap_or_default();
         let total = self
             .git_state
             .as_ref()
@@ -12471,8 +12805,12 @@ impl WorkspaceView {
                                             let row = *rows.get(display_index)?;
                                             if let GitSectionRow::Header(section) = row {
                                                 let label = match section {
-                                                    GitSection::Staged => "STAGED CHANGES",
-                                                    GitSection::Changes => "CHANGES",
+                                                    GitSection::Staged => {
+                                                        format!("STAGED CHANGES · {staged_count}")
+                                                    }
+                                                    GitSection::Changes => {
+                                                        format!("CHANGES · {changes_count}")
+                                                    }
                                                 };
                                                 if display_index < 2 {
                                                     tracing::debug!(
@@ -12609,7 +12947,14 @@ impl WorkspaceView {
                                                                     });
                                                                 }
                                                             })
-                                                            .child(if pending_row { "…" } else { action_label }),
+                                                            .child(if pending_row {
+                                                                match operation {
+                                                                    GitIndexMutation::Stage => "Staging…",
+                                                                    GitIndexMutation::Unstage => "Unstaging…",
+                                                                }
+                                                            } else {
+                                                                action_label
+                                                            }),
                                                     ),
                                             )
                                         })
@@ -12622,6 +12967,161 @@ impl WorkspaceView {
                         )
                     }),
             )
+            .when(
+                self.git_state
+                    .as_ref()
+                    .is_some_and(|state| !state.identity.is_configured()),
+                |this| {
+                    this.child(
+                        div()
+                            .id("git-identity-area")
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .p_2()
+                            .border_t_1()
+                            .border_color(t.border_subtle)
+                            .child(div().text_size(px(12.)).text_color(t.text_secondary).child("Git identity required"))
+                            .child(div().text_size(px(11.)).text_color(t.text_muted).child("Name"))
+                            .child(
+                                attach_single_line_input_actions!(
+                                    div().id("git-identity-name").key_context("SingleLineInput"),
+                                    cx
+                                )
+                                .track_focus(self.git_identity_name.focus.as_ref().expect("identity name focus"))
+                                .h(px(30.))
+                                .px_2()
+                                .border_1()
+                                .border_color(t.border_subtle)
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.active_text_input = ActiveTextInput::GitIdentityName;
+                                    this.git_identity_name.active = true;
+                                    let byte = this.git_identity_name.geometry.hit_test(event.position.x);
+                                    this.git_identity_name.mouse_down(byte, event.click_count);
+                                    window.focus(this.git_identity_name.focus.as_ref().expect("identity name focus"));
+                                    cx.notify();
+                                }))
+                                .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
+                                .on_mouse_up(MouseButton::Left, cx.listener(Self::provider_base_url_drag_end))
+                                .child(crate::ui::input_line::render_state(cx.entity(), &self.git_identity_name)),
+                            )
+                            .child(div().text_size(px(11.)).text_color(t.text_muted).child("Email"))
+                            .child(
+                                attach_single_line_input_actions!(
+                                    div().id("git-identity-email").key_context("SingleLineInput"),
+                                    cx
+                                )
+                                .track_focus(self.git_identity_email.focus.as_ref().expect("identity email focus"))
+                                .h(px(30.))
+                                .px_2()
+                                .border_1()
+                                .border_color(t.border_subtle)
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.active_text_input = ActiveTextInput::GitIdentityEmail;
+                                    this.git_identity_email.active = true;
+                                    let byte = this.git_identity_email.geometry.hit_test(event.position.x);
+                                    this.git_identity_email.mouse_down(byte, event.click_count);
+                                    window.focus(this.git_identity_email.focus.as_ref().expect("identity email focus"));
+                                    cx.notify();
+                                }))
+                                .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
+                                .on_mouse_up(MouseButton::Left, cx.listener(Self::provider_base_url_drag_end))
+                                .child(crate::ui::input_line::render_state(cx.entity(), &self.git_identity_email)),
+                            )
+                            .child(
+                                div()
+                                    .id("git-save-identity")
+                                    .px_2()
+                                    .py_1()
+                                    .text_size(px(12.))
+                                    .text_color(t.text_primary)
+                                    .bg(t.accent)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.request_git_identity_save();
+                                        cx.notify();
+                                    }))
+                                    .child(if self.git_identity_save_inflight { "Saving…" } else { "Save Git Identity" }),
+                            ),
+                    )
+                },
+            )
+            .child({
+                let can_commit = self
+                    .git_state
+                    .as_ref()
+                    .is_some_and(|state| {
+                        state.identity.is_configured() && !git_staged_indices(state).is_empty()
+                    })
+                    && !self.git_commit_message.text.trim().is_empty()
+                    && !self.git_mutation_inflight
+                    && self.git_mutation_pending.is_none()
+                    && !self.git_commit_inflight;
+                let message = self.git_commit_message.text.clone();
+                div()
+                    .id("git-commit-area")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .border_t_1()
+                    .border_color(t.border_subtle)
+                    .when_some(self.git_commit_error.clone(), |this, error| {
+                        this.child(div().text_size(px(11.)).text_color(t.error).child(error))
+                    })
+                    .child(
+                        div()
+                            .key_context("SingleLineInput")
+                            .cursor(CursorStyle::IBeam)
+                            .on_action(cx.listener(Self::input_backspace))
+                            .on_action(cx.listener(Self::input_delete))
+                            .on_action(cx.listener(Self::input_left))
+                            .on_action(cx.listener(Self::input_right))
+                            .on_action(cx.listener(Self::input_home))
+                            .on_action(cx.listener(Self::input_end))
+                            .on_action(cx.listener(Self::input_select_all))
+                            .on_action(cx.listener(Self::input_select_left))
+                            .on_action(cx.listener(Self::input_select_right))
+                            .on_action(cx.listener(Self::input_copy))
+                            .on_action(cx.listener(Self::input_cut))
+                            .on_action(cx.listener(Self::input_paste))
+                            .on_action(cx.listener(Self::input_enter))
+                            .track_focus(self.git_commit_message.focus.as_ref().expect("commit focus"))
+                            .h(px(30.))
+                            .px_2()
+                            .border_1()
+                            .border_color(t.border_subtle)
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.active_text_input = ActiveTextInput::GitCommitMessage;
+                                this.git_commit_message.active = true;
+                                let byte = this.git_commit_message.geometry.hit_test(event.position.x);
+                                this.git_commit_message.mouse_down(byte, event.click_count);
+                                window.focus(this.git_commit_message.focus.as_ref().expect("commit focus"));
+                                cx.notify();
+                            }))
+                            .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::provider_base_url_drag_end))
+                            .child(crate::ui::input_line::render_state(cx.entity(), &self.git_commit_message)),
+                    )
+                    .child(
+                        div()
+                            .id("git-commit-button")
+                            .px_2()
+                            .py_1()
+                            .text_size(px(12.))
+                            .text_color(if can_commit { t.text_primary } else { t.text_muted })
+                            .bg(if can_commit { t.accent } else { t.menu_background })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if can_commit {
+                                    this.request_git_commit(message.clone());
+                                    cx.notify();
+                                }
+                            }))
+                            .child(if self.git_commit_inflight { "Committing…" } else { "Commit" }),
+                    )
+            })
             .child(
                 div()
                     .id("version-control-resize-divider")
@@ -15001,6 +15501,12 @@ impl EntityInputHandler for WorkspaceView {
             &self.provider_model_input.text
         } else if self.active_text_input == ActiveTextInput::ProviderBaseUrl {
             &self.provider_base_url.text
+        } else if self.active_text_input == ActiveTextInput::GitCommitMessage {
+            &self.git_commit_message.text
+        } else if self.active_text_input == ActiveTextInput::GitIdentityName {
+            &self.git_identity_name.text
+        } else if self.active_text_input == ActiveTextInput::GitIdentityEmail {
+            &self.git_identity_email.text
         } else if self.explorer_operation.is_some() {
             self.modal_field_text(self.explorer_modal_field)
         } else if self.settings_visible && !self.command_palette_visible {
@@ -15078,6 +15584,33 @@ impl EntityInputHandler for WorkspaceView {
                     ),
                 reversed: self.provider_model_input.selection_anchor
                     > self.provider_model_input.selection_active,
+            });
+        }
+        if self.active_text_input == ActiveTextInput::GitCommitMessage {
+            return Some(UTF16Selection {
+                range: byte_to_utf16_offset(
+                    &self.git_commit_message.text,
+                    self.git_commit_message.selection_anchor,
+                )..byte_to_utf16_offset(
+                    &self.git_commit_message.text,
+                    self.git_commit_message.selection_active,
+                ),
+                reversed: self.git_commit_message.selection_anchor
+                    > self.git_commit_message.selection_active,
+            });
+        }
+        if self.active_text_input == ActiveTextInput::GitIdentityName {
+            return Some(UTF16Selection {
+                range: byte_to_utf16_offset(&self.git_identity_name.text, self.git_identity_name.selection_anchor)
+                    ..byte_to_utf16_offset(&self.git_identity_name.text, self.git_identity_name.selection_active),
+                reversed: self.git_identity_name.selection_anchor > self.git_identity_name.selection_active,
+            });
+        }
+        if self.active_text_input == ActiveTextInput::GitIdentityEmail {
+            return Some(UTF16Selection {
+                range: byte_to_utf16_offset(&self.git_identity_email.text, self.git_identity_email.selection_anchor)
+                    ..byte_to_utf16_offset(&self.git_identity_email.text, self.git_identity_email.selection_active),
+                reversed: self.git_identity_email.selection_anchor > self.git_identity_email.selection_active,
             });
         }
         if self.explorer_operation.is_some() {
@@ -15175,6 +15708,41 @@ impl EntityInputHandler for WorkspaceView {
             cx.notify();
             return;
         }
+        if self.active_text_input == ActiveTextInput::GitCommitMessage {
+            let range = range.unwrap_or_else(|| {
+                byte_to_utf16_offset(
+                    &self.git_commit_message.text,
+                    self.git_commit_message
+                        .selection_anchor
+                        .min(self.git_commit_message.selection_active),
+                )..byte_to_utf16_offset(
+                    &self.git_commit_message.text,
+                    self.git_commit_message
+                        .selection_anchor
+                        .max(self.git_commit_message.selection_active),
+                )
+            });
+            let sanitized = crate::ui::input_line::SingleLineInputState::sanitize_single_line(text);
+            let (value, caret) = replace_utf16_range(&self.git_commit_message.text, range, &sanitized);
+            self.git_commit_message.text = value;
+            self.git_commit_message.selection_anchor = caret;
+            self.git_commit_message.selection_active = caret;
+            cx.notify();
+            return;
+        }
+        if matches!(
+            self.active_text_input,
+            ActiveTextInput::GitIdentityName | ActiveTextInput::GitIdentityEmail
+        ) {
+            let input = if self.active_text_input == ActiveTextInput::GitIdentityName {
+                &mut self.git_identity_name
+            } else {
+                &mut self.git_identity_email
+            };
+            replace_provider_input_text(input, range, text);
+            cx.notify();
+            return;
+        }
         if self.explorer_operation.is_some() {
             let range = range.unwrap_or_else(|| {
                 self.modal_field_selection(self.explorer_modal_field)
@@ -15249,6 +15817,15 @@ impl EntityInputHandler for WorkspaceView {
         } else if self.active_text_input == ActiveTextInput::ProviderModel {
             let byte = self.provider_model_input.geometry.hit_test(point.x);
             byte_to_utf16_offset(&self.provider_model_input.text, byte)
+        } else if self.active_text_input == ActiveTextInput::GitCommitMessage {
+            let byte = self.git_commit_message.geometry.hit_test(point.x);
+            byte_to_utf16_offset(&self.git_commit_message.text, byte)
+        } else if self.active_text_input == ActiveTextInput::GitIdentityName {
+            let byte = self.git_identity_name.geometry.hit_test(point.x);
+            byte_to_utf16_offset(&self.git_identity_name.text, byte)
+        } else if self.active_text_input == ActiveTextInput::GitIdentityEmail {
+            let byte = self.git_identity_email.geometry.hit_test(point.x);
+            byte_to_utf16_offset(&self.git_identity_email.text, byte)
         } else if self.explorer_operation.is_some() {
             let byte =
                 self.modal_field_geometry[self.explorer_modal_field as usize].hit_test(point.x);
