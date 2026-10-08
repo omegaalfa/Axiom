@@ -499,6 +499,7 @@ name = "axiom-agent"
 version = "0.1.0"
 dependencies = [
  "axiom-ai-provider",
+ "serde",
  "serde_json",
  "tracing",
 ]
@@ -624,6 +625,7 @@ version = "0.1.0"
 dependencies = [
  "portable-pty",
  "tempfile",
+ "tracing",
  "vt100",
 ]
 

@@ -36,13 +36,15 @@ use axiom_index::{
 use axiom_lsp::{PositionCodec, ServerStatus, uri_to_path};
 use axiom_php::{RuntimeStubProvider, RuntimeSymbolIndex};
 use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_content};
-use axiom_terminal::{TerminalLink, TerminalLinkKind, TerminalProfile, TerminalSession};
+use axiom_terminal::{
+    TerminalLink, TerminalLinkKind, TerminalManager, TerminalProfile, TerminalSessionId,
+};
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
     LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     ScrollHandle, SharedString, Style, Timer, UTF16Selection, UniformListScrollHandle, Window,
-    actions, div, prelude::*, px, relative,
+    actions, background_executor, div, prelude::*, px, relative,
 };
 
 use crate::{
@@ -401,6 +403,7 @@ fn reset_git_diff_scroll(handle: &UniformListScrollHandle) {
 mod git_changes_tests {
     use super::*;
     use axiom_git::{GitDiffHunk, GitDiffLine};
+    use gpui::point;
 
     fn file(index: GitChangeState, worktree: GitChangeState) -> axiom_git::GitFileStatus {
         axiom_git::GitFileStatus {
@@ -1356,6 +1359,152 @@ enum ChatRequestState {
 enum AiPanelMode {
     Chat,
     Agent,
+    Memory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryUiTab {
+    Overview,
+    Sessions,
+    Decisions,
+    Gotchas,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryUiState {
+    Loading,
+    Ready,
+    Empty,
+    Unavailable,
+}
+
+#[derive(Clone, Debug)]
+struct MemoryUiSnapshot {
+    scope: axiom_agent::MemoryScope,
+    recent: Vec<axiom_agent::MemoryResult>,
+    sessions: Vec<axiom_agent::MemoryResult>,
+    decisions: Vec<axiom_agent::MemoryResult>,
+    gotchas: Vec<axiom_agent::MemoryResult>,
+}
+
+const MAX_MEMORY_UI_RESULTS: usize = 24;
+const MAX_MEMORY_UI_CONTENT_CHARS: usize = 512;
+
+fn memory_scope_label(scope: axiom_agent::MemoryScope) -> &'static str {
+    match scope {
+        axiom_agent::MemoryScope::User => "User",
+        axiom_agent::MemoryScope::Workspace => "Workspace",
+        axiom_agent::MemoryScope::Project => "Project",
+    }
+}
+
+fn truncate_memory_ui_content(content: &str) -> String {
+    let mut chars = content.chars();
+    let value: String = chars.by_ref().take(MAX_MEMORY_UI_CONTENT_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{value}…")
+    } else {
+        value
+    }
+}
+
+fn memory_ui_state_for_snapshot(snapshot: &MemoryUiSnapshot) -> MemoryUiState {
+    if snapshot.recent.is_empty()
+        && snapshot.sessions.is_empty()
+        && snapshot.decisions.is_empty()
+        && snapshot.gotchas.is_empty()
+    {
+        MemoryUiState::Empty
+    } else {
+        MemoryUiState::Ready
+    }
+}
+
+fn memory_ui_entries_for_tab(
+    snapshot: &MemoryUiSnapshot,
+    tab: MemoryUiTab,
+) -> Vec<axiom_agent::MemoryResult> {
+    let entries = match tab {
+        MemoryUiTab::Overview => &snapshot.recent,
+        MemoryUiTab::Sessions => &snapshot.sessions,
+        MemoryUiTab::Decisions => &snapshot.decisions,
+        MemoryUiTab::Gotchas => &snapshot.gotchas,
+    };
+    entries.iter().take(MAX_MEMORY_UI_RESULTS).cloned().collect()
+}
+
+fn memory_ui_request_is_current(
+    current_generation: u64,
+    current_scope: axiom_agent::MemoryScope,
+    current_mode: AiPanelMode,
+    request_generation: u64,
+    request_scope: axiom_agent::MemoryScope,
+) -> bool {
+    current_generation == request_generation
+        && current_scope == request_scope
+        && current_mode == AiPanelMode::Memory
+}
+
+#[cfg(test)]
+mod memory_ui_tests {
+    use super::*;
+    use axiom_agent::{MemoryCategory, MemoryResult, MemoryScope};
+
+    fn entry(category: MemoryCategory) -> MemoryResult {
+        MemoryResult {
+            id: Some("memory".into()),
+            scope: MemoryScope::Workspace,
+            category: Some(category),
+            content: "content".into(),
+        }
+    }
+
+    #[test]
+    fn memory_ui_filters_decisions_and_gotchas_without_backend_access() {
+        let snapshot = MemoryUiSnapshot {
+            scope: MemoryScope::Workspace,
+            recent: vec![entry(MemoryCategory::Remember)],
+            sessions: Vec::new(),
+            decisions: vec![entry(MemoryCategory::Decision)],
+            gotchas: vec![entry(MemoryCategory::Gotcha)],
+        };
+        assert_eq!(memory_ui_entries_for_tab(&snapshot, MemoryUiTab::Decisions).len(), 1);
+        assert_eq!(memory_ui_entries_for_tab(&snapshot, MemoryUiTab::Gotchas).len(), 1);
+        assert_eq!(memory_ui_state_for_snapshot(&snapshot), MemoryUiState::Ready);
+    }
+
+    #[test]
+    fn memory_ui_empty_and_stale_states_are_safe() {
+        let snapshot = MemoryUiSnapshot {
+            scope: MemoryScope::Project,
+            recent: Vec::new(),
+            sessions: Vec::new(),
+            decisions: Vec::new(),
+            gotchas: Vec::new(),
+        };
+        assert_eq!(memory_ui_state_for_snapshot(&snapshot), MemoryUiState::Empty);
+        assert!(memory_ui_request_is_current(
+            2,
+            MemoryScope::Workspace,
+            AiPanelMode::Memory,
+            2,
+            MemoryScope::Workspace,
+        ));
+        assert!(!memory_ui_request_is_current(
+            3,
+            MemoryScope::Project,
+            AiPanelMode::Memory,
+            2,
+            MemoryScope::Workspace,
+        ));
+    }
+
+    #[test]
+    fn memory_ui_content_is_bounded() {
+        let content = "x".repeat(MAX_MEMORY_UI_CONTENT_CHARS + 10);
+        assert_eq!(truncate_memory_ui_content(&content).chars().count(), MAX_MEMORY_UI_CONTENT_CHARS + 1);
+        assert_eq!(memory_scope_label(MemoryScope::Project), "Project");
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1935,6 +2084,12 @@ pub struct WorkspaceView {
     agent_copy_notice: Option<u64>,
     agent_scroll_handle: ScrollHandle,
     agent_status: Option<String>,
+    memory_service: Option<Arc<Mutex<Box<dyn axiom_agent::MemoryService>>>>,
+    memory_ui_tab: MemoryUiTab,
+    memory_ui_state: MemoryUiState,
+    memory_ui_scope: axiom_agent::MemoryScope,
+    memory_ui_snapshot: Option<MemoryUiSnapshot>,
+    memory_ui_generation: u64,
     chat_context_sources: Vec<ContextSource>,
     chat_context_feedback: Option<String>,
     chat_scroll_handle: ScrollHandle,
@@ -1971,8 +2126,11 @@ pub struct WorkspaceView {
     ollama_models: Vec<axiom_ai_provider::ProviderModel>,
     default_provider: Option<String>,
     active_provider: Option<String>,
-    terminal_session: Option<std::sync::Arc<TerminalSession>>,
-    terminal_view: Option<Entity<TerminalView>>,
+    terminal_manager: TerminalManager,
+    terminal_views: HashMap<TerminalSessionId, Entity<TerminalView>>,
+    terminal_profiles: Vec<TerminalProfile>,
+    terminal_profiles_discovered: bool,
+    terminal_profile_picker_open: bool,
     terminal_visible: bool,
     navigation_back: Vec<NavigationLocation>,
     navigation_forward: Vec<NavigationLocation>,
@@ -3067,6 +3225,12 @@ impl WorkspaceView {
             agent_copy_notice: None,
             agent_scroll_handle: ScrollHandle::new(),
             agent_status: None,
+            memory_service: None,
+            memory_ui_tab: MemoryUiTab::Overview,
+            memory_ui_state: MemoryUiState::Unavailable,
+            memory_ui_scope: axiom_agent::MemoryScope::Workspace,
+            memory_ui_snapshot: None,
+            memory_ui_generation: 0,
             chat_context_sources: Vec::new(),
             chat_context_feedback: None,
             chat_scroll_handle: ScrollHandle::new(),
@@ -3151,8 +3315,11 @@ impl WorkspaceView {
                         .any(|(name, _)| name == p)
                 })
                 .or_else(|| ui_settings.default_provider.clone()),
-            terminal_session: None,
-            terminal_view: None,
+            terminal_manager: TerminalManager::new(8),
+            terminal_views: HashMap::new(),
+            terminal_profiles: TerminalProfile::built_in_profiles(),
+            terminal_profiles_discovered: false,
+            terminal_profile_picker_open: false,
             terminal_visible: false,
             navigation_back: Vec::new(),
             navigation_forward: Vec::new(),
@@ -4854,10 +5021,16 @@ impl WorkspaceView {
         self.project_index = None;
         self.semantic_engine = None;
         self.lsp = None;
-        if let Some(session) = self.terminal_session.take() {
-            let _ = session.terminate();
+        let ids = self
+            .terminal_manager
+            .sessions()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.terminal_manager.close_session(id);
         }
-        self.terminal_view = None;
+        self.terminal_views.clear();
         self.terminal_visible = false;
         self.status = "No project".into();
     }
@@ -7173,10 +7346,13 @@ impl WorkspaceView {
         let tools = (tools_enabled
             && axiom_ai_provider::supports_native_tools(provider_protocol))
         .then(|| {
+            let memory_enabled = registry
+                .as_ref()
+                .is_some_and(|registry| registry.has_memory_tools());
             if provider_protocol == axiom_ai_provider::ProviderProtocol::Google {
-                agent_bridge::gemini_agent_tool_definitions()
+                agent_bridge::gemini_agent_tool_definitions_with_memory(memory_enabled)
             } else {
-                agent_bridge::production_tool_definitions()
+                agent_bridge::production_tool_definitions_with_memory(memory_enabled)
             }
         });
         let request = ProviderChatRequest {
@@ -9527,7 +9703,196 @@ impl WorkspaceView {
         match self.ai_panel_mode {
             AiPanelMode::Chat => matches!(self.chat_request_state, ChatRequestState::Sending),
             AiPanelMode::Agent => matches!(self.agent_ui_state, AgentUiState::Running),
+            AiPanelMode::Memory => false,
         }
+    }
+
+    /// Injects the provider-neutral memory service used by the read-only UI.
+    /// The service is intentionally optional: an absent or unavailable backend
+    /// is rendered as an explicit unavailable state.
+    #[allow(dead_code)]
+    pub fn set_memory_service(
+        &mut self,
+        service: Box<dyn axiom_agent::MemoryService>,
+        cx: &mut Context<Self>,
+    ) {
+        self.memory_service = Some(Arc::new(Mutex::new(service)));
+        if self.ai_panel_mode == AiPanelMode::Memory {
+            self.refresh_memory(cx);
+        }
+    }
+
+    fn refresh_memory(&mut self, cx: &mut Context<Self>) {
+        self.memory_ui_generation = self.memory_ui_generation.wrapping_add(1);
+        let generation = self.memory_ui_generation;
+        let scope = self.memory_ui_scope;
+        let service = self.memory_service.clone();
+        self.memory_ui_state = MemoryUiState::Loading;
+        self.memory_ui_snapshot = None;
+        cx.spawn(async move |this, cx| {
+            let result = background_executor()
+                .spawn(async move {
+                    let service = service.ok_or(())?;
+                    let service = service.lock().map_err(|_| ())?;
+                    if !service.is_available() {
+                        return Err(());
+                    }
+                    let recent = service.recent(scope, MAX_MEMORY_UI_RESULTS);
+                    let history = service.history(scope, MAX_MEMORY_UI_RESULTS);
+                    let decisions = history
+                        .iter()
+                        .filter(|entry| {
+                            entry.category.as_ref()
+                                == Some(&axiom_agent::MemoryCategory::Decision)
+                        })
+                        .take(MAX_MEMORY_UI_RESULTS)
+                        .cloned()
+                        .collect();
+                    let gotchas = history
+                        .iter()
+                        .filter(|entry| {
+                            entry.category.as_ref()
+                                == Some(&axiom_agent::MemoryCategory::Gotcha)
+                        })
+                        .take(MAX_MEMORY_UI_RESULTS)
+                        .cloned()
+                        .collect();
+                    Ok(MemoryUiSnapshot {
+                        scope,
+                        sessions: history,
+                        recent,
+                        decisions,
+                        gotchas,
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |workspace, cx| {
+                if !memory_ui_request_is_current(
+                    workspace.memory_ui_generation,
+                    workspace.memory_ui_scope,
+                    workspace.ai_panel_mode,
+                    generation,
+                    scope,
+                ) {
+                    return;
+                }
+                match result {
+                    Ok(snapshot) => {
+                        workspace.memory_ui_state = memory_ui_state_for_snapshot(&snapshot);
+                        workspace.memory_ui_snapshot = Some(snapshot);
+                    }
+                    Err(()) => {
+                        workspace.memory_ui_state = MemoryUiState::Unavailable;
+                        workspace.memory_ui_snapshot = None;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn set_memory_ui_tab(&mut self, tab: MemoryUiTab, cx: &mut Context<Self>) {
+        self.memory_ui_tab = tab;
+        cx.notify();
+    }
+
+    fn render_memory_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let scope = self
+            .memory_ui_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.scope)
+            .unwrap_or(self.memory_ui_scope);
+        let scope_label = memory_scope_label(scope);
+        let entries = self
+            .memory_ui_snapshot
+            .as_ref()
+            .map(|snapshot| memory_ui_entries_for_tab(snapshot, self.memory_ui_tab))
+            .unwrap_or_default();
+        let state = self.memory_ui_state;
+        div()
+            .id("ai-memory-panel")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child("Memory")
+                    .child(
+                        div()
+                            .text_color(t.text_muted)
+                            .child(format!("Scope: {scope_label}")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .children([
+                        (MemoryUiTab::Overview, "Overview"),
+                        (MemoryUiTab::Sessions, "Sessions"),
+                        (MemoryUiTab::Decisions, "Decisions"),
+                        (MemoryUiTab::Gotchas, "Gotchas"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (tab, label))| {
+                        div()
+                            .id(("ai-memory-tab", index))
+                            .px_2()
+                            .py_1()
+                            .rounded(m.border_radius_small)
+                            .cursor(CursorStyle::PointingHand)
+                            .when(self.memory_ui_tab == tab, |this| {
+                                this.bg(t.inactive_selection).text_color(t.text_primary)
+                            })
+                            .when(self.memory_ui_tab != tab, |this| {
+                                this.text_color(t.text_muted)
+                            })
+                            .hover(move |style| style.bg(t.hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_memory_ui_tab(tab, cx);
+                            }))
+                            .child(label)
+                    })),
+            )
+            .child(match state {
+                MemoryUiState::Loading => div().text_color(t.text_muted).child("Loading memory…"),
+                MemoryUiState::Unavailable => div()
+                    .text_color(t.text_muted)
+                    .child("Memory unavailable"),
+                MemoryUiState::Empty => div()
+                    .text_color(t.text_muted)
+                    .child("No memories in this scope"),
+                MemoryUiState::Ready => div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(entries.into_iter().take(MAX_MEMORY_UI_RESULTS).map(|entry| {
+                        let content = truncate_memory_ui_content(&entry.content);
+                        div()
+                            .id(SharedString::from(format!(
+                                "ai-memory-entry-{}",
+                                entry.id.as_deref().unwrap_or("anonymous")
+                            )))
+                            .px_2()
+                            .py_1()
+                            .rounded(m.border_radius_small)
+                            .bg(t.editor_background)
+                            .text_color(t.text_primary)
+                            .child(content)
+                    })),
+            })
     }
 
     fn switch_ai_panel_mode(&mut self, mode: AiPanelMode, cx: &mut Context<Self>) {
@@ -9540,8 +9905,10 @@ impl WorkspaceView {
             self.chat_auto_follow = true;
             self.chat_scroll_observed = false;
             self.chat_programmatic_scroll_pending = true;
-        } else {
+        } else if mode == AiPanelMode::Agent {
             self.agent_scroll_handle.scroll_to_bottom();
+        } else {
+            self.refresh_memory(cx);
         }
         cx.notify();
     }
@@ -9714,6 +10081,25 @@ impl WorkspaceView {
                                 this.switch_ai_panel_mode(AiPanelMode::Agent, cx);
                             }))
                             .child("Agent"),
+                    )
+                    .child(
+                        div()
+                            .id("ai-memory-mode-tab")
+                            .px_3()
+                            .py_1()
+                            .rounded(m.border_radius_small)
+                            .cursor(CursorStyle::PointingHand)
+                            .when(self.ai_panel_mode == AiPanelMode::Memory, |this| {
+                                this.bg(t.inactive_selection).text_color(t.text_primary)
+                            })
+                            .when(self.ai_panel_mode != AiPanelMode::Memory, |this| {
+                                this.text_color(t.text_muted)
+                            })
+                            .hover(move |s| s.bg(t.hover).text_color(t.text_primary))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.switch_ai_panel_mode(AiPanelMode::Memory, cx);
+                            }))
+                            .child("Memory"),
                     ),
             )
             .when(
@@ -9831,6 +10217,9 @@ impl WorkspaceView {
             .when(self.ai_panel_mode == AiPanelMode::Agent, |this| {
                 this.child(self.render_agent_conversation(cx))
             })
+            .when(self.ai_panel_mode == AiPanelMode::Memory, |this| {
+                this.child(self.render_memory_panel(cx))
+            })
             .when(
                 !self.chat_messages.is_empty() && self.ai_panel_mode == AiPanelMode::Chat,
                 |this| {
@@ -9877,7 +10266,8 @@ impl WorkspaceView {
                     )
                 },
             )
-            .child(
+            .when(self.ai_panel_mode != AiPanelMode::Memory, |this| {
+                this.child(
                 div()
                     .m_3()
                     .p_2()
@@ -10193,7 +10583,8 @@ impl WorkspaceView {
                                     ),
                             ),
                     ),
-            )
+                )
+            })
             .when(self.model_picker_open, |this| {
                 this.child(self.render_model_picker(cx))
             })
@@ -10215,6 +10606,71 @@ impl WorkspaceView {
             )
     }
 
+    fn create_terminal_session(
+        &mut self,
+        profile: TerminalProfile,
+        cx: &mut Context<Self>,
+    ) -> Option<TerminalSessionId> {
+        let cwd = self.project.as_ref()?.root_path().to_path_buf();
+        let id = match self.terminal_manager.create_session(&cwd, profile) {
+            Ok(id) => id,
+            Err(error) => {
+                self.status = format!("Terminal failed to start: {error}").into();
+                cx.notify();
+                return None;
+            }
+        };
+        let session = self.terminal_manager.session(id)?;
+        let workspace = cx.entity().downgrade();
+        let view = cx.new(|cx| TerminalView::new(session, workspace, cx));
+        self.terminal_views.insert(id, view);
+        self.terminal_visible = true;
+        cx.notify();
+        Some(id)
+    }
+
+    fn activate_terminal_session(&mut self, id: TerminalSessionId, cx: &mut Context<Self>) {
+        if self.terminal_manager.activate_session(id) {
+            cx.notify();
+        }
+    }
+
+    fn close_terminal_session(&mut self, id: TerminalSessionId, cx: &mut Context<Self>) {
+        self.terminal_views.remove(&id);
+        self.terminal_manager.close_session(id);
+        if self.terminal_manager.len() == 0 {
+            self.terminal_visible = false;
+        }
+        cx.notify();
+    }
+
+    fn discover_terminal_profiles(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_profiles_discovered {
+            return;
+        }
+        self.terminal_profiles_discovered = true;
+        #[cfg(not(windows))]
+        let _ = cx;
+        #[cfg(windows)]
+        {
+            let owner = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                let wsl_available = background_executor()
+                    .spawn(async { TerminalProfile::wsl_available() })
+                    .await;
+                let _ = owner.update(cx, |workspace, cx| {
+                    if !wsl_available {
+                        workspace
+                            .terminal_profiles
+                            .retain(|profile| profile.id() != "ubuntu");
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
     fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
         self.open_menu = None;
         if self.terminal_visible {
@@ -10222,29 +10678,21 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
-        if self.terminal_view.is_none() {
-            let Some(project) = &self.project else {
-                self.status = "Open a project before starting a terminal".into();
+        self.discover_terminal_profiles(cx);
+        if self.terminal_manager.len() == 0 {
+            let Some(profile) = self.terminal_profiles.first().cloned() else {
+                self.status = "No terminal profile available".into();
                 cx.notify();
                 return;
             };
-            match TerminalSession::spawn(project.root_path(), TerminalProfile::platform_default()) {
-                Ok(session) => {
-                    let session = std::sync::Arc::new(session);
-                    let workspace = cx.entity().downgrade();
-                    let view = cx.new(|cx| TerminalView::new(session.clone(), workspace, cx));
-                    self.terminal_session = Some(session);
-                    self.terminal_view = Some(view);
-                }
-                Err(error) => {
-                    self.status = format!("Terminal failed to start: {error}").into();
-                    cx.notify();
-                    return;
-                }
+            if self.create_terminal_session(profile, cx).is_none() {
+                return;
             }
         }
         self.terminal_visible = true;
-        if let Some(terminal) = &self.terminal_view {
+        if let Some(id) = self.terminal_manager.active_session()
+            && let Some(terminal) = self.terminal_views.get(&id)
+        {
             window.focus(&terminal.read(cx).focus_handle());
         }
         cx.notify();
@@ -10260,16 +10708,18 @@ impl WorkspaceView {
             return;
         };
         let directory = Self::context_directory(&context.path, context.kind).to_path_buf();
-        match TerminalSession::spawn(&directory, TerminalProfile::platform_default()) {
-            Ok(session) => {
-                let session = std::sync::Arc::new(session);
+        let profile = TerminalProfile::platform_default();
+        match self.terminal_manager.create_session(&directory, profile) {
+            Ok(id) => {
+                let Some(session) = self.terminal_manager.session(id) else {
+                    return;
+                };
                 let workspace = cx.entity().downgrade();
-                let view = cx.new(|cx| TerminalView::new(session.clone(), workspace, cx));
-                self.terminal_session = Some(session);
-                self.terminal_view = Some(view);
+                let view = cx.new(|cx| TerminalView::new(session, workspace, cx));
+                self.terminal_views.insert(id, view);
                 self.terminal_visible = true;
                 self.status = format!("Terminal opened in {}", directory.display()).into();
-                if let Some(terminal) = &self.terminal_view {
+                if let Some(terminal) = self.terminal_views.get(&id) {
                     window.focus(&terminal.read(cx).focus_handle());
                 }
             }
@@ -14796,23 +15246,129 @@ impl WorkspaceView {
         let t = theme();
         let m = metrics();
         let workspace = cx.entity();
-        let profile = self
-            .terminal_session
-            .as_ref()
-            .map(|session| session.profile_label())
-            .unwrap_or("Terminal");
-        let status = self
-            .terminal_session
-            .as_ref()
-            .map(|session| {
-                if session.is_exited() {
-                    "exited"
-                } else {
-                    "running"
-                }
-            })
-            .unwrap_or("not started");
+        let active_id = self.terminal_manager.active_session();
+        let tabs = self.terminal_manager.sessions().into_iter().map(|info| {
+            let id = info.id;
+            let active = active_id == Some(id);
+            let tab_workspace = workspace.clone();
+            let close_workspace = workspace.clone();
+            div()
+                .id(SharedString::from(format!("terminal-tab-{id}")))
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(m.border_radius_small)
+                .cursor(CursorStyle::PointingHand)
+                .text_color(if active { t.text_primary } else { t.text_muted })
+                .when(active, |this| this.bg(t.pressed))
+                .hover(move |style| style.bg(t.hover))
+                .on_click(move |_, _, cx| {
+                    tab_workspace.update(cx, |this, cx| {
+                        this.activate_terminal_session(id, cx);
+                    });
+                })
+                .child(info.label)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("terminal-tab-close-{id}")))
+                        .px_1()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(move |_, _, cx| {
+                            close_workspace.update(cx, |this, cx| {
+                                this.close_terminal_session(id, cx);
+                            });
+                        })
+                        .child("×"),
+                )
+        });
+        let profile_picker = self.terminal_profile_picker_open.then(|| {
+            div()
+                .absolute()
+                .top(m.panel_header_height)
+                .right(px(28.))
+                .p_1()
+                .gap_1()
+                .flex()
+                .flex_col()
+                .bg(t.panel_background)
+                .border_1()
+                .border_color(t.border)
+                .children(self.terminal_profiles.iter().cloned().map(|profile| {
+                    let label = profile.label().to_owned();
+                    let profile_workspace = workspace.clone();
+                    div()
+                        .id(SharedString::from(format!("terminal-profile-{}", profile.id())))
+                        .px_2()
+                        .py_1()
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |style| style.bg(t.hover))
+                        .on_click(move |_, _, cx| {
+                            profile_workspace.update(cx, |this, cx| {
+                                this.terminal_profile_picker_open = false;
+                                this.create_terminal_session(profile.clone(), cx);
+                            });
+                        })
+                        .child(label)
+                }))
+        });
 
+        let controls_workspace = workspace.clone();
+        let close_panel_workspace = workspace.clone();
+        let controls = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .id("new-terminal")
+                    .px_2()
+                    .rounded(m.border_radius_small)
+                    .cursor(CursorStyle::PointingHand)
+                    .text_color(t.text_muted)
+                    .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
+                    .on_click(move |_, _, cx| {
+                        controls_workspace.update(cx, |this, cx| {
+                            this.terminal_profile_picker_open =
+                                !this.terminal_profile_picker_open;
+                            cx.notify();
+                        });
+                    })
+                    .child("+"),
+            )
+            .child(
+                div()
+                    .id("close-terminal")
+                    .px_2()
+                    .rounded(m.border_radius_small)
+                    .text_color(t.text_muted)
+                    .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
+                    .on_click(move |_, _, cx| {
+                        close_panel_workspace.update(cx, |this, cx| {
+                            this.terminal_visible = false;
+                            cx.notify();
+                        });
+                    })
+                    .child("x"),
+            );
+        let header = div()
+            .h(m.panel_header_height)
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(t.border_subtle)
+            .bg(t.panel_background)
+            .child(div().flex().items_center().gap_1().children(tabs))
+            .child(controls);
+        let content = div()
+            .flex_1()
+            .when_some(
+                active_id.and_then(|id| self.terminal_views.get(&id).cloned()),
+                |this, terminal| this.child(terminal),
+            );
         div()
             .h(px(220.))
             .min_h(px(120.))
@@ -14821,51 +15377,9 @@ impl WorkspaceView {
             .border_t_1()
             .border_color(t.border)
             .bg(t.editor_background)
-            .child(
-                div()
-                    .h(m.panel_header_height)
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(t.border_subtle)
-                    .bg(t.panel_background)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().text_color(t.text_primary).child("Terminal"))
-                            .child(
-                                div()
-                                    .text_color(t.text_muted)
-                                    .child(format!("{profile} - {status}")),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("close-terminal")
-                            .px_2()
-                            .rounded(m.border_radius_small)
-                            .text_color(t.text_muted)
-                            .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
-                            .on_click(move |_, _, cx| {
-                                workspace.update(cx, |this, cx| {
-                                    this.terminal_visible = false;
-                                    cx.notify();
-                                });
-                            })
-                            .child("x"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .when_some(self.terminal_view.clone(), |this, terminal| {
-                        this.child(terminal)
-                    }),
-            )
+            .child(header)
+            .children(profile_picker)
+            .child(content)
     }
 
     fn render_features(&self, cx: &mut Context<Self>) -> impl IntoElement {

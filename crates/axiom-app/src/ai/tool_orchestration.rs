@@ -128,6 +128,37 @@ pub(crate) fn find_references_definition() -> ProviderToolDefinition {
     }
 }
 
+pub(crate) fn memory_search_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: "memory_search".into(),
+        description: "Search bounded historical memory in the current workspace scope. Memory may be stale or incomplete; verify current project state before relying on it.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "maxLength": 256 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn memory_get_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: "memory_get".into(),
+        description: "Get one bounded historical memory entry by its Axiom logical ID. Memory may be stale or incomplete; verify current project state.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "maxLength": 256 }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 pub(crate) fn chat_tool_definitions() -> Vec<ProviderToolDefinition> {
     vec![
         read_file_definition(),
@@ -681,9 +712,18 @@ mod tests {
         let definition = find_symbol_definition();
         assert_eq!(definition.name, "find_symbol");
         assert_eq!(definition.parameters["required"], json!(["query"]));
-        assert_eq!(definition.parameters["properties"]["query"]["type"], "string");
-        assert_eq!(definition.parameters["properties"]["kind"]["type"], "string");
-        assert_eq!(definition.parameters["properties"]["limit"]["type"], "integer");
+        assert_eq!(
+            definition.parameters["properties"]["query"]["type"],
+            "string"
+        );
+        assert_eq!(
+            definition.parameters["properties"]["kind"]["type"],
+            "string"
+        );
+        assert_eq!(
+            definition.parameters["properties"]["limit"]["type"],
+            "integer"
+        );
         assert_eq!(definition.parameters["properties"]["limit"]["minimum"], 1);
         assert_eq!(definition.parameters["properties"]["limit"]["maximum"], 100);
         assert_eq!(definition.parameters["additionalProperties"], false);

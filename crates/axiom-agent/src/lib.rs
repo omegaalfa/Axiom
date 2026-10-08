@@ -4,6 +4,31 @@
 //! only identity, state, budget, cancellation, and event semantics that a
 //! future execution adapter can use.
 
+mod memory;
+mod memory_backend;
+mod memory_local;
+mod memory_manager;
+mod system_prompt;
+
+pub use memory::{
+    InMemoryMemoryService, MemoryCategory, MemoryHandoff, MemoryObservation, MemoryResult,
+    MemoryScope, MemoryService, MemorySessionId, NoMemory,
+};
+pub use memory_backend::{
+    AiMemoryBackend, AiMemoryReadTransport, MAX_BACKEND_RESULTS, MemoryReadError,
+    MemoryReadOperation, MemoryReadRequest,
+};
+pub use memory_local::{
+    AxiomMemoryBackend, AxiomMemoryError, AxiomMemoryScopeIds, MAX_LOCAL_MEMORY_RESULTS,
+    MAX_RECORD_CONTENT_CHARS,
+};
+pub use memory_manager::{
+    MemoryBackendConfig, MemoryBackendLauncher, MemoryHealthCheck, MemoryLaunchRequest,
+    MemoryManager, MemoryManagerError, MemoryStatus, MemoryUnavailableReason,
+    default_data_directory,
+};
+pub use system_prompt::agent_system_instruction;
+
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -618,7 +643,8 @@ impl ToolPolicy for ReadOnlyToolPolicy {
         call: &axiom_ai_provider::ProviderToolCall,
     ) -> ToolPolicyDecision {
         match call.name.as_str() {
-            "read_file" | "list_directory" | "find_files" | "find_symbol" | "find_references" | "fetch_url" | "search_text" => {
+            "read_file" | "list_directory" | "find_files" | "find_symbol" | "find_references"
+            | "fetch_url" | "search_text" | "memory_search" | "memory_get" => {
                 ToolPolicyDecision::Allow
             }
             "write_file" | "update_file" | "delete_file" => ToolPolicyDecision::RequireApproval {
@@ -882,34 +908,33 @@ pub struct AgentExecutor<'a, P, T, Policy = ReadOnlyToolPolicy> {
     provider: &'a mut P,
     tools: &'a mut T,
     policy: Policy,
+    memory: Box<dyn MemoryService>,
+    memory_scope: MemoryScope,
+    memory_session: Option<MemorySessionId>,
+    memory_observations: usize,
     pending: Option<ExecutionContinuation>,
 }
 
-/// Permanent, provider-neutral behavioral contract for every Agent run.
-/// Dynamic task context and visible conversation messages remain caller-owned.
-pub fn agent_system_instruction() -> &'static str {
-    "You are Axiom Agent with access to native project tools. When a request depends on the current project, workspace, code, architecture, files, symbols, references, implementation, or project-specific errors, proactively inspect the workspace with the available tools before answering. Do not ask the user to paste project information that the tools can access. Prefer deterministic/native project tools and use the minimum number of tool calls necessary. For broad requests, perform a bounded initial inspection of the top-level structure, relevant manifests, and a small representative set of files or symbols, then summarize; do not recursively inspect the entire repository. Read-only requests must remain read-only: do not mutate merely to analyze, explain, or review. General conversation and questions independent of the workspace should not trigger unnecessary project inspection. The current deterministic project state is authoritative over model assumptions."
-}
+const MAX_MEMORY_OBSERVATIONS_PER_RUN: usize = 32;
+const MAX_MEMORY_BRIEFING_ITEMS: usize = 6;
+const MAX_MEMORY_BRIEFING_ITEM_CHARS: usize = 512;
+const MAX_MEMORY_BRIEFING_CHARS: usize = 2048;
 
 fn with_agent_system_instruction(
     mut request: axiom_ai_provider::ProviderChatRequest,
 ) -> axiom_ai_provider::ProviderChatRequest {
-    let already_present = request.messages.iter().any(|message| {
-        message.role == axiom_ai_provider::ChatRole::System
-            && message.content == agent_system_instruction()
-    });
-    if !already_present {
-        request.messages.insert(
-            0,
-            axiom_ai_provider::ProviderChatMessage {
-                role: axiom_ai_provider::ChatRole::System,
-                content: agent_system_instruction().into(),
-                reasoning: None,
-                tool_call_id: None,
-                tool_calls: Vec::new(),
-            },
-        );
-    }
+    // This is the sole injection point owned by AgentExecutor. Callers pass
+    // dynamic messages only, so structural ownership guarantees one copy.
+    request.messages.insert(
+        0,
+        axiom_ai_provider::ProviderChatMessage {
+            role: axiom_ai_provider::ChatRole::System,
+            content: agent_system_instruction().into(),
+            reasoning: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        },
+    );
     request
 }
 
@@ -930,12 +955,45 @@ where
     Policy: ToolPolicy,
 {
     pub fn with_policy(provider: &'a mut P, tools: &'a mut T, policy: Policy) -> Self {
+        Self::with_policy_and_memory(provider, tools, policy, Box::new(NoMemory))
+    }
+
+    pub fn with_policy_and_memory(
+        provider: &'a mut P,
+        tools: &'a mut T,
+        policy: Policy,
+        memory: Box<dyn MemoryService>,
+    ) -> Self {
+        Self::with_policy_and_memory_in_scope(
+            provider,
+            tools,
+            policy,
+            memory,
+            MemoryScope::Workspace,
+        )
+    }
+
+    pub fn with_policy_and_memory_in_scope(
+        provider: &'a mut P,
+        tools: &'a mut T,
+        policy: Policy,
+        memory: Box<dyn MemoryService>,
+        memory_scope: MemoryScope,
+    ) -> Self {
         Self {
             provider,
             tools,
             policy,
+            memory,
+            memory_scope,
+            memory_session: None,
+            memory_observations: 0,
             pending: None,
         }
+    }
+
+    pub fn memory_service(&self) -> &dyn MemoryService {
+        self.memory.as_ref()
     }
 
     pub fn execute(
@@ -944,15 +1002,17 @@ where
         request: axiom_ai_provider::ProviderChatRequest,
         emit: &mut dyn FnMut(AgentEvent),
     ) -> Result<AgentExecutionResult, AgentExecutionError> {
+        self.start_memory_session();
         emit(AgentEvent::RunStarted { run_id: run.id() });
         run.transition(AgentState::Preparing)
             .map_err(AgentExecutionError::Transition)?;
         run.transition(AgentState::RunningModel)
             .map_err(AgentExecutionError::Transition)?;
-        self.drive(
+        let request = self.inject_memory_briefing(with_agent_system_instruction(request));
+        let result = self.drive(
             run,
             ExecutionContinuation {
-                request: with_agent_system_instruction(request),
+                request,
                 content: String::new(),
                 thinking: String::new(),
                 calls: Vec::new(),
@@ -960,7 +1020,9 @@ where
             },
             false,
             emit,
-        )
+        );
+        self.finish_memory_if_terminal(run, &result);
+        result
     }
 
     pub fn approve(
@@ -1000,7 +1062,9 @@ where
                 ApprovalError::UnknownApproval,
             ));
         }
-        self.drive(run, continuation, true, emit)
+        let result = self.drive(run, continuation, true, emit);
+        self.finish_memory_if_terminal(run, &result);
+        result
     }
 
     pub fn allow_for_request(
@@ -1090,7 +1154,139 @@ where
             run.transition(AgentState::RunningModel)
                 .map_err(AgentExecutionError::Transition)?;
         }
-        self.drive(run, continuation, false, emit)
+        let result = self.drive(run, continuation, false, emit);
+        self.finish_memory_if_terminal(run, &result);
+        result
+    }
+
+    fn start_memory_session(&mut self) {
+        if self.memory_session.is_none() {
+            self.memory_observations = 0;
+            self.memory_session = Some(self.memory.session_start(self.memory_scope));
+        }
+    }
+
+    fn inject_memory_briefing(
+        &mut self,
+        mut request: axiom_ai_provider::ProviderChatRequest,
+    ) -> axiom_ai_provider::ProviderChatRequest {
+        let results = self
+            .memory
+            .briefing(self.memory_scope, MAX_MEMORY_BRIEFING_ITEMS);
+        let mut content = String::from(
+            "Memory briefing (historical, possibly stale or incomplete). Verify current project state; current deterministic state wins over memory.\n",
+        );
+        let mut included = 0;
+        for result in results {
+            if result.scope != self.memory_scope || included >= MAX_MEMORY_BRIEFING_ITEMS {
+                continue;
+            }
+            let item = result
+                .content
+                .chars()
+                .take(MAX_MEMORY_BRIEFING_ITEM_CHARS)
+                .collect::<String>();
+            if item.is_empty() {
+                continue;
+            }
+            let line = format!("- {item}\n");
+            if content.chars().count() + line.chars().count() > MAX_MEMORY_BRIEFING_CHARS {
+                break;
+            }
+            content.push_str(&line);
+            included += 1;
+        }
+        if included == 0 {
+            return request;
+        }
+        let position = request
+            .messages
+            .iter()
+            .position(|message| message.role != axiom_ai_provider::ChatRole::System)
+            .unwrap_or(request.messages.len());
+        request.messages.insert(
+            position,
+            axiom_ai_provider::ProviderChatMessage {
+                role: axiom_ai_provider::ChatRole::System,
+                content,
+                reasoning: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+        );
+        request
+    }
+
+    fn finish_memory_if_terminal(
+        &mut self,
+        run: &AgentRun,
+        result: &Result<AgentExecutionResult, AgentExecutionError>,
+    ) {
+        if !run.state().is_terminal() {
+            return;
+        }
+        let Some(session) = self.memory_session else {
+            return;
+        };
+        let outcome = match result {
+            Ok(_) => "completed successfully",
+            Err(AgentExecutionError::Cancelled) => "cancelled",
+            Err(AgentExecutionError::Provider(_))
+            | Err(AgentExecutionError::ProviderProtocol(_)) => "failed due to provider error",
+            Err(AgentExecutionError::Tool(_)) => "failed due to tool error",
+            Err(AgentExecutionError::BudgetExceeded(_)) => "tool budget exhausted",
+            Err(_) => "failed",
+        };
+        self.observe_memory(MemoryObservation::TaskOutcome(outcome.into()));
+        self.memory.session_end(session);
+        self.memory_session = None;
+    }
+
+    fn observe_memory(&mut self, observation: MemoryObservation) {
+        let Some(session) = self.memory_session else {
+            return;
+        };
+        if self.memory_observations >= MAX_MEMORY_OBSERVATIONS_PER_RUN {
+            return;
+        }
+        self.memory_observations += 1;
+        self.memory.observe(session, observation);
+    }
+
+    fn observe_tool_event(&mut self, call: &axiom_ai_provider::ProviderToolCall, succeeded: bool) {
+        if !succeeded {
+            return;
+        }
+        let observation = if matches!(
+            call.name.as_str(),
+            "write_file" | "update_file" | "delete_file"
+        ) {
+            Some(MemoryObservation::MutationSummary(format!(
+                "{} completed",
+                call.name
+            )))
+        } else if matches!(
+            call.name.as_str(),
+            "run_tests" | "run_test" | "validate" | "check" | "cargo_check"
+        ) {
+            Some(MemoryObservation::Validation(format!(
+                "{} completed successfully",
+                call.name
+            )))
+        } else if matches!(
+            call.name.as_str(),
+            "list_directory" | "find_files" | "find_symbol" | "find_references"
+        ) {
+            Some(MemoryObservation::Discovery(format!(
+                "{} completed",
+                call.name
+            )))
+        } else {
+            None
+        };
+        if let Some(observation) = observation {
+            self.observe_memory(observation);
+        }
     }
 
     fn drive(
@@ -1366,6 +1562,7 @@ where
                     });
                 }
             };
+            self.observe_tool_event(&call, matches!(&outcome, ToolOutcome::Success(_)));
             match outcome {
                 ToolOutcome::Success(result) => {
                     tracing::info!(
@@ -1507,7 +1704,6 @@ mod tests {
     #[test]
     fn normal_agent_request_receives_one_central_system_instruction() {
         let request = with_agent_system_instruction(request());
-        let request = with_agent_system_instruction(request);
         assert_eq!(
             request
                 .messages
@@ -1527,11 +1723,17 @@ mod tests {
         let projected = finalization_request(&request);
         assert!(projected.tools.is_none());
         assert_eq!(projected.messages[0].role, ChatRole::System);
-        assert!(projected.messages[0].content.contains("Tool results/context"));
-        assert!(projected
-            .messages
-            .iter()
-            .any(|message| message.content == agent_system_instruction()));
+        assert!(
+            projected.messages[0]
+                .content
+                .contains("Tool results/context")
+        );
+        assert!(
+            projected
+                .messages
+                .iter()
+                .any(|message| message.content == agent_system_instruction())
+        );
     }
 
     fn message(role: ChatRole, content: &str) -> ProviderChatMessage {
@@ -1797,6 +1999,80 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct MemoryLog {
+        events: Arc<Mutex<Vec<MemoryObservation>>>,
+        sessions_started: Arc<Mutex<Vec<(MemorySessionId, MemoryScope)>>>,
+        sessions_ended: Arc<Mutex<Vec<MemorySessionId>>>,
+        briefings: Arc<Mutex<usize>>,
+    }
+
+    struct RecordingMemory {
+        log: MemoryLog,
+        next: u64,
+        briefing_results: Vec<MemoryResult>,
+    }
+
+    impl RecordingMemory {
+        fn new(log: MemoryLog) -> Self {
+            Self {
+                log,
+                next: 0,
+                briefing_results: Vec::new(),
+            }
+        }
+
+        fn with_briefing(log: MemoryLog, briefing_results: Vec<MemoryResult>) -> Self {
+            Self {
+                log,
+                next: 0,
+                briefing_results,
+            }
+        }
+    }
+
+    impl MemoryService for RecordingMemory {
+        fn session_start(&mut self, scope: MemoryScope) -> MemorySessionId {
+            self.next += 1;
+            let session = MemorySessionId::new(self.next);
+            self.log
+                .sessions_started
+                .lock()
+                .unwrap()
+                .push((session, scope));
+            session
+        }
+
+        fn observe(&mut self, _session: MemorySessionId, observation: MemoryObservation) {
+            self.log.events.lock().unwrap().push(observation);
+        }
+
+        fn session_end(&mut self, session: MemorySessionId) {
+            self.log.sessions_ended.lock().unwrap().push(session);
+        }
+
+        fn query(&self, _: MemoryScope, _: &str, _: usize) -> Vec<MemoryResult> {
+            Vec::new()
+        }
+
+        fn recent(&self, _: MemoryScope, _: usize) -> Vec<MemoryResult> {
+            Vec::new()
+        }
+
+        fn history(&self, _: MemoryScope, _: usize) -> Vec<MemoryResult> {
+            Vec::new()
+        }
+
+        fn briefing(&self, _: MemoryScope, _: usize) -> Vec<MemoryResult> {
+            *self.log.briefings.lock().unwrap() += 1;
+            self.briefing_results.clone()
+        }
+
+        fn handoff(&self, _: MemorySessionId) -> Option<MemoryHandoff> {
+            None
+        }
+    }
+
     struct CancellingProvider {
         cancellation: Cancellation,
         calls: usize,
@@ -1863,6 +2139,266 @@ mod tests {
         std::fs::write(root.join("jogo.html"), "old").unwrap();
         std::fs::write(root.join("config.php"), "old").unwrap();
         root
+    }
+
+    #[test]
+    fn one_agent_run_starts_and_ends_one_memory_session() {
+        let log = MemoryLog::default();
+        let mut provider = FakeProvider {
+            scripts: vec![Ok(vec![
+                ProviderChatStreamEvent::ContentDelta("done".into()),
+                ProviderChatStreamEvent::Done,
+            ])],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: Vec::new(),
+            calls: Vec::new(),
+        };
+        let mut executor = AgentExecutor::with_policy_and_memory_in_scope(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            Box::new(RecordingMemory::new(log.clone())),
+            MemoryScope::Project,
+        );
+        let mut run = AgentRun::new(AgentRunId::new(100), budget());
+        let _ = executor.execute(&mut run, request(), &mut |_| {}).unwrap();
+        assert_eq!(log.sessions_started.lock().unwrap().len(), 1);
+        assert_eq!(
+            log.sessions_started.lock().unwrap()[0].1,
+            MemoryScope::Project
+        );
+        assert_eq!(log.sessions_ended.lock().unwrap().len(), 1);
+        assert!(log.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            MemoryObservation::TaskOutcome(value) if value == "completed successfully"
+        )));
+    }
+
+    #[test]
+    fn briefing_is_bounded_and_nomemory_adds_no_context_message() {
+        let log = MemoryLog::default();
+        let mut provider = FakeProvider {
+            scripts: vec![Ok(vec![ProviderChatStreamEvent::Done])],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: Vec::new(),
+            calls: Vec::new(),
+        };
+        let mut executor = AgentExecutor::with_policy_and_memory_in_scope(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            Box::new(RecordingMemory::with_briefing(
+                log,
+                (0..20)
+                    .map(|index| MemoryResult {
+                        id: Some(index.to_string()),
+                        scope: MemoryScope::Workspace,
+                        category: None,
+                        content: "x".repeat(1000),
+                    })
+                    .collect(),
+            )),
+            MemoryScope::Workspace,
+        );
+        let mut run = AgentRun::new(AgentRunId::new(104), budget());
+        executor.execute(&mut run, request(), &mut |_| {}).unwrap();
+        let briefing = provider.requests[0]
+            .messages
+            .iter()
+            .find(|message| message.content.contains("Memory briefing"))
+            .unwrap();
+        assert!(briefing.content.chars().count() <= MAX_MEMORY_BRIEFING_CHARS);
+        assert!(briefing.content.matches("- ").count() <= MAX_MEMORY_BRIEFING_ITEMS);
+
+        let mut provider = FakeProvider {
+            scripts: vec![Ok(vec![ProviderChatStreamEvent::Done])],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut executor = AgentExecutor::new(&mut provider, &mut tools);
+        let mut run = AgentRun::new(AgentRunId::new(105), budget());
+        executor.execute(&mut run, request(), &mut |_| {}).unwrap();
+        assert!(
+            !provider.requests[0]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Memory briefing"))
+        );
+    }
+
+    #[test]
+    fn multiple_provider_turns_keep_one_session_and_capture_semantic_events() {
+        let log = MemoryLog::default();
+        let mut provider = FakeProvider {
+            scripts: vec![
+                Ok(vec![
+                    tool_call("read", "list_directory"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ContentDelta("done".into()),
+                    ProviderChatStreamEvent::Done,
+                ]),
+            ],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: vec![Ok(ToolOutcome::Success("raw listing with secrets".into()))],
+            calls: Vec::new(),
+        };
+        let mut executor = AgentExecutor::with_policy_and_memory(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            Box::new(RecordingMemory::with_briefing(
+                log.clone(),
+                vec![
+                    MemoryResult {
+                        id: Some("project-fact".into()),
+                        scope: MemoryScope::Workspace,
+                        category: None,
+                        content: "historical workspace constraint".into(),
+                    },
+                    MemoryResult {
+                        id: Some("other-scope".into()),
+                        scope: MemoryScope::Project,
+                        category: None,
+                        content: "must not leak".into(),
+                    },
+                ],
+            )),
+        );
+        let mut run = AgentRun::new(AgentRunId::new(101), AgentBudget::new(3, 2));
+        executor.execute(&mut run, request(), &mut |_| {}).unwrap();
+        assert_eq!(provider.calls, 2);
+        assert_eq!(*log.briefings.lock().unwrap(), 1);
+        assert_eq!(log.sessions_started.lock().unwrap().len(), 1);
+        for request in &provider.requests {
+            let briefings = request
+                .messages
+                .iter()
+                .filter(|message| message.content.contains("Memory briefing"))
+                .collect::<Vec<_>>();
+            assert_eq!(briefings.len(), 1);
+            assert!(
+                briefings[0]
+                    .content
+                    .contains("historical workspace constraint")
+            );
+            assert!(!briefings[0].content.contains("must not leak"));
+            assert_eq!(briefings[0].role, ChatRole::System);
+        }
+        assert!(log.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            MemoryObservation::Discovery(value) if value == "list_directory completed"
+        )));
+        assert!(!log.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            MemoryObservation::Discovery(value) if value.contains("raw listing")
+        )));
+    }
+
+    #[test]
+    fn finalization_reuses_one_memory_briefing_without_refetching() {
+        let log = MemoryLog::default();
+        let mut provider = FakeProvider {
+            scripts: vec![
+                Ok(vec![
+                    tool_call("read", "list_directory"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ContentDelta("final answer".into()),
+                    ProviderChatStreamEvent::Done,
+                ]),
+            ],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: vec![Ok(ToolOutcome::Success("listing".into()))],
+            calls: Vec::new(),
+        };
+        let mut executor = AgentExecutor::with_policy_and_memory(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            Box::new(RecordingMemory::with_briefing(
+                log.clone(),
+                vec![MemoryResult {
+                    id: Some("historical-fact".into()),
+                    scope: MemoryScope::Workspace,
+                    category: None,
+                    content: "historical fact".into(),
+                }],
+            )),
+        );
+        let mut run = AgentRun::new(AgentRunId::new(106), AgentBudget::new(2, 2));
+        executor.execute(&mut run, request(), &mut |_| {}).unwrap();
+
+        assert_eq!(*log.briefings.lock().unwrap(), 1);
+        assert_eq!(provider.requests.len(), 2);
+        for provider_request in &provider.requests {
+            assert_eq!(
+                provider_request
+                    .messages
+                    .iter()
+                    .filter(|message| message.content.contains("Memory briefing"))
+                    .count(),
+                1
+            );
+        }
+        assert!(provider.requests[1].tools.is_none());
+    }
+
+    #[test]
+    fn provider_failure_and_cancellation_end_memory_session_without_failing_memory() {
+        let log = MemoryLog::default();
+        let mut provider = FakeProvider {
+            scripts: vec![Err(ProviderError::Timeout)],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: Vec::new(),
+            calls: Vec::new(),
+        };
+        let mut executor = AgentExecutor::with_policy_and_memory(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            Box::new(RecordingMemory::new(log.clone())),
+        );
+        let mut run = AgentRun::new(AgentRunId::new(102), budget());
+        assert!(executor.execute(&mut run, request(), &mut |_| {}).is_err());
+        assert_eq!(log.sessions_ended.lock().unwrap().len(), 1);
+        assert!(log.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            MemoryObservation::TaskOutcome(value) if value == "failed due to provider error"
+        )));
+
+        let cancellation = Cancellation::default();
+        let mut provider = CancellingProvider {
+            cancellation: cancellation.clone(),
+            calls: 0,
+        };
+        let log = MemoryLog::default();
+        let mut executor = AgentExecutor::with_policy_and_memory(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            Box::new(RecordingMemory::new(log.clone())),
+        );
+        let mut run = AgentRun::new(AgentRunId::new(103), budget());
+        assert!(executor.execute(&mut run, request(), &mut |_| {}).is_err());
+        assert_eq!(log.sessions_ended.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -3150,7 +3686,12 @@ mod tests {
                 .iter()
                 .map(|message| message.role.clone())
                 .collect::<Vec<_>>(),
-            vec![ChatRole::System, ChatRole::System, ChatRole::User, ChatRole::User]
+            vec![
+                ChatRole::System,
+                ChatRole::System,
+                ChatRole::User,
+                ChatRole::User
+            ]
         );
         let context = &provider.requests[4].messages[0].content;
         assert_eq!(occurrence_count(context, "[tool result call-0]"), 1);
@@ -3315,7 +3856,12 @@ mod tests {
                 .iter()
                 .map(|message| message.role.clone())
                 .collect::<Vec<_>>(),
-            vec![ChatRole::System, ChatRole::System, ChatRole::User, ChatRole::User]
+            vec![
+                ChatRole::System,
+                ChatRole::System,
+                ChatRole::User,
+                ChatRole::User
+            ]
         );
         assert_eq!(
             provider.requests[1]

@@ -1,11 +1,11 @@
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{ops::Range, sync::{Arc, Mutex}};
 
-use axiom_terminal::{TerminalLink, TerminalSession, detect_links};
+use axiom_terminal::{TerminalLink, TerminalSession, TerminalState, detect_links};
 use gpui::{
     App, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, Focusable, GlobalElementId, IntoElement, KeyBinding, LayoutId, Pixels, Point,
     Render, SharedString, Style, UTF16Selection, WeakEntity, Window, actions, div, prelude::*, px,
-    relative,
+    background_executor, relative,
 };
 
 use crate::ui::{metrics, metrics::CODE_FONT_FAMILY, theme};
@@ -39,6 +39,7 @@ pub struct TerminalView {
     focus: FocusHandle,
     contents: SharedString,
     revision: u64,
+    state: TerminalState,
     marked_text: Option<String>,
     line_links: Vec<Vec<TerminalLink>>,
     hovered_link: Option<TerminalLink>,
@@ -59,11 +60,13 @@ impl TerminalView {
         workspace: WeakEntity<WorkspaceView>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let events = Arc::new(Mutex::new(session.subscribe()));
         let mut view = Self {
             session,
             focus: cx.focus_handle(),
             contents: "Starting terminal…".into(),
             revision: 0,
+            state: TerminalState::Running,
             marked_text: None,
             line_links: Vec::new(),
             hovered_link: None,
@@ -77,10 +80,26 @@ impl TerminalView {
         view.refresh();
         cx.spawn(async move |this, cx| {
             loop {
-                gpui::Timer::after(Duration::from_millis(33)).await;
+                let event = background_executor()
+                    .spawn({
+                        let events = events.clone();
+                        async move {
+                            events
+                                .lock()
+                                .map_err(|_| ())?
+                                .recv()
+                                .map_err(|_| ())
+                        }
+                    })
+                    .await;
+                let Ok(event) = event else {
+                    break;
+                };
                 if this
                     .update(cx, |this, cx| {
-                        if this.refresh() {
+                        let changed = this.refresh();
+                        this.session.acknowledge_event(event.generation);
+                        if changed {
                             cx.notify();
                         }
                     })
@@ -100,10 +119,12 @@ impl TerminalView {
 
     fn refresh(&mut self) -> bool {
         let revision = self.session.revision();
-        if revision == self.revision {
+        let state = self.session.state();
+        if revision == self.revision && state == self.state {
             return false;
         }
         self.revision = revision;
+        self.state = state;
         self.contents = self.session.contents().into();
         let cwd = self.session.cwd().to_path_buf();
         self.line_links = self
@@ -385,6 +406,23 @@ impl Render for TerminalView {
                         )
                     })),
             )
+            .when(self.state != TerminalState::Running, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_2()
+                        .right_2()
+                        .px_2()
+                        .py_1()
+                        .bg(t.panel_background)
+                        .text_color(t.text_muted)
+                        .child(match self.state {
+                            TerminalState::Exited => "Terminal exited",
+                            TerminalState::Failed => "Terminal unavailable",
+                            TerminalState::Running => "",
+                        }),
+                )
+            })
             .child(
                 div()
                     .absolute()
@@ -591,8 +629,10 @@ impl Element for TerminalInputElement {
         let (rows, cols, focus) = {
             let terminal = self.terminal.read(cx);
             (
-                (f32::from(bounds.size.height) / f32::from(metrics().editor_line_height)) as u16,
-                (f32::from(bounds.size.width) / TERMINAL_CELL_WIDTH) as u16,
+                ((f32::from(bounds.size.height) / f32::from(metrics().editor_line_height))
+                    as u16)
+                    .max(1),
+                ((f32::from(bounds.size.width) / TERMINAL_CELL_WIDTH) as u16).max(1),
                 terminal.focus.clone(),
             )
         };

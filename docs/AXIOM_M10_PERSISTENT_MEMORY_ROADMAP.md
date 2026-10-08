@@ -1597,6 +1597,90 @@ M.11 Skills
 M.12 Closed Learning Loop
 ```
 
+## M.10 / M.11 / M.12 Alignment Contract
+
+The boundaries between these milestones are intentional:
+
+### M.10 — Factual and Episodic Memory
+
+M.10 owns historical knowledge about work, including:
+
+```text
+sessions
+observations
+decisions
+discoveries
+gotchas
+outcomes
+briefing and query
+consolidation
+retention
+workspace and project scopes
+```
+
+Memory is historical context, not authority over current deterministic state.
+The current project files, explicit instructions, and accepted decisions take
+precedence over stale or conflicting memory. Skills and active procedures are
+not part of M.10.
+
+### M.11 — Skills and Procedural Knowledge
+
+M.11 owns reusable procedures in a human-readable, versionable format such as
+`SKILL.md`. Skill context uses progressive disclosure:
+
+```text
+Level 0  compact index: name, description, tags, and metadata
+Level 1  full SKILL.md, loaded only when relevant
+Level 2  references, scripts, and templates, loaded only when necessary
+```
+
+The context cost must scale with relevance, not total skill count. A task does
+not automatically create a Skill. A `ProcedureCandidate` may be proposed from
+signals such as repeated success, a non-trivial multi-tool workflow, successful
+error recovery, a validated outcome, novelty, and clear future reuse value;
+these signals are evidence, not sufficient promotion rules. Active Skills must
+never be silently rewritten from memory.
+
+### M.12 — Closed Learning Loop
+
+The loop is:
+
+```text
+Execute → Evaluate → Extract → Retrieve
+```
+
+Its architectural promotion path is:
+
+```text
+Trace
+  → Evaluator
+  → Experience
+  → ProcedureCandidate
+  → SkillCandidate
+  → Validation
+  → Human Review
+  → Active Skill
+```
+
+Future candidate comparison may consider success rate, token efficiency,
+execution time, and reliability. No particular external framework, including
+GEPA, is required. Human review remains mandatory before a candidate can
+change an active Skill.
+
+The concepts remain distinct:
+
+```text
+Trace       evidence of what happened
+Memory      useful historical knowledge
+Skills      reusable procedures
+Evaluator   judges outcomes
+```
+
+FTS, metadata, scope, and recency remain the first retrieval mechanisms. Local
+embeddings may be added later, but embeddings and vector indexes are derived,
+rebuildable retrieval indexes, never the durable source of truth. Durable
+knowledge should remain open and human-readable where practical.
+
 ---
 
 # M.10.43 — Relationship to MCP

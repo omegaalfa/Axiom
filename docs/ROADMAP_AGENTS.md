@@ -3003,6 +3003,83 @@ Skill candidate v2
 
 ---
 
+# M.10 / M.11 / M.12 — Alignment Contract
+
+Os limites entre esses marcos são parte da arquitetura e não devem ser
+misturados.
+
+## M.10 — Memória factual e episódica
+
+M.10 armazena conhecimento histórico útil sobre o trabalho:
+
+```text
+sessões, observações, decisões, descobertas, gotchas e resultados
+briefing/query, consolidação, retenção e escopos de workspace/projeto
+```
+
+Memória descreve experiência passada; não é autoridade sobre o estado
+determinístico atual. Arquivos atuais, instruções explícitas e decisões
+aceitas têm precedência. Skills e procedimentos ativos não pertencem ao M.10.
+
+## M.11 — Skills / conhecimento procedural
+
+M.11 representa procedimentos reutilizáveis em formato humano-legível e
+versionável, como `SKILL.md`. O carregamento é progressivo:
+
+```text
+Level 0  índice compacto: nome, descrição, tags e metadados
+Level 1  SKILL.md completo, somente quando relevante
+Level 2  referências, scripts e templates, somente quando necessários
+```
+
+O custo de contexto deve crescer com a relevância, não com a quantidade total
+de Skills. Uma tarefa não cria automaticamente uma Skill. Um
+`ProcedureCandidate` pode ser proposto por sinais como padrão repetido de
+sucesso, fluxo não trivial com várias ferramentas, recuperação bem-sucedida de
+erro, resultado validado, novidade e valor claro de reutilização futura. Esses
+sinais não bastam sozinhos para promoção. Uma Skill ativa nunca pode ser
+reescrita silenciosamente a partir da memória.
+
+## M.12 — Closed Learning Loop
+
+O ciclo é:
+
+```text
+Execute → Evaluate → Extract → Retrieve
+```
+
+O caminho de promoção é:
+
+```text
+Trace
+  → Evaluator
+  → Experience
+  → ProcedureCandidate
+  → SkillCandidate
+  → Validation
+  → Human Review
+  → Active Skill
+```
+
+Comparações futuras podem considerar taxa de sucesso, eficiência de tokens,
+tempo de execução e confiabilidade, sem exigir GEPA ou qualquer framework
+externo específico. A revisão humana continua obrigatória antes de promover ou
+alterar uma Skill ativa.
+
+```text
+Trace       evidência do que aconteceu
+Memory      conhecimento histórico útil
+Skills      procedimentos reutilizáveis
+Evaluator   julga resultados
+```
+
+FTS, metadados, escopo e recência vêm primeiro. Embeddings locais podem ser
+adicionados depois; embeddings, índices vetoriais, SQLite/FTS e grafos são
+índices derivados e reconstruíveis, nunca a fonte durável de verdade. Onde for
+prático, o conhecimento durável deve permanecer aberto e humano-legível.
+
+---
+
 # M.13 — Hermes Integration
 
 **Só agora eu integraria Hermes.**

@@ -2,8 +2,9 @@
 
 use super::tool_orchestration::{
     delete_file_definition, fetch_url_definition, find_files_definition,
-    find_references_definition, find_symbol_definition, list_directory_definition, read_file_definition,
-    search_text_definition, update_file_definition, write_file_definition,
+    find_references_definition, find_symbol_definition, list_directory_definition,
+    memory_get_definition, memory_search_definition, read_file_definition, search_text_definition,
+    update_file_definition, write_file_definition,
 };
 use super::tools::{ToolArguments, ToolError, ToolName, ToolRegistry, ToolRequest};
 use axiom_agent::{
@@ -235,8 +236,15 @@ pub(crate) fn next_agent_run_id() -> AgentRunId {
     AgentRunId::new(NEXT_AGENT_RUN_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+#[cfg(test)]
 pub(crate) fn production_tool_definitions() -> Vec<axiom_ai_provider::ProviderToolDefinition> {
-    vec![
+    production_tool_definitions_with_memory(false)
+}
+
+pub(crate) fn production_tool_definitions_with_memory(
+    memory_enabled: bool,
+) -> Vec<axiom_ai_provider::ProviderToolDefinition> {
+    let mut definitions = vec![
         read_file_definition(),
         list_directory_definition(),
         find_files_definition(),
@@ -247,9 +255,36 @@ pub(crate) fn production_tool_definitions() -> Vec<axiom_ai_provider::ProviderTo
         write_file_definition(),
         update_file_definition(),
         delete_file_definition(),
-    ]
+    ];
+    if memory_enabled {
+        definitions.push(memory_search_definition());
+        definitions.push(memory_get_definition());
+    }
+    definitions
 }
 
+pub(crate) fn gemini_agent_tool_definitions_with_memory(
+    memory_enabled: bool,
+) -> Vec<axiom_ai_provider::ProviderToolDefinition> {
+    let mut definitions = vec![
+        read_file_definition(),
+        list_directory_definition(),
+        find_files_definition(),
+        search_text_definition(),
+        find_symbol_definition(),
+        find_references_definition(),
+        write_file_definition(),
+        update_file_definition(),
+        delete_file_definition(),
+    ];
+    if memory_enabled {
+        definitions.push(memory_search_definition());
+        definitions.push(memory_get_definition());
+    }
+    definitions
+}
+
+#[cfg(test)]
 pub(crate) fn gemini_agent_tool_definitions() -> Vec<axiom_ai_provider::ProviderToolDefinition> {
     vec![
         read_file_definition(),
@@ -459,7 +494,9 @@ fn provider_call_to_request(call: &ProviderToolCall) -> Result<ToolRequest, Stri
                 .ok_or_else(|| "pattern must be a string".to_owned())?;
             Ok(ToolRequest {
                 name: ToolName::FindFiles,
-                arguments: ToolArguments::FindFiles { pattern: pattern.into() },
+                arguments: ToolArguments::FindFiles {
+                    pattern: pattern.into(),
+                },
             })
         }
         "find_symbol" => {
@@ -469,14 +506,22 @@ fn provider_call_to_request(call: &ProviderToolCall) -> Result<ToolRequest, Stri
                 .ok_or_else(|| "query must be a string".to_owned())?;
             let kind = match object.get("kind") {
                 None => None,
-                Some(value) => Some(value.as_str().ok_or_else(|| "kind must be a string".to_owned())?.to_owned()),
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| "kind must be a string".to_owned())?
+                        .to_owned(),
+                ),
             };
             let limit = match object.get("limit") {
                 None => None,
-                Some(value) => Some(value.as_u64()
-                    .filter(|limit| *limit > 0)
-                    .and_then(|limit| usize::try_from(limit).ok())
-                    .ok_or_else(|| "limit must be a positive integer".to_owned())?),
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .filter(|limit| *limit > 0)
+                        .and_then(|limit| usize::try_from(limit).ok())
+                        .ok_or_else(|| "limit must be a positive integer".to_owned())?,
+                ),
             };
             Ok(ToolRequest {
                 name: ToolName::FindSymbol,
@@ -494,14 +539,22 @@ fn provider_call_to_request(call: &ProviderToolCall) -> Result<ToolRequest, Stri
                 .ok_or_else(|| "query must be a string".to_owned())?;
             let kind = match object.get("kind") {
                 None => None,
-                Some(value) => Some(value.as_str().ok_or_else(|| "kind must be a string".to_owned())?.to_owned()),
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| "kind must be a string".to_owned())?
+                        .to_owned(),
+                ),
             };
             let limit = match object.get("limit") {
                 None => None,
-                Some(value) => Some(value.as_u64()
-                    .filter(|limit| *limit > 0)
-                    .and_then(|limit| usize::try_from(limit).ok())
-                    .ok_or_else(|| "limit must be a positive integer".to_owned())?),
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .filter(|limit| *limit > 0)
+                        .and_then(|limit| usize::try_from(limit).ok())
+                        .ok_or_else(|| "limit must be a positive integer".to_owned())?,
+                ),
             };
             Ok(ToolRequest {
                 name: ToolName::FindReferences,
@@ -578,6 +631,39 @@ fn provider_call_to_request(call: &ProviderToolCall) -> Result<ToolRequest, Stri
                     path: path.into(),
                     expected_fingerprint: expected_fingerprint.into(),
                 },
+            })
+        }
+        "memory_search" => {
+            let query = object
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "query must be a string".to_owned())?;
+            let limit = match object.get("limit") {
+                None => None,
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .filter(|limit| *limit > 0)
+                        .and_then(|limit| usize::try_from(limit).ok())
+                        .ok_or_else(|| "limit must be a positive integer".to_owned())?,
+                ),
+            };
+            Ok(ToolRequest {
+                name: ToolName::MemorySearch,
+                arguments: ToolArguments::MemorySearch {
+                    query: query.into(),
+                    limit,
+                },
+            })
+        }
+        "memory_get" => {
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "id must be a string".to_owned())?;
+            Ok(ToolRequest {
+                name: ToolName::MemoryGet,
+                arguments: ToolArguments::MemoryGet { id: id.into() },
             })
         }
         other => Ok(ToolRequest {
@@ -921,6 +1007,46 @@ mod tests {
                 "delete_file"
             ]
         );
+    }
+
+    #[test]
+    fn memory_tools_are_agent_only_and_optional_in_provider_declarations() {
+        let production_without_memory: Vec<_> = production_tool_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(
+            !production_without_memory
+                .iter()
+                .any(|name| name == "memory_search")
+        );
+        assert!(
+            !production_without_memory
+                .iter()
+                .any(|name| name == "memory_get")
+        );
+
+        let production_with_memory: Vec<_> = production_tool_definitions_with_memory(true)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(
+            production_with_memory
+                .iter()
+                .any(|name| name == "memory_search")
+        );
+        assert!(
+            production_with_memory
+                .iter()
+                .any(|name| name == "memory_get")
+        );
+
+        let chat: Vec<_> = super::super::tool_orchestration::chat_tool_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(!chat.iter().any(|name| name == "memory_search"));
+        assert!(!chat.iter().any(|name| name == "memory_get"));
     }
 }
 

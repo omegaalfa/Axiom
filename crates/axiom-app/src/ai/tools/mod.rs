@@ -1,22 +1,24 @@
 //! Minimal, provider-independent Agent tool layer.
 
 mod delete_file;
-mod find_files;
-mod find_symbol;
-mod find_references;
 mod fetch_url;
+mod find_files;
+mod find_references;
+mod find_symbol;
 mod list_directory;
 mod read_file;
 mod search_text;
 mod update_file;
 mod write_file;
 
+use axiom_agent::{MemoryResult, MemoryScope, MemoryService};
 use axiom_project::project_delete::ProjectDeleteCapability;
 use axiom_project::project_directory::ProjectDirectoryCapability;
 use axiom_project::project_read::{ProjectReadCapability, ReadFileRange};
 use axiom_project::project_search::ProjectSearchCapability;
 use axiom_project::project_update::{ProjectUpdateCapability, TextFileFingerprint};
 use axiom_project::project_write::ProjectWriteCapability;
+use serde_json::json;
 
 pub(crate) use fetch_url::FetchUrlTool;
 
@@ -26,8 +28,8 @@ pub(crate) use fetch_url::FetchUrlTool;
 pub(crate) const MAX_TOOL_CONTENT_BYTES: usize = 24 * 1024;
 pub(crate) use delete_file::DeleteFileTool;
 pub(crate) use find_files::FindFilesTool;
-pub(crate) use find_symbol::FindSymbolTool;
 pub(crate) use find_references::FindReferencesTool;
+pub(crate) use find_symbol::FindSymbolTool;
 pub(crate) use list_directory::ListDirectoryTool;
 pub(crate) use read_file::ReadFileTool;
 pub(crate) use search_text::SearchTextTool;
@@ -46,6 +48,8 @@ pub(crate) enum ToolName {
     WriteFile,
     UpdateFile,
     DeleteFile,
+    MemorySearch,
+    MemoryGet,
     Unknown(String),
 }
 
@@ -97,6 +101,13 @@ pub(crate) enum ToolArguments {
     DeleteFile {
         path: String,
         expected_fingerprint: String,
+    },
+    MemorySearch {
+        query: String,
+        limit: Option<usize>,
+    },
+    MemoryGet {
+        id: String,
     },
 }
 
@@ -176,7 +187,6 @@ pub(crate) struct ToolResult {
     pub(crate) result: Result<ToolOutput, ToolError>,
 }
 
-#[derive(Clone, Debug)]
 pub(crate) struct ToolRegistry {
     read_file: ReadFileTool,
     list_directory: ListDirectoryTool,
@@ -188,7 +198,15 @@ pub(crate) struct ToolRegistry {
     write_file: Option<WriteFileTool>,
     update_file: Option<UpdateFileTool>,
     delete_file: Option<DeleteFileTool>,
+    memory: Option<Box<dyn MemoryService>>,
+    memory_scope: MemoryScope,
 }
+
+pub(crate) const MEMORY_SEARCH_DEFAULT_LIMIT: usize = 5;
+pub(crate) const MEMORY_SEARCH_MAX_LIMIT: usize = 20;
+pub(crate) const MEMORY_QUERY_MAX_CHARS: usize = 256;
+pub(crate) const MEMORY_RESULT_MAX_CHARS: usize = 512;
+pub(crate) const MEMORY_OUTPUT_MAX_CHARS: usize = 4096;
 
 impl ToolRegistry {
     #[cfg(test)]
@@ -226,6 +244,8 @@ impl ToolRegistry {
             write_file: None,
             update_file: None,
             delete_file: None,
+            memory: None,
+            memory_scope: MemoryScope::Workspace,
         }
     }
 
@@ -272,6 +292,8 @@ impl ToolRegistry {
             write_file: Some(WriteFileTool::new(write_capability)),
             update_file: None,
             delete_file: None,
+            memory: None,
+            memory_scope: MemoryScope::Workspace,
         }
     }
 
@@ -300,6 +322,8 @@ impl ToolRegistry {
             write_file: Some(WriteFileTool::new(write_capability)),
             update_file: Some(UpdateFileTool::new(update_capability)),
             delete_file: None,
+            memory: None,
+            memory_scope: MemoryScope::Workspace,
         }
     }
 
@@ -322,17 +346,43 @@ impl ToolRegistry {
         registry
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn with_memory_service(self, memory: Box<dyn MemoryService>) -> Self {
+        self.with_memory_service_in_scope(memory, MemoryScope::Workspace)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_memory_service_in_scope(
+        mut self,
+        memory: Box<dyn MemoryService>,
+        scope: MemoryScope,
+    ) -> Self {
+        if memory.is_available() {
+            self.memory = Some(memory);
+            self.memory_scope = scope;
+        }
+        self
+    }
+
+    pub(crate) fn has_memory_tools(&self) -> bool {
+        self.memory.is_some()
+    }
+
     pub(crate) fn kind(&self, name: &ToolName) -> Option<ToolKind> {
         match name {
-            ToolName::ReadFile | ToolName::ListDirectory | ToolName::SearchText | ToolName::FetchUrl => {
-                Some(ToolKind::ReadOnly)
-            }
+            ToolName::ReadFile
+            | ToolName::ListDirectory
+            | ToolName::SearchText
+            | ToolName::FetchUrl => Some(ToolKind::ReadOnly),
             ToolName::FindFiles => Some(ToolKind::ReadOnly),
             ToolName::FindSymbol => Some(ToolKind::ReadOnly),
             ToolName::FindReferences => Some(ToolKind::ReadOnly),
             ToolName::WriteFile => self.write_file.is_some().then_some(ToolKind::Mutating),
             ToolName::UpdateFile => self.update_file.is_some().then_some(ToolKind::Mutating),
             ToolName::DeleteFile => self.delete_file.is_some().then_some(ToolKind::Mutating),
+            ToolName::MemorySearch | ToolName::MemoryGet => {
+                self.memory.is_some().then_some(ToolKind::ReadOnly)
+            }
             ToolName::Unknown(_) => None,
         }
     }
@@ -356,8 +406,15 @@ impl ToolRegistry {
             } => self.list_directory.execute(path),
             ToolRequest {
                 name: ToolName::SearchText,
-                arguments: ToolArguments::SearchText { query, path, file_pattern },
-            } => self.search_text.execute(query, path, file_pattern, cancelled),
+                arguments:
+                    ToolArguments::SearchText {
+                        query,
+                        path,
+                        file_pattern,
+                    },
+            } => self
+                .search_text
+                .execute(query, path, file_pattern, cancelled),
             ToolRequest {
                 name: ToolName::FindFiles,
                 arguments: ToolArguments::FindFiles { pattern },
@@ -438,6 +495,14 @@ impl ToolRegistry {
                 }
             }
             ToolRequest {
+                name: ToolName::MemorySearch,
+                arguments: ToolArguments::MemorySearch { query, limit },
+            } => self.memory_search(query, limit),
+            ToolRequest {
+                name: ToolName::MemoryGet,
+                arguments: ToolArguments::MemoryGet { id },
+            } => self.memory_get(id),
+            ToolRequest {
                 name: ToolName::Unknown(name),
                 ..
             } => ToolResult {
@@ -452,11 +517,130 @@ impl ToolRegistry {
             },
         }
     }
+
+    fn memory_search(&self, query: String, limit: Option<usize>) -> ToolResult {
+        let query = normalize_memory_query(&query);
+        if query.is_empty() {
+            return memory_error(ToolName::MemorySearch, "query must not be empty");
+        }
+        let Some(memory) = self.memory.as_ref() else {
+            return memory_error(ToolName::MemorySearch, "memory unavailable");
+        };
+        let limit = limit
+            .unwrap_or(MEMORY_SEARCH_DEFAULT_LIMIT)
+            .min(MEMORY_SEARCH_MAX_LIMIT);
+        let results = memory
+            .query(self.memory_scope, &query, limit)
+            .into_iter()
+            .filter(|result| result.scope == self.memory_scope)
+            .collect();
+        memory_success(ToolName::MemorySearch, format_memory_results(results))
+    }
+
+    fn memory_get(&self, id: String) -> ToolResult {
+        let id = id.trim();
+        if id.is_empty() || id.chars().count() > MEMORY_QUERY_MAX_CHARS {
+            return memory_error(ToolName::MemoryGet, "id is invalid or too long");
+        }
+        let Some(memory) = self.memory.as_ref() else {
+            return memory_error(ToolName::MemoryGet, "memory unavailable");
+        };
+        let result = memory.get(self.memory_scope, id);
+        memory_success(
+            ToolName::MemoryGet,
+            format_memory_results(result.into_iter().collect()),
+        )
+    }
+}
+
+fn normalize_memory_query(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MEMORY_QUERY_MAX_CHARS)
+        .collect()
+}
+
+fn compact_memory_result(result: MemoryResult) -> serde_json::Value {
+    json!({
+        "id": result.id,
+        "scope": match result.scope {
+            MemoryScope::User => "user",
+            MemoryScope::Workspace => "workspace",
+            MemoryScope::Project => "project",
+        },
+        "content": result.content.chars().take(MEMORY_RESULT_MAX_CHARS).collect::<String>(),
+    })
+}
+
+fn format_memory_results(results: Vec<MemoryResult>) -> String {
+    let warning =
+        "Memory is historical and may be stale or incomplete; verify current project state.";
+    let mut items = Vec::new();
+    for result in results {
+        items.push(compact_memory_result(result));
+        let candidate = json!({
+            "historical": true,
+            "warning": warning,
+            "results": items,
+        })
+        .to_string();
+        if candidate.chars().count() > MEMORY_OUTPUT_MAX_CHARS {
+            items.pop();
+            break;
+        }
+    }
+    json!({
+        "historical": true,
+        "warning": warning,
+        "results": items,
+    })
+    .to_string()
+}
+
+fn memory_success(tool: ToolName, content: String) -> ToolResult {
+    ToolResult {
+        tool,
+        result: Ok(ToolOutput {
+            content,
+            metadata: empty_tool_metadata(),
+        }),
+    }
+}
+
+fn memory_error(tool: ToolName, message: &str) -> ToolResult {
+    ToolResult {
+        tool,
+        result: Ok(ToolOutput {
+            content: json!({
+                "historical": true,
+                "available": false,
+                "results": [],
+                "message": message,
+            })
+            .to_string(),
+            metadata: empty_tool_metadata(),
+        }),
+    }
+}
+
+fn empty_tool_metadata() -> ToolMetadata {
+    ToolMetadata {
+        path: String::new(),
+        bytes: 0,
+        range: None,
+        source_bytes: None,
+        truncated: false,
+        fingerprint: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axiom_agent::{InMemoryMemoryService, MemoryObservation, MemoryService};
     use axiom_project::project_read::ProjectReadCapability;
     use axiom_project::project_update::ProjectUpdateCapability;
     use axiom_project::project_write::ProjectWriteCapability;
@@ -524,6 +708,115 @@ mod tests {
         );
         assert_eq!(registry.kind(&ToolName::FetchUrl), Some(ToolKind::ReadOnly));
         assert_eq!(registry.kind(&ToolName::WriteFile), None);
+    }
+
+    #[test]
+    fn memory_tools_are_optional_and_read_only() {
+        let (_dir, empty_registry) = registry();
+        assert!(!empty_registry.has_memory_tools());
+        assert_eq!(empty_registry.kind(&ToolName::MemorySearch), None);
+        assert_eq!(empty_registry.kind(&ToolName::MemoryGet), None);
+
+        let mut memory = InMemoryMemoryService::default();
+        let session = memory.session_start(MemoryScope::Project);
+        memory.observe(
+            session,
+            MemoryObservation::Discovery("project-only fact".into()),
+        );
+        memory.session_end(session);
+        let registry = registry()
+            .1
+            .with_memory_service_in_scope(Box::new(memory), MemoryScope::Project);
+        assert_eq!(
+            registry.kind(&ToolName::MemorySearch),
+            Some(ToolKind::ReadOnly)
+        );
+        assert_eq!(
+            registry.kind(&ToolName::MemoryGet),
+            Some(ToolKind::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn memory_search_is_scoped_normalized_and_bounded() {
+        let mut memory = InMemoryMemoryService::default();
+        let project = memory.session_start(MemoryScope::Project);
+        for index in 0..40 {
+            memory.observe(
+                project,
+                MemoryObservation::Discovery(format!("project fact {index} {}", "x".repeat(900))),
+            );
+        }
+        memory.session_end(project);
+        let workspace = memory.session_start(MemoryScope::Workspace);
+        memory.observe(
+            workspace,
+            MemoryObservation::Discovery("workspace-only fact".into()),
+        );
+        memory.session_end(workspace);
+
+        let registry = registry()
+            .1
+            .with_memory_service_in_scope(Box::new(memory), MemoryScope::Project);
+        let result = registry.execute(ToolRequest {
+            name: ToolName::MemorySearch,
+            arguments: ToolArguments::MemorySearch {
+                query: "  project   fact  ".into(),
+                limit: Some(usize::MAX),
+            },
+        });
+        let ToolResult {
+            result: Ok(output), ..
+        } = result
+        else {
+            panic!("memory search must return a normalized result");
+        };
+        assert!(output.content.chars().count() <= MEMORY_OUTPUT_MAX_CHARS);
+        assert!(!output.content.contains("workspace-only fact"));
+        let payload: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(payload["historical"], true);
+        assert!(payload["results"].as_array().unwrap().len() <= MEMORY_SEARCH_MAX_LIMIT);
+    }
+
+    #[test]
+    fn memory_search_rejects_empty_query_and_memory_get_is_bounded() {
+        let mut memory = InMemoryMemoryService::default();
+        let session = memory.session_start(MemoryScope::Workspace);
+        memory.observe(
+            session,
+            MemoryObservation::Decision("known decision".into()),
+        );
+        memory.session_end(session);
+        let id = memory.briefing(MemoryScope::Workspace, 1)[0]
+            .id
+            .clone()
+            .unwrap();
+        let registry = registry().1.with_memory_service(Box::new(memory));
+
+        let empty = registry.execute(ToolRequest {
+            name: ToolName::MemorySearch,
+            arguments: ToolArguments::MemorySearch {
+                query: " \n\t ".into(),
+                limit: None,
+            },
+        });
+        assert!(
+            matches!(empty.result, Ok(output) if output.content.contains("query must not be empty"))
+        );
+
+        let found = registry.execute(ToolRequest {
+            name: ToolName::MemoryGet,
+            arguments: ToolArguments::MemoryGet { id },
+        });
+        assert!(matches!(found.result, Ok(output) if output.content.contains("known decision")));
+
+        let too_long = registry.execute(ToolRequest {
+            name: ToolName::MemoryGet,
+            arguments: ToolArguments::MemoryGet {
+                id: "x".repeat(MEMORY_QUERY_MAX_CHARS + 1),
+            },
+        });
+        assert!(matches!(too_long.result, Ok(output) if output.content.contains("too long")));
     }
 
     #[test]

@@ -8,6 +8,7 @@ description = "Headless lifecycle contracts for Axiom agent runs"
 
 [dependencies]
 axiom-ai-provider = { path = "../axiom-ai-provider" }
+serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 
