@@ -147,13 +147,6 @@ pub fn registry() -> Vec<CommandDescriptor> {
             "ctrl-shift-enter",
         ),
         command(
-            "terminal.toggle",
-            "Terminal",
-            "Shows or hides the integrated terminal.",
-            "Tool Windows",
-            "ctrl-`",
-        ),
-        command(
             "workspace.commands",
             "Command Palette",
             "Searches and runs Axiom commands.",

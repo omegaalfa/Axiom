@@ -40,7 +40,6 @@ fn main() -> anyhow::Result<()> {
             cx.bind_keys(editor_view::key_bindings());
             cx.bind_keys(outline_popup::key_bindings());
             cx.bind_keys(workspace_view::key_bindings());
-            cx.bind_keys(terminal_view::key_bindings());
 
             let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
             let window = cx

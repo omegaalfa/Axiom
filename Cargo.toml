@@ -7,9 +7,9 @@ members = [
     "crates/axiom-lsp",
     "crates/axiom-php",
     "crates/axiom-syntax",
-    "crates/axiom-terminal",
     "crates/axiom-ai-provider",
     "crates/axiom-web",
+    "crates/axiom-terminal",
     "crates/axiom-index",
     "crates/axiom-agent",
     "crates/axiom-git",
@@ -29,12 +29,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.25"
 tree-sitter-php = "0.24.2"
+alacritty_terminal = "=0.26.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 lsp-types = "0.97"
 url = "2.5"
-portable-pty = "0.9"
-vt100 = "0.16.2"
 gix = { version = "0.88.0", default-features = false, features = ["status", "sha1", "parallel"] }
 
 [patch.crates-io]

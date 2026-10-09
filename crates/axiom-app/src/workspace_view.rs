@@ -36,9 +36,7 @@ use axiom_index::{
 use axiom_lsp::{PositionCodec, ServerStatus, uri_to_path};
 use axiom_php::{RuntimeStubProvider, RuntimeSymbolIndex};
 use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_content};
-use axiom_terminal::{
-    TerminalLink, TerminalLinkKind, TerminalManager, TerminalProfile, TerminalSessionId,
-};
+use axiom_terminal::TerminalSession;
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
@@ -55,7 +53,6 @@ use crate::{
     },
     editor_view::EditorView,
     lsp_bridge::{IdeLspEvent, LspBridge, LspRequestKind},
-    terminal_view::TerminalView,
     ui::{
         components::tooltip,
         icons::{
@@ -80,7 +77,6 @@ actions!(
         Find,
         ToggleProject,
         ToggleAiPanel,
-        ToggleTerminal,
         OpenInTerminal,
         ImportRuntimeStubs,
         ImportRuntimeStubFiles,
@@ -122,7 +118,6 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-o", OpenFile, None),
         KeyBinding::new("secondary-f", Find, None),
         KeyBinding::new("ctrl-alt-a", ToggleAiPanel, None),
-        KeyBinding::new("secondary-`", ToggleTerminal, None),
         KeyBinding::new("ctrl-shift-p", CommandPalette, None),
         KeyBinding::new("up", PaletteUp, Some("CommandPalette")),
         KeyBinding::new("down", PaletteDown, Some("CommandPalette")),
@@ -2126,12 +2121,13 @@ pub struct WorkspaceView {
     ollama_models: Vec<axiom_ai_provider::ProviderModel>,
     default_provider: Option<String>,
     active_provider: Option<String>,
-    terminal_manager: TerminalManager,
-    terminal_views: HashMap<TerminalSessionId, Entity<TerminalView>>,
-    terminal_profiles: Vec<TerminalProfile>,
-    terminal_profiles_discovered: bool,
-    terminal_profile_picker_open: bool,
     terminal_visible: bool,
+    terminal_panel_height: Pixels,
+    terminal_panel_resizing: bool,
+    terminal_panel_resize_start_y: f32,
+    terminal_panel_resize_start_height: f32,
+    terminal_session: Option<Arc<Mutex<TerminalSession>>>,
+    terminal_view: Option<Entity<crate::terminal_view::TerminalView>>,
     navigation_back: Vec<NavigationLocation>,
     navigation_forward: Vec<NavigationLocation>,
     definition_targets: Vec<DefinitionTarget>,
@@ -3315,12 +3311,13 @@ impl WorkspaceView {
                         .any(|(name, _)| name == p)
                 })
                 .or_else(|| ui_settings.default_provider.clone()),
-            terminal_manager: TerminalManager::new(8),
-            terminal_views: HashMap::new(),
-            terminal_profiles: TerminalProfile::built_in_profiles(),
-            terminal_profiles_discovered: false,
-            terminal_profile_picker_open: false,
             terminal_visible: false,
+            terminal_panel_height: px(220.),
+            terminal_panel_resizing: false,
+            terminal_panel_resize_start_y: 0.,
+            terminal_panel_resize_start_height: 220.,
+            terminal_session: None,
+            terminal_view: None,
             navigation_back: Vec::new(),
             navigation_forward: Vec::new(),
             definition_targets: Vec::new(),
@@ -5021,16 +5018,6 @@ impl WorkspaceView {
         self.project_index = None;
         self.semantic_engine = None;
         self.lsp = None;
-        let ids = self
-            .terminal_manager
-            .sessions()
-            .into_iter()
-            .map(|session| session.id)
-            .collect::<Vec<_>>();
-        for id in ids {
-            self.terminal_manager.close_session(id);
-        }
-        self.terminal_views.clear();
         self.terminal_visible = false;
         self.status = "No project".into();
     }
@@ -5340,7 +5327,6 @@ impl WorkspaceView {
             "help.features" => self.show_features(&ShowFeatures, window, cx),
             "settings.open" => self.settings(&Settings, window, cx),
             "workspace.commands" => self.command_palette(&CommandPalette, window, cx),
-            "terminal.toggle" => self.toggle_terminal(&ToggleTerminal, window, cx),
             "project.open_project" => self.open_project(&OpenProject, window, cx),
             "project.open_file" => self.open_file_dialog(&OpenFile, window, cx),
             "project.rename" => {
@@ -10606,98 +10592,6 @@ impl WorkspaceView {
             )
     }
 
-    fn create_terminal_session(
-        &mut self,
-        profile: TerminalProfile,
-        cx: &mut Context<Self>,
-    ) -> Option<TerminalSessionId> {
-        let cwd = self.project.as_ref()?.root_path().to_path_buf();
-        let id = match self.terminal_manager.create_session(&cwd, profile) {
-            Ok(id) => id,
-            Err(error) => {
-                self.status = format!("Terminal failed to start: {error}").into();
-                cx.notify();
-                return None;
-            }
-        };
-        let session = self.terminal_manager.session(id)?;
-        let workspace = cx.entity().downgrade();
-        let view = cx.new(|cx| TerminalView::new(session, workspace, cx));
-        self.terminal_views.insert(id, view);
-        self.terminal_visible = true;
-        cx.notify();
-        Some(id)
-    }
-
-    fn activate_terminal_session(&mut self, id: TerminalSessionId, cx: &mut Context<Self>) {
-        if self.terminal_manager.activate_session(id) {
-            cx.notify();
-        }
-    }
-
-    fn close_terminal_session(&mut self, id: TerminalSessionId, cx: &mut Context<Self>) {
-        self.terminal_views.remove(&id);
-        self.terminal_manager.close_session(id);
-        if self.terminal_manager.len() == 0 {
-            self.terminal_visible = false;
-        }
-        cx.notify();
-    }
-
-    fn discover_terminal_profiles(&mut self, cx: &mut Context<Self>) {
-        if self.terminal_profiles_discovered {
-            return;
-        }
-        self.terminal_profiles_discovered = true;
-        #[cfg(not(windows))]
-        let _ = cx;
-        #[cfg(windows)]
-        {
-            let owner = cx.entity().downgrade();
-            cx.spawn(async move |_, cx| {
-                let wsl_available = background_executor()
-                    .spawn(async { TerminalProfile::wsl_available() })
-                    .await;
-                let _ = owner.update(cx, |workspace, cx| {
-                    if !wsl_available {
-                        workspace
-                            .terminal_profiles
-                            .retain(|profile| profile.id() != "ubuntu");
-                    }
-                    cx.notify();
-                });
-            })
-            .detach();
-        }
-    }
-
-    fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_menu = None;
-        if self.terminal_visible {
-            self.terminal_visible = false;
-            cx.notify();
-            return;
-        }
-        self.discover_terminal_profiles(cx);
-        if self.terminal_manager.len() == 0 {
-            let Some(profile) = self.terminal_profiles.first().cloned() else {
-                self.status = "No terminal profile available".into();
-                cx.notify();
-                return;
-            };
-            if self.create_terminal_session(profile, cx).is_none() {
-                return;
-            }
-        }
-        self.terminal_visible = true;
-        if let Some(id) = self.terminal_manager.active_session()
-            && let Some(terminal) = self.terminal_views.get(&id)
-        {
-            window.focus(&terminal.read(cx).focus_handle());
-        }
-        cx.notify();
-    }
-
     fn open_in_terminal(
         &mut self,
         _: &OpenInTerminal,
@@ -10707,72 +10601,9 @@ impl WorkspaceView {
         let Some(context) = self.explorer_context.take() else {
             return;
         };
-        let directory = Self::context_directory(&context.path, context.kind).to_path_buf();
-        let profile = TerminalProfile::platform_default();
-        match self.terminal_manager.create_session(&directory, profile) {
-            Ok(id) => {
-                let Some(session) = self.terminal_manager.session(id) else {
-                    return;
-                };
-                let workspace = cx.entity().downgrade();
-                let view = cx.new(|cx| TerminalView::new(session, workspace, cx));
-                self.terminal_views.insert(id, view);
-                self.terminal_visible = true;
-                self.status = format!("Terminal opened in {}", directory.display()).into();
-                if let Some(terminal) = self.terminal_views.get(&id) {
-                    window.focus(&terminal.read(cx).focus_handle());
-                }
-            }
-            Err(error) => self.status = format!("Terminal failed to start: {error}").into(),
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn open_terminal_link(
-        &mut self,
-        link: TerminalLink,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match link.kind {
-            TerminalLinkKind::Url => {
-                if link.target.starts_with("http://") || link.target.starts_with("https://") {
-                    if let Err(error) = open::that(&link.target) {
-                        self.status = format!("Unable to open link: {error}").into();
-                    }
-                }
-            }
-            TerminalLinkKind::File | TerminalLinkKind::FileLine { .. } => {
-                let Some(path) = link.path else { return };
-                if !path.is_file() {
-                    self.status = format!("File not found: {}", path.display()).into();
-                    cx.notify();
-                    return;
-                }
-                self.open_file(path.clone(), window, cx);
-                if let Some(line) = match link.kind {
-                    TerminalLinkKind::FileLine { line, .. } => Some(line),
-                    TerminalLinkKind::File => None,
-                    TerminalLinkKind::Url => None,
-                } {
-                    let column = match link.kind {
-                        TerminalLinkKind::FileLine { column, .. } => column,
-                        _ => None,
-                    };
-                    if let Some(index) = self.active.and_then(|index| self.tabs.get(index)) {
-                        index.editor.update(cx, |editor, cx| {
-                            editor.reveal_lsp_position(
-                                lsp_types::Position {
-                                    line: line.saturating_sub(1),
-                                    character: column.unwrap_or(1).saturating_sub(1),
-                                },
-                                cx,
-                            )
-                        });
-                    }
-                }
-            }
-        }
+        let _ = (context, window);
+        self.terminal_visible = true;
+        self.status = "Terminal unavailable — terminal engine pending integration".into();
         cx.notify();
     }
 
@@ -12788,7 +12619,6 @@ impl WorkspaceView {
             )
             .child({
                 let workspace = workspace.clone();
-                let active = self.terminal_visible;
                 div()
                     .id("activity-terminal")
                     .relative()
@@ -12799,12 +12629,10 @@ impl WorkspaceView {
                     .justify_center()
                     .tooltip(|_, cx| tooltip("Terminal (Ctrl+`)", cx))
                     .hover(move |style| style.bg(t.hover))
-                    .on_click(move |_, window, cx| {
-                        workspace.update(cx, |this, cx| {
-                            this.toggle_terminal(&ToggleTerminal, window, cx);
-                        });
+                    .on_click(move |_, _window, cx| {
+                        workspace.update(cx, |this, cx| { if this.terminal_visible { this.terminal_visible = false; cx.notify(); } else { this.ensure_terminal(cx); } });
                     })
-                    .when(active, |this| {
+                    .when(self.terminal_visible, |this| {
                         this.child(
                             div()
                                 .absolute()
@@ -12817,7 +12645,7 @@ impl WorkspaceView {
                     })
                     .child(activity_icon(
                         ActivityIcon::Terminal,
-                        if active { t.accent } else { t.text_secondary },
+                        if self.terminal_visible { t.accent } else { t.text_secondary },
                     ))
             })
             .child(div().flex_1())
@@ -14813,7 +14641,6 @@ impl WorkspaceView {
             })
             .when(menu == Some(MenuKind::View), |this| {
                 this.child(Self::action_item("Project Tool Window", ToggleProject))
-                    .child(self.command_item("terminal.toggle", "Terminal", ToggleTerminal))
             })
             .when(menu == Some(MenuKind::Code), |this| {
                 this.child(self.command_item(
@@ -15242,144 +15069,47 @@ impl WorkspaceView {
             })
     }
 
-    fn render_terminal_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = theme();
-        let m = metrics();
-        let workspace = cx.entity();
-        let active_id = self.terminal_manager.active_session();
-        let tabs = self.terminal_manager.sessions().into_iter().map(|info| {
-            let id = info.id;
-            let active = active_id == Some(id);
-            let tab_workspace = workspace.clone();
-            let close_workspace = workspace.clone();
-            div()
-                .id(SharedString::from(format!("terminal-tab-{id}")))
-                .flex()
-                .items_center()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .rounded(m.border_radius_small)
-                .cursor(CursorStyle::PointingHand)
-                .text_color(if active { t.text_primary } else { t.text_muted })
-                .when(active, |this| this.bg(t.pressed))
-                .hover(move |style| style.bg(t.hover))
-                .on_click(move |_, _, cx| {
-                    tab_workspace.update(cx, |this, cx| {
-                        this.activate_terminal_session(id, cx);
-                    });
-                })
-                .child(info.label)
-                .child(
-                    div()
-                        .id(SharedString::from(format!("terminal-tab-close-{id}")))
-                        .px_1()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(move |_, _, cx| {
-                            close_workspace.update(cx, |this, cx| {
-                                this.close_terminal_session(id, cx);
-                            });
-                        })
-                        .child("×"),
-                )
-        });
-        let profile_picker = self.terminal_profile_picker_open.then(|| {
-            div()
-                .absolute()
-                .top(m.panel_header_height)
-                .right(px(28.))
-                .p_1()
-                .gap_1()
-                .flex()
-                .flex_col()
-                .bg(t.panel_background)
-                .border_1()
-                .border_color(t.border)
-                .children(self.terminal_profiles.iter().cloned().map(|profile| {
-                    let label = profile.label().to_owned();
-                    let profile_workspace = workspace.clone();
-                    div()
-                        .id(SharedString::from(format!("terminal-profile-{}", profile.id())))
-                        .px_2()
-                        .py_1()
-                        .cursor(CursorStyle::PointingHand)
-                        .hover(move |style| style.bg(t.hover))
-                        .on_click(move |_, _, cx| {
-                            profile_workspace.update(cx, |this, cx| {
-                                this.terminal_profile_picker_open = false;
-                                this.create_terminal_session(profile.clone(), cx);
-                            });
-                        })
-                        .child(label)
-                }))
-        });
+    fn render_terminal_panel(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let content = self.terminal_view.clone().map(|view| view.into_any_element()).unwrap_or_else(|| div().child("Terminal unavailable").into_any_element());
+        div().h(self.terminal_panel_height).flex().flex_col().bg(theme().editor_background).child(div().flex_1().min_h_0().size_full().child(content))
+    }
 
-        let controls_workspace = workspace.clone();
-        let close_panel_workspace = workspace.clone();
-        let controls = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(
-                div()
-                    .id("new-terminal")
-                    .px_2()
-                    .rounded(m.border_radius_small)
-                    .cursor(CursorStyle::PointingHand)
-                    .text_color(t.text_muted)
-                    .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
-                    .on_click(move |_, _, cx| {
-                        controls_workspace.update(cx, |this, cx| {
-                            this.terminal_profile_picker_open =
-                                !this.terminal_profile_picker_open;
-                            cx.notify();
-                        });
-                    })
-                    .child("+"),
-            )
-            .child(
-                div()
-                    .id("close-terminal")
-                    .px_2()
-                    .rounded(m.border_radius_small)
-                    .text_color(t.text_muted)
-                    .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
-                    .on_click(move |_, _, cx| {
-                        close_panel_workspace.update(cx, |this, cx| {
-                            this.terminal_visible = false;
-                            cx.notify();
-                        });
-                    })
-                    .child("x"),
-            );
-        let header = div()
-            .h(m.panel_header_height)
-            .px_3()
-            .flex()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(t.border_subtle)
-            .bg(t.panel_background)
-            .child(div().flex().items_center().gap_1().children(tabs))
-            .child(controls);
-        let content = div()
-            .flex_1()
-            .when_some(
-                active_id.and_then(|id| self.terminal_views.get(&id).cloned()),
-                |this, terminal| this.child(terminal),
-            );
-        div()
-            .h(px(220.))
-            .min_h(px(120.))
-            .flex()
-            .flex_col()
-            .border_t_1()
-            .border_color(t.border)
-            .bg(t.editor_background)
-            .child(header)
-            .children(profile_picker)
-            .child(content)
+    fn ensure_terminal(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_session.is_none() {
+            let cwd = self.project.as_ref().map(|project| project.root_path().to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            match TerminalSession::spawn(cwd) {
+                Ok(session) => {
+                    let session = Arc::new(Mutex::new(session));
+                    let view = cx.new(|cx| crate::terminal_view::TerminalView::new(session.clone(), self.terminal_panel_height - px(16.), cx));
+                    self.terminal_session = Some(session);
+                    self.terminal_view = Some(view);
+                }
+                Err(error) => self.status = format!("Terminal failed to start: {error}").into(),
+            }
+        }
+        self.terminal_visible = true;
+        cx.notify();
+    }
+
+    fn terminal_panel_resize_start(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_panel_resizing = true;
+        self.terminal_panel_resize_start_y = event.position.y.into();
+        self.terminal_panel_resize_start_height = self.terminal_panel_height.into();
+        cx.notify();
+    }
+
+    fn terminal_panel_resize_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_panel_resizing {
+            let y: f32 = event.position.y.into();
+            self.terminal_panel_height = px((self.terminal_panel_resize_start_height - y + self.terminal_panel_resize_start_y).clamp(120., 520.));
+            if let Some(view) = self.terminal_view.clone() { view.update(cx, |view, _| view.set_viewport_height(self.terminal_panel_height - px(16.))); }
+            cx.notify();
+        }
+    }
+
+    fn terminal_panel_resize_end(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_panel_resizing = false;
+        cx.notify();
     }
 
     fn render_features(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -15585,7 +15315,6 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::find))
             .on_action(cx.listener(Self::toggle_project))
             .on_action(cx.listener(Self::toggle_ai_panel))
-            .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::import_runtime_stubs_action))
             .on_action(cx.listener(Self::import_runtime_stub_files_action))
             .on_action(cx.listener(Self::navigate_back))
@@ -15635,8 +15364,8 @@ impl Render for WorkspaceView {
                     .hover(|style| style.bg(t.hover))
                     .on_click({
                         let workspace = workspace.clone();
-                        move |_, window, cx| {
-                            workspace.update(cx, |this, cx| this.toggle_terminal(&ToggleTerminal, window, cx));
+                        move |_, _window, cx| {
+                            workspace.update(cx, |this, cx| { if this.terminal_visible { this.terminal_visible = false; cx.notify(); } else { this.ensure_terminal(cx); } });
                         }
                     })
                     .child("▣  Terminal"),
@@ -15675,6 +15404,7 @@ impl Render for WorkspaceView {
                     .child(
                     div()
                         .flex_1()
+                        .min_w(px(0.))
                         .h_full()
                         .flex()
                         .flex_col()
@@ -15700,7 +15430,24 @@ impl Render for WorkspaceView {
                                 }),
                         )
                         .when(self.terminal_visible, |this| {
-                            this.child(self.render_terminal_panel(cx))
+                            this.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .id("terminal-panel-splitter")
+                                            .h(px(5.))
+                                            .cursor(CursorStyle::ResizeUpDown)
+                                            .bg(t.border_subtle)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(Self::terminal_panel_resize_start))
+                                            .on_mouse_move(cx.listener(Self::terminal_panel_resize_move))
+                                            .on_mouse_up(MouseButton::Left, cx.listener(Self::terminal_panel_resize_end))
+                                            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::terminal_panel_resize_end)),
+                                    )
+                                    .child(self.render_terminal_panel(cx)),
+                            )
                         }),
                 )
                 .when(self.ai_panel_visible, |this| this.child(self.render_ai_panel(window, cx))),

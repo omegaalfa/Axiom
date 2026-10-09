@@ -21,8 +21,6 @@ Este inventário é técnico e não substitui revisão jurídica.
 | rfd | 0.17.2 | crates.io | MIT | Seletores cross-platform de arquivo e diretório |
 | directories | 6.0.0 | crates.io | MIT OR Apache-2.0 | Diretório de configuração específico da plataforma |
 | open | 5.3.x | crates.io | MIT OR Apache-2.0 | Abertura segura de URLs no navegador padrão |
-| portable-pty | 0.9.0 | crates.io | MIT | PTY/ConPTY para terminal integrado |
-| vt100 | 0.16.2 | crates.io | MIT | Parser VT100 e tela em memória do terminal integrado |
 
 ## Fonte externa opcional
 
@@ -36,3 +34,4 @@ de atribuição e compatibilidade.
 As versões exatas de todo o grafo estão em `Cargo.lock`. Não há dependências
 Git diretas no baseline. Dependências planejadas, mas não utilizadas, foram
 removidas do manifest raiz.
+| alacritty_terminal | 0.26.0 | crates.io | Apache-2.0 | Upstream Alacritty terminal engine |
