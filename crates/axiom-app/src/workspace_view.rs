@@ -36,9 +36,7 @@ use axiom_index::{
 use axiom_lsp::{PositionCodec, ServerStatus, uri_to_path};
 use axiom_php::{RuntimeStubProvider, RuntimeSymbolIndex};
 use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_content};
-use axiom_terminal::{
-    TerminalLink, TerminalLinkKind, TerminalManager, TerminalProfile, TerminalSessionId,
-};
+use axiom_terminal::{discover_wsl_distros, TerminalProfile, TerminalSession};
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
@@ -2145,6 +2143,20 @@ pub struct WorkspaceView {
     default_provider: Option<String>,
     active_provider: Option<String>,
     terminal_visible: bool,
+    terminal_panel_height: Pixels,
+    terminal_panel_resizing: bool,
+    terminal_panel_resize_start_y: f32,
+    terminal_panel_resize_start_height: f32,
+    terminal_session: Option<Arc<Mutex<TerminalSession>>>,
+    terminal_view: Option<Entity<crate::terminal_view::TerminalView>>,
+    terminal_profile: TerminalProfile,
+    terminal_profiles: Vec<TerminalProfile>,
+    terminal_tabs: Vec<TerminalTab>,
+    active_terminal_tab: Option<TerminalTabId>,
+    next_terminal_tab_id: TerminalTabId,
+    terminal_profile_picker_mode: TerminalProfilePickerMode,
+    terminal_tab_picker_open: bool,
+    terminal_profiles_discovery_started: bool,
     navigation_back: Vec<NavigationLocation>,
     navigation_forward: Vec<NavigationLocation>,
     definition_targets: Vec<DefinitionTarget>,
@@ -3329,6 +3341,20 @@ impl WorkspaceView {
                 })
                 .or_else(|| ui_settings.default_provider.clone()),
             terminal_visible: false,
+            terminal_panel_height: px(220.),
+            terminal_panel_resizing: false,
+            terminal_panel_resize_start_y: 0.,
+            terminal_panel_resize_start_height: 220.,
+            terminal_session: None,
+            terminal_view: None,
+            terminal_profile: TerminalProfile::default(),
+            terminal_profiles: vec![TerminalProfile::powershell(), TerminalProfile::command_prompt(), TerminalProfile::wsl_default(None)],
+            terminal_tabs: Vec::new(),
+            active_terminal_tab: None,
+            next_terminal_tab_id: 1,
+            terminal_profile_picker_mode: TerminalProfilePickerMode::RestartActive,
+            terminal_tab_picker_open: false,
+            terminal_profiles_discovery_started: false,
             navigation_back: Vec::new(),
             navigation_forward: Vec::new(),
             definition_targets: Vec::new(),
@@ -15080,144 +15106,203 @@ impl WorkspaceView {
             })
     }
 
-    fn render_terminal_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = theme();
-        let m = metrics();
-        let workspace = cx.entity();
-        let active_id = self.terminal_manager.active_session();
-        let tabs = self.terminal_manager.sessions().into_iter().map(|info| {
-            let id = info.id;
-            let active = active_id == Some(id);
-            let tab_workspace = workspace.clone();
-            let close_workspace = workspace.clone();
-            div()
-                .id(SharedString::from(format!("terminal-tab-{id}")))
-                .flex()
-                .items_center()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .rounded(m.border_radius_small)
-                .cursor(CursorStyle::PointingHand)
-                .text_color(if active { t.text_primary } else { t.text_muted })
-                .when(active, |this| this.bg(t.pressed))
-                .hover(move |style| style.bg(t.hover))
-                .on_click(move |_, _, cx| {
-                    tab_workspace.update(cx, |this, cx| {
-                        this.activate_terminal_session(id, cx);
-                    });
-                })
-                .child(info.label)
-                .child(
-                    div()
-                        .id(SharedString::from(format!("terminal-tab-close-{id}")))
-                        .px_1()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(move |_, _, cx| {
-                            close_workspace.update(cx, |this, cx| {
-                                this.close_terminal_session(id, cx);
-                            });
-                        })
-                        .child("×"),
-                )
-        });
-        let profile_picker = self.terminal_profile_picker_open.then(|| {
-            div()
-                .absolute()
-                .top(m.panel_header_height)
-                .right(px(28.))
-                .p_1()
-                .gap_1()
-                .flex()
-                .flex_col()
-                .bg(t.panel_background)
-                .border_1()
-                .border_color(t.border)
-                .children(self.terminal_profiles.iter().cloned().map(|profile| {
-                    let label = profile.label().to_owned();
-                    let profile_workspace = workspace.clone();
-                    div()
-                        .id(SharedString::from(format!("terminal-profile-{}", profile.id())))
-                        .px_2()
-                        .py_1()
-                        .cursor(CursorStyle::PointingHand)
-                        .hover(move |style| style.bg(t.hover))
-                        .on_click(move |_, _, cx| {
-                            profile_workspace.update(cx, |this, cx| {
-                                this.terminal_profile_picker_open = false;
-                                this.create_terminal_session(profile.clone(), cx);
-                            });
-                        })
-                        .child(label)
-                }))
-        });
+    fn render_terminal_panel(&self, cx: &mut Context<Self>) -> Div {
+        self.render_terminal_tabs_panel(cx)
+    }
 
-        let controls_workspace = workspace.clone();
-        let close_panel_workspace = workspace.clone();
-        let controls = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(
-                div()
-                    .id("new-terminal")
-                    .px_2()
-                    .rounded(m.border_radius_small)
-                    .cursor(CursorStyle::PointingHand)
-                    .text_color(t.text_muted)
-                    .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
-                    .on_click(move |_, _, cx| {
-                        controls_workspace.update(cx, |this, cx| {
-                            this.terminal_profile_picker_open =
-                                !this.terminal_profile_picker_open;
-                            cx.notify();
+    fn render_terminal_tabs_panel(&self, cx: &mut Context<Self>) -> Div {
+        let t = theme();
+        let workspace = cx.entity();
+        let active = self.active_terminal_tab.and_then(|id| self.terminal_tabs.iter().find(|tab| tab.id == id));
+        let profiles = self.terminal_profiles.clone();
+        let content = active.and_then(|tab| {
+            if tab.starting {
+                Some(div().flex().items_center().justify_center().text_color(t.text_secondary).child(format!("Starting {}...", tab.title)).into_any_element())
+            } else if let Some(error) = &tab.error {
+                Some(div().flex().items_center().justify_center().text_color(t.error).child(error.clone()).into_any_element())
+            } else {
+                tab.view.clone().map(|view| view.into_any_element())
+            }
+        }).unwrap_or_else(|| div().flex().flex_col().items_center().justify_center().gap_2().text_color(t.text_muted).child("No terminal sessions").child(div().id("new-terminal-empty").px_3().py_1().bg(t.accent).text_color(t.window_background).child("+ New Terminal").on_click({ let workspace = workspace.clone(); move |_, _, cx| workspace.update(cx, |this, cx| this.create_terminal_tab(TerminalProfile::default(), cx)) })).into_any_element());
+        let tabs = self.terminal_tabs.iter().map(|tab| {
+            let id = tab.id;
+            let active = self.active_terminal_tab == Some(id);
+            let switch_workspace = workspace.clone();
+            let close_workspace = workspace.clone();
+            div().id(SharedString::from(format!("terminal-tab-{id}"))).h(px(28.)).px_2().flex().items_center().gap_1().bg(if active { t.inactive_selection } else { t.panel_background }).border_b_2().border_color(if active { t.accent } else { t.border_subtle }).text_color(if active { t.text_primary } else { t.text_secondary }).hover(|style| if active { style } else { style.bg(t.hover) })
+                .child(tab.title.clone())
+                .child(div().id(SharedString::from(format!("terminal-tab-close-{id}"))).px_1().child("×").on_click(move |_, _, cx| close_workspace.update(cx, |this, cx| this.close_terminal_tab(id, cx))))
+                .on_click(move |_, window, cx| switch_workspace.update(cx, |this, cx| { this.active_terminal_tab = Some(id); if let Some(tab) = this.terminal_tabs.iter().find(|tab| tab.id == id) && let Some(view) = &tab.view { window.focus(&view.read(cx).focus_handle(cx)); } cx.notify(); }))
+        });
+        let add = div().id("terminal-tab-add").h(px(28.)).px_2().child("+").when(self.terminal_tabs.len() < MAX_TERMINAL_TABS, |button| button.on_click({ let workspace = workspace.clone(); move |_, _, cx| workspace.update(cx, |this, cx| { this.terminal_profile_picker_mode = TerminalProfilePickerMode::CreateNew; this.terminal_tab_picker_open = !this.terminal_tab_picker_open; cx.notify(); }) }));
+        let active_profile = active.map(|tab| tab.profile.label.clone()).unwrap_or_else(|| "Terminal".into());
+        let active_picker = div().id("active-terminal-profile").h(px(28.)).px_2().flex().items_center().text_color(t.accent).child(format!("Profile: {} ▾", active_profile)).on_click({ let workspace = workspace.clone(); move |_, _, cx| workspace.update(cx, |this, cx| { this.terminal_profile_picker_mode = TerminalProfilePickerMode::RestartActive; this.terminal_tab_picker_open = !this.terminal_tab_picker_open; cx.notify(); }) });
+        let tabs_width: f32 = self.terminal_tabs.iter().map(|tab| tab.title.chars().count() as f32 * 7.2 + 32.).sum();
+        let picker = div().id("terminal-tab-profile-picker").absolute().top(px(30.)).left(px(tabs_width + 8.)).w(px(240.)).p_1().flex().flex_col().bg(t.elevated_surface).border_1().border_color(t.border).shadow_lg().children(profiles.into_iter().map(|profile| {
+            let workspace = workspace.clone();
+            div().id(SharedString::from(format!("new-terminal-profile-{}", profile.label))).h(px(28.)).px_2().flex().items_center().text_color(t.text_primary).hover(|style| style.bg(t.hover)).child(profile.label.clone()).on_click(move |_, _, cx| {
+                let profile = profile.clone();
+                workspace.update(cx, |this, cx| { if this.terminal_profile_picker_mode == TerminalProfilePickerMode::CreateNew { this.create_terminal_tab(profile, cx); } else { this.restart_active_terminal_tab(profile, cx); } this.terminal_tab_picker_open = false; cx.notify(); });
+            })
+        }));
+        let controls = div().relative().h(px(28.)).flex().items_center().child(active_picker).child(add);
+        div().relative().h(self.terminal_panel_height).flex().flex_col().bg(t.editor_background)
+            .child(div().h(px(28.)).flex().items_center().gap_2().children(tabs).child(controls))
+            .child(div().flex_1().min_h_0().size_full().child(content))
+            .when(self.terminal_tab_picker_open, |panel| panel.child(picker))
+    }
+
+    fn ensure_terminal(&mut self, cx: &mut Context<Self>) {
+        self.discover_terminal_profiles(cx);
+        if self.terminal_session.is_none() {
+            let cwd = self.project.as_ref().map(|project| project.root_path().to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            match TerminalSession::spawn(&self.terminal_profile, cwd) {
+                Ok(session) => {
+                    let session = Arc::new(Mutex::new(session));
+                    let view = cx.new(|cx| crate::terminal_view::TerminalView::new(session.clone(), self.terminal_panel_height - px(44.), None, cx));
+                    self.terminal_session = Some(session);
+                    self.terminal_view = Some(view);
+                    let id = self.next_terminal_tab_id;
+                    self.next_terminal_tab_id += 1;
+                    self.terminal_tabs.push(TerminalTab { id, profile: self.terminal_profile.clone(), session: self.terminal_session.clone(), view: self.terminal_view.clone(), title: self.terminal_profile.label.clone(), starting: false, generation: 0, error: None });
+                    self.active_terminal_tab = Some(id);
+                }
+                Err(error) => self.status = format!("Terminal failed to start: {error}").into(),
+            }
+        }
+        self.terminal_visible = true;
+        cx.notify();
+    }
+
+    fn create_terminal_tab(&mut self, profile: TerminalProfile, cx: &mut Context<Self>) {
+        if self.terminal_tabs.len() >= MAX_TERMINAL_TABS {
+            self.status = "Maximum 8 terminal sessions".into();
+            cx.notify();
+            return;
+        }
+        let id = self.next_terminal_tab_id;
+        self.next_terminal_tab_id += 1;
+        let generation = 1;
+        let title = profile.label.clone();
+        self.terminal_tabs.push(TerminalTab { id, profile: profile.clone(), session: None, view: None, title: title.clone(), starting: true, generation, error: None });
+        self.active_terminal_tab = Some(id);
+        self.terminal_visible = true;
+        let cwd = self.project.as_ref().map(|project| project.root_path().to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let workspace = cx.entity().downgrade();
+        let panel_height = self.terminal_panel_height;
+        cx.spawn(async move |_, cx| {
+            let result = background_executor().spawn(async move { TerminalSession::spawn(&profile, cwd) }).await;
+            let _ = workspace.update(cx, |this, cx| {
+                let Some(tab) = this.terminal_tabs.iter_mut().find(|tab| tab.id == id) else { return; };
+                match result {
+                    Ok(session) => {
+                        let session = Arc::new(Mutex::new(session));
+                        let ready_workspace = workspace.clone();
+                        let ready_callback: Arc<dyn Fn(&mut gpui::AsyncApp) + Send + Sync> = Arc::new(move |cx| {
+                            let _ = ready_workspace.update(cx, |this, cx| {
+                                if let Some(tab) = this.terminal_tabs.iter_mut().find(|tab| tab.id == id) && tab.generation == generation {
+                                    tab.starting = false;
+                                    cx.notify();
+                                }
+                            });
                         });
-                    })
-                    .child("+"),
-            )
-            .child(
-                div()
-                    .id("close-terminal")
-                    .px_2()
-                    .rounded(m.border_radius_small)
-                    .text_color(t.text_muted)
-                    .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
-                    .on_click(move |_, _, cx| {
-                        close_panel_workspace.update(cx, |this, cx| {
-                            this.terminal_visible = false;
-                            cx.notify();
+                        let view = cx.new(|cx| crate::terminal_view::TerminalView::new(session.clone(), panel_height - px(44.), Some(ready_callback), cx));
+                        tab.session = Some(session);
+                        tab.view = Some(view);
+                    }
+                    Err(error) => { tab.starting = false; tab.error = Some(format!("Terminal failed to start: {error}")); }
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
+    }
+
+    fn close_terminal_tab(&mut self, id: TerminalTabId, cx: &mut Context<Self>) {
+        let Some(index) = self.terminal_tabs.iter().position(|tab| tab.id == id) else { return; };
+        let tab = self.terminal_tabs.remove(index);
+        if let Some(session) = tab.session && let Ok(mut session) = session.lock() { session.shutdown(); }
+        if self.active_terminal_tab == Some(id) {
+            self.active_terminal_tab = self.terminal_tabs.get(index).or_else(|| index.checked_sub(1).and_then(|i| self.terminal_tabs.get(i))).map(|tab| tab.id);
+        }
+        cx.notify();
+    }
+
+    fn restart_active_terminal_tab(&mut self, profile: TerminalProfile, cx: &mut Context<Self>) {
+        let Some(id) = self.active_terminal_tab else { return; };
+        let Some(tab) = self.terminal_tabs.iter_mut().find(|tab| tab.id == id) else { return; };
+        if let Some(session) = tab.session.take() && let Ok(mut session) = session.lock() { session.shutdown(); }
+        tab.view = None;
+        tab.profile = profile.clone();
+        tab.title = profile.label.clone();
+        tab.starting = true;
+        tab.error = None;
+        tab.generation = tab.generation.wrapping_add(1);
+        let generation = tab.generation;
+        let cwd = self.project.as_ref().map(|project| project.root_path().to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let workspace = cx.entity().downgrade();
+        let panel_height = self.terminal_panel_height;
+        cx.spawn(async move |_, cx| {
+            let result = background_executor().spawn(async move { TerminalSession::spawn(&profile, cwd) }).await;
+            let _ = workspace.update(cx, |this, cx| {
+                let Some(tab) = this.terminal_tabs.iter_mut().find(|tab| tab.id == id) else { return; };
+                match result {
+                    Ok(session) => {
+                        let session = Arc::new(Mutex::new(session));
+                        let ready_workspace = workspace.clone();
+                        let ready_callback: Arc<dyn Fn(&mut gpui::AsyncApp) + Send + Sync> = Arc::new(move |cx| {
+                            let _ = ready_workspace.update(cx, |this, cx| {
+                                if let Some(tab) = this.terminal_tabs.iter_mut().find(|tab| tab.id == id) && tab.generation == generation { tab.starting = false; cx.notify(); }
+                            });
                         });
-                    })
-                    .child("x"),
-            );
-        let header = div()
-            .h(m.panel_header_height)
-            .px_3()
-            .flex()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(t.border_subtle)
-            .bg(t.panel_background)
-            .child(div().flex().items_center().gap_1().children(tabs))
-            .child(controls);
-        let content = div()
-            .flex_1()
-            .when_some(
-                active_id.and_then(|id| self.terminal_views.get(&id).cloned()),
-                |this, terminal| this.child(terminal),
-            );
-        div()
-            .h(px(220.))
-            .min_h(px(120.))
-            .flex()
-            .flex_col()
-            .border_t_1()
-            .border_color(t.border)
-            .bg(t.editor_background)
-            .child(header)
-            .children(profile_picker)
-            .child(content)
+                        let view = cx.new(|cx| crate::terminal_view::TerminalView::new(session.clone(), panel_height - px(44.), Some(ready_callback), cx));
+                        tab.session = Some(session);
+                        tab.view = Some(view);
+                    }
+                    Err(error) => { tab.starting = false; tab.error = Some(format!("Terminal failed to start: {error}")); }
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
+    }
+
+    fn discover_terminal_profiles(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_profiles_discovery_started { return; }
+        self.terminal_profiles_discovery_started = true;
+        let cwd = self.project.as_ref().map(|project| project.root_path().to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let workspace = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let distros = background_executor().spawn(async move { discover_wsl_distros().unwrap_or_default() }).await;
+            let _ = workspace.update(cx, |this, cx| {
+                let mut profiles = vec![TerminalProfile::powershell(), TerminalProfile::command_prompt(), TerminalProfile::wsl_default(Some(&cwd))];
+                profiles.extend(distros.into_iter().map(|distro| TerminalProfile::wsl_distro(distro, Some(&cwd))));
+                this.terminal_profiles = profiles;
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn terminal_panel_resize_start(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_panel_resizing = true;
+        self.terminal_panel_resize_start_y = event.position.y.into();
+        self.terminal_panel_resize_start_height = self.terminal_panel_height.into();
+        cx.notify();
+    }
+
+    fn terminal_panel_resize_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_panel_resizing {
+            let y: f32 = event.position.y.into();
+            self.terminal_panel_height = px((self.terminal_panel_resize_start_height - y + self.terminal_panel_resize_start_y).clamp(120., 520.));
+            if let Some(view) = self.terminal_view.clone() { view.update(cx, |view, _| view.set_viewport_height(self.terminal_panel_height - px(44.))); }
+            for tab in &self.terminal_tabs { if let Some(view) = tab.view.clone() { view.update(cx, |view, _| view.set_viewport_height(self.terminal_panel_height - px(44.))); } }
+            cx.notify();
+        }
+    }
+
+    fn terminal_panel_resize_end(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_panel_resizing = false;
+        cx.notify();
     }
 
     fn render_features(&self, cx: &mut Context<Self>) -> impl IntoElement {
