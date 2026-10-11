@@ -36,11 +36,13 @@ use axiom_index::{
 use axiom_lsp::{PositionCodec, ServerStatus, uri_to_path};
 use axiom_php::{RuntimeStubProvider, RuntimeSymbolIndex};
 use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_content};
-use axiom_terminal::TerminalSession;
+use axiom_terminal::{
+    TerminalLink, TerminalLinkKind, TerminalManager, TerminalProfile, TerminalSessionId,
+};
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, KeyDownEvent,
-    LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    Div, LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     ScrollHandle, SharedString, Style, Timer, UTF16Selection, UniformListScrollHandle, Window,
     actions, background_executor, div, prelude::*, px, relative,
 };
@@ -62,6 +64,27 @@ use crate::{
         metrics, theme,
     },
 };
+
+const MAX_TERMINAL_TABS: usize = 8;
+
+type TerminalTabId = u64;
+
+struct TerminalTab {
+    id: TerminalTabId,
+    profile: TerminalProfile,
+    session: Option<Arc<Mutex<TerminalSession>>>,
+    view: Option<Entity<crate::terminal_view::TerminalView>>,
+    title: String,
+    starting: bool,
+    generation: u64,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminalProfilePickerMode {
+    RestartActive,
+    CreateNew,
+}
 
 actions!(
     workspace,
@@ -2122,12 +2145,6 @@ pub struct WorkspaceView {
     default_provider: Option<String>,
     active_provider: Option<String>,
     terminal_visible: bool,
-    terminal_panel_height: Pixels,
-    terminal_panel_resizing: bool,
-    terminal_panel_resize_start_y: f32,
-    terminal_panel_resize_start_height: f32,
-    terminal_session: Option<Arc<Mutex<TerminalSession>>>,
-    terminal_view: Option<Entity<crate::terminal_view::TerminalView>>,
     navigation_back: Vec<NavigationLocation>,
     navigation_forward: Vec<NavigationLocation>,
     definition_targets: Vec<DefinitionTarget>,
@@ -3312,12 +3329,6 @@ impl WorkspaceView {
                 })
                 .or_else(|| ui_settings.default_provider.clone()),
             terminal_visible: false,
-            terminal_panel_height: px(220.),
-            terminal_panel_resizing: false,
-            terminal_panel_resize_start_y: 0.,
-            terminal_panel_resize_start_height: 220.,
-            terminal_session: None,
-            terminal_view: None,
             navigation_back: Vec::new(),
             navigation_forward: Vec::new(),
             definition_targets: Vec::new(),
@@ -15069,47 +15080,144 @@ impl WorkspaceView {
             })
     }
 
-    fn render_terminal_panel(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let content = self.terminal_view.clone().map(|view| view.into_any_element()).unwrap_or_else(|| div().child("Terminal unavailable").into_any_element());
-        div().h(self.terminal_panel_height).flex().flex_col().bg(theme().editor_background).child(div().flex_1().min_h_0().size_full().child(content))
-    }
+    fn render_terminal_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let m = metrics();
+        let workspace = cx.entity();
+        let active_id = self.terminal_manager.active_session();
+        let tabs = self.terminal_manager.sessions().into_iter().map(|info| {
+            let id = info.id;
+            let active = active_id == Some(id);
+            let tab_workspace = workspace.clone();
+            let close_workspace = workspace.clone();
+            div()
+                .id(SharedString::from(format!("terminal-tab-{id}")))
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(m.border_radius_small)
+                .cursor(CursorStyle::PointingHand)
+                .text_color(if active { t.text_primary } else { t.text_muted })
+                .when(active, |this| this.bg(t.pressed))
+                .hover(move |style| style.bg(t.hover))
+                .on_click(move |_, _, cx| {
+                    tab_workspace.update(cx, |this, cx| {
+                        this.activate_terminal_session(id, cx);
+                    });
+                })
+                .child(info.label)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("terminal-tab-close-{id}")))
+                        .px_1()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(move |_, _, cx| {
+                            close_workspace.update(cx, |this, cx| {
+                                this.close_terminal_session(id, cx);
+                            });
+                        })
+                        .child("×"),
+                )
+        });
+        let profile_picker = self.terminal_profile_picker_open.then(|| {
+            div()
+                .absolute()
+                .top(m.panel_header_height)
+                .right(px(28.))
+                .p_1()
+                .gap_1()
+                .flex()
+                .flex_col()
+                .bg(t.panel_background)
+                .border_1()
+                .border_color(t.border)
+                .children(self.terminal_profiles.iter().cloned().map(|profile| {
+                    let label = profile.label().to_owned();
+                    let profile_workspace = workspace.clone();
+                    div()
+                        .id(SharedString::from(format!("terminal-profile-{}", profile.id())))
+                        .px_2()
+                        .py_1()
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |style| style.bg(t.hover))
+                        .on_click(move |_, _, cx| {
+                            profile_workspace.update(cx, |this, cx| {
+                                this.terminal_profile_picker_open = false;
+                                this.create_terminal_session(profile.clone(), cx);
+                            });
+                        })
+                        .child(label)
+                }))
+        });
 
-    fn ensure_terminal(&mut self, cx: &mut Context<Self>) {
-        if self.terminal_session.is_none() {
-            let cwd = self.project.as_ref().map(|project| project.root_path().to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            match TerminalSession::spawn(cwd) {
-                Ok(session) => {
-                    let session = Arc::new(Mutex::new(session));
-                    let view = cx.new(|cx| crate::terminal_view::TerminalView::new(session.clone(), self.terminal_panel_height - px(16.), cx));
-                    self.terminal_session = Some(session);
-                    self.terminal_view = Some(view);
-                }
-                Err(error) => self.status = format!("Terminal failed to start: {error}").into(),
-            }
-        }
-        self.terminal_visible = true;
-        cx.notify();
-    }
-
-    fn terminal_panel_resize_start(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.terminal_panel_resizing = true;
-        self.terminal_panel_resize_start_y = event.position.y.into();
-        self.terminal_panel_resize_start_height = self.terminal_panel_height.into();
-        cx.notify();
-    }
-
-    fn terminal_panel_resize_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.terminal_panel_resizing {
-            let y: f32 = event.position.y.into();
-            self.terminal_panel_height = px((self.terminal_panel_resize_start_height - y + self.terminal_panel_resize_start_y).clamp(120., 520.));
-            if let Some(view) = self.terminal_view.clone() { view.update(cx, |view, _| view.set_viewport_height(self.terminal_panel_height - px(16.))); }
-            cx.notify();
-        }
-    }
-
-    fn terminal_panel_resize_end(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.terminal_panel_resizing = false;
-        cx.notify();
+        let controls_workspace = workspace.clone();
+        let close_panel_workspace = workspace.clone();
+        let controls = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .id("new-terminal")
+                    .px_2()
+                    .rounded(m.border_radius_small)
+                    .cursor(CursorStyle::PointingHand)
+                    .text_color(t.text_muted)
+                    .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
+                    .on_click(move |_, _, cx| {
+                        controls_workspace.update(cx, |this, cx| {
+                            this.terminal_profile_picker_open =
+                                !this.terminal_profile_picker_open;
+                            cx.notify();
+                        });
+                    })
+                    .child("+"),
+            )
+            .child(
+                div()
+                    .id("close-terminal")
+                    .px_2()
+                    .rounded(m.border_radius_small)
+                    .text_color(t.text_muted)
+                    .hover(move |style| style.bg(t.hover).text_color(t.text_primary))
+                    .on_click(move |_, _, cx| {
+                        close_panel_workspace.update(cx, |this, cx| {
+                            this.terminal_visible = false;
+                            cx.notify();
+                        });
+                    })
+                    .child("x"),
+            );
+        let header = div()
+            .h(m.panel_header_height)
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(t.border_subtle)
+            .bg(t.panel_background)
+            .child(div().flex().items_center().gap_1().children(tabs))
+            .child(controls);
+        let content = div()
+            .flex_1()
+            .when_some(
+                active_id.and_then(|id| self.terminal_views.get(&id).cloned()),
+                |this, terminal| this.child(terminal),
+            );
+        div()
+            .h(px(220.))
+            .min_h(px(120.))
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(t.border)
+            .bg(t.editor_background)
+            .child(header)
+            .children(profile_picker)
+            .child(content)
     }
 
     fn render_features(&self, cx: &mut Context<Self>) -> impl IntoElement {

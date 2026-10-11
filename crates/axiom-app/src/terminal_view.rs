@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use axiom_terminal::{CellFlags, CursorShape, NamedColor, Rgb, TerminalCell, TerminalColor as Color, TerminalScrollState, TerminalSession, TerminalSize, encode_key};
-use gpui::{ClipboardItem, Context, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, Pixels, Render, ScrollDelta, ScrollWheelEvent, Timer, Window, background_executor, div, prelude::*, px, rgb, FontWeight};
+use gpui::{AsyncApp, ClipboardItem, Context, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, Pixels, Render, ScrollDelta, ScrollWheelEvent, Timer, Window, background_executor, div, prelude::*, px, rgb, FontWeight};
 use std::time::Duration;
 use crate::ui::metrics::{CODE_FONT_FAMILY, code_font, metrics};
 
@@ -135,17 +135,29 @@ fn row_runs(cells: &[TerminalCell], row: usize, selection: Option<SelectionRange
     runs
 }
 
-pub struct TerminalView { session: Arc<Mutex<TerminalSession>>, focus: FocusHandle, viewport_height: Pixels, last_terminal_size: Option<(usize, usize)>, selection_anchor: Option<TerminalPoint>, selection_head: Option<TerminalPoint>, is_selecting: bool, scrollbar_dragging: bool, scrollbar_grab_offset_y: Pixels, scrollbar_drag_thumb_y: Option<Pixels>, scrollbar_last_target: Option<usize>, scroll_remainder: f32, cursor_blink_visible: bool, terminal_focused: bool }
+pub struct TerminalView { session: Arc<Mutex<TerminalSession>>, focus: FocusHandle, viewport_height: Pixels, ready_callback: Option<Arc<dyn Fn(&mut AsyncApp) + Send + Sync>>, first_activity_reported: bool, last_terminal_size: Option<(usize, usize)>, selection_anchor: Option<TerminalPoint>, selection_head: Option<TerminalPoint>, is_selecting: bool, scrollbar_dragging: bool, scrollbar_grab_offset_y: Pixels, scrollbar_drag_thumb_y: Option<Pixels>, scrollbar_last_target: Option<usize>, scroll_remainder: f32, cursor_blink_visible: bool, terminal_focused: bool }
 impl TerminalView {
-    pub fn new(session: Arc<Mutex<TerminalSession>>, viewport_height: Pixels, cx: &mut Context<Self>) -> Self {
-        let view = Self { session: session.clone(), focus: cx.focus_handle(), viewport_height, last_terminal_size: None, selection_anchor: None, selection_head: None, is_selecting: false, scrollbar_dragging: false, scrollbar_grab_offset_y: px(0.), scrollbar_drag_thumb_y: None, scrollbar_last_target: None, scroll_remainder: 0., cursor_blink_visible: true, terminal_focused: false };
+    pub fn new(session: Arc<Mutex<TerminalSession>>, viewport_height: Pixels, ready_callback: Option<Arc<dyn Fn(&mut AsyncApp) + Send + Sync>>, cx: &mut Context<Self>) -> Self {
+        let view = Self { session: session.clone(), focus: cx.focus_handle(), viewport_height, ready_callback, first_activity_reported: false, last_terminal_size: None, selection_anchor: None, selection_head: None, is_selecting: false, scrollbar_dragging: false, scrollbar_grab_offset_y: px(0.), scrollbar_drag_thumb_y: None, scrollbar_last_target: None, scroll_remainder: 0., cursor_blink_visible: true, terminal_focused: false };
         let events = session.lock().ok().map(|session| session.event_receiver());
         cx.spawn(async move |this, cx| {
             let Some(events) = events else { return; };
             loop {
                 let receiver = events.clone();
                 let changed = background_executor().spawn(async move { receiver.lock().ok().is_some_and(|events| events.recv().is_ok()) }).await;
-                if !changed || this.update(cx, |_, cx| cx.notify()).is_err() { break; }
+                if !changed { break; }
+                let callback = this.update(cx, |view, _| {
+                    let active = view.session.lock().ok().map(|session| {
+                        let snapshot = session.snapshot();
+                        snapshot.cells.iter().flatten().any(|cell| !cell.character.is_whitespace()) || !matches!(snapshot.state, axiom_terminal::TerminalState::Running)
+                    }).unwrap_or(false);
+                    if active && !view.first_activity_reported {
+                        view.first_activity_reported = true;
+                        view.ready_callback.clone()
+                    } else { None }
+                });
+                if let Ok(Some(callback)) = callback { callback(cx); }
+                if this.update(cx, |_, cx| cx.notify()).is_err() { break; }
             }
         }).detach();
         cx.spawn(async move |this, cx| {

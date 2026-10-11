@@ -1,11 +1,83 @@
 //! Single-session terminal bridge backed by `alacritty_terminal`.
 
-use std::{io, path::Path, sync::{Arc, Mutex, mpsc::{self, Receiver, SyncSender}, atomic::{AtomicBool, Ordering}}};
+use std::{io, path::{Path, PathBuf}, process::Command, sync::{Arc, Mutex, mpsc::{self, Receiver, SyncSender}, atomic::{AtomicBool, Ordering}}};
 use alacritty_terminal::{event::{Event, EventListener, WindowSize}, event_loop::{EventLoop, EventLoopSender, Msg}, grid::{Dimensions, Scroll}, sync::FairMutex, term::{Config, Term}, term::cell::Flags, tty::{self, Options, Shell}, vte::ansi::Color};
 pub use alacritty_terminal::term::cell::Flags as CellFlags;
 pub use alacritty_terminal::vte::ansi::{Color as TerminalColor, NamedColor, Rgb};
 
 pub use alacritty_terminal::vte::ansi::CursorShape;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TerminalProfileId {
+    PowerShell,
+    CommandPrompt,
+    WslDefault,
+    WslDistro(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalProfile {
+    pub id: TerminalProfileId,
+    pub label: String,
+    pub program: PathBuf,
+    pub args: Vec<String>,
+}
+
+impl TerminalProfile {
+    pub fn powershell() -> Self { Self { id: TerminalProfileId::PowerShell, label: "PowerShell".into(), program: "powershell.exe".into(), args: vec!["-NoLogo".into(), "-NoProfile".into()] } }
+    pub fn command_prompt() -> Self { Self { id: TerminalProfileId::CommandPrompt, label: "Command Prompt".into(), program: "cmd.exe".into(), args: vec![] } }
+    pub fn wsl_default(cwd: Option<&Path>) -> Self { Self::wsl(TerminalProfileId::WslDefault, "WSL", None, cwd) }
+    pub fn wsl_distro(name: impl Into<String>, cwd: Option<&Path>) -> Self { let name = name.into(); Self::wsl(TerminalProfileId::WslDistro(name.clone()), name.clone(), Some(name), cwd) }
+    fn wsl(id: TerminalProfileId, label: impl Into<String>, distro: Option<String>, cwd: Option<&Path>) -> Self {
+        let mut args = Vec::new();
+        if let Some(distro) = distro { args.extend(["-d".into(), distro]); }
+        if let Some(cwd) = cwd.and_then(windows_path_to_wsl) { args.extend(["--cd".into(), cwd]); }
+        Self { id, label: label.into(), program: "wsl.exe".into(), args }
+    }
+    pub fn default() -> Self {
+        if cfg!(windows) { Self::powershell() } else { Self { id: TerminalProfileId::PowerShell, label: "Shell".into(), program: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()).into(), args: vec![] } }
+    }
+}
+
+pub fn windows_path_to_wsl(path: &Path) -> Option<String> {
+    windows_path_str_to_wsl(&path.to_string_lossy())
+}
+
+pub fn normalize_windows_shell_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let rest = text.strip_prefix(r"\\?\");
+    if let Some(rest) = rest && rest.len() >= 3 && rest.as_bytes()[1] == b':' && rest.as_bytes()[2] == b'\\' {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
+pub fn windows_path_str_to_wsl(path: &str) -> Option<String> {
+    let path = path.strip_prefix(r"\\?\").filter(|rest| rest.len() >= 3 && rest.as_bytes()[1] == b':' && rest.as_bytes()[2] == b'\\').unwrap_or(path);
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() || !matches!(bytes[2], b'\\' | b'/') { return None; }
+    let rest = path[3..].replace('\\', "/");
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    if rest.is_empty() { Some(format!("/mnt/{drive}")) } else { Some(format!("/mnt/{drive}/{rest}")) }
+}
+
+pub fn parse_wsl_distro_output(bytes: &[u8]) -> Vec<String> {
+    let text = if bytes.len() >= 2 && bytes.chunks_exact(2).all(|pair| pair[1] == 0) {
+        String::from_utf16_lossy(&bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect::<Vec<_>>())
+    } else { String::from_utf8_lossy(bytes).into_owned() };
+    let mut result = Vec::new();
+    for line in text.lines().map(|line| line.trim().trim_start_matches('\u{feff}')).filter(|line| !line.is_empty()) {
+        if !result.iter().any(|existing| existing == line) { result.push(line.to_owned()); }
+    }
+    result
+}
+
+pub fn discover_wsl_distros() -> io::Result<Vec<String>> {
+    if !cfg!(windows) { return Ok(Vec::new()); }
+    let output = Command::new("wsl.exe").args(["--list", "--quiet"]).output()?;
+    if !output.status.success() { return Ok(Vec::new()); }
+    Ok(parse_wsl_distro_output(&output.stdout))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalSize { pub cols: u16, pub rows: u16 }
@@ -43,12 +115,12 @@ impl Dimensions for Size { fn total_lines(&self) -> usize { self.rows } fn scree
 pub struct TerminalSession { terminal: Arc<FairMutex<Term<Listener>>>, sender: EventLoopSender, child: Option<std::thread::JoinHandle<(EventLoop<tty::Pty, Listener>, alacritty_terminal::event_loop::State)>>, events: Arc<Mutex<Receiver<()>>>, state: Arc<AtomicBool>, size: TerminalSize }
 
 impl TerminalSession {
-    pub fn spawn(cwd: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn spawn(profile: &TerminalProfile, cwd: impl AsRef<Path>) -> io::Result<Self> {
         let size = TerminalSize::new(80, 24); let (tx, events) = mpsc::sync_channel(16); let exited = Arc::new(AtomicBool::new(false));
         let listener = Listener { tx: tx.clone(), exited: exited.clone() }; let terminal = Arc::new(FairMutex::new(Term::new(Config::default(), &Size { cols: size.cols as usize, rows: size.rows as usize }, listener)));
-        let mut options = Options { working_directory: Some(cwd.as_ref().to_path_buf()), ..Options::default() };
-        #[cfg(windows)] { options.shell = Some(Shell::new("powershell.exe".into(), vec!["-NoLogo".into(), "-NoProfile".into()])); }
-        #[cfg(not(windows))] { options.shell = Some(Shell::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()), vec![])); }
+        let mut options = Options { working_directory: Some(normalize_windows_shell_path(cwd.as_ref())), ..Options::default() };
+        #[cfg(windows)] { options.shell = Some(Shell::new(profile.program.to_string_lossy().into_owned(), profile.args.clone())); }
+        #[cfg(not(windows))] { let _ = profile; options.shell = Some(Shell::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()), vec![])); }
         tty::setup_env(); let pty = tty::new(&options, WindowSize { num_lines: size.rows, num_cols: size.cols, cell_width: 0, cell_height: 0 }, 0).map_err(io::Error::other)?;
         let event_loop = EventLoop::new(terminal.clone(), Listener { tx, exited: exited.clone() }, pty, options.drain_on_exit, false).map_err(io::Error::other)?;
         let sender = event_loop.channel(); let child = Some(event_loop.spawn());
@@ -94,4 +166,4 @@ fn encode_bracketed_paste(text: &str) -> Vec<u8> { let mut bytes = Vec::with_cap
 impl Drop for TerminalSession { fn drop(&mut self) { self.shutdown(); } }
 
 #[cfg(test)]
-    mod tests { use super::*; #[test] fn size_is_clamped() { assert_eq!(TerminalSize::new(0, 0), TerminalSize::new(1, 1)); } #[test] fn space_is_encoded_as_one_byte() { assert_eq!(encode_key("space", false, false), Some(vec![0x20])); } #[test] fn special_keys_use_gpui_names() { assert_eq!(encode_key("enter", false, false), Some(b"\r".to_vec())); assert_eq!(encode_key("arrowleft", false, false), Some(b"\x1b[D".to_vec())); } #[cfg(unix)] #[test] fn shell_output_reaches_engine() { let session = TerminalSession::spawn(".").unwrap(); session.write(b"printf AXIOM_TERMINAL_OK\n").unwrap(); for _ in 0..50 { std::thread::sleep(std::time::Duration::from_millis(20)); if session.try_recv_event() && session.snapshot().cells.iter().flatten().any(|cell| cell.character == 'A') { return; } } panic!("shell output not received"); } }
+    mod tests { use super::*; #[test] fn size_is_clamped() { assert_eq!(TerminalSize::new(0, 0), TerminalSize::new(1, 1)); } #[test] fn space_is_encoded_as_one_byte() { assert_eq!(encode_key("space", false, false), Some(vec![0x20])); } #[test] fn special_keys_use_gpui_names() { assert_eq!(encode_key("enter", false, false), Some(b"\r".to_vec())); assert_eq!(encode_key("arrowleft", false, false), Some(b"\x1b[D".to_vec())); } #[test] fn profile_args_are_explicit() { assert_eq!(TerminalProfile::powershell().args, vec!["-NoLogo", "-NoProfile"]); assert!(TerminalProfile::command_prompt().args.is_empty()); assert_eq!(TerminalProfile::wsl_distro("Ubuntu", None).args, vec!["-d", "Ubuntu"]); } #[test] fn wsl_paths_are_arguments_not_shell_text() { assert_eq!(windows_path_str_to_wsl(r"E:\dev\Axiom"), Some("/mnt/e/dev/Axiom".into())); assert_eq!(windows_path_str_to_wsl("C:/Users/Test/My Project"), Some("/mnt/c/Users/Test/My Project".into())); assert_eq!(windows_path_str_to_wsl("E:/á/项目"), Some("/mnt/e/á/项目".into())); assert_eq!(windows_path_str_to_wsl("\\\\server\\share"), None); } #[test] fn distro_output_is_normalized() { assert_eq!(parse_wsl_distro_output(b"Ubuntu\r\nUbuntu\n Debian \r\n\r\n"), vec!["Ubuntu", "Debian"]); } #[cfg(unix)] #[test] fn shell_output_reaches_engine() { let session = TerminalSession::spawn(&TerminalProfile::default(), ".").unwrap(); session.write(b"printf AXIOM_TERMINAL_OK\n").unwrap(); for _ in 0..50 { std::thread::sleep(std::time::Duration::from_millis(20)); if session.try_recv_event() && session.snapshot().cells.iter().flatten().any(|cell| cell.character == 'A') { return; } } panic!("shell output not received"); } }
