@@ -10,7 +10,7 @@ mod remote;
 
 pub use remote::{
     ProviderProtocol, provider_chat_stream_with_cancel, provider_protocol,
-    supports_native_tools, test_provider_connection,
+    supports_native_tools, supports_native_tools_for_model, test_provider_connection,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -309,6 +309,9 @@ fn parse_tool_calls(
     let Some(calls) = message.and_then(|message| message.get("tool_calls")) else {
         return Ok(Vec::new());
     };
+    if calls.is_null() {
+        return Ok(Vec::new());
+    }
     let calls = calls
         .as_array()
         .ok_or_else(|| diagnostic_invalid_response(InvalidResponseCategory::ToolCallsNotArray))?;
@@ -1400,6 +1403,20 @@ mod tests {
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(calls[0].arguments["path"], "README.md");
         assert_eq!(calls[1].id, None);
+    }
+
+    #[test]
+    fn null_tool_calls_are_treated_as_no_tool_calls() {
+        let value = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "plain answer", "tool_calls": null},
+                "finish_reason": "stop"
+            }],
+            "usage": null,
+            "system_fingerprint": null
+        });
+        let message = value["choices"][0].get("message");
+        assert!(parse_tool_calls(message).unwrap().is_empty());
     }
 
     #[test]

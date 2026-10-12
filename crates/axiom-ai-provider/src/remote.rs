@@ -2,10 +2,12 @@ use crate::{
     InvalidResponseCategory, OllamaProvider, ProviderChatRequest, ProviderChatStreamEvent,
     ProviderConnectionRequest, ProviderConnectivity, ProviderError, ProviderKind, ProviderModel,
     ProviderResponseMetadata, ProviderToolCall, ProviderToolDefinition, ThinkingLevel,
+    parse_tool_calls,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use std::{
+    collections::BTreeMap,
     io::Read,
     thread,
     time::{Duration, Instant},
@@ -47,7 +49,16 @@ pub fn provider_protocol(kind: &ProviderKind) -> ProviderProtocol {
 /// declarations and parses native calls. This is protocol capability, not a
 /// model-name allowlist.
 pub const fn supports_native_tools(protocol: ProviderProtocol) -> bool {
-    matches!(protocol, ProviderProtocol::Ollama | ProviderProtocol::Google)
+    matches!(
+        protocol,
+        ProviderProtocol::Ollama | ProviderProtocol::Google | ProviderProtocol::OpenAi
+    )
+}
+
+pub fn supports_native_tools_for_model(protocol: ProviderProtocol, model: &str) -> bool {
+    supports_native_tools(protocol)
+        && !(protocol == ProviderProtocol::OpenAi
+            && model.to_ascii_lowercase().contains("mimo"))
 }
 
 pub fn test_provider_connection(
@@ -251,6 +262,68 @@ fn log_google_http_error(
         "Google provider request failed",
     );
     message
+}
+
+fn sanitize_openai_error_text(value: &serde_json::Value) -> Option<String> {
+    let raw = value.as_str()?;
+    let sanitized = raw.chars().map(|character| {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':' | '/' | ' ') {
+            character
+        } else {
+            '_'
+        }
+    }).take(160).collect::<String>();
+    (!sanitized.trim().is_empty()).then_some(sanitized)
+}
+
+fn openai_error_message(value: &serde_json::Value) -> Option<String> {
+    let error = value.get("error").unwrap_or(value);
+    error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned)
+}
+
+fn log_openai_http_error(http_status: u16, response: &mut reqwest::blocking::Response) -> Option<String> {
+    let mut body = Vec::new();
+    tracing::debug!(
+        target: "axiom.ai_diag",
+        event = "openai_compatible_http_error_response",
+        http_status,
+        response_headers = ?response.headers(),
+        "captured OpenAI-compatible error response headers before parsing",
+    );
+    let _ = response.read_to_end(&mut body);
+    tracing::debug!(
+        target: "axiom.ai_diag",
+        event = "openai_compatible_http_error_body",
+        http_status,
+        raw_body = ?body,
+        "captured raw OpenAI-compatible error response body",
+    );
+    let value = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            let text = String::from_utf8_lossy(&body).trim().to_owned();
+            return (!text.is_empty()).then_some(text);
+        }
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let code = error.get("code").and_then(sanitize_openai_error_text);
+    let error_type = error.get("type").and_then(sanitize_openai_error_text);
+    let message = error.get("message").and_then(sanitize_openai_error_text);
+    tracing::warn!(
+        target: "axiom.ai_diag",
+        event = "openai_compatible_http_error",
+        http_status,
+        provider_error_code = code.as_deref().unwrap_or("<unknown>"),
+        provider_error_type = error_type.as_deref().unwrap_or("<unknown>"),
+        provider_error_message = message.as_deref().unwrap_or("<unknown>"),
+        "OpenAI-compatible provider request failed",
+    );
+    openai_error_message(&value)
 }
 
 struct RemoteProvider;
@@ -510,7 +583,8 @@ impl RemoteProvider {
                 "google thinking request configuration"
             );
         }
-        let Some(response) = Self::with_http_retry_diagnostics(
+        let mut last_openai_error = None;
+        let response_result = Self::with_http_retry_diagnostics(
             protocol,
             |attempt| {
                 tracing::info!(
@@ -547,10 +621,27 @@ impl RemoteProvider {
                     if status == 400 {
                         return message.map(ProviderError::RequestRejected);
                     }
+                } else if protocol == ProviderProtocol::OpenAi {
+                    let message = log_openai_http_error(status, response);
+                    if let Some(message) = message {
+                        last_openai_error = Some(message.clone());
+                        if !Self::is_retryable_status(status) {
+                            return Some(ProviderError::RequestRejected(message));
+                        }
+                    }
                 }
                 None
             },
-        )?
+        );
+        let Some(response) = (match response_result {
+            Err(error) if protocol == ProviderProtocol::OpenAi => {
+                if let Some(message) = last_openai_error {
+                    return Err(ProviderError::RequestRejected(message));
+                }
+                return Err(error);
+            }
+            result => result?,
+        })
         else {
             return Ok(());
         };
@@ -563,11 +654,64 @@ impl RemoteProvider {
                 "[AI-DIAG]"
             );
         }
+        if protocol == ProviderProtocol::OpenAi {
+            tracing::debug!(
+                target: "axiom.ai_diag",
+                event = "openai_compatible_response_headers",
+                http_status = response.status().as_u16(),
+                response_headers = ?response.headers(),
+                model = request.model.as_str(),
+                "captured OpenAI-compatible response headers before body parsing",
+            );
+        }
         if protocol == ProviderProtocol::Google {
             return Self::stream_google_response(response, &mut is_cancelled, &mut on_event);
         }
-        let value: serde_json::Value = match response.json() {
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let response_status = response.status().as_u16();
+        let body = response.bytes().map_err(|error| {
+            tracing::warn!(
+                target: "axiom.ai_diag",
+                event = "openai_compatible_response_read_failed",
+                provider = protocol.as_str(),
+                error = %error,
+                "OpenAI-compatible response body could not be read",
+            );
+            ProviderError::invalid_response(InvalidResponseCategory::ResponseDecode)
+        })?;
+        if protocol == ProviderProtocol::OpenAi {
+            tracing::debug!(
+                target: "axiom.ai_diag",
+                event = "openai_compatible_raw_response_body",
+                http_status = response_status,
+                raw_body = ?body.as_ref(),
+                "captured raw OpenAI-compatible response body before parsing",
+            );
+        }
+        if protocol == ProviderProtocol::OpenAi
+            && (content_type.contains("text/event-stream")
+                || body.trim_ascii_start().starts_with(b"data:"))
+        {
+            return stream_openai_sse_response(&body, &mut on_event);
+        }
+        let value: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(value) => value,
+            Err(error) if protocol == ProviderProtocol::OpenAi => {
+                tracing::warn!(
+                    target: "axiom.ai_diag",
+                    event = "openai_compatible_json_decode_fallback",
+                    provider = protocol.as_str(),
+                    error = %error,
+                    body_prefix = %String::from_utf8_lossy(&body).chars().take(80).collect::<String>(),
+                    "trying tolerant SSE parsing for OpenAI-compatible response",
+                );
+                return stream_openai_sse_response(&body, &mut on_event);
+            }
             Err(_) => {
                 tracing::info!(
                     target: "axiom.ai_diag",
@@ -577,9 +721,7 @@ impl RemoteProvider {
                     terminal = "invalid_response",
                     "[AI-DIAG]"
                 );
-                return Err(ProviderError::invalid_response(
-                    InvalidResponseCategory::ResponseDecode,
-                ));
+                return Err(ProviderError::invalid_response(InvalidResponseCategory::ResponseDecode));
             }
         };
         tracing::info!(
@@ -616,6 +758,9 @@ impl RemoteProvider {
         }
         if !content.is_empty() {
             on_event(ProviderChatStreamEvent::ContentDelta(content))?;
+        }
+        for call in parsed.tool_calls {
+            on_event(ProviderChatStreamEvent::ToolCall(call))?;
         }
         for metadata in parsed.metadata {
             on_event(ProviderChatStreamEvent::ResponseMetadata(metadata))?;
@@ -1023,6 +1168,17 @@ fn gemini_function_declaration(
     }))
 }
 
+fn openai_tool_definition(tool: &ProviderToolDefinition) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        }
+    })
+}
+
 fn chat_request(
     protocol: ProviderProtocol,
     base_url: &str,
@@ -1197,20 +1353,41 @@ fn chat_request(
                 .messages
                 .iter()
                 .map(|message| {
-                    serde_json::json!({
+                    let mut value = serde_json::json!({
                         "role": message_role(&message.role),
                         "content": message.content,
-                    })
+                    });
+                    if matches!(message.role, crate::ChatRole::Assistant) && !message.tool_calls.is_empty() {
+                        value["tool_calls"] = serde_json::Value::Array(message.tool_calls.iter().map(|call| {
+                            serde_json::json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": call.arguments.to_string(),
+                                }
+                            })
+                        }).collect());
+                    }
+                    if matches!(message.role, crate::ChatRole::Tool) {
+                        if let Some(id) = &message.tool_call_id {
+                            value["tool_call_id"] = serde_json::Value::String(id.clone());
+                        }
+                    }
+                    value
                 })
                 .collect::<Vec<_>>();
-            Ok((
-                url,
-                serde_json::json!({
-                    "model": request.model,
-                    "messages": messages,
-                    "stream": false,
-                }),
-            ))
+            let mut body = serde_json::json!({
+                "model": request.model,
+                "messages": messages,
+                "stream": false,
+            });
+            if let Some(tools) = request.tools.as_ref().filter(|tools| !tools.is_empty()) {
+                body["tools"] = serde_json::Value::Array(
+                    tools.iter().map(openai_tool_definition).collect(),
+                );
+            }
+            Ok((url, body))
         }
     }
 }
@@ -1239,6 +1416,7 @@ struct ParsedChatContent {
     content: String,
     thinking: String,
     metadata: Vec<ProviderResponseMetadata>,
+    tool_calls: Vec<ProviderToolCall>,
     diagnostics: Option<GoogleResponseDiagnostics>,
 }
 
@@ -1262,23 +1440,221 @@ fn parse_chat_content_with_diagnostics(
                 content,
                 thinking: String::new(),
                 metadata: Vec::new(),
+                tool_calls: Vec::new(),
                 diagnostics: None,
             })
             .ok_or_else(invalid),
-        _ => value
-            .get("choices")
-            .and_then(|choices| choices.get(0))
-            .and_then(|choice| choice.get("message"))
-            .and_then(|message| message.get("content"))
-            .and_then(|content| content.as_str())
-            .map(|content| ParsedChatContent {
-                content: content.to_owned(),
-                thinking: String::new(),
-                metadata: Vec::new(),
-                diagnostics: None,
-            })
-            .ok_or_else(invalid),
+        _ => parse_openai_chat_content(value, invalid),
     }
+}
+
+fn parse_openai_chat_content(
+    value: &serde_json::Value,
+    invalid: impl Fn() -> ProviderError,
+) -> Result<ParsedChatContent, ProviderError> {
+    let Some(choices) = value.get("choices") else {
+        tracing::warn!(
+            target: "axiom.ai_diag",
+            event = "openai_compatible_response_missing_choices",
+            "OpenAI-compatible response did not contain choices",
+        );
+        return Err(invalid());
+    };
+    let Some(choices) = choices.as_array() else {
+        tracing::warn!(
+            target: "axiom.ai_diag",
+            event = "openai_compatible_response_choices_not_array",
+            "OpenAI-compatible response choices was not an array",
+        );
+        return Err(invalid());
+    };
+    let Some(choice) = choices.first() else {
+        tracing::warn!(
+            target: "axiom.ai_diag",
+            event = "openai_compatible_response_empty_choices",
+            "OpenAI-compatible response choices was empty",
+        );
+        return Err(invalid());
+    };
+    let Some(message) = choice.get("message") else {
+        tracing::warn!(
+            target: "axiom.ai_diag",
+            event = "openai_compatible_response_missing_message",
+            "OpenAI-compatible response choice did not contain message",
+        );
+        return Err(invalid());
+    };
+    let content = message
+        .get("content")
+        .and_then(|content| content.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let tool_calls = parse_tool_calls(Some(message))?;
+    if content.is_empty() && tool_calls.is_empty() {
+        tracing::warn!(
+            target: "axiom.ai_diag",
+            event = "openai_compatible_response_without_usable_content",
+            content_is_null = message.get("content").is_some_and(serde_json::Value::is_null),
+            tool_calls_present = message.get("tool_calls").is_some(),
+            "OpenAI-compatible response contained no visible content or tool calls",
+        );
+        return Err(invalid());
+    }
+    Ok(ParsedChatContent {
+        content,
+        thinking: String::new(),
+        metadata: Vec::new(),
+        tool_calls,
+        diagnostics: None,
+    })
+}
+
+fn stream_openai_sse_response<F>(
+    body: &[u8],
+    on_event: &mut F,
+) -> Result<(), ProviderError>
+where
+    F: FnMut(ProviderChatStreamEvent) -> Result<(), ProviderError>,
+{
+    let text = String::from_utf8_lossy(body);
+    let mut saw_sse_marker = false;
+    let mut saw_payload = false;
+    let mut tool_calls = BTreeMap::<usize, ProviderToolCall>::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
+            continue;
+        }
+        let Some(data) = line.strip_prefix("data:") else {
+            if line.starts_with("id:") || line.starts_with("retry:") || line == "ping" {
+                saw_sse_marker = true;
+                continue;
+            }
+            continue;
+        };
+        saw_sse_marker = true;
+        let data = data.trim();
+        tracing::debug!(
+            target: "axiom.ai_diag",
+            event = "openai_compatible_raw_sse_chunk",
+            raw_chunk = data,
+            "captured raw OpenAI-compatible SSE data chunk before parsing",
+        );
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let value = match serde_json::from_str::<serde_json::Value>(data) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    target: "axiom.ai_diag",
+                    event = "openai_compatible_sse_chunk_ignored",
+                    error = %error,
+                    "ignored malformed OpenAI-compatible SSE data chunk",
+                );
+                continue;
+            }
+        };
+        let Some(choices) = value.get("choices") else {
+            tracing::debug!(
+                target: "axiom.ai_diag",
+                event = "openai_compatible_sse_chunk_without_choices",
+                "ignored OpenAI-compatible SSE metadata chunk",
+            );
+            continue;
+        };
+        let Some(choices) = choices.as_array() else {
+            tracing::warn!(
+                target: "axiom.ai_diag",
+                event = "openai_compatible_sse_choices_not_array",
+                "ignored OpenAI-compatible SSE chunk with invalid choices",
+            );
+            continue;
+        };
+        saw_payload = true;
+        for choice in choices {
+            let Some(delta) = choice.get("delta").or_else(|| choice.get("message")) else {
+                continue;
+            };
+            if let Some(content) = delta.get("content").and_then(|value| value.as_str()) {
+                if !content.is_empty() {
+                    on_event(ProviderChatStreamEvent::ContentDelta(content.to_owned()))?;
+                }
+            }
+            if let Some(calls) = delta.get("tool_calls").and_then(|value| value.as_array()) {
+                for call in calls {
+                    let index = call
+                        .get("index")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(tool_calls.len() as u64) as usize;
+                    let entry = tool_calls.entry(index).or_insert_with(|| ProviderToolCall {
+                        id: None,
+                        name: String::new(),
+                        arguments: serde_json::Value::String(String::new()),
+                    });
+                    if let Some(id) = call.get("id").and_then(|value| value.as_str()) {
+                        entry.id = Some(id.to_owned());
+                    }
+                    if let Some(function) = call.get("function") {
+                        if let Some(name) = function.get("name").and_then(|value| value.as_str()) {
+                            entry.name.push_str(name);
+                        }
+                        if let Some(arguments) = function
+                            .get("arguments")
+                            .and_then(|value| value.as_str())
+                        {
+                            if let Some(existing) = entry.arguments.as_str() {
+                                entry.arguments = serde_json::Value::String(format!(
+                                    "{existing}{arguments}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !saw_sse_marker {
+        tracing::warn!(
+            target: "axiom.ai_diag",
+            event = "openai_compatible_sse_not_detected",
+            "response was neither valid JSON nor recognizable SSE",
+        );
+        return Err(ProviderError::invalid_response(InvalidResponseCategory::ResponseDecode));
+    }
+    for (_, mut call) in tool_calls {
+        let arguments = match call.arguments.as_str() {
+            Some(arguments) if arguments.trim().is_empty() => serde_json::json!({}),
+            Some(arguments) => match serde_json::from_str(arguments) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "axiom.ai_diag",
+                        event = "openai_compatible_sse_tool_arguments_invalid",
+                        error = %error,
+                        tool = call.name.as_str(),
+                        "ignored incomplete streamed tool call",
+                    );
+                    continue;
+                }
+            },
+            None => serde_json::json!({}),
+        };
+        call.arguments = arguments;
+        if !call.name.is_empty() {
+            on_event(ProviderChatStreamEvent::ToolCall(call))?;
+        }
+    }
+    if !saw_payload {
+        tracing::debug!(
+            target: "axiom.ai_diag",
+            event = "openai_compatible_sse_without_usable_choices",
+            "SSE response contained no usable choices",
+        );
+    }
+    on_event(ProviderChatStreamEvent::Done)
 }
 
 fn parse_google_chat_content(
@@ -1381,6 +1757,7 @@ fn parse_google_chat_content(
         content: visible_content,
         thinking,
         metadata,
+        tool_calls: Vec::new(),
         diagnostics: Some(diagnostics),
     })
 }
@@ -1389,6 +1766,196 @@ fn parse_google_chat_content(
 mod tests {
     use super::*;
     use crate::{ProviderChatMessage, ProviderToolDefinition};
+
+    #[test]
+    fn openai_sse_ignores_done_ping_null_content_and_metadata_chunks() {
+        let body = br#": ping
+data: {"id":"x","choices":[{"delta":{"content":null}}]}
+data: {"choices":[]}
+data: {"choices":[{"delta":{"content":"hello"}}]}
+data: [DONE]
+"#;
+        let mut events = Vec::new();
+        stream_openai_sse_response(body, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                ProviderChatStreamEvent::ContentDelta("hello".into()),
+                ProviderChatStreamEvent::Done,
+            ]
+        );
+    }
+
+    #[test]
+    fn openai_sse_reassembles_fragmented_tool_arguments() {
+        let body = br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"execute_command","arguments":"{\"command\":"}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"pwd\"}"}}]}}]}
+data: [DONE]
+"#;
+        let mut events = Vec::new();
+        stream_openai_sse_response(body, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            ProviderChatStreamEvent::ToolCall(ProviderToolCall {
+                id: Some("call-1".into()),
+                name: "execute_command".into(),
+                arguments: serde_json::json!({"command": "pwd"}),
+            })
+        );
+        assert_eq!(events[1], ProviderChatStreamEvent::Done);
+    }
+
+    #[test]
+    fn openai_sse_without_valid_marker_returns_decode_error() {
+        let error = stream_openai_sse_response(br#"unexpected body"#, &mut |_| Ok(())).unwrap_err();
+        assert_eq!(
+            error.invalid_response_category(),
+            Some(InvalidResponseCategory::ResponseDecode)
+        );
+    }
+
+    #[test]
+    fn openai_protocol_supports_native_tools_except_explicit_mimo_fallback() {
+        assert!(supports_native_tools(ProviderProtocol::OpenAi));
+        assert!(supports_native_tools_for_model(ProviderProtocol::OpenAi, "gpt-5"));
+        assert!(!supports_native_tools_for_model(ProviderProtocol::OpenAi, "MiMo-V2-Flash"));
+        assert!(!supports_native_tools_for_model(ProviderProtocol::Anthropic, "MiMo"));
+    }
+
+    #[test]
+    fn openai_compatible_request_serializes_tool_definitions() {
+        let request = ProviderChatRequest {
+            model: "gpt-5".into(),
+            messages: vec![ProviderChatMessage {
+                role: crate::ChatRole::User,
+                content: "run a command".into(),
+                reasoning: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            }],
+            think: None,
+            thinking_level: None,
+            tools: Some(vec![ProviderToolDefinition {
+                name: "execute_command".into(),
+                description: "Run a command".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }),
+            }]),
+        };
+        let (_, body) = chat_request(ProviderProtocol::OpenAi, "https://example.test/v1", &request).unwrap();
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "execute_command");
+        assert_eq!(body["tools"][0]["function"]["parameters"]["required"][0], "command");
+    }
+
+    #[test]
+    fn openai_compatible_history_serializes_tool_calls_and_correlated_results() {
+        let request = ProviderChatRequest {
+            model: "test-model".into(),
+            messages: vec![
+                ProviderChatMessage {
+                    role: crate::ChatRole::Assistant,
+                    content: String::new(),
+                    reasoning: None,
+                    tool_call_id: None,
+                    tool_calls: vec![ProviderToolCall {
+                        id: Some("call_synth_123".into()),
+                        name: "execute_command".into(),
+                        arguments: serde_json::json!({"command": "pwd"}),
+                    }],
+                },
+                ProviderChatMessage {
+                    role: crate::ChatRole::Tool,
+                    content: "{\"stdout\":\"/workspace\"}".into(),
+                    reasoning: None,
+                    tool_call_id: Some("call_synth_123".into()),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            think: None,
+            thinking_level: None,
+            tools: None,
+        };
+        let (_, body) = chat_request(
+            ProviderProtocol::OpenAi,
+            "https://platform.xiaomimimo.com/v1",
+            &request,
+        ).unwrap();
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_synth_123");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["type"], "function");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["function"]["name"], "execute_command");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["function"]["arguments"], "{\"command\":\"pwd\"}");
+        assert_eq!(body["messages"][1]["role"], "tool");
+        assert_eq!(body["messages"][1]["tool_call_id"], "call_synth_123");
+        assert_eq!(body["messages"][1]["content"], "{\"stdout\":\"/workspace\"}");
+
+        let mut native_request = request.clone();
+        native_request.messages[0].tool_calls[0].id = Some("call_native_456".into());
+        native_request.messages[1].tool_call_id = Some("call_native_456".into());
+        let (_, native_body) = chat_request(
+            ProviderProtocol::OpenAi,
+            "https://platform.xiaomimimo.com/v1",
+            &native_request,
+        ).unwrap();
+        assert_eq!(native_body["messages"][0]["tool_calls"][0]["id"], "call_native_456");
+        assert_eq!(native_body["messages"][1]["tool_call_id"], "call_native_456");
+    }
+
+    #[test]
+    fn openai_compatible_error_returns_provider_message_without_rewriting_it() {
+        let value = serde_json::json!({
+            "error": {
+                "code": "invalid_request",
+                "type": "bad_request",
+                "message": "tool_call_id missing; unexpected <payload>"
+            }
+        });
+        assert_eq!(
+            sanitize_openai_error_text(&value["error"]["message"]).as_deref(),
+            Some("tool_call_id missing_ unexpected _payload_")
+        );
+        assert_eq!(
+            openai_error_message(&value).as_deref(),
+            Some("tool_call_id missing; unexpected <payload>")
+        );
+    }
+
+    #[test]
+    fn openai_response_ignores_optional_and_unknown_top_level_fields() {
+        let value = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "mimo-v2.6-flash",
+            "system_fingerprint": "fp-test",
+            "usage": {"total_tokens": 5},
+            "choices": [{
+                "finish_reason": "stop",
+                "unexpected_choice_field": true,
+                "message": {"role": "assistant", "content": "ok", "unexpected": null}
+            }]
+        });
+        let parsed = parse_chat_content_with_diagnostics(ProviderProtocol::OpenAi, &value).unwrap();
+        assert_eq!(parsed.content, "ok");
+    }
+
+    #[test]
+    fn openai_json_error_payload_extracts_message() {
+        let value = serde_json::json!({"error": {"message": "invalid tool schema"}});
+        assert_eq!(openai_error_message(&value).as_deref(), Some("invalid tool schema"));
+    }
 
     fn agent_tool_definition_set(include_find_symbol: bool) -> Vec<ProviderToolDefinition> {
         let mut definitions = vec![

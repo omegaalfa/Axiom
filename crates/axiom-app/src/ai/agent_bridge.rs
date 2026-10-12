@@ -26,6 +26,8 @@ use std::sync::{
 
 static NEXT_AGENT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_APPROVAL_RUN_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_SYNTHETIC_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_TEXTUAL_TOOL_CONTEXT_CHARS: usize = 12_000;
 
 pub(crate) type AgentEventQueue = Arc<Mutex<Vec<AgentEvent>>>;
 
@@ -339,6 +341,8 @@ impl ProviderExecutor for AgentProviderAdapter {
         request: &ProviderChatRequest,
         emit: &mut dyn FnMut(ProviderChatStreamEvent),
     ) -> Result<(), ProviderError> {
+        let mut content = String::new();
+        let mut has_native_tool_calls = false;
         provider_chat_stream_with_cancel(
             &self.kind,
             &self.api_key,
@@ -346,11 +350,90 @@ impl ProviderExecutor for AgentProviderAdapter {
             request,
             || self.cancellation.is_cancelled(),
             |event| {
-                emit(event);
+                match event {
+                    ProviderChatStreamEvent::ContentDelta(delta) => content.push_str(&delta),
+                    ProviderChatStreamEvent::ToolCall(_) => {
+                        has_native_tool_calls = true;
+                        emit(event);
+                    }
+                    event => emit(event),
+                }
                 Ok(())
             },
-        )
+        )?;
+        let fallback_calls = text_fallback_calls(&content, has_native_tool_calls);
+        if fallback_calls.is_empty() {
+            if !content.is_empty() {
+                emit(ProviderChatStreamEvent::ContentDelta(content));
+            }
+        } else {
+            for call in fallback_calls {
+                emit(ProviderChatStreamEvent::ToolCall(call));
+            }
+        }
+        Ok(())
     }
+}
+
+fn text_fallback_calls(content: &str, has_native_tool_calls: bool) -> Vec<ProviderToolCall> {
+    if has_native_tool_calls { return Vec::new(); }
+    parse_xml_tool_calls(content)
+}
+
+fn parse_xml_tool_calls(content: &str) -> Vec<ProviderToolCall> {
+    if !content.contains("<tool_call>") && !content.contains("<function=") { return Vec::new(); }
+    let mut calls = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("<function=") {
+        rest = &rest[start + "<function=".len()..];
+        let Some(name_end) = rest.find('>') else { break };
+        let raw_name = rest[..name_end].trim();
+        let body_start = name_end + 1;
+        let rest_after_name = &rest[body_start..];
+        let Some(body_end) = rest_after_name.find("</function>") else { break };
+        rest = &rest_after_name[body_end + "</function>".len()..];
+
+        if raw_name.is_empty() || !raw_name.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')) { continue; }
+        let body = &rest_after_name[..body_end];
+        let Some(arguments) = parse_xml_parameters(body) else { continue };
+        let name = match raw_name.to_ascii_lowercase().as_str() {
+            "bash" | "shell" => "execute_command",
+            _ => raw_name,
+        };
+        if name == "execute_command" && arguments.get("command").and_then(Value::as_str).is_none() { continue; }
+        calls.push(ProviderToolCall {
+            id: Some(format!("call_synth_{}", NEXT_SYNTHETIC_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed))),
+            name: name.to_owned(),
+            arguments,
+        });
+    }
+    calls
+}
+
+fn parse_xml_parameters(body: &str) -> Option<Value> {
+    let mut object = serde_json::Map::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("<parameter=") {
+        rest = &rest[start + "<parameter=".len()..];
+        let end = rest.find('>')?;
+        let name = rest[..end].trim();
+        if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')) { return None; }
+        let close = format!("</parameter>");
+        let value_start = end + 1;
+        let remaining = &rest[value_start..];
+        let value_end = remaining.find(&close)?;
+        if object.insert(name.to_owned(), Value::String(decode_xml_entities(remaining[..value_end].trim()))).is_some() { return None; }
+        rest = &remaining[value_end + close.len()..];
+    }
+    Some(Value::Object(object))
+}
+
+fn decode_xml_entities(value: &str) -> String {
+    value.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 pub(crate) struct AgentToolAdapter {
@@ -791,6 +874,22 @@ pub(crate) fn execute_agent_run(
     bridge: &ApprovalBridge,
     queue: &AgentEventQueue,
 ) -> Result<axiom_agent::AgentExecutionResult, axiom_agent::AgentExecutionError> {
+    let protocol = axiom_ai_provider::provider_protocol(&provider_kind);
+    let native_tools = axiom_ai_provider::supports_native_tools_for_model(protocol, &request.model);
+    let request = if !native_tools && registry.is_some() {
+        let memory_enabled = registry
+            .as_ref()
+            .is_some_and(|registry| registry.has_memory_tools());
+        let memory_writable = registry
+            .as_ref()
+            .is_some_and(|registry| registry.has_memory_write_tool());
+        let definitions = production_tool_definitions_with_memory(memory_enabled, memory_writable);
+        let mut request = request;
+        request.tools = None;
+        inject_textual_tool_context(request, &definitions)
+    } else {
+        request
+    };
     let cancellation = run.cancellation();
     let mut provider =
         AgentProviderAdapter::new(provider_kind, api_key, base_url, cancellation.clone());
@@ -825,6 +924,43 @@ pub(crate) fn execute_agent_run(
         );
     }
     result
+}
+
+fn inject_textual_tool_context(
+    mut request: ProviderChatRequest,
+    definitions: &[axiom_ai_provider::ProviderToolDefinition],
+) -> ProviderChatRequest {
+    let mut content = String::from(
+        "Available Axiom tools (text fallback): use exactly one XML call when a tool is needed. Format: <tool_call><function=TOOL_NAME><parameter=NAME>VALUE</parameter></function></tool_call>. Do not invent tools or parameters. Tool output is returned by Axiom before the next turn.\n\n",
+    );
+    for definition in definitions {
+        let entry = format!(
+            "Tool: {}\nDescription: {}\nParameters: {}\n\n",
+            definition.name,
+            definition.description,
+            definition.parameters
+        );
+        if content.chars().count() + entry.chars().count() > MAX_TEXTUAL_TOOL_CONTEXT_CHARS {
+            break;
+        }
+        content.push_str(&entry);
+    }
+    let position = request
+        .messages
+        .iter()
+        .position(|message| message.role != axiom_ai_provider::ChatRole::System)
+        .unwrap_or(request.messages.len());
+    request.messages.insert(
+        position,
+        axiom_ai_provider::ProviderChatMessage {
+            role: axiom_ai_provider::ChatRole::System,
+            content,
+            reasoning: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        },
+    );
+    request
 }
 
 #[cfg(test)]
@@ -975,6 +1111,65 @@ mod tests {
         project_update::ProjectUpdateCapability,
     };
     use std::fs;
+
+    #[test]
+    fn xml_bash_fallback_maps_command_and_decodes_entities() {
+        let calls = parse_xml_tool_calls(
+            r#"<tool_call><function=Bash><parameter=command>echo &quot;hi&quot; &amp;&amp; pwd</parameter></function></tool_call>"#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "execute_command");
+        assert!(calls[0].id.as_deref().is_some_and(|id| id.starts_with("call_synth_")));
+        assert_eq!(calls[0].arguments["command"], "echo \"hi\" && pwd");
+    }
+
+    #[test]
+    fn xml_fallback_only_runs_without_native_tool_calls() {
+        let content = "<tool_call><function=shell><parameter=command>pwd</parameter></function></tool_call>";
+        assert_eq!(text_fallback_calls(content, true), Vec::new());
+        let calls = text_fallback_calls(content, false);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "execute_command");
+    }
+
+    #[test]
+    fn ordinary_or_malformed_markup_remains_unparsed_text() {
+        assert!(parse_xml_tool_calls("Here is the explanation.").is_empty());
+        assert!(parse_xml_tool_calls("<tool_call><function=Bash></function>").is_empty());
+        assert!(parse_xml_tool_calls("<function=execute_command><parameter=cwd>.</parameter></function>").is_empty());
+    }
+
+    #[test]
+    fn textual_fallback_injects_bounded_tool_context_before_user_messages() {
+        let request = ProviderChatRequest {
+            model: "MiMo-V2-Flash".into(),
+            messages: vec![ProviderChatMessage {
+                role: axiom_ai_provider::ChatRole::User,
+                content: "inspect the project".into(),
+                reasoning: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            }],
+            think: None,
+            thinking_level: None,
+            tools: None,
+        };
+        let definitions = vec![ProviderToolDefinition {
+            name: "execute_command".into(),
+            description: "Run an approved command".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }),
+        }];
+        let request = inject_textual_tool_context(request, &definitions);
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].role, axiom_ai_provider::ChatRole::System);
+        assert!(request.messages[0].content.contains("execute_command"));
+        assert!(request.messages[0].content.contains("<tool_call>"));
+        assert_eq!(request.messages[1].content, "inspect the project");
+    }
 
     fn adapter() -> (tempfile::TempDir, AgentToolAdapter) {
         let dir = tempfile::tempdir().unwrap();

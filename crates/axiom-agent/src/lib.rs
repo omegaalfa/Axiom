@@ -722,7 +722,7 @@ impl AgentExecutionError {
             Self::BudgetExceeded(error) => AgentFailureDiagnostic {
                 kind: AgentFailureKind::BudgetExceeded,
                 message: format!(
-                    "{} (limit={}, attempted={})",
+                    "execution budget exhausted: {} (limit={}, attempted={})",
                     match error.resource {
                         BudgetResource::ProviderTurns => "provider turns",
                         BudgetResource::ToolCalls => "tool calls",
@@ -4612,10 +4612,12 @@ mod tests {
             request(),
             &mut |event| events.push(event),
         );
-        assert!(matches!(
-            result,
-            Err(AgentExecutionError::BudgetExceeded(_))
-        ));
+        let error = result.unwrap_err();
+        assert!(matches!(&error, AgentExecutionError::BudgetExceeded(_)));
+        assert_eq!(
+            error.diagnostic().message,
+            "execution budget exhausted: tool calls (limit=0, attempted=1)"
+        );
         assert_eq!(provider.calls, 1);
         assert!(tools.calls.is_empty());
         assert_eq!(run.state(), AgentState::Failed);
@@ -4676,7 +4678,7 @@ mod tests {
         let second = AgentRunId::new(29);
         let diagnostic = AgentFailureDiagnostic {
             kind: AgentFailureKind::BudgetExceeded,
-            message: "provider turns (limit=5, attempted=6)".into(),
+            message: "execution budget exhausted: provider turns (limit=5, attempted=6)".into(),
         };
         let event = AgentEvent::Failed {
             run_id: first,

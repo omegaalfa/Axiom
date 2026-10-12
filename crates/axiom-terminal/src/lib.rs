@@ -53,6 +53,29 @@ pub fn normalize_windows_shell_path(path: &Path) -> PathBuf {
 }
 
 pub fn windows_path_str_to_wsl(path: &str) -> Option<String> {
+    let extended_unc;
+    let path = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        extended_unc = format!(r"\\{rest}");
+        extended_unc.as_str()
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path)
+    };
+    let normalized_unc = path.replace('/', "\\");
+    let unc = normalized_unc.trim_start_matches('\\');
+    let mut components = unc.split('\\').filter(|component| !component.is_empty());
+    if components
+        .next()
+        .is_some_and(|server| server.eq_ignore_ascii_case("wsl.localhost") || server.eq_ignore_ascii_case("wsl$"))
+    {
+        let _distro = components.next()?;
+        let linux_path = components.collect::<Vec<_>>().join("/");
+        return Some(if linux_path.is_empty() {
+            "/".into()
+        } else {
+            format!("/{linux_path}")
+        });
+    }
+
     let path = path.strip_prefix(r"\\?\").filter(|rest| rest.len() >= 3 && rest.as_bytes()[1] == b':' && rest.as_bytes()[2] == b'\\').unwrap_or(path);
     let bytes = path.as_bytes();
     if bytes.len() < 3 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() || !matches!(bytes[2], b'\\' | b'/') { return None; }
@@ -101,7 +124,7 @@ pub fn encode_key(key: &str, ctrl: bool, application_cursor: bool) -> Option<Vec
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalCell { pub character: char, pub foreground: Color, pub background: Color, pub flags: Flags }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TerminalSnapshot { pub cells: Vec<Vec<TerminalCell>>, pub cursor: (usize, usize), pub cursor_shape: CursorShape, pub cursor_visible: bool, pub display_offset: usize, pub size: TerminalSize, pub state: TerminalState }
+pub struct TerminalSnapshot { pub cells: Vec<Vec<TerminalCell>>, pub cursor: (usize, usize), pub cursor_shape: CursorShape, pub cursor_visible: bool, pub display_offset: usize, pub history_size: usize, pub size: TerminalSize, pub state: TerminalState }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalScrollState { pub display_offset: usize, pub max_offset: usize, pub visible_rows: usize }
 
@@ -118,7 +141,14 @@ impl TerminalSession {
     pub fn spawn(profile: &TerminalProfile, cwd: impl AsRef<Path>) -> io::Result<Self> {
         let size = TerminalSize::new(80, 24); let (tx, events) = mpsc::sync_channel(16); let exited = Arc::new(AtomicBool::new(false));
         let listener = Listener { tx: tx.clone(), exited: exited.clone() }; let terminal = Arc::new(FairMutex::new(Term::new(Config::default(), &Size { cols: size.cols as usize, rows: size.rows as usize }, listener)));
-        let mut options = Options { working_directory: Some(normalize_windows_shell_path(cwd.as_ref())), ..Options::default() };
+        let working_directory = if cfg!(windows)
+            && matches!(&profile.id, TerminalProfileId::WslDefault | TerminalProfileId::WslDistro(_))
+        {
+            None
+        } else {
+            Some(normalize_windows_shell_path(cwd.as_ref()))
+        };
+        let mut options = Options { working_directory, ..Options::default() };
         #[cfg(windows)] { options.shell = Some(Shell::new(profile.program.to_string_lossy().into_owned(), profile.args.clone())); }
         #[cfg(not(windows))] { let _ = profile; options.shell = Some(Shell::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()), vec![])); }
         tty::setup_env(); let pty = tty::new(&options, WindowSize { num_lines: size.rows, num_cols: size.cols, cell_width: 0, cell_height: 0 }, 0).map_err(io::Error::other)?;
@@ -147,6 +177,7 @@ impl TerminalSession {
     pub fn scroll_to_bottom(&self) { self.terminal.lock().scroll_display(Scroll::Bottom); }
     pub fn snapshot(&self) -> TerminalSnapshot {
         let term = self.terminal.lock();
+        let history_size = term.grid().history_size();
         let content = term.renderable_content();
         let mut cells = vec![Vec::with_capacity(self.size.cols as usize); self.size.rows as usize];
         let mut display_line = None;
@@ -162,7 +193,7 @@ impl TerminalSession {
                 cells[viewport_row].push(TerminalCell { character: cell.cell.c, foreground: cell.cell.fg, background: cell.cell.bg, flags: cell.cell.flags });
             }
         }
-        TerminalSnapshot { cells, cursor: (content.cursor.point.column.0, content.cursor.point.line.0.max(0) as usize), cursor_shape: content.cursor.shape, cursor_visible: content.mode.contains(alacritty_terminal::term::TermMode::SHOW_CURSOR), display_offset: content.display_offset, size: self.size, state: if self.state.load(Ordering::Acquire) { TerminalState::Exited } else { TerminalState::Running } }
+        TerminalSnapshot { cells, cursor: (content.cursor.point.column.0, content.cursor.point.line.0.max(0) as usize), cursor_shape: content.cursor.shape, cursor_visible: content.mode.contains(alacritty_terminal::term::TermMode::SHOW_CURSOR), display_offset: content.display_offset, history_size, size: self.size, state: if self.state.load(Ordering::Acquire) { TerminalState::Exited } else { TerminalState::Running } }
     }
     pub fn try_recv_event(&self) -> bool { self.events.lock().ok().is_some_and(|events| events.try_recv().is_ok()) }
     pub fn wait_event(&self) -> bool { self.events.lock().ok().is_some_and(|events| events.recv().is_ok()) }
@@ -183,7 +214,7 @@ impl Drop for TerminalSession { fn drop(&mut self) { self.shutdown(); } }
 
 #[cfg(test)]
 mod newline_tests {
-    use super::normalize_terminal_newlines;
+    use super::{normalize_terminal_newlines, windows_path_str_to_wsl, TerminalProfile};
 
     #[test]
     fn normalizes_lf_without_duplicate_cr() {
@@ -196,6 +227,19 @@ mod newline_tests {
         let mut previous_cr = false;
         assert_eq!(normalize_terminal_newlines(b"a\r", &mut previous_cr), b"a\r");
         assert_eq!(normalize_terminal_newlines(b"\nb", &mut previous_cr), b"\nb");
+    }
+
+    #[test]
+    fn normalizes_wsl_unc_paths_to_linux_paths() {
+        assert_eq!(windows_path_str_to_wsl(r"\\wsl.localhost\Ubuntu\home\user\project"), Some("/home/user/project".into()));
+        assert_eq!(windows_path_str_to_wsl(r"\\wsl$\Ubuntu\home\user\project"), Some("/home/user/project".into()));
+        assert_eq!(windows_path_str_to_wsl(r"\\?\UNC\wsl.localhost\Ubuntu\home\user\project"), Some("/home/user/project".into()));
+    }
+
+    #[test]
+    fn wsl_profile_passes_normalized_linux_cwd() {
+        let profile = TerminalProfile::wsl_distro("Ubuntu", Some(std::path::Path::new(r"\\?\UNC\wsl.localhost\Ubuntu\home\user\project")));
+        assert!(profile.args.windows(2).any(|pair| pair[0] == "--cd" && pair[1] == "/home/user/project"));
     }
 }
 

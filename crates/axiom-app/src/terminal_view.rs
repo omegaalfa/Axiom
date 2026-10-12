@@ -37,6 +37,14 @@ fn scrollbar_offset_from_top(top: Pixels, track_height: Pixels, thumb_height: Pi
 
 fn first_visible_row(state: TerminalScrollState) -> usize { state.max_offset.saturating_sub(state.display_offset) }
 fn logical_row(state: TerminalScrollState, viewport_row: usize) -> usize { first_visible_row(state).saturating_add(viewport_row) }
+fn snapshot_first_visible_row(snapshot: &axiom_terminal::TerminalSnapshot) -> usize {
+    snapshot.history_size.saturating_sub(snapshot.display_offset)
+}
+fn terminal_grid_dimensions(width: Pixels, height: Pixels, cell_width: Pixels, cell_height: Pixels) -> (usize, usize) {
+    let columns = (width / cell_width.max(px(1.))).floor().max(1.) as usize;
+    let rows = (height / cell_height.max(px(1.))).floor().max(1.) as usize;
+    (columns, rows)
+}
 fn selection_viewport_row(raw_row: i32, visible_rows: usize) -> (usize, i8) {
     if visible_rows == 0 { return (0, 0); }
     if raw_row < 0 { (0, -1) }
@@ -74,20 +82,19 @@ fn selected(range: SelectionRange, point: TerminalPoint) -> bool {
 }
 
 fn selected_text(cells: &[Vec<TerminalCell>], range: SelectionRange, first_row: usize) -> String {
-    let mut output = String::new();
     let selected_rows = cells.iter().enumerate().filter_map(|(row, cells)| {
         let absolute_row = first_row + row;
         if absolute_row < range.start.row || absolute_row > range.end.row { return None; }
         let start = if absolute_row == range.start.row { range.start.column } else { 0 };
-        let end = if absolute_row == range.end.row { range.end.column } else { cells.len().saturating_sub(1) };
-        let line: String = cells.get(start..=end).unwrap_or(&[]).iter().map(|cell| cell.character).collect();
+        let end = if absolute_row == range.end.row { range.end.column } else { cells.len().saturating_sub(1) }.min(cells.len().saturating_sub(1));
+        let line: String = if start <= end {
+            cells.get(start..=end).unwrap_or(&[]).iter().map(|cell| cell.character).collect()
+        } else {
+            String::new()
+        };
         Some(line.trim_end_matches(' ').to_owned())
     }).collect::<Vec<_>>();
-    for (index, line) in selected_rows.iter().enumerate() {
-        output.push_str(line.trim_end_matches(' '));
-        if index + 1 < selected_rows.len() { output.push_str("\r\n"); }
-    }
-    output
+    selected_rows.join("\n")
 }
 
 fn ansi_color(index: u8) -> u32 {
@@ -146,10 +153,10 @@ fn row_cells(cells: &[TerminalCell], absolute_row: usize, selection: Option<Sele
     }).collect()
 }
 
-pub struct TerminalView { session: Arc<Mutex<TerminalSession>>, focus: FocusHandle, viewport_height: Pixels, ready_callback: Option<Arc<dyn Fn(&mut AsyncApp) + Send + Sync>>, first_activity_reported: bool, last_terminal_size: Option<(usize, usize)>, selection_anchor: Option<TerminalPoint>, selection_head: Option<TerminalPoint>, selection_pointer: Option<TerminalPoint>, selection_pointer_y: Option<Pixels>, selection_edge: i8, is_selecting: bool, selection_dragged: bool, context_menu: Option<Point<Pixels>>, scrollbar_dragging: bool, scrollbar_grab_offset_y: Pixels, scrollbar_drag_thumb_y: Option<Pixels>, scrollbar_last_target: Option<usize>, scroll_remainder: f32, cursor_blink_visible: bool, terminal_focused: bool }
+pub struct TerminalView { session: Arc<Mutex<TerminalSession>>, focus: FocusHandle, viewport_width: Option<Pixels>, viewport_height: Pixels, ready_callback: Option<Arc<dyn Fn(&mut AsyncApp) + Send + Sync>>, first_activity_reported: bool, last_terminal_size: Option<(usize, usize)>, selection_anchor: Option<TerminalPoint>, selection_head: Option<TerminalPoint>, selection_pointer: Option<TerminalPoint>, selection_pointer_y: Option<Pixels>, selection_edge: i8, is_selecting: bool, selection_dragged: bool, context_menu: Option<Point<Pixels>>, scrollbar_dragging: bool, scrollbar_grab_offset_y: Pixels, scrollbar_drag_thumb_y: Option<Pixels>, scrollbar_last_target: Option<usize>, scroll_remainder: f32, cursor_blink_visible: bool, terminal_focused: bool }
 impl TerminalView {
     pub fn new(session: Arc<Mutex<TerminalSession>>, viewport_height: Pixels, ready_callback: Option<Arc<dyn Fn(&mut AsyncApp) + Send + Sync>>, cx: &mut Context<Self>) -> Self {
-        let view = Self { session: session.clone(), focus: cx.focus_handle(), viewport_height, ready_callback, first_activity_reported: false, last_terminal_size: None, selection_anchor: None, selection_head: None, selection_pointer: None, selection_pointer_y: None, selection_edge: 0, is_selecting: false, selection_dragged: false, context_menu: None, scrollbar_dragging: false, scrollbar_grab_offset_y: px(0.), scrollbar_drag_thumb_y: None, scrollbar_last_target: None, scroll_remainder: 0., cursor_blink_visible: true, terminal_focused: false };
+        let view = Self { session: session.clone(), focus: cx.focus_handle(), viewport_width: None, viewport_height, ready_callback, first_activity_reported: false, last_terminal_size: None, selection_anchor: None, selection_head: None, selection_pointer: None, selection_pointer_y: None, selection_edge: 0, is_selecting: false, selection_dragged: false, context_menu: None, scrollbar_dragging: false, scrollbar_grab_offset_y: px(0.), scrollbar_drag_thumb_y: None, scrollbar_last_target: None, scroll_remainder: 0., cursor_blink_visible: true, terminal_focused: false };
         let events = session.lock().ok().map(|session| session.event_receiver());
         cx.spawn(async move |this, cx| {
             let Some(events) = events else { return; };
@@ -185,7 +192,10 @@ impl TerminalView {
         }).detach();
         view
     }
-    pub fn set_viewport_height(&mut self, viewport_height: Pixels) { self.viewport_height = viewport_height; }
+    pub fn set_viewport_size(&mut self, viewport_width: Pixels, viewport_height: Pixels) {
+        self.viewport_width = Some(viewport_width);
+        self.viewport_height = viewport_height;
+    }
     fn prepare_for_terminal_input(&mut self, cx: &mut Context<Self>) {
         self.cursor_blink_visible = true;
         if self.session.lock().ok().is_some_and(|session| session.display_offset() > 0) {
@@ -195,7 +205,10 @@ impl TerminalView {
     }
     fn selection_range(&self) -> Option<SelectionRange> { self.selection_anchor.zip(self.selection_head).map(|(anchor, head)| normalize_selection(anchor, head)) }
     fn logical_row(&self, viewport_row: usize) -> usize {
-        self.session.lock().ok().map(|session| logical_row(session.scroll_state(), viewport_row)).unwrap_or(viewport_row)
+        self.session.lock().ok().map(|session| {
+            let snapshot = session.snapshot();
+            snapshot_first_visible_row(&snapshot).saturating_add(viewport_row)
+        }).unwrap_or(viewport_row)
     }
     fn update_selection_head_from_pointer(&mut self, cx: &mut Context<Self>) {
         if let Some(pointer) = self.selection_pointer {
@@ -283,8 +296,7 @@ impl TerminalView {
         if ctrl && key.eq_ignore_ascii_case("c") && (shift || has_selection) {
             if let (Some(range), Ok(session)) = (selection, self.session.lock()) {
                 let snapshot = session.snapshot();
-                let scroll = session.scroll_state();
-                let first_row = scroll.max_offset.saturating_sub(snapshot.display_offset);
+                let first_row = snapshot_first_visible_row(&snapshot);
                 let text = selected_text(&snapshot.cells, range, first_row);
                 if !text.is_empty() { cx.write_to_clipboard(ClipboardItem::new_string(text)); }
             }
@@ -315,8 +327,7 @@ impl TerminalView {
     fn copy_selection(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(range) = self.selection_range() && let Ok(session) = self.session.lock() {
             let snapshot = session.snapshot();
-            let scroll = session.scroll_state();
-            let first_row = scroll.max_offset.saturating_sub(snapshot.display_offset);
+            let first_row = snapshot_first_visible_row(&snapshot);
             let text = selected_text(&snapshot.cells, range, first_row);
             if !text.is_empty() { cx.write_to_clipboard(ClipboardItem::new_string(text)); }
         }
@@ -328,6 +339,7 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut viewport = window.viewport_size();
+        viewport.width = self.viewport_width.unwrap_or(viewport.width);
         viewport.height = self.viewport_height;
         let font_size = metrics().editor_font_size;
         let font_id = window.text_system().resolve_font(&code_font());
@@ -338,15 +350,14 @@ impl Render for TerminalView {
             .map(|(width, height)| (width.width, height))
             .unwrap_or((px(1.), font_size));
         let glyph_height = window.text_system().bounding_box(font_id, font_size).size.height.min(cell_height);
-        let cols = (viewport.width / cell_width).floor().max(1.) as usize;
-        let rows = (viewport.height / cell_height).floor().max(1.) as usize;
+        let (cols, rows) = terminal_grid_dimensions(viewport.width, viewport.height, cell_width, cell_height);
         if self.last_terminal_size != Some((cols, rows)) {
             if let Ok(mut session) = self.session.lock() { let _ = session.resize(TerminalSize::new(cols as u16, rows as u16)); }
             self.last_terminal_size = Some((cols, rows));
         }
         let snapshot = self.session.lock().ok().map(|session| session.snapshot());
         let scroll_state = self.session.lock().ok().map(|session| session.scroll_state()).unwrap_or(TerminalScrollState { display_offset: 0, max_offset: 0, visible_rows: rows });
-        let first_row = first_visible_row(scroll_state);
+        let first_row = snapshot.as_ref().map(snapshot_first_visible_row).unwrap_or_else(|| first_visible_row(scroll_state));
         let cursor = snapshot.as_ref().map(|snapshot| (snapshot.cursor, snapshot.cursor_visible, snapshot.cursor_shape));
         let selection = self.selection_range();
         let body = snapshot.as_ref().map(|snapshot| div().flex().flex_col().children(snapshot.cells.iter().enumerate().map(|(row_index, row)| div().h(cell_height).flex().children(row_cells(row, first_row + row_index, selection).into_iter().enumerate().map(|(column, (character, style))| {
@@ -375,6 +386,13 @@ mod tests {
     use super::*;
 
     fn cell(character: char) -> TerminalCell { TerminalCell { character, foreground: Color::Named(NamedColor::Foreground), background: Color::Named(NamedColor::Background), flags: CellFlags::empty() } }
+
+    #[test]
+    fn terminal_grid_tracks_horizontal_and_vertical_viewport_changes() {
+        assert_eq!(terminal_grid_dimensions(px(800.), px(400.), px(10.), px(20.)), (80, 20));
+        assert_eq!(terminal_grid_dimensions(px(500.), px(300.), px(10.), px(20.)), (50, 15));
+        assert_eq!(terminal_grid_dimensions(px(0.), px(0.), px(10.), px(20.)), (1, 1));
+    }
 
     #[test]
     fn selections_normalize_in_row_major_order() {
@@ -441,7 +459,32 @@ mod tests {
     #[test]
     fn selected_text_preserves_lines_and_trims_padding() {
         let cells = vec![vec![cell('A'), cell(' '), cell(' ')], vec![cell('B'), cell(' '), cell('C')]];
-        assert_eq!(selected_text(&cells, SelectionRange { start: TerminalPoint { row: 0, column: 0 }, end: TerminalPoint { row: 1, column: 2 } }, 0), "A\r\nB C");
+        assert_eq!(selected_text(&cells, SelectionRange { start: TerminalPoint { row: 0, column: 0 }, end: TerminalPoint { row: 1, column: 2 } }, 0), "A\nB C");
+    }
+
+    #[test]
+    fn selected_text_matches_partial_viewport_bounds_and_scrollback_offset() {
+        let cells = vec![
+            vec![cell('A'), cell('B'), cell('C'), cell('D')],
+            vec![cell('E'), cell('F'), cell('G'), cell('H')],
+        ];
+        let range = SelectionRange {
+            start: TerminalPoint { row: 9, column: 1 },
+            end: TerminalPoint { row: 11, column: 2 },
+        };
+        // history_size 12 - display_offset 2 = first visible row 10.
+        let first_visible = 12usize.saturating_sub(2);
+        assert_eq!(selected_text(&cells, range, first_visible), "ABCD\nEFG");
+    }
+
+    #[test]
+    fn selected_text_copies_only_the_inclusive_highlighted_columns() {
+        let cells = vec![vec![cell('A'), cell('é'), cell('C'), cell('D')]];
+        let range = SelectionRange {
+            start: TerminalPoint { row: 5, column: 1 },
+            end: TerminalPoint { row: 5, column: 2 },
+        };
+        assert_eq!(selected_text(&cells, range, 5), "éC");
     }
 
     #[test]

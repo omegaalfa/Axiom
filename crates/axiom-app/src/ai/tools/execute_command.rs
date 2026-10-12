@@ -78,7 +78,10 @@ fn execute_with_timeout(
         .map_err(ExecuteCommandError::Invalid)?;
     let cwd = resolve_cwd(workspace_root, cwd.as_deref())?;
     let mut process = build_command(profile, &command, &cwd);
-    process.current_dir(&cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if !(cfg!(windows) && matches!(profile, CommandProfile::Wsl | CommandProfile::Ubuntu)) {
+        process.current_dir(&cwd);
+    }
+    process.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = process
         .spawn()
         .map_err(|error| ExecuteCommandError::Spawn(error.to_string()))?;
@@ -167,7 +170,10 @@ fn build_command(profile: CommandProfile, command: &str, cwd: &Path) -> Command 
                 if matches!(profile, CommandProfile::Ubuntu) {
                     process.args(["-d", "Ubuntu"]);
                 }
-                process.args(["--cd", &cwd.to_string_lossy(), "--", "sh", "-lc", command]);
+                if let Some(wsl_cwd) = axiom_terminal::windows_path_to_wsl(cwd) {
+                    process.args(["--cd", &wsl_cwd]);
+                }
+                process.args(["--", "sh", "-lc", command]);
                 process
             }
         }
@@ -243,6 +249,19 @@ mod tests {
             resolve_cwd(workspace.path(), Some(outside.path().to_str().unwrap())),
             Err(ExecuteCommandError::Cwd(_))
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_command_uses_linux_cwd_for_wsl_unc_workspace() {
+        let cwd = PathBuf::from(r"\\?\UNC\wsl.localhost\Ubuntu\home\user\project");
+        let process = build_command(CommandProfile::Ubuntu, "pwd", &cwd);
+        let args = process
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["--cd", "/home/user/project"]));
+        assert!(!args.iter().any(|argument| argument.contains("\\\\?\\UNC")));
     }
 
     #[test]

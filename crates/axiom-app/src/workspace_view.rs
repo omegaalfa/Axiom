@@ -293,6 +293,23 @@ fn valid_php_identifier(value: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_alphanumeric())
 }
 
+fn php_file_stem(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() >= 4
+        && value
+            .get(value.len() - 4..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".php"))
+    {
+        &value[..value.len() - 4]
+    } else {
+        value
+    }
+}
+
+fn php_file_name(value: &str) -> String {
+    format!("{}.php", php_file_stem(value))
+}
+
 fn valid_php_namespace(value: &str) -> bool {
     let value = value.trim().trim_matches('\\');
     value.is_empty() || value.split('\\').all(valid_php_identifier)
@@ -369,7 +386,30 @@ fn ai_panel_width_for_viewport(
     fixed_left: Pixels,
 ) -> Pixels {
     let available = (viewport.width - fixed_left - px(160.)).max(px(0.));
-    requested.min(px(520.)).min(available).max(px(0.))
+    requested.min(px(600.)).min(available).max(px(0.))
+}
+
+fn terminal_panel_height_bounds(viewport_height: Pixels) -> (f32, f32) {
+    let height: f32 = viewport_height.into();
+    let minimum = (height * 0.15).max(120.);
+    (minimum, (height * 0.65).max(minimum))
+}
+
+fn terminal_content_width_for_viewport(
+    viewport: gpui::Size<Pixels>,
+    activity_width: Pixels,
+    project_visible: bool,
+    project_width: Pixels,
+    ai_visible: bool,
+    requested_ai_width: Pixels,
+) -> Pixels {
+    let fixed_left = activity_width + if project_visible { project_width } else { px(0.) };
+    let ai_width = if ai_visible {
+        ai_panel_width_for_viewport(requested_ai_width, viewport, fixed_left)
+    } else {
+        px(0.)
+    };
+    (viewport.width - fixed_left - ai_width - px(16.)).max(px(1.))
 }
 
 #[derive(Clone)]
@@ -664,6 +704,34 @@ mod semantic_popup_visual_tests {
         assert_eq!(width, px(0.));
         let width = ai_panel_width_for_viewport(px(340.), gpui::size(px(900.), px(300.)), px(260.));
         assert_eq!(width, px(340.));
+        let width = ai_panel_width_for_viewport(px(640.), gpui::size(px(1200.), px(800.)), px(300.));
+        assert_eq!(width, px(600.));
+        let width = ai_panel_width_for_viewport(px(640.), gpui::size(px(1200.), px(800.)), px(300.));
+        assert_eq!(width, px(600.));
+    }
+
+    #[test]
+    fn terminal_viewport_width_tracks_visible_sidebars_and_splitter_bounds_scale() {
+        let viewport = gpui::size(px(1280.), px(1000.));
+        let width = terminal_content_width_for_viewport(
+            viewport,
+            px(48.),
+            true,
+            px(240.),
+            true,
+            px(320.),
+        );
+        assert_eq!(width, px(656.));
+        let without_ai = terminal_content_width_for_viewport(
+            viewport,
+            px(48.),
+            true,
+            px(240.),
+            false,
+            px(320.),
+        );
+        assert_eq!(without_ai, px(976.));
+        assert_eq!(terminal_panel_height_bounds(px(1000.)), (150., 650.));
     }
 
     #[test]
@@ -755,6 +823,11 @@ mod semantic_popup_visual_tests {
             ),
             "App/Service"
         );
+        assert_eq!(php_file_stem("teste_novo.php"), "teste_novo");
+        assert!(valid_php_identifier(php_file_stem("teste_novo.php")));
+        assert_eq!(php_file_name("teste_novo.php"), "teste_novo.php");
+        assert_eq!(php_file_name("teste_novo"), "teste_novo.php");
+        assert!(!valid_php_identifier(php_file_stem(".php")));
     }
 }
 
@@ -3583,7 +3656,7 @@ impl WorkspaceView {
             project_panel_visible: true,
             version_control_visible: false,
             ai_panel_visible: ui_settings.ai_panel_visible,
-            ai_panel_width: px(ui_settings.ai_panel_width.clamp(280.0, 520.0)),
+            ai_panel_width: px(ui_settings.ai_panel_width.clamp(280.0, 600.0)),
             ai_panel_resizing: false,
             ai_panel_resize_start_x: 0.0,
             ai_panel_resize_start_width: ui_settings.ai_panel_width,
@@ -7319,10 +7392,15 @@ impl WorkspaceView {
     ) {
         if self.ai_panel_resizing {
             let x: f32 = event.position.x.into();
-            self.ai_panel_width = px((self.ai_panel_resize_start_width - x
+            let width = (self.ai_panel_resize_start_width - x
                 + self.ai_panel_resize_start_x)
-                .clamp(280.0, 520.0));
-            cx.notify();
+                .clamp(280.0, 600.0)
+                .round();
+            let current: f32 = self.ai_panel_width.into();
+            if (current - width).abs() >= 1.0 {
+                self.ai_panel_width = px(width);
+                cx.notify();
+            }
         }
     }
 
@@ -7781,7 +7859,7 @@ impl WorkspaceView {
         let run_id = agent_bridge::next_agent_run_id();
         // Twelve provider turns are available for native tool rounds; the
         // executor reserves one additional bounded turn for finalization.
-        let budget = axiom_agent::AgentBudget::new(13, 16);
+        let budget = axiom_agent::AgentBudget::new(13, 32);
         let mut run = axiom_agent::AgentRun::new(run_id, budget);
         let cancellation = run.cancellation();
         self.agent_run_id = Some(run_id);
@@ -10551,6 +10629,7 @@ impl WorkspaceView {
     fn render_ai_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
+        let workspace = cx.entity();
         let active_context = self.chat_context_sources.first();
         let context_label = active_context.map(context_source_ui_label);
         let context_full_label = active_context.map(|source| source.label.clone());
@@ -10578,6 +10657,8 @@ impl WorkspaceView {
             ))
             .h_full()
             .flex()
+            .flex_shrink_0()
+            .min_w(px(0.))
             .flex_col()
             .bg(t.panel_background)
             .border_l_1()
@@ -11270,11 +11351,35 @@ impl WorkspaceView {
                     .left(px(0.))
                     .top(px(0.))
                     .bottom(px(0.))
-                    .w(px(5.))
+                    .w(px(6.))
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .bg(t.border_subtle)
+                    .hover(|this| this.bg(t.accent))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::ai_panel_resize_start))
-                    .on_mouse_move(cx.listener(Self::ai_panel_resize_move))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::ai_panel_resize_end))
-                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::ai_panel_resize_end)),
+                    .child(gpui::canvas(
+                        |_, _, _| (),
+                        move |_, _, window, app| {
+                            if !workspace.read(app).ai_panel_resizing {
+                                return;
+                            }
+                            let resize_workspace = workspace.clone();
+                            window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, window, app| {
+                                if phase == gpui::DispatchPhase::Capture && event.dragging() {
+                                    let _ = resize_workspace.update(app, |this, cx| {
+                                        this.ai_panel_resize_move(event, window, cx);
+                                    });
+                                }
+                            });
+                            let resize_workspace = workspace.clone();
+                            window.on_mouse_event(move |event: &MouseUpEvent, phase, window, app| {
+                                if phase == gpui::DispatchPhase::Capture && event.button == MouseButton::Left {
+                                    let _ = resize_workspace.update(app, |this, cx| {
+                                        this.ai_panel_resize_end(event, window, cx);
+                                    });
+                                }
+                            });
+                        },
+                    )),
             )
     }
 
@@ -12239,12 +12344,17 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
-        if is_php
-            && (!valid_php_identifier(name.trim_end_matches(".php"))
-                || !valid_php_namespace(&self.explorer_namespace)
-                || self.explorer_file.trim().is_empty()
-                || self.explorer_file.contains(['/', '\\']))
-        {
+        let invalid_php = match operation {
+            ExplorerOperation::NewPhpFile(_) => !valid_php_identifier(php_file_stem(&name)),
+            ExplorerOperation::NewPhp { .. } => {
+                !valid_php_identifier(php_file_stem(&name))
+                    || !valid_php_namespace(&self.explorer_namespace)
+                    || self.explorer_file.trim().is_empty()
+                    || self.explorer_file.contains(['/', '\\'])
+            }
+            _ => false,
+        };
+        if is_php && invalid_php {
             self.status = "Invalid PHP name or namespace".into();
             cx.notify();
             return;
@@ -12262,21 +12372,12 @@ impl WorkspaceView {
         let operation = match operation {
             ExplorerOperation::NewFile(directory) => (directory, name, None),
             ExplorerOperation::NewPhpFile(directory) => {
-                let name = if self.explorer_file.ends_with(".php") {
-                    self.explorer_file.trim().to_owned()
-                } else {
-                    format!("{}.php", self.explorer_file.trim())
-                };
+                let name = php_file_name(&name);
                 (directory, name, None)
             }
             ExplorerOperation::NewPhp { directory, keyword } => {
-                let file = self.explorer_file.trim();
-                let name = if file.ends_with(".php") {
-                    file.to_owned()
-                } else {
-                    format!("{file}.php")
-                };
-                let symbol = name.trim_end_matches(".php");
+                let name = php_file_name(&self.explorer_file);
+                let symbol = php_file_stem(&name);
                 let generated = crate::php_type_template::render_with_caret(
                     keyword,
                     symbol,
@@ -14764,7 +14865,7 @@ impl WorkspaceView {
                         self.explorer_operation,
                         Some(ExplorerOperation::NewPhp { .. })
                     )
-                    && !valid_php_identifier(self.explorer_input.trim_end_matches(".php")),
+                    && !valid_php_identifier(php_file_stem(&self.explorer_input)),
                 |this| {
                     this.child(
                         div()
@@ -14869,7 +14970,7 @@ impl WorkspaceView {
             .as_ref()
             .is_some_and(|operation| match operation {
                 ExplorerOperation::NewPhp { .. } => {
-                    valid_php_identifier(self.explorer_input.trim_end_matches(".php"))
+                    valid_php_identifier(php_file_stem(&self.explorer_input))
                         && valid_php_namespace(&self.explorer_namespace)
                 }
                 ExplorerOperation::NewPhpFile(_) => !self.explorer_input.trim().is_empty(),
@@ -15755,7 +15856,12 @@ impl WorkspaceView {
             })
     }
 
-    fn render_terminal_panel(&self, cx: &mut Context<Self>) -> Div {
+    fn render_terminal_panel(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        self.update_terminal_viewport_sizes(
+            self.terminal_content_width(window),
+            self.terminal_panel_height - px(44.),
+            cx,
+        );
         self.render_terminal_tabs_panel(cx)
     }
 
@@ -16020,12 +16126,45 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn terminal_panel_resize_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn terminal_content_width(&self, window: &Window) -> Pixels {
+        terminal_content_width_for_viewport(
+            window.viewport_size(),
+            metrics().activity_bar_width,
+            self.project_panel_visible,
+            self.project_panel_width,
+            self.ai_panel_visible,
+            self.ai_panel_width,
+        )
+    }
+
+    fn update_terminal_viewport_sizes(&self, width: Pixels, height: Pixels, cx: &mut Context<Self>) {
+        if let Some(view) = self.terminal_view.clone() {
+            view.update(cx, |view, _| view.set_viewport_size(width, height));
+        }
+        for tab in &self.terminal_tabs {
+            if let Some(view) = tab.view.clone() {
+                view.update(cx, |view, _| view.set_viewport_size(width, height));
+            }
+        }
+    }
+
+    fn terminal_panel_resize_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.terminal_panel_resizing {
             let y: f32 = event.position.y.into();
-            self.terminal_panel_height = px((self.terminal_panel_resize_start_height - y + self.terminal_panel_resize_start_y).clamp(120., 520.));
-            if let Some(view) = self.terminal_view.clone() { view.update(cx, |view, _| view.set_viewport_height(self.terminal_panel_height - px(44.))); }
-            for tab in &self.terminal_tabs { if let Some(view) = tab.view.clone() { view.update(cx, |view, _| view.set_viewport_height(self.terminal_panel_height - px(44.))); } }
+            let (minimum, maximum) = terminal_panel_height_bounds(window.viewport_size().height);
+            let height = (self.terminal_panel_resize_start_height - y + self.terminal_panel_resize_start_y)
+                .clamp(minimum, maximum)
+                .round();
+            let current_height: f32 = self.terminal_panel_height.into();
+            if (current_height - height).abs() < 1. {
+                return;
+            }
+            self.terminal_panel_height = px(height);
+            self.update_terminal_viewport_sizes(
+                self.terminal_content_width(window),
+                self.terminal_panel_height - px(44.),
+                cx,
+            );
             cx.notify();
         }
     }
@@ -16226,6 +16365,7 @@ impl Render for WorkspaceView {
             "Loading definition{}",
             ".".repeat(usize::from(self.definition_loading_tick))
         );
+        let terminal_resize_workspace = workspace.clone();
         div()
             .size_full()
             .flex()
@@ -16375,12 +16515,33 @@ impl Render for WorkspaceView {
                                             .h(px(5.))
                                             .cursor(CursorStyle::ResizeUpDown)
                                             .bg(t.border_subtle)
-                                            .on_mouse_down(MouseButton::Left, cx.listener(Self::terminal_panel_resize_start))
-                                            .on_mouse_move(cx.listener(Self::terminal_panel_resize_move))
-                                            .on_mouse_up(MouseButton::Left, cx.listener(Self::terminal_panel_resize_end))
-                                            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::terminal_panel_resize_end)),
+                                        .on_mouse_down(MouseButton::Left, cx.listener(Self::terminal_panel_resize_start))
+                                        .child(gpui::canvas(
+                                            |_, _, _| (),
+                                            move |_, _, window, app| {
+                                                if !terminal_resize_workspace.read(app).terminal_panel_resizing {
+                                                    return;
+                                                }
+                                                let resize_workspace = terminal_resize_workspace.clone();
+                                                window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, window, app| {
+                                                    if phase == gpui::DispatchPhase::Capture && event.dragging() {
+                                                        let _ = resize_workspace.update(app, |this, cx| {
+                                                            this.terminal_panel_resize_move(event, window, cx);
+                                                        });
+                                                    }
+                                                });
+                                                let resize_workspace = terminal_resize_workspace.clone();
+                                                window.on_mouse_event(move |event: &MouseUpEvent, phase, window, app| {
+                                                    if phase == gpui::DispatchPhase::Capture && event.button == MouseButton::Left {
+                                                        let _ = resize_workspace.update(app, |this, cx| {
+                                                            this.terminal_panel_resize_end(event, window, cx);
+                                                        });
+                                                    }
+                                                });
+                                            },
+                                        )),
                                     )
-                                    .child(self.render_terminal_panel(cx)),
+                                    .child(self.render_terminal_panel(window, cx)),
                             )
                         }),
                 )
