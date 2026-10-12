@@ -2264,6 +2264,7 @@ pub struct WorkspaceView {
     memory_ui_scope: axiom_agent::MemoryScope,
     memory_ui_snapshot: Option<MemoryUiSnapshot>,
     memory_ui_generation: u64,
+    memory_clear_confirmation: bool,
     chat_context_sources: Vec<ContextSource>,
     chat_context_feedback: Option<String>,
     chat_scroll_handle: ScrollHandle,
@@ -3729,6 +3730,7 @@ impl WorkspaceView {
             memory_ui_scope: axiom_agent::MemoryScope::Workspace,
             memory_ui_snapshot: None,
             memory_ui_generation: 0,
+            memory_clear_confirmation: false,
             chat_context_sources: Vec::new(),
             chat_context_feedback: None,
             chat_scroll_handle: ScrollHandle::new(),
@@ -10452,9 +10454,103 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn delete_memory_entry_from_ui(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(service) = self.memory_service.clone() else {
+            self.status = "Persistent memory is unavailable".into();
+            cx.notify();
+            return;
+        };
+        let scope = self.memory_ui_scope;
+        self.memory_ui_generation = self.memory_ui_generation.wrapping_add(1);
+        let generation = self.memory_ui_generation;
+        if let Some(snapshot) = self.memory_ui_snapshot.as_mut() {
+            for entries in [
+                &mut snapshot.sessions,
+                &mut snapshot.recent,
+                &mut snapshot.decisions,
+                &mut snapshot.gotchas,
+            ] {
+                entries.retain(|entry| entry.id.as_deref() != Some(id.as_str()));
+            }
+            self.memory_ui_state = memory_ui_state_for_snapshot(snapshot);
+        }
+        self.status = "Deleting memory entry…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = background_executor()
+                .spawn(async move { service.delete_memory_entry(scope, &id) })
+                .await;
+            let _ = this.update(cx, |workspace, cx| {
+                if workspace.memory_ui_generation != generation {
+                    return;
+                }
+                workspace.status = match result {
+                    Ok(true) => "Memory entry deleted".into(),
+                    Ok(false) => "Memory entry was already absent".into(),
+                    Err(_) => "Could not delete memory entry; storage outcome may be unknown".into(),
+                };
+                workspace.refresh_memory(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn request_clear_memory(&mut self, cx: &mut Context<Self>) {
+        self.memory_clear_confirmation = true;
+        cx.notify();
+    }
+
+    fn cancel_clear_memory(&mut self, cx: &mut Context<Self>) {
+        self.memory_clear_confirmation = false;
+        cx.notify();
+    }
+
+    fn clear_memory_from_ui(&mut self, cx: &mut Context<Self>) {
+        self.memory_clear_confirmation = false;
+        if self.memory_ui_scope != axiom_agent::MemoryScope::Workspace {
+            self.status = "Clear Memory is available only for workspace scope".into();
+            cx.notify();
+            return;
+        }
+        let Some(service) = self.memory_service.clone() else {
+            self.status = "Persistent memory is unavailable".into();
+            cx.notify();
+            return;
+        };
+        let scope = self.memory_ui_scope;
+        self.memory_ui_generation = self.memory_ui_generation.wrapping_add(1);
+        let generation = self.memory_ui_generation;
+        if let Some(snapshot) = self.memory_ui_snapshot.as_mut() {
+            snapshot.sessions.clear();
+            snapshot.recent.clear();
+            snapshot.decisions.clear();
+            snapshot.gotchas.clear();
+        }
+        self.memory_ui_state = MemoryUiState::Empty;
+        self.status = "Clearing workspace memory…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = background_executor()
+                .spawn(async move { service.clear_memory(scope) })
+                .await;
+            let _ = this.update(cx, |workspace, cx| {
+                if workspace.memory_ui_generation != generation {
+                    return;
+                }
+                workspace.status = match result {
+                    Ok(removed) => format!("Cleared {removed} workspace memory entries").into(),
+                    Err(_) => "Could not clear workspace memory; storage outcome may be unknown".into(),
+                };
+                workspace.refresh_memory(cx);
+            });
+        })
+        .detach();
+    }
+
     fn render_memory_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         let m = metrics();
+        let workspace = cx.entity();
         let scope = self
             .memory_ui_snapshot
             .as_ref()
@@ -10484,8 +10580,30 @@ impl WorkspaceView {
                     .child("Memory")
                     .child(
                         div()
-                            .text_color(t.text_muted)
-                            .child(format!("Scope: {scope_label}")),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(t.text_muted)
+                                    .child(format!("Scope: {scope_label}")),
+                            )
+                            .when(scope == axiom_agent::MemoryScope::Workspace, |this| {
+                                this.child(
+                                    div()
+                                        .id("ai-memory-clear")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(m.border_radius_small)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .text_color(t.error)
+                                        .hover(move |style| style.bg(t.hover))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.request_clear_memory(cx);
+                                        }))
+                                        .child("Clear Memory"),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -10534,17 +10652,49 @@ impl WorkspaceView {
                     .gap_1()
                     .children(entries.into_iter().take(MAX_MEMORY_UI_RESULTS).map(|entry| {
                         let content = truncate_memory_ui_content(&entry.content);
+                        let id = entry.id.clone();
+                        let group = SharedString::from(format!(
+                            "ai-memory-entry-group-{}",
+                            id.as_deref().unwrap_or("anonymous")
+                        ));
+                        let delete_workspace = workspace.clone();
                         div()
                             .id(SharedString::from(format!(
                                 "ai-memory-entry-{}",
                                 entry.id.as_deref().unwrap_or("anonymous")
                             )))
+                            .group(group.clone())
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .items_start()
+                            .gap_2()
                             .px_2()
                             .py_1()
                             .rounded(m.border_radius_small)
                             .bg(t.editor_background)
                             .text_color(t.text_primary)
-                            .child(content)
+                            .child(div().flex_1().min_w_0().child(content))
+                            .when_some(id, |this, id| {
+                                this.child(
+                                    div()
+                                        .id(SharedString::from(format!("ai-memory-delete-{id}")))
+                                        .flex_shrink_0()
+                                        .px_1()
+                                        .cursor(CursorStyle::PointingHand)
+                                        .text_color(t.error)
+                                        .opacity(0.)
+                                        .group_hover(group, |style| style.opacity(1.))
+                                        .tooltip(|_, cx| tooltip("Delete memory entry", cx))
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            delete_workspace.update(cx, |this, cx| {
+                                                this.delete_memory_entry_from_ui(id.clone(), cx);
+                                            });
+                                        })
+                                        .child("🗑"),
+                                )
+                            })
                     })),
             })
     }
@@ -15651,6 +15801,13 @@ impl WorkspaceView {
                 .right(px(0.))
                 .bottom(px(0.))
         })
+            .when(self.memory_clear_confirmation, |this| {
+                this.absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .bottom(px(0.))
+            })
             .when_some(self.pending_delete.clone(), |this, path| {
                 let confirm_workspace = workspace.clone();
                 let cancel_workspace = workspace.clone();
@@ -15749,6 +15906,78 @@ impl WorkspaceView {
                                                     confirm_workspace.update(cx, |this, cx| this.confirm_delete(cx));
                                                 })
                                                 .child("Delete"),
+                                        ),
+                                ),
+                        ),
+                )
+            })
+            .when(self.memory_clear_confirmation, |this| {
+                let confirm_workspace = workspace.clone();
+                let cancel_workspace = workspace.clone();
+                let cancel_backdrop = workspace.clone();
+                this.child(
+                    div()
+                        .id("memory-clear-confirm-backdrop")
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::rgba(0x00000055))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                            cancel_backdrop.update(cx, |this, cx| this.cancel_clear_memory(cx));
+                        })
+                        .child(
+                            div()
+                                .w(px(430.))
+                                .p_4()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .bg(t.popup_background)
+                                .border_1()
+                                .border_color(t.border)
+                                .rounded(m.border_radius_medium)
+                                .shadow_lg()
+                                .text_color(t.text_primary)
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child("Clear workspace memory?")
+                                .child("Are you sure you want to clear all memory entries for this workspace?")
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id("memory-clear-cancel")
+                                                .px_3()
+                                                .py_1()
+                                                .rounded(m.border_radius_small)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .bg(t.pressed)
+                                                .on_click(move |_, _, cx| {
+                                                    cancel_workspace.update(cx, |this, cx| this.cancel_clear_memory(cx));
+                                                })
+                                                .child("Cancel"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("memory-clear-confirm")
+                                                .px_3()
+                                                .py_1()
+                                                .rounded(m.border_radius_small)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .bg(t.error)
+                                                .text_color(t.window_background)
+                                                .on_click(move |_, _, cx| {
+                                                    confirm_workspace.update(cx, |this, cx| this.clear_memory_from_ui(cx));
+                                                })
+                                                .child("Clear Memory"),
                                         ),
                                 ),
                         ),

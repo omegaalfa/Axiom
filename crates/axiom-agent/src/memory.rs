@@ -61,6 +61,13 @@ pub enum MemoryWriteError {
     Timeout,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryMutationError {
+    Unavailable,
+    StorageFailure,
+    Timeout,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryHandoff {
     pub session: MemorySessionId,
@@ -178,6 +185,16 @@ pub trait MemoryService: Send {
             return Err(MemoryReadError::Unavailable);
         }
         Ok(self.get(scope, id))
+    }
+    fn delete_memory_entry(
+        &self,
+        _scope: MemoryScope,
+        _id: &str,
+    ) -> Result<bool, MemoryMutationError> {
+        Err(MemoryMutationError::Unavailable)
+    }
+    fn clear_memory(&self, _scope: MemoryScope) -> Result<usize, MemoryMutationError> {
+        Err(MemoryMutationError::Unavailable)
     }
     fn handoff(&self, session: MemorySessionId) -> Option<MemoryHandoff>;
 
@@ -352,6 +369,24 @@ impl MemoryService for SharedMemoryService {
             .get_checked(scope, id)
     }
 
+    fn delete_memory_entry(
+        &self,
+        scope: MemoryScope,
+        id: &str,
+    ) -> Result<bool, MemoryMutationError> {
+        self.0
+            .lock()
+            .map_err(|_| MemoryMutationError::Unavailable)?
+            .delete_memory_entry(scope, id)
+    }
+
+    fn clear_memory(&self, scope: MemoryScope) -> Result<usize, MemoryMutationError> {
+        self.0
+            .lock()
+            .map_err(|_| MemoryMutationError::Unavailable)?
+            .clear_memory(scope)
+    }
+
     fn handoff(&self, session: MemorySessionId) -> Option<MemoryHandoff> {
         self.0.lock().ok()?.handoff(session)
     }
@@ -420,6 +455,18 @@ impl MemoryService for NoMemory {
 
     fn get(&self, _scope: MemoryScope, _id: &str) -> Option<MemoryResult> {
         None
+    }
+
+    fn delete_memory_entry(
+        &self,
+        _scope: MemoryScope,
+        _id: &str,
+    ) -> Result<bool, MemoryMutationError> {
+        Err(MemoryMutationError::Unavailable)
+    }
+
+    fn clear_memory(&self, _scope: MemoryScope) -> Result<usize, MemoryMutationError> {
+        Err(MemoryMutationError::Unavailable)
     }
 
     fn query_checked(

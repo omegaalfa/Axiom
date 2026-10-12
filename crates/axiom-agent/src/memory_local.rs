@@ -6,7 +6,7 @@
 
 use crate::{
     MemoryCategory, MemoryHandoff, MemoryObservation, MemoryReadError, MemoryResult, MemoryScope,
-    MemoryService, MemorySnapshot, MemorySnapshotError, MemoryWriteError,
+    MemoryMutationError, MemoryService, MemorySnapshot, MemorySnapshotError, MemoryWriteError,
 };
 use serde::{Deserialize, Serialize};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -246,6 +246,74 @@ impl AxiomMemoryBackend {
 
     pub fn remember(&self, scope: MemoryScope, content: &str) -> Result<(), AxiomMemoryError> {
         self.append(scope, LocalRecordKind::Remember, content)
+    }
+
+    pub fn delete_memory_entry(&self, id: &str) -> Result<bool, AxiomMemoryError> {
+        let Some((scope_id, _)) = id.split_once(':') else {
+            return Ok(false);
+        };
+        let mut matching_scopes = [
+            MemoryScope::User,
+            MemoryScope::Workspace,
+            MemoryScope::Project,
+        ]
+        .into_iter()
+        .filter(|scope| self.scope_ids.id(*scope) == scope_id);
+        let Some(scope) = matching_scopes.next() else {
+            return Ok(false);
+        };
+        if matching_scopes.next().is_some() {
+            return Ok(false);
+        }
+        self.delete_memory_entry_in_scope(scope, id)
+    }
+
+    pub fn delete_memory_entry_in_scope(
+        &self,
+        scope: MemoryScope,
+        id: &str,
+    ) -> Result<bool, AxiomMemoryError> {
+        self.retry_completed_sessions();
+        let Some((scope_id, record_id)) = id.split_once(':') else {
+            return Ok(false);
+        };
+        if scope_id != self.scope_ids.id(scope) {
+            return Ok(false);
+        }
+        let Ok(record_id) = record_id.parse::<u64>() else {
+            return Ok(false);
+        };
+        let Some(mut file) = self.read_file(scope)? else {
+            return Ok(false);
+        };
+        let original_len = file.records.len();
+        file.records.retain(|record| record.id != record_id);
+        if file.records.len() == original_len {
+            return Ok(false);
+        }
+        self.write_file(scope, &file)?;
+        self.refresh_index(scope, &file)?;
+        Ok(true)
+    }
+
+    pub fn clear_memory(&self, scope: MemoryScope) -> Result<usize, AxiomMemoryError> {
+        self.retry_completed_sessions();
+        let Some(mut file) = self.read_file(scope)? else {
+            return Ok(0);
+        };
+        let removed = file.records.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        file.records.clear();
+        self.write_file(scope, &file)?;
+        self.refresh_index(scope, &file)?;
+        self.vacuum_index()?;
+        Ok(removed)
+    }
+
+    pub fn clear_all_workspace_memory(&self) -> Result<usize, AxiomMemoryError> {
+        self.clear_memory(MemoryScope::Workspace)
     }
 
     pub fn decision(&self, scope: MemoryScope, content: &str) -> Result<(), AxiomMemoryError> {
@@ -772,6 +840,17 @@ impl AxiomMemoryBackend {
         Ok(())
     }
 
+    fn vacuum_index(&self) -> Result<(), AxiomMemoryError> {
+        let connection = Connection::open(self.index_path()?).map_err(sqlite_error)?;
+        connection
+            .busy_timeout(std::time::Duration::from_millis(250))
+            .map_err(sqlite_error)?;
+        connection
+            .execute("INSERT INTO memory_fts(memory_fts) VALUES('optimize')", [])
+            .map_err(sqlite_error)?;
+        connection.execute_batch("VACUUM;").map_err(sqlite_error)
+    }
+
     fn fts_records(
         &self,
         scope: MemoryScope,
@@ -1069,6 +1148,20 @@ impl MemoryService for AxiomMemoryBackend {
             .into_iter()
             .find(|record| record.id == record_id)
             .map(|record| self.result(scope, record)))
+    }
+
+    fn delete_memory_entry(
+        &self,
+        scope: MemoryScope,
+        id: &str,
+    ) -> Result<bool, MemoryMutationError> {
+        AxiomMemoryBackend::delete_memory_entry_in_scope(self, scope, id)
+            .map_err(|_| MemoryMutationError::StorageFailure)
+    }
+
+    fn clear_memory(&self, scope: MemoryScope) -> Result<usize, MemoryMutationError> {
+        AxiomMemoryBackend::clear_memory(self, scope)
+            .map_err(|_| MemoryMutationError::StorageFailure)
     }
 
     fn handoff(&self, _session: crate::MemorySessionId) -> Option<MemoryHandoff> {
@@ -1435,6 +1528,70 @@ mod tests {
                 .unwrap(),
             Some(found[0].clone())
         );
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn deleting_and_clearing_memory_updates_canonical_records_and_fts() {
+        let (backend, path) = backend();
+        backend
+            .remember(MemoryScope::Workspace, "workspace removable observation")
+            .unwrap();
+        backend
+            .remember(MemoryScope::Workspace, "workspace retained until clear")
+            .unwrap();
+        backend
+            .remember(MemoryScope::Project, "project memory survives workspace clear")
+            .unwrap();
+
+        let entry = backend.history(MemoryScope::Workspace, 10)[0].clone();
+        let id = entry.id.as_deref().unwrap();
+        assert_eq!(backend.query(MemoryScope::Workspace, "removable observation", 10).len(), 1);
+        assert!(!backend
+            .delete_memory_entry_in_scope(MemoryScope::Project, id)
+            .unwrap());
+        assert!(backend
+            .delete_memory_entry(id)
+            .unwrap());
+        assert!(backend.get(MemoryScope::Workspace, id).is_none());
+        assert!(backend
+            .query(MemoryScope::Workspace, "removable observation", 10)
+            .is_empty());
+
+        assert_eq!(backend.clear_all_workspace_memory().unwrap(), 1);
+        assert!(backend.history(MemoryScope::Workspace, 10).is_empty());
+        assert_eq!(
+            backend
+                .query(MemoryScope::Project, "project memory survives", 10)
+                .len(),
+            1
+        );
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn workspace_purge_vacuums_and_shrinks_the_fts_database() {
+        let (backend, path) = backend();
+        let payload = "memory payload ".repeat(240);
+        for index in 0..32 {
+            backend
+                .remember(
+                    MemoryScope::Workspace,
+                    &format!("entry {index} {payload}"),
+                )
+                .unwrap();
+        }
+        let index_path = path.join("memory_index.sqlite");
+        let size_before = fs::metadata(&index_path).unwrap().len();
+        assert_eq!(backend.clear_all_workspace_memory().unwrap(), 32);
+        let size_after = fs::metadata(&index_path).unwrap().len();
+        assert!(
+            size_after < size_before,
+            "expected VACUUM to shrink index: {size_before} -> {size_after} bytes"
+        );
+        assert!(backend
+            .query(MemoryScope::Workspace, "memory payload", 10)
+            .is_empty());
         let _ = fs::remove_dir_all(path);
     }
 

@@ -6,7 +6,7 @@
 
 use crate::{
     AxiomMemoryBackend, AxiomMemoryError, AxiomMemoryScopeIds, MemoryHandoff, MemoryManagerError,
-    MemoryObservation, MemoryReadError, MemoryResult, MemoryScope, MemoryService, MemorySessionId,
+    MemoryMutationError, MemoryObservation, MemoryReadError, MemoryResult, MemoryScope, MemoryService, MemorySessionId,
     MemorySnapshot, MemorySnapshotError, MemoryStatus, MemoryUnavailableReason, MemoryWriteError,
 };
 use std::{
@@ -21,6 +21,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
 type ReadReply<T> = mpsc::SyncSender<Result<T, MemoryReadError>>;
 type WriteReply = mpsc::SyncSender<Result<(), MemoryWriteError>>;
+type MutationReply<T> = mpsc::SyncSender<Result<T, MemoryMutationError>>;
 
 enum MemoryCommand {
     SessionStart {
@@ -69,6 +70,15 @@ enum MemoryCommand {
         scope: MemoryScope,
         content: String,
         reply: WriteReply,
+    },
+    DeleteEntry {
+        scope: MemoryScope,
+        id: String,
+        reply: MutationReply<bool>,
+    },
+    ClearScope {
+        scope: MemoryScope,
+        reply: MutationReply<usize>,
     },
     Shutdown {
         reply: mpsc::SyncSender<Result<(), MemoryManagerError>>,
@@ -257,6 +267,22 @@ impl BackgroundMemoryService {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(MemoryWriteError::Timeout),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(MemoryWriteError::Unavailable),
+        }
+    }
+
+    fn mutate<T>(
+        &self,
+        command: MemoryCommand,
+        receiver: mpsc::Receiver<Result<T, MemoryMutationError>>,
+    ) -> Result<T, MemoryMutationError> {
+        send_command(&self.inner, command).map_err(|error| match error {
+            MemoryReadError::Timeout => MemoryMutationError::Timeout,
+            _ => MemoryMutationError::Unavailable,
+        })?;
+        match receiver.recv_timeout(self.inner.timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(MemoryMutationError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(MemoryMutationError::Unavailable),
         }
     }
 }
@@ -448,6 +474,27 @@ impl MemoryService for BackgroundMemoryService {
         )
     }
 
+    fn delete_memory_entry(
+        &self,
+        scope: MemoryScope,
+        id: &str,
+    ) -> Result<bool, MemoryMutationError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.mutate(
+            MemoryCommand::DeleteEntry {
+                scope,
+                id: id.to_owned(),
+                reply,
+            },
+            receiver,
+        )
+    }
+
+    fn clear_memory(&self, scope: MemoryScope) -> Result<usize, MemoryMutationError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.mutate(MemoryCommand::ClearScope { scope, reply }, receiver)
+    }
+
     fn handoff(&self, _session: MemorySessionId) -> Option<MemoryHandoff> {
         None
     }
@@ -525,6 +572,26 @@ fn worker_loop(
                     Ok(MemoryService::session_start(&mut backend, scope))
                 } else {
                     Err(MemoryReadError::Unavailable)
+                };
+                let _ = reply.send(result);
+            }
+            MemoryCommand::DeleteEntry { scope, id, reply } => {
+                let result = if is_ready(&inner) {
+                    backend
+                        .delete_memory_entry_in_scope(scope, &id)
+                        .map_err(|_| MemoryMutationError::StorageFailure)
+                } else {
+                    Err(MemoryMutationError::Unavailable)
+                };
+                let _ = reply.send(result);
+            }
+            MemoryCommand::ClearScope { scope, reply } => {
+                let result = if is_ready(&inner) {
+                    backend
+                        .clear_memory(scope)
+                        .map_err(|_| MemoryMutationError::StorageFailure)
+                } else {
+                    Err(MemoryMutationError::Unavailable)
                 };
                 let _ = reply.send(result);
             }
@@ -725,6 +792,44 @@ mod tests {
             service
                 .query_checked(MemoryScope::Project, "durable fact", 10)
                 .unwrap()
+                .len(),
+            1
+        );
+        service.shutdown().unwrap();
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn worker_deletes_entries_and_clears_only_requested_scope() {
+        let (path, scopes) = test_backend();
+        let service = BackgroundMemoryService::start_ready(
+            path.clone(),
+            scopes,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        service
+            .remember(MemoryScope::Workspace, "worker workspace entry")
+            .unwrap();
+        service
+            .remember(MemoryScope::Workspace, "worker workspace clear target")
+            .unwrap();
+        service
+            .remember(MemoryScope::Project, "worker project entry")
+            .unwrap();
+        let entry = service.history(MemoryScope::Workspace, 10).remove(0);
+        let id = entry.id.as_deref().unwrap();
+        assert!(service
+            .delete_memory_entry(MemoryScope::Workspace, id)
+            .unwrap());
+        assert!(service
+            .query(MemoryScope::Workspace, "workspace entry", 10)
+            .is_empty());
+        assert_eq!(service.clear_memory(MemoryScope::Workspace).unwrap(), 1);
+        assert!(service.history(MemoryScope::Workspace, 10).is_empty());
+        assert_eq!(
+            service
+                .query(MemoryScope::Project, "project entry", 10)
                 .len(),
             1
         );

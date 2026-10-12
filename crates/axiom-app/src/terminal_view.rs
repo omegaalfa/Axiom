@@ -36,6 +36,7 @@ fn scrollbar_offset_from_top(top: Pixels, track_height: Pixels, thumb_height: Pi
 }
 
 fn first_visible_row(state: TerminalScrollState) -> usize { state.max_offset.saturating_sub(state.display_offset) }
+#[cfg(test)]
 fn logical_row(state: TerminalScrollState, viewport_row: usize) -> usize { first_visible_row(state).saturating_add(viewport_row) }
 fn snapshot_first_visible_row(snapshot: &axiom_terminal::TerminalSnapshot) -> usize {
     snapshot.history_size.saturating_sub(snapshot.display_offset)

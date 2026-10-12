@@ -14,7 +14,7 @@ mod system_prompt;
 
 pub use memory::{
     InMemoryMemoryService, MemoryCategory, MemoryHandoff, MemoryObservation, MemoryResult,
-    MemoryReadError, MemoryScope, MemoryService, MemorySessionId, MemorySnapshot,
+    MemoryMutationError, MemoryReadError, MemoryScope, MemoryService, MemorySessionId, MemorySnapshot,
     MemorySnapshotError, MemoryWriteError, NoMemory, SharedMemoryService,
 };
 pub use memory_backend::{
