@@ -976,7 +976,9 @@ fn gemini_schema(
                 normalized.insert(key.clone(), value.clone());
             }
             "additionalProperties" if value == &serde_json::Value::Bool(false) => {}
-            "minimum" | "maximum" => {}
+            // Gemini's Schema subset does not support numeric or string
+            // length bounds. Runtime tool validation remains authoritative.
+            "minimum" | "maximum" | "minLength" | "maxLength" => {}
             // OpenAPI-only fields such as additionalProperties are not part
             // of Gemini's function declaration Schema subset.
             _ => {
@@ -1879,6 +1881,64 @@ mod tests {
     }
 
     #[test]
+    fn gemini_memory_tool_declarations_omit_unsupported_length_bounds() {
+        let definitions = [
+            ProviderToolDefinition {
+                name: "memory_search".into(),
+                description: "Search memory".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "maxLength": 256 },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            },
+            ProviderToolDefinition {
+                name: "memory_get".into(),
+                description: "Get memory".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "id": { "type": "string", "maxLength": 256 } },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }),
+            },
+        ];
+        let request = ProviderChatRequest {
+            model: "gemini-2.5-pro".into(),
+            messages: Vec::new(),
+            think: None,
+            thinking_level: None,
+            tools: Some(definitions.into()),
+        };
+
+        let (_, body) = chat_request(
+            ProviderProtocol::Google,
+            "https://generativelanguage.googleapis.com",
+            &request,
+        )
+        .expect("Memory declarations must be serializable for Gemini");
+
+        let declarations = body["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap();
+        assert_eq!(declarations.len(), 2);
+        assert_eq!(declarations[0]["name"], "memory_search");
+        assert_eq!(declarations[1]["name"], "memory_get");
+        assert!(declarations.iter().all(|declaration| {
+            declaration["parameters"]["properties"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|property| property.get("maxLength").is_none())
+                && declaration["parameters"].get("additionalProperties").is_none()
+        }));
+    }
+
+    #[test]
     fn google_function_call_parses_without_visible_thinking() {
         let events = parse_google_stream_payload(
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read_file","id":"call-7","args":{"path":"jogo.html"}},"thoughtSignature":"opaque-signature"}]}}]}"#,
@@ -1902,6 +1962,23 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, ProviderChatStreamEvent::ThinkingDelta(_)))
         );
+    }
+
+    #[test]
+    fn google_mixed_text_and_function_call_are_both_accepted() {
+        let events = parse_google_stream_payload(
+            br#"{"candidates":[{"content":{"parts":[{"text":"checking"},{"functionCall":{"name":"memory_search","args":{"query":"tests"}}}]}}]}"#,
+        )
+        .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderChatStreamEvent::ContentDelta(text) if text == "checking"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderChatStreamEvent::ToolCall(call)
+                if call.name == "memory_search" && call.arguments["query"] == "tests"
+        )));
     }
 
     #[test]

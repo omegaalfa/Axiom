@@ -1,16 +1,16 @@
 //! Production adapters and the small UI-facing bridge for one Agent run.
 
 use super::tool_orchestration::{
-    delete_file_definition, fetch_url_definition, find_files_definition,
+    delete_file_definition, execute_command_definition, fetch_url_definition, find_files_definition,
     find_references_definition, find_symbol_definition, list_directory_definition,
     memory_get_definition, memory_search_definition, read_file_definition, search_text_definition,
-    update_file_definition, write_file_definition,
+    memory_remember_definition, update_file_definition, write_file_definition,
 };
 use super::tools::{ToolArguments, ToolError, ToolName, ToolRegistry, ToolRequest};
 use axiom_agent::{
     AgentEvent, AgentExecutionError, AgentExecutor, AgentRun, AgentRunId, ApprovalId,
     ApprovalRequest, Cancellation, ProductionToolPolicy, ProviderExecutor, ToolExecutor,
-    ToolInfrastructureError, ToolOutcome, ToolPolicy,
+    SkillCatalog, ToolInfrastructureError, ToolOutcome, ToolPolicy,
 };
 use axiom_ai_provider::{
     ProviderChatRequest, ProviderChatStreamEvent, ProviderError, ProviderKind, ProviderToolCall,
@@ -238,11 +238,12 @@ pub(crate) fn next_agent_run_id() -> AgentRunId {
 
 #[cfg(test)]
 pub(crate) fn production_tool_definitions() -> Vec<axiom_ai_provider::ProviderToolDefinition> {
-    production_tool_definitions_with_memory(false)
+    production_tool_definitions_with_memory(false, false)
 }
 
 pub(crate) fn production_tool_definitions_with_memory(
     memory_enabled: bool,
+    memory_writable: bool,
 ) -> Vec<axiom_ai_provider::ProviderToolDefinition> {
     let mut definitions = vec![
         read_file_definition(),
@@ -255,16 +256,21 @@ pub(crate) fn production_tool_definitions_with_memory(
         write_file_definition(),
         update_file_definition(),
         delete_file_definition(),
+        execute_command_definition(),
     ];
     if memory_enabled {
         definitions.push(memory_search_definition());
         definitions.push(memory_get_definition());
+    }
+    if memory_writable {
+        definitions.push(memory_remember_definition());
     }
     definitions
 }
 
 pub(crate) fn gemini_agent_tool_definitions_with_memory(
     memory_enabled: bool,
+    memory_writable: bool,
 ) -> Vec<axiom_ai_provider::ProviderToolDefinition> {
     let mut definitions = vec![
         read_file_definition(),
@@ -276,10 +282,14 @@ pub(crate) fn gemini_agent_tool_definitions_with_memory(
         write_file_definition(),
         update_file_definition(),
         delete_file_definition(),
+        execute_command_definition(),
     ];
     if memory_enabled {
         definitions.push(memory_search_definition());
         definitions.push(memory_get_definition());
+    }
+    if memory_writable {
+        definitions.push(memory_remember_definition());
     }
     definitions
 }
@@ -296,6 +306,7 @@ pub(crate) fn gemini_agent_tool_definitions() -> Vec<axiom_ai_provider::Provider
         write_file_definition(),
         update_file_definition(),
         delete_file_definition(),
+        execute_command_definition(),
     ]
 }
 
@@ -633,6 +644,30 @@ fn provider_call_to_request(call: &ProviderToolCall) -> Result<ToolRequest, Stri
                 },
             })
         }
+        "execute_command" => {
+            let command = object
+                .get("command")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "command must be a string".to_owned())?;
+            let optional_string = |name: &str| -> Result<Option<String>, String> {
+                match object.get(name) {
+                    None => Ok(None),
+                    Some(value) => value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("{name} must be a string"))
+                        .map(Some),
+                }
+            };
+            Ok(ToolRequest {
+                name: ToolName::ExecuteCommand,
+                arguments: ToolArguments::ExecuteCommand {
+                    command: command.into(),
+                    cwd: optional_string("cwd")?,
+                    profile: optional_string("profile")?,
+                },
+            })
+        }
         "memory_search" => {
             let query = object
                 .get("query")
@@ -664,6 +699,18 @@ fn provider_call_to_request(call: &ProviderToolCall) -> Result<ToolRequest, Stri
             Ok(ToolRequest {
                 name: ToolName::MemoryGet,
                 arguments: ToolArguments::MemoryGet { id: id.into() },
+            })
+        }
+        "memory_remember" => {
+            let content = object
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "content must be a string".to_owned())?;
+            Ok(ToolRequest {
+                name: ToolName::MemoryRemember,
+                arguments: ToolArguments::MemoryRemember {
+                    content: content.into(),
+                },
             })
         }
         other => Ok(ToolRequest {
@@ -714,6 +761,21 @@ fn tool_error_message(error: &ToolError) -> String {
         ToolError::CurrentFileTooLarge { path, .. } => {
             format!("current file is too large: {path}")
         }
+        ToolError::MemoryWriteUnavailable => "persistent memory is unavailable for writing".into(),
+        ToolError::MemoryWriteRejected => {
+            "memory observation rejected by validation or retention limits".into()
+        }
+        ToolError::MemoryWriteFailed => "memory observation could not be persisted".into(),
+        ToolError::MemoryWriteTimeout => {
+            "memory write timed out; persistence outcome is unknown; do not retry automatically".into()
+        }
+        ToolError::MemoryReadFailed => "persistent memory could not be read; results are unavailable".into(),
+        ToolError::CommandInvalid(message) => message.clone(),
+        ToolError::CommandCwd(message) => format!("invalid command working directory: {message}"),
+        ToolError::CommandSpawn(message) => format!("could not start command: {message}"),
+        ToolError::CommandWait(message) => format!("could not wait for command: {message}"),
+        ToolError::CommandRead(message) => format!("could not read command output: {message}"),
+        ToolError::CommandTimeout => "command timed out after 30 seconds and was terminated".into(),
     }
 }
 
@@ -725,6 +787,7 @@ pub(crate) fn execute_agent_run(
     base_url: String,
     registry: Option<ToolRegistry>,
     workspace_root: Option<std::path::PathBuf>,
+    memory: Option<axiom_agent::SharedMemoryService>,
     bridge: &ApprovalBridge,
     queue: &AgentEventQueue,
 ) -> Result<axiom_agent::AgentExecutionResult, axiom_agent::AgentExecutionError> {
@@ -735,14 +798,19 @@ pub(crate) fn execute_agent_run(
         Some(registry) => AgentToolAdapter::new(registry, cancellation),
         None => AgentToolAdapter::without_tools(cancellation),
     };
-    let result = execute_with_approval(
+    let result = execute_with_approval_and_memory(
         run,
         request,
         &mut provider,
         &mut tools,
         workspace_root
-            .map(ProductionToolPolicy::with_workspace_root)
+            .as_ref()
+            .map(|root| ProductionToolPolicy::with_workspace_root(root.clone()))
             .unwrap_or_default(),
+        memory,
+        workspace_root
+            .as_deref()
+            .map(SkillCatalog::discover),
         bridge,
         queue,
     );
@@ -759,6 +827,7 @@ pub(crate) fn execute_agent_run(
     result
 }
 
+#[cfg(test)]
 pub(crate) fn execute_with_approval<P, T, Policy>(
     run: &mut AgentRun,
     request: ProviderChatRequest,
@@ -773,8 +842,55 @@ where
     T: ToolExecutor,
     Policy: ToolPolicy,
 {
+    execute_with_approval_and_memory(
+        run,
+        request,
+        provider,
+        tools,
+        policy,
+        None,
+        None,
+        bridge,
+        queue,
+    )
+}
+
+fn execute_with_approval_and_memory<P, T, Policy>(
+    run: &mut AgentRun,
+    request: ProviderChatRequest,
+    provider: &mut P,
+    tools: &mut T,
+    policy: Policy,
+    memory: Option<axiom_agent::SharedMemoryService>,
+    skills: Option<SkillCatalog>,
+    bridge: &ApprovalBridge,
+    queue: &AgentEventQueue,
+) -> Result<axiom_agent::AgentExecutionResult, AgentExecutionError>
+where
+    P: ProviderExecutor,
+    T: ToolExecutor,
+    Policy: ToolPolicy,
+{
     let handle = bridge.register(run.id(), run.cancellation());
-    let mut executor = AgentExecutor::with_policy(provider, tools, policy);
+    let mut executor = match (memory, skills) {
+        (Some(memory), Some(skills)) => AgentExecutor::with_policy_and_memory_in_scope_and_skills(
+            provider,
+            tools,
+            policy,
+            memory.boxed(),
+            axiom_agent::MemoryScope::Workspace,
+            skills,
+        ),
+        (Some(memory), None) => AgentExecutor::with_policy_and_memory_in_scope(
+            provider,
+            tools,
+            policy,
+            memory.boxed(),
+            axiom_agent::MemoryScope::Workspace,
+        ),
+        (None, Some(skills)) => AgentExecutor::with_policy_and_skills(provider, tools, policy, skills),
+        (None, None) => AgentExecutor::with_policy(provider, tools, policy),
+    };
     let mut result = executor.execute(run, request, &mut |event| {
         publish_event(&handle, queue, event);
     });
@@ -979,10 +1095,12 @@ mod tests {
                 "find_files",
                 "search_text",
                 "find_symbol",
+                "find_references",
                 "fetch_url",
                 "write_file",
                 "update_file",
-                "delete_file"
+                "delete_file",
+                "execute_command"
             ]
         );
     }
@@ -1004,7 +1122,8 @@ mod tests {
                 "find_references",
                 "write_file",
                 "update_file",
-                "delete_file"
+                "delete_file",
+                "execute_command"
             ]
         );
     }
@@ -1025,8 +1144,25 @@ mod tests {
                 .iter()
                 .any(|name| name == "memory_get")
         );
+        assert!(
+            !production_without_memory
+                .iter()
+                .any(|name| name == "memory_remember")
+        );
 
-        let production_with_memory: Vec<_> = production_tool_definitions_with_memory(true)
+        let production_read_only_memory: Vec<_> =
+            production_tool_definitions_with_memory(true, false)
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect();
+        assert!(production_read_only_memory
+            .iter()
+            .any(|name| name == "memory_search"));
+        assert!(!production_read_only_memory
+            .iter()
+            .any(|name| name == "memory_remember"));
+
+        let production_with_memory: Vec<_> = production_tool_definitions_with_memory(true, true)
             .into_iter()
             .map(|definition| definition.name)
             .collect();
@@ -1040,6 +1176,28 @@ mod tests {
                 .iter()
                 .any(|name| name == "memory_get")
         );
+        assert!(
+            production_with_memory
+                .iter()
+                .any(|name| name == "memory_remember")
+        );
+
+        let gemini_with_memory: Vec<_> = gemini_agent_tool_definitions_with_memory(true, true)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(
+            gemini_with_memory
+                .iter()
+                .any(|name| name == "memory_remember")
+        );
+        let gemini_read_only_memory: Vec<_> = gemini_agent_tool_definitions_with_memory(true, false)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(!gemini_read_only_memory
+            .iter()
+            .any(|name| name == "memory_remember"));
 
         let chat: Vec<_> = super::super::tool_orchestration::chat_tool_definitions()
             .into_iter()
@@ -1047,13 +1205,34 @@ mod tests {
             .collect();
         assert!(!chat.iter().any(|name| name == "memory_search"));
         assert!(!chat.iter().any(|name| name == "memory_get"));
+        assert!(!chat.iter().any(|name| name == "memory_remember"));
+    }
+
+    #[test]
+    fn memory_remember_provider_call_is_parsed_without_a_model_selectable_scope() {
+        let call = ProviderToolCall {
+            id: Some("remember-1".into()),
+            name: "memory_remember".into(),
+            arguments: serde_json::json!({
+                "content": "A durable workspace fact"
+            }),
+        };
+        assert_eq!(
+            provider_call_to_request(&call),
+            Ok(ToolRequest {
+                name: ToolName::MemoryRemember,
+                arguments: ToolArguments::MemoryRemember {
+                    content: "A durable workspace fact".into(),
+                },
+            })
+        );
     }
 }
 
 #[cfg(test)]
 mod approval_bridge_tests {
     use super::*;
-    use axiom_agent::{ToolPolicyContext, ToolPolicyDecision};
+    use axiom_agent::{MemoryService, ToolPolicyContext, ToolPolicyDecision};
     use axiom_ai_provider::{ChatRole, ProviderChatMessage, ProviderChatStreamEvent};
     use axiom_project::{
         project_delete::ProjectDeleteCapability, project_update::ProjectUpdateCapability,
@@ -1284,6 +1463,54 @@ mod approval_bridge_tests {
             assert!(Instant::now() < deadline, "approval did not become pending");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn injected_shared_memory_records_agent_run_for_ui_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = axiom_agent::AxiomMemoryBackend::new(
+            directory.path(),
+            axiom_agent::AxiomMemoryScopeIds::new(
+                "local-user-v1",
+                "workspace-test",
+                "project-test",
+            ),
+        );
+        backend.initialize_storage().unwrap();
+        let memory = axiom_agent::SharedMemoryService::new(Box::new(backend));
+        let mut provider = ScriptedProvider {
+            scripts: vec![vec![
+                ProviderChatStreamEvent::ContentDelta("completed".into()),
+                ProviderChatStreamEvent::Done,
+            ]],
+            requests: Arc::new(Mutex::new(Vec::new())),
+            calls: 0,
+        };
+        let mut tools = AgentToolAdapter::without_tools(Cancellation::default());
+        let mut run = AgentRun::new(AgentRunId::new(9401), axiom_agent::AgentBudget::new(2, 1));
+        let bridge = ApprovalBridge::default();
+        let queue = Arc::new(Mutex::new(Vec::new()));
+
+        execute_with_approval_and_memory(
+            &mut run,
+            request(),
+            &mut provider,
+            &mut tools,
+            ProductionToolPolicy::default(),
+            Some(memory.clone()),
+            None,
+            &bridge,
+            &queue,
+        )
+        .unwrap();
+
+        let snapshot = memory
+            .snapshot(axiom_agent::MemoryScope::Workspace, 10)
+            .unwrap();
+        assert!(snapshot.history.iter().any(|entry| {
+            entry.category == Some(axiom_agent::MemoryCategory::Outcome)
+                && entry.content == "completed successfully"
+        }));
     }
 
     #[test]

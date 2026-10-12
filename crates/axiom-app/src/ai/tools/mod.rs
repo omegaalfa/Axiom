@@ -1,6 +1,7 @@
 //! Minimal, provider-independent Agent tool layer.
 
 mod delete_file;
+mod execute_command;
 mod fetch_url;
 mod find_files;
 mod find_references;
@@ -11,7 +12,7 @@ mod search_text;
 mod update_file;
 mod write_file;
 
-use axiom_agent::{MemoryResult, MemoryScope, MemoryService};
+use axiom_agent::{MemoryResult, MemoryScope, MemoryService, MemoryWriteError};
 use axiom_project::project_delete::ProjectDeleteCapability;
 use axiom_project::project_directory::ProjectDirectoryCapability;
 use axiom_project::project_read::{ProjectReadCapability, ReadFileRange};
@@ -36,6 +37,20 @@ pub(crate) use search_text::SearchTextTool;
 pub(crate) use update_file::UpdateFileTool;
 pub(crate) use write_file::WriteFileTool;
 
+#[derive(Clone, Debug)]
+pub(crate) enum TerminalCommandEvent {
+    Started {
+        command: String,
+        cwd: Option<String>,
+        profile: Option<String>,
+    },
+    Output {
+        stderr: bool,
+        text: String,
+    },
+    Finished,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ToolName {
     ReadFile,
@@ -48,8 +63,10 @@ pub(crate) enum ToolName {
     WriteFile,
     UpdateFile,
     DeleteFile,
+    ExecuteCommand,
     MemorySearch,
     MemoryGet,
+    MemoryRemember,
     Unknown(String),
 }
 
@@ -102,12 +119,20 @@ pub(crate) enum ToolArguments {
         path: String,
         expected_fingerprint: String,
     },
+    ExecuteCommand {
+        command: String,
+        cwd: Option<String>,
+        profile: Option<String>,
+    },
     MemorySearch {
         query: String,
         limit: Option<usize>,
     },
     MemoryGet {
         id: String,
+    },
+    MemoryRemember {
+        content: String,
     },
 }
 
@@ -179,6 +204,17 @@ pub(crate) enum ToolError {
         limit: usize,
         actual: usize,
     },
+    MemoryWriteUnavailable,
+    MemoryWriteRejected,
+    MemoryWriteFailed,
+    MemoryWriteTimeout,
+    MemoryReadFailed,
+    CommandInvalid(String),
+    CommandCwd(String),
+    CommandSpawn(String),
+    CommandWait(String),
+    CommandRead(String),
+    CommandTimeout,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,6 +234,8 @@ pub(crate) struct ToolRegistry {
     write_file: Option<WriteFileTool>,
     update_file: Option<UpdateFileTool>,
     delete_file: Option<DeleteFileTool>,
+    workspace_root: std::path::PathBuf,
+    terminal_events: Option<std::sync::mpsc::SyncSender<TerminalCommandEvent>>,
     memory: Option<Box<dyn MemoryService>>,
     memory_scope: MemoryScope,
 }
@@ -205,7 +243,8 @@ pub(crate) struct ToolRegistry {
 pub(crate) const MEMORY_SEARCH_DEFAULT_LIMIT: usize = 5;
 pub(crate) const MEMORY_SEARCH_MAX_LIMIT: usize = 20;
 pub(crate) const MEMORY_QUERY_MAX_CHARS: usize = 256;
-pub(crate) const MEMORY_RESULT_MAX_CHARS: usize = 512;
+pub(crate) const MEMORY_SEARCH_RESULT_MAX_CHARS: usize = 1024;
+pub(crate) const MEMORY_GET_RESULT_MAX_CHARS: usize = 3500;
 pub(crate) const MEMORY_OUTPUT_MAX_CHARS: usize = 4096;
 
 impl ToolRegistry {
@@ -244,6 +283,8 @@ impl ToolRegistry {
             write_file: None,
             update_file: None,
             delete_file: None,
+            workspace_root,
+            terminal_events: None,
             memory: None,
             memory_scope: MemoryScope::Workspace,
         }
@@ -292,6 +333,8 @@ impl ToolRegistry {
             write_file: Some(WriteFileTool::new(write_capability)),
             update_file: None,
             delete_file: None,
+            workspace_root,
+            terminal_events: None,
             memory: None,
             memory_scope: MemoryScope::Workspace,
         }
@@ -322,6 +365,8 @@ impl ToolRegistry {
             write_file: Some(WriteFileTool::new(write_capability)),
             update_file: Some(UpdateFileTool::new(update_capability)),
             delete_file: None,
+            workspace_root,
+            terminal_events: None,
             memory: None,
             memory_scope: MemoryScope::Workspace,
         }
@@ -351,6 +396,14 @@ impl ToolRegistry {
         self.with_memory_service_in_scope(memory, MemoryScope::Workspace)
     }
 
+    pub(crate) fn with_terminal_events(
+        mut self,
+        events: std::sync::mpsc::SyncSender<TerminalCommandEvent>,
+    ) -> Self {
+        self.terminal_events = Some(events);
+        self
+    }
+
     #[allow(dead_code)]
     pub(crate) fn with_memory_service_in_scope(
         mut self,
@@ -368,6 +421,12 @@ impl ToolRegistry {
         self.memory.is_some()
     }
 
+    pub(crate) fn has_memory_write_tool(&self) -> bool {
+        self.memory
+            .as_ref()
+            .is_some_and(|memory| memory.can_remember())
+    }
+
     pub(crate) fn kind(&self, name: &ToolName) -> Option<ToolKind> {
         match name {
             ToolName::ReadFile
@@ -380,9 +439,15 @@ impl ToolRegistry {
             ToolName::WriteFile => self.write_file.is_some().then_some(ToolKind::Mutating),
             ToolName::UpdateFile => self.update_file.is_some().then_some(ToolKind::Mutating),
             ToolName::DeleteFile => self.delete_file.is_some().then_some(ToolKind::Mutating),
+            ToolName::ExecuteCommand => Some(ToolKind::Mutating),
             ToolName::MemorySearch | ToolName::MemoryGet => {
                 self.memory.is_some().then_some(ToolKind::ReadOnly)
             }
+            ToolName::MemoryRemember => self
+                .memory
+                .as_ref()
+                .is_some_and(|memory| memory.can_remember())
+                .then_some(ToolKind::Mutating),
             ToolName::Unknown(_) => None,
         }
     }
@@ -495,6 +560,65 @@ impl ToolRegistry {
                 }
             }
             ToolRequest {
+                name: ToolName::ExecuteCommand,
+                arguments: ToolArguments::ExecuteCommand {
+                    command,
+                    cwd,
+                    profile,
+                },
+            } => {
+                if let Some(events) = &self.terminal_events {
+                    let _ = events.try_send(TerminalCommandEvent::Started {
+                        command: command.clone(),
+                        cwd: cwd.clone(),
+                        profile: profile.clone(),
+                    });
+                }
+                let sink = self.terminal_events.as_ref().map(|events| {
+                    let events = events.clone();
+                    std::sync::Arc::new(move |stderr, text| {
+                        let _ = events.try_send(TerminalCommandEvent::Output { stderr, text });
+                    }) as std::sync::Arc<dyn Fn(bool, String) + Send + Sync>
+                });
+                let result = match sink {
+                    Some(sink) => execute_command::execute_with_sink(
+                        &self.workspace_root,
+                        command,
+                        cwd,
+                        profile,
+                        sink,
+                    ),
+                    None => execute_command::execute(&self.workspace_root, command, cwd, profile),
+                };
+                if let Some(events) = &self.terminal_events {
+                    let _ = events.try_send(TerminalCommandEvent::Finished);
+                }
+                match result {
+                Ok(content) => memory_success(ToolName::ExecuteCommand, content),
+                Err(error) => ToolResult {
+                    tool: ToolName::ExecuteCommand,
+                    result: Err(match error {
+                        execute_command::ExecuteCommandError::Invalid(message) => {
+                            ToolError::CommandInvalid(message)
+                        }
+                        execute_command::ExecuteCommandError::Cwd(message) => {
+                            ToolError::CommandCwd(message)
+                        }
+                        execute_command::ExecuteCommandError::Spawn(message) => {
+                            ToolError::CommandSpawn(message)
+                        }
+                        execute_command::ExecuteCommandError::Wait(message) => {
+                            ToolError::CommandWait(message)
+                        }
+                        execute_command::ExecuteCommandError::Read(message) => {
+                            ToolError::CommandRead(message)
+                        }
+                        execute_command::ExecuteCommandError::Timeout => ToolError::CommandTimeout,
+                    }),
+                },
+                }
+            }
+            ToolRequest {
                 name: ToolName::MemorySearch,
                 arguments: ToolArguments::MemorySearch { query, limit },
             } => self.memory_search(query, limit),
@@ -502,6 +626,18 @@ impl ToolRegistry {
                 name: ToolName::MemoryGet,
                 arguments: ToolArguments::MemoryGet { id },
             } => self.memory_get(id),
+            ToolRequest {
+                name: ToolName::MemoryRemember,
+                arguments: ToolArguments::MemoryRemember { content },
+            } => {
+                if cancelled() {
+                    return ToolResult {
+                        tool: ToolName::MemoryRemember,
+                        result: Err(ToolError::Cancelled),
+                    };
+                }
+                self.memory_remember(content)
+            }
             ToolRequest {
                 name: ToolName::Unknown(name),
                 ..
@@ -529,12 +665,22 @@ impl ToolRegistry {
         let limit = limit
             .unwrap_or(MEMORY_SEARCH_DEFAULT_LIMIT)
             .min(MEMORY_SEARCH_MAX_LIMIT);
-        let results = memory
-            .query(self.memory_scope, &query, limit)
-            .into_iter()
-            .filter(|result| result.scope == self.memory_scope)
-            .collect();
-        memory_success(ToolName::MemorySearch, format_memory_results(results))
+        let results = match memory.query_checked(self.memory_scope, &query, limit) {
+            Ok(results) => results,
+            Err(_) => {
+                return ToolResult {
+                    tool: ToolName::MemorySearch,
+                    result: Err(ToolError::MemoryReadFailed),
+                };
+            }
+        }
+        .into_iter()
+        .filter(|result| result.scope == self.memory_scope)
+        .collect();
+        memory_success(
+            ToolName::MemorySearch,
+            format_memory_results(results, Some(&query), MEMORY_SEARCH_RESULT_MAX_CHARS),
+        )
     }
 
     fn memory_get(&self, id: String) -> ToolResult {
@@ -545,11 +691,69 @@ impl ToolRegistry {
         let Some(memory) = self.memory.as_ref() else {
             return memory_error(ToolName::MemoryGet, "memory unavailable");
         };
-        let result = memory.get(self.memory_scope, id);
+        let result = match memory.get_checked(self.memory_scope, id) {
+            Ok(result) => result,
+            Err(_) => {
+                return ToolResult {
+                    tool: ToolName::MemoryGet,
+                    result: Err(ToolError::MemoryReadFailed),
+                };
+            }
+        };
         memory_success(
             ToolName::MemoryGet,
-            format_memory_results(result.into_iter().collect()),
+            format_memory_results(
+                result.into_iter().collect(),
+                None,
+                MEMORY_GET_RESULT_MAX_CHARS,
+            ),
         )
+    }
+
+    fn memory_remember(&self, content: String) -> ToolResult {
+        let Some(memory) = self.memory.as_ref() else {
+            return ToolResult {
+                tool: ToolName::MemoryRemember,
+                result: Err(ToolError::MemoryWriteUnavailable),
+            };
+        };
+        if content.chars().count() > axiom_agent::MAX_RECORD_CONTENT_CHARS {
+            return ToolResult {
+                tool: ToolName::MemoryRemember,
+                result: Err(ToolError::MemoryWriteRejected),
+            };
+        }
+        match memory.remember(self.memory_scope, &content) {
+            Ok(()) => memory_success(
+                ToolName::MemoryRemember,
+                json!({
+                    "persisted": true,
+                    "scope": match self.memory_scope {
+                        MemoryScope::User => "user",
+                        MemoryScope::Workspace => "workspace",
+                        MemoryScope::Project => "project",
+                    },
+                    "message": "Observation persisted to workspace memory."
+                })
+                .to_string(),
+            ),
+            Err(MemoryWriteError::Unavailable) => ToolResult {
+                tool: ToolName::MemoryRemember,
+                result: Err(ToolError::MemoryWriteUnavailable),
+            },
+            Err(MemoryWriteError::Rejected) => ToolResult {
+                tool: ToolName::MemoryRemember,
+                result: Err(ToolError::MemoryWriteRejected),
+            },
+            Err(MemoryWriteError::StorageFailure) => ToolResult {
+                tool: ToolName::MemoryRemember,
+                result: Err(ToolError::MemoryWriteFailed),
+            },
+            Err(MemoryWriteError::Timeout) => ToolResult {
+                tool: ToolName::MemoryRemember,
+                result: Err(ToolError::MemoryWriteTimeout),
+            },
+        }
     }
 }
 
@@ -563,7 +767,49 @@ fn normalize_memory_query(value: &str) -> String {
         .collect()
 }
 
-fn compact_memory_result(result: MemoryResult) -> serde_json::Value {
+fn relevant_memory_excerpt(content: &str, query: &str, max_chars: usize) -> String {
+    let chars = content.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return content.to_owned();
+    }
+
+    let query_chars = query.chars().collect::<Vec<_>>();
+    let match_start = if query_chars.is_empty() || query_chars.len() > chars.len() {
+        0
+    } else {
+        chars
+            .windows(query_chars.len())
+            .position(|window| {
+                window
+                    .iter()
+                    .zip(&query_chars)
+                    .all(|(left, right)| left.eq_ignore_ascii_case(right))
+            })
+            .unwrap_or(0)
+    };
+    let context_before = max_chars.saturating_sub(query_chars.len()) / 2;
+    let start = match_start.saturating_sub(context_before);
+    let end = (start + max_chars).min(chars.len());
+    let mut excerpt = String::new();
+    if start > 0 {
+        excerpt.push('…');
+    }
+    excerpt.extend(chars[start..end].iter());
+    if end < chars.len() {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
+fn compact_memory_result(
+    result: MemoryResult,
+    query: Option<&str>,
+    max_chars: usize,
+) -> serde_json::Value {
+    let content = match query {
+        Some(query) => relevant_memory_excerpt(&result.content, query, max_chars),
+        None => result.content.chars().take(max_chars).collect::<String>(),
+    };
     json!({
         "id": result.id,
         "scope": match result.scope {
@@ -571,16 +817,20 @@ fn compact_memory_result(result: MemoryResult) -> serde_json::Value {
             MemoryScope::Workspace => "workspace",
             MemoryScope::Project => "project",
         },
-        "content": result.content.chars().take(MEMORY_RESULT_MAX_CHARS).collect::<String>(),
+        "content": content,
     })
 }
 
-fn format_memory_results(results: Vec<MemoryResult>) -> String {
+fn format_memory_results(
+    results: Vec<MemoryResult>,
+    query: Option<&str>,
+    max_result_chars: usize,
+) -> String {
     let warning =
         "Memory is historical and may be stale or incomplete; verify current project state.";
     let mut items = Vec::new();
     for result in results {
-        items.push(compact_memory_result(result));
+        items.push(compact_memory_result(result, query, max_result_chars));
         let candidate = json!({
             "historical": true,
             "warning": warning,
@@ -640,7 +890,10 @@ fn empty_tool_metadata() -> ToolMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axiom_agent::{InMemoryMemoryService, MemoryObservation, MemoryService};
+    use axiom_agent::{
+        AxiomMemoryBackend, AxiomMemoryScopeIds, InMemoryMemoryService, MemoryObservation,
+        MemoryService,
+    };
     use axiom_project::project_read::ProjectReadCapability;
     use axiom_project::project_update::ProjectUpdateCapability;
     use axiom_project::project_write::ProjectWriteCapability;
@@ -711,11 +964,18 @@ mod tests {
     }
 
     #[test]
-    fn memory_tools_are_optional_and_read_only() {
+    fn memory_tools_are_optional_and_writes_require_a_writable_backend() {
         let (_dir, empty_registry) = registry();
         assert!(!empty_registry.has_memory_tools());
         assert_eq!(empty_registry.kind(&ToolName::MemorySearch), None);
         assert_eq!(empty_registry.kind(&ToolName::MemoryGet), None);
+
+        let unavailable = registry()
+            .1
+            .with_memory_service(Box::new(axiom_agent::NoMemory));
+        assert!(!unavailable.has_memory_tools());
+        assert_eq!(unavailable.kind(&ToolName::MemorySearch), None);
+        assert_eq!(unavailable.kind(&ToolName::MemoryGet), None);
 
         let mut memory = InMemoryMemoryService::default();
         let session = memory.session_start(MemoryScope::Project);
@@ -735,6 +995,7 @@ mod tests {
             registry.kind(&ToolName::MemoryGet),
             Some(ToolKind::ReadOnly)
         );
+        assert_eq!(registry.kind(&ToolName::MemoryRemember), None);
     }
 
     #[test]
@@ -817,6 +1078,113 @@ mod tests {
             },
         });
         assert!(matches!(too_long.result, Ok(output) if output.content.contains("too long")));
+    }
+
+    #[test]
+    fn memory_tools_report_read_failure_instead_of_empty_results() {
+        let dir = tempdir().unwrap();
+        let ids = AxiomMemoryScopeIds::new("user", "workspace-read-error", "project");
+        let backend = AxiomMemoryBackend::new(dir.path(), ids.clone());
+        backend.initialize_storage().unwrap();
+        std::fs::write(
+            dir.path()
+                .join("workspace")
+                .join(format!("{}.json", ids.workspace)),
+            b"corrupt",
+        )
+        .unwrap();
+        let (_workspace, registry) = registry();
+        let registry =
+            registry.with_memory_service_in_scope(Box::new(backend), MemoryScope::Workspace);
+
+        let search = registry.execute(ToolRequest {
+            name: ToolName::MemorySearch,
+            arguments: ToolArguments::MemorySearch {
+                query: "some fact".into(),
+                limit: None,
+            },
+        });
+        assert_eq!(search.result, Err(ToolError::MemoryReadFailed));
+        let get = registry.execute(ToolRequest {
+            name: ToolName::MemoryGet,
+            arguments: ToolArguments::MemoryGet {
+                id: "workspace-read-error:1".into(),
+            },
+        });
+        assert_eq!(get.result, Err(ToolError::MemoryReadFailed));
+    }
+
+    #[test]
+    fn memory_search_and_get_recover_architecture_details() {
+        let architecture = format!(
+            "{}\naxiom-app: GPUI application shell and user interface.\n\
+             axiom-syntax: Tree-sitter parsing, tokens, syntax highlighting, and diagnostics.\n\
+             axiom-project: project lifecycle, filesystem model, Composer metadata, and PSR-4 resolution.",
+            "Axiom architecture context. ".repeat(18)
+        );
+        let mut memory = InMemoryMemoryService::default();
+        let session = memory.session_start(MemoryScope::Workspace);
+        memory.observe(session, MemoryObservation::Discovery(architecture.clone()));
+        memory.session_end(session);
+        let id = memory.briefing(MemoryScope::Workspace, 1)[0]
+            .id
+            .clone()
+            .unwrap();
+        let registry = registry()
+            .1
+            .with_memory_service_in_scope(Box::new(memory), MemoryScope::Workspace);
+
+        let search = registry.execute(ToolRequest {
+            name: ToolName::MemorySearch,
+            arguments: ToolArguments::MemorySearch {
+                query: "axiom-syntax".into(),
+                limit: Some(1),
+            },
+        });
+        let ToolResult {
+            result: Ok(search_output),
+            ..
+        } = search
+        else {
+            panic!("memory search must return the matching architecture record");
+        };
+        assert!(search_output.content.chars().count() <= MEMORY_OUTPUT_MAX_CHARS);
+        for detail in [
+            "axiom-app: GPUI application shell and user interface",
+            "axiom-syntax: Tree-sitter parsing, tokens, syntax highlighting, and diagnostics",
+            "axiom-project: project lifecycle, filesystem model, Composer metadata, and PSR-4 resolution",
+        ] {
+            assert!(search_output.content.contains(detail), "missing {detail}");
+        }
+
+        let get = registry.execute(ToolRequest {
+            name: ToolName::MemoryGet,
+            arguments: ToolArguments::MemoryGet { id },
+        });
+        let ToolResult {
+            result: Ok(get_output),
+            ..
+        } = get
+        else {
+            panic!("memory_get must return the full architecture record");
+        };
+        assert!(get_output.content.chars().count() <= MEMORY_OUTPUT_MAX_CHARS);
+        let payload: serde_json::Value = serde_json::from_str(&get_output.content).unwrap();
+        let expected = format!(
+            "discovery: {}",
+            architecture
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert_eq!(payload["results"][0]["content"], expected);
+        for detail in [
+            "axiom-app: GPUI application shell and user interface",
+            "axiom-syntax: Tree-sitter parsing, tokens, syntax highlighting, and diagnostics",
+            "axiom-project: project lifecycle, filesystem model, Composer metadata, and PSR-4 resolution",
+        ] {
+            assert!(get_output.content.contains(detail), "missing {detail}");
+        }
     }
 
     #[test]

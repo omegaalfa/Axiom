@@ -12,6 +12,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axiom_agent::MemoryService;
+use crate::ai::agent_history::{
+    AgentHistoryConversation, AgentHistoryMessage, AgentHistoryRole, AgentHistoryStore,
+    AgentHistoryWriteEvent, AgentHistoryWriter, AgentToolSummary, load_for_workspace,
+    format_timestamp, now_unix_seconds, tool_context_message, tool_summaries_from_messages,
+};
+use crate::ai::tools::TerminalCommandEvent;
 use axiom_ai_provider::{
     ChatRole, ProviderChatMessage, ProviderChatRequest, ProviderChatStreamEvent,
     ProviderConnectionRequest, ProviderError, ProviderKind, ProviderUiState, RequestTracker,
@@ -76,12 +83,27 @@ struct TerminalTab {
     starting: bool,
     generation: u64,
     error: Option<String>,
+    pending_command_output: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TerminalProfilePickerMode {
     RestartActive,
     CreateNew,
+}
+
+fn terminal_profile_for_agent_request(
+    profile: Option<&str>,
+    cwd: Option<&Path>,
+) -> TerminalProfile {
+    match profile.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if value.eq_ignore_ascii_case("cmd") => TerminalProfile::command_prompt(),
+        Some(value) if value.eq_ignore_ascii_case("wsl") => TerminalProfile::wsl_default(cwd),
+        Some(value) if value.eq_ignore_ascii_case("ubuntu") => {
+            TerminalProfile::wsl_distro("Ubuntu", cwd)
+        }
+        _ => TerminalProfile::powershell(),
+    }
 }
 
 actions!(
@@ -1103,6 +1125,14 @@ struct ChatHistoryStore {
     conversations: Vec<ChatConversation>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AgentHistorySaveState {
+    Saved,
+    Saving,
+    Error(String),
+    Unavailable(String),
+}
+
 const CHAT_HISTORY_VERSION: u32 = 1;
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1250,6 +1280,26 @@ fn provider_messages_from_agent_session(messages: &[AgentUiMessage]) -> Vec<Prov
             tool_calls: Vec::new(),
         })
         .collect()
+}
+
+fn provider_messages_from_agent_history(
+    messages: &[AgentUiMessage],
+    tool_summaries: &[AgentToolSummary],
+) -> Vec<ProviderChatMessage> {
+    let mut provider_messages = provider_messages_from_agent_session(messages);
+    if let Some(content) = tool_context_message(tool_summaries) {
+        provider_messages.insert(
+            0,
+            ProviderChatMessage {
+                role: ChatRole::System,
+                content,
+                reasoning: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+        );
+    }
+    provider_messages
 }
 
 fn apply_agent_message_event(
@@ -1667,6 +1717,25 @@ fn agent_failure_status(diagnostic: &axiom_agent::AgentFailureDiagnostic) -> Str
     format!("Agent {category} failure: {}", diagnostic.message)
 }
 
+fn agent_history_status_text(
+    has_conversation: bool,
+    state: &AgentHistorySaveState,
+) -> Option<String> {
+    if !has_conversation && matches!(state, AgentHistorySaveState::Saved) {
+        return None;
+    }
+    Some(match state {
+        AgentHistorySaveState::Saved => "Conversation saved".into(),
+        AgentHistorySaveState::Saving => "Saving conversation…".into(),
+        AgentHistorySaveState::Error(error) => format!(
+            "Not saved: {error}. Messages remain available in this session."
+        ),
+        AgentHistorySaveState::Unavailable(error) => format!(
+            "History unavailable: {error}. Messages remain available in this session."
+        ),
+    })
+}
+
 fn should_send_ai_on_enter(active: ActiveTextInput, text: &str, state: &ChatRequestState) -> bool {
     active == ActiveTextInput::AiComposer
         && !text.trim().is_empty()
@@ -1826,7 +1895,14 @@ enum PendingOperation {
     Exit,
 }
 
-type ProjectLoadPayload = (Project, Vec<ProjectEntry>, Arc<LspBridge>, Option<GitRepositoryState>);
+type ProjectLoadPayload = (
+    Project,
+    Vec<ProjectEntry>,
+    Arc<LspBridge>,
+    Option<GitRepositoryState>,
+    Option<axiom_agent::SharedMemoryService>,
+    Result<(PathBuf, AgentHistoryStore), String>,
+);
 type SemanticIndexPayload = (ProjectSymbolIndex, Arc<SemanticEngine>);
 type ExplorerStructureResult = (u64, Result<Vec<ProjectEntry>, String>);
 type GitRefreshResult = (u64, Result<Option<GitRepositoryState>, String>);
@@ -2097,10 +2173,19 @@ pub struct WorkspaceView {
     agent_events: AgentEventQueue,
     agent_messages: Vec<AgentUiMessage>,
     agent_next_message_id: u64,
+    agent_history_writer: Option<AgentHistoryWriter>,
+    agent_history_conversations: Vec<AgentHistoryConversation>,
+    active_agent_conversation_id: Option<String>,
+    agent_tool_summaries: Vec<AgentToolSummary>,
+    agent_history_open: bool,
+    agent_history_save_state: AgentHistorySaveState,
+    agent_history_requested_revision: u64,
+    agent_history_dirty_since: Option<Instant>,
+    agent_history_force_save: bool,
     agent_copy_notice: Option<u64>,
     agent_scroll_handle: ScrollHandle,
     agent_status: Option<String>,
-    memory_service: Option<Arc<Mutex<Box<dyn axiom_agent::MemoryService>>>>,
+    memory_service: Option<axiom_agent::SharedMemoryService>,
     memory_ui_tab: MemoryUiTab,
     memory_ui_state: MemoryUiState,
     memory_ui_scope: axiom_agent::MemoryScope,
@@ -2157,6 +2242,10 @@ pub struct WorkspaceView {
     terminal_profile_picker_mode: TerminalProfilePickerMode,
     terminal_tab_picker_open: bool,
     terminal_profiles_discovery_started: bool,
+    terminal_command_sender: mpsc::SyncSender<TerminalCommandEvent>,
+    terminal_command_receiver: Arc<Mutex<Receiver<TerminalCommandEvent>>>,
+    terminal_command_tab: Option<TerminalTabId>,
+    terminal_focus_pending: Option<TerminalTabId>,
     navigation_back: Vec<NavigationLocation>,
     navigation_forward: Vec<NavigationLocation>,
     definition_targets: Vec<DefinitionTarget>,
@@ -2406,6 +2495,305 @@ fn render_markdown_inline(text: &str, color: gpui::Rgba) -> gpui::Div {
 }
 
 impl WorkspaceView {
+    fn set_agent_history(&mut self, loaded: Result<(PathBuf, AgentHistoryStore), String>) {
+        let shutdown_error = self
+            .agent_history_writer
+            .take()
+            .and_then(|mut writer| writer.shutdown().err());
+        self.agent_history_conversations.clear();
+        self.active_agent_conversation_id = None;
+        self.agent_tool_summaries.clear();
+        self.agent_messages.clear();
+        self.agent_next_message_id = 1;
+        self.agent_history_dirty_since = None;
+        self.agent_history_force_save = false;
+        self.agent_history_requested_revision = 0;
+        match loaded {
+            Ok((directory, store)) => {
+                self.agent_history_conversations = store.conversations().to_vec();
+                self.agent_history_save_state = store
+                    .warning()
+                    .map(|warning| AgentHistorySaveState::Error(format!(
+                        "Recovered an older history snapshot; some recent changes may be missing ({warning})"
+                    )))
+                    .unwrap_or(AgentHistorySaveState::Saved);
+                match AgentHistoryWriter::new(directory, store) {
+                    Ok(writer) => self.agent_history_writer = Some(writer),
+                    Err(error) => {
+                        self.agent_history_save_state = AgentHistorySaveState::Unavailable(error)
+                    }
+                }
+            }
+            Err(error) => {
+                self.agent_history_save_state = AgentHistorySaveState::Unavailable(error);
+            }
+        }
+        if let Some(error) = shutdown_error {
+            self.agent_history_save_state = AgentHistorySaveState::Error(format!(
+                "Previous Agent history writer did not finish: {error}"
+            ));
+        }
+    }
+
+    fn queue_agent_history_save(&mut self, force: bool) {
+        if self.agent_messages.is_empty() {
+            return;
+        }
+        let first_user = self
+            .agent_messages
+            .iter()
+            .find(|message| message.role == ChatRole::User)
+            .map(|message| message.content.clone());
+        let Some(first_user) = first_user else { return };
+        let Some(writer) = self.agent_history_writer.as_mut() else {
+            if let AgentHistorySaveState::Saved = self.agent_history_save_state {
+                self.agent_history_save_state = AgentHistorySaveState::Unavailable(
+                    "Agent history storage is unavailable".into(),
+                );
+            }
+            self.agent_history_force_save = false;
+            self.agent_history_dirty_since = None;
+            return;
+        };
+        if self.active_agent_conversation_id.is_none() {
+            self.active_agent_conversation_id = Some(
+                writer
+                    .store_mut()
+                    .create_conversation(&first_user, now_unix_seconds()),
+            );
+        }
+        let Some(id) = self.active_agent_conversation_id.as_deref() else { return };
+        let messages = self
+            .agent_messages
+            .iter()
+            .filter(|message| {
+                matches!(message.role, ChatRole::User | ChatRole::Assistant)
+                    && !(message.role == ChatRole::Assistant && message.content.is_empty())
+            })
+            .map(|message| AgentHistoryMessage {
+                id: message.id,
+                role: if message.role == ChatRole::User {
+                    AgentHistoryRole::User
+                } else {
+                    AgentHistoryRole::Assistant
+                },
+                content: message.content.clone(),
+            })
+            .collect();
+        if let Err(error) = writer
+            .store_mut()
+            .replace_messages(id, messages, now_unix_seconds())
+        {
+            self.agent_history_save_state = AgentHistorySaveState::Error(error);
+            self.agent_history_dirty_since = None;
+            self.agent_history_force_save = false;
+            return;
+        }
+        self.agent_history_conversations = writer.store().conversations().to_vec();
+        if force {
+            match writer.submit() {
+                Ok(revision) => {
+                    self.agent_history_requested_revision = revision;
+                    self.agent_history_save_state = AgentHistorySaveState::Saving;
+                    self.agent_history_dirty_since = None;
+                    self.agent_history_force_save = false;
+                }
+                Err(error) => {
+                    self.agent_history_save_state = AgentHistorySaveState::Error(error);
+                    self.agent_history_force_save = false;
+                    self.agent_history_dirty_since = None;
+                }
+            }
+        } else {
+            self.agent_history_dirty_since.get_or_insert_with(Instant::now);
+        }
+    }
+
+    fn flush_agent_history_if_due(&mut self) {
+        let should_flush = self.agent_history_force_save
+            || self.agent_history_dirty_since.is_some_and(|since| {
+                since.elapsed() >= Duration::from_millis(350)
+            });
+        if should_flush {
+            self.queue_agent_history_save(true);
+        }
+    }
+
+    fn poll_agent_history(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if let Some(writer) = &self.agent_history_writer {
+            while let Some(event) = writer.try_event() {
+                match event {
+                    AgentHistoryWriteEvent::Saved(revision)
+                        if revision == self.agent_history_requested_revision
+                            && self.agent_history_dirty_since.is_none()
+                            && !self.agent_history_force_save =>
+                    {
+                        self.agent_history_save_state = AgentHistorySaveState::Saved;
+                        changed = true;
+                    }
+                    AgentHistoryWriteEvent::Failed(revision, error)
+                        if revision == self.agent_history_requested_revision =>
+                    {
+                        self.agent_history_save_state = AgentHistorySaveState::Error(error);
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let pending_before = self.agent_history_dirty_since;
+        self.flush_agent_history_if_due();
+        changed |= pending_before != self.agent_history_dirty_since;
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn new_agent_conversation(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.agent_ui_state, AgentUiState::Running) {
+            return;
+        }
+        let has_current_messages = !self.agent_messages.is_empty();
+        self.queue_agent_history_save(true);
+        if has_current_messages
+            && matches!(
+                self.agent_history_save_state,
+                AgentHistorySaveState::Error(_) | AgentHistorySaveState::Unavailable(_)
+            )
+        {
+            cx.notify();
+            return;
+        }
+        self.active_agent_conversation_id = None;
+        self.agent_messages.clear();
+        self.agent_next_message_id = 1;
+        self.agent_history_open = false;
+        self.agent_tool_summaries.clear();
+        self.agent_history_dirty_since = None;
+        self.agent_history_force_save = false;
+        self.agent_ui_state = AgentUiState::Idle;
+        self.agent_status = None;
+        cx.notify();
+    }
+
+    fn toggle_agent_history(&mut self, cx: &mut Context<Self>) {
+        self.agent_history_open = !self.agent_history_open;
+        cx.notify();
+    }
+
+    fn open_agent_conversation(&mut self, id: String, cx: &mut Context<Self>) {
+        if matches!(self.agent_ui_state, AgentUiState::Running) {
+            return;
+        }
+        let has_current_messages = !self.agent_messages.is_empty();
+        self.queue_agent_history_save(true);
+        if has_current_messages
+            && matches!(
+                self.agent_history_save_state,
+                AgentHistorySaveState::Error(_) | AgentHistorySaveState::Unavailable(_)
+            )
+        {
+            cx.notify();
+            return;
+        }
+        let Some(conversation) = self
+            .agent_history_conversations
+            .iter()
+            .find(|conversation| conversation.id == id)
+            .cloned()
+        else {
+            self.agent_history_save_state = AgentHistorySaveState::Error(
+                "The selected Agent conversation is unavailable".into(),
+            );
+            cx.notify();
+            return;
+        };
+        self.active_agent_conversation_id = Some(conversation.id);
+        self.agent_next_message_id = conversation
+            .messages
+            .iter()
+            .map(|message| message.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.agent_messages = conversation
+            .messages
+            .into_iter()
+            .map(|message| AgentUiMessage {
+                id: message.id,
+                run_id: None,
+                role: match message.role {
+                    AgentHistoryRole::User => ChatRole::User,
+                    AgentHistoryRole::Assistant => ChatRole::Assistant,
+                },
+                content: message.content,
+                thinking: None,
+            })
+            .collect();
+        self.agent_tool_summaries = conversation.tool_summaries;
+        self.agent_ui_state = AgentUiState::Completed;
+        self.agent_status = None;
+        self.agent_history_open = false;
+        self.agent_scroll_handle.scroll_to_bottom();
+        cx.notify();
+    }
+
+    fn delete_agent_conversation(&mut self, id: String, cx: &mut Context<Self>) {
+        if matches!(self.agent_ui_state, AgentUiState::Running) {
+            return;
+        }
+        let Some(writer) = self.agent_history_writer.as_mut() else {
+            self.agent_history_save_state = AgentHistorySaveState::Unavailable(
+                "Agent history storage is unavailable".into(),
+            );
+            cx.notify();
+            return;
+        };
+        if !writer.store_mut().delete_conversation(&id) {
+            return;
+        }
+        self.agent_history_conversations = writer.store().conversations().to_vec();
+        if self.active_agent_conversation_id.as_deref() == Some(id.as_str()) {
+            self.active_agent_conversation_id = None;
+            self.agent_messages.clear();
+            self.agent_tool_summaries.clear();
+            self.agent_next_message_id = 1;
+            self.agent_ui_state = AgentUiState::Idle;
+            self.agent_status = None;
+        }
+        match writer.submit() {
+            Ok(revision) => {
+                self.agent_history_requested_revision = revision;
+                self.agent_history_save_state = AgentHistorySaveState::Saving;
+            }
+            Err(error) => {
+                self.agent_history_save_state = AgentHistorySaveState::Error(error);
+            }
+        }
+        self.agent_history_dirty_since = None;
+        self.agent_history_force_save = false;
+        cx.notify();
+    }
+
+    fn retry_agent_history_save(&mut self, cx: &mut Context<Self>) {
+        if self.agent_messages.is_empty() {
+            if let Some(writer) = self.agent_history_writer.as_mut() {
+                match writer.submit() {
+                    Ok(revision) => {
+                        self.agent_history_requested_revision = revision;
+                        self.agent_history_save_state = AgentHistorySaveState::Saving;
+                    }
+                    Err(error) => self.agent_history_save_state = AgentHistorySaveState::Error(error),
+                }
+            }
+        } else {
+            self.agent_history_force_save = true;
+            self.flush_agent_history_if_due();
+        }
+        cx.notify();
+    }
+
     fn persist_chat_history(&mut self) {
         let Some(path) = &self.chat_history_path else {
             return;
@@ -3097,6 +3485,7 @@ impl WorkspaceView {
         let ui_settings = ui_path.as_deref().map(UiSettings::load).unwrap_or_default();
         let keymap = Keymap::load_user();
         let (semantic_update_sender, semantic_update_receiver) = mpsc::channel();
+        let (terminal_command_sender, terminal_command_receiver) = mpsc::sync_channel(64);
         if debug_input_enabled() {
             tracing::info!(
                 command = "project.rename",
@@ -3247,6 +3636,17 @@ impl WorkspaceView {
             agent_events: Arc::new(Mutex::new(Vec::new())),
             agent_messages: Vec::new(),
             agent_next_message_id: 1,
+            agent_history_writer: None,
+            agent_history_conversations: Vec::new(),
+            active_agent_conversation_id: None,
+            agent_tool_summaries: Vec::new(),
+            agent_history_open: false,
+            agent_history_save_state: AgentHistorySaveState::Unavailable(
+                "Open a workspace to save Agent conversations".into(),
+            ),
+            agent_history_requested_revision: 0,
+            agent_history_dirty_since: None,
+            agent_history_force_save: false,
             agent_copy_notice: None,
             agent_scroll_handle: ScrollHandle::new(),
             agent_status: None,
@@ -3355,6 +3755,10 @@ impl WorkspaceView {
             terminal_profile_picker_mode: TerminalProfilePickerMode::RestartActive,
             terminal_tab_picker_open: false,
             terminal_profiles_discovery_started: false,
+            terminal_command_sender,
+            terminal_command_receiver: Arc::new(Mutex::new(terminal_command_receiver)),
+            terminal_command_tab: None,
+            terminal_focus_pending: None,
             navigation_back: Vec::new(),
             navigation_forward: Vec::new(),
             definition_targets: Vec::new(),
@@ -3541,6 +3945,8 @@ impl WorkspaceView {
                         this.poll_lsp(cx);
                         this.poll_chat_stream(cx);
                         this.poll_agent_events(cx);
+                        this.poll_agent_history(cx);
+                        this.poll_terminal_command_events(cx);
                         let lsp_us = poll_started.elapsed().as_micros();
                         if this.index_results.is_some() {
                             this.indexing_phase = this.indexing_phase.wrapping_add(6) % 100;
@@ -4511,7 +4917,16 @@ impl WorkspaceView {
                     .map_err(|error| error.to_string())?;
                 let lsp = LspBridge::start(project.root_path());
                 let git_state = load_git_state(project.root_path(), &git_scan_inflight).unwrap_or(None);
-                Ok((project, entries, lsp, git_state))
+                let memory = crate::ai::memory_runtime::initialize_workspace_memory(&root);
+                let history = axiom_config_dir()
+                    .ok_or_else(|| "Axiom configuration directory is unavailable".to_owned())
+                    .and_then(|config| load_for_workspace(&config, &root));
+                if memory.is_none() {
+                    tracing::warn!(
+                        "persistent memory initialization failed; continuing without memory"
+                    );
+                }
+                Ok((project, entries, lsp, git_state, memory, history))
             })();
             if debug_input_enabled() {
                 tracing::info!(
@@ -4545,9 +4960,9 @@ impl WorkspaceView {
             return;
         }
         match result {
-            Ok((project, entries, lsp, git_state)) => {
+            Ok((project, entries, lsp, git_state, memory, history)) => {
                 let started = Instant::now();
-                self.finish_project_load(project, entries, lsp, git_state, cx);
+                self.finish_project_load(project, entries, lsp, git_state, memory, history, cx);
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 if debug_input_enabled() && elapsed_ms > 50 {
                     tracing::warn!(
@@ -4576,6 +4991,8 @@ impl WorkspaceView {
         entries: Vec<ProjectEntry>,
         lsp: Arc<LspBridge>,
         git_state: Option<GitRepositoryState>,
+        memory: Option<axiom_agent::SharedMemoryService>,
+        history: Result<(PathBuf, AgentHistoryStore), String>,
         cx: &mut Context<Self>,
     ) {
         self.navigation_back.clear();
@@ -4636,6 +5053,9 @@ impl WorkspaceView {
         self.expanded.clear();
         self.status = "Project opened — indexing...".into();
         self.project = Some(project);
+        self.set_memory_service(memory, cx);
+        self.queue_agent_history_save(true);
+        self.set_agent_history(history);
         self.git_refresh_generation = self.git_refresh_generation.wrapping_add(1);
         self.git_refresh_last_scan = Instant::now();
         self.git_refresh_requested = true;
@@ -5005,6 +5425,11 @@ impl WorkspaceView {
     }
 
     fn clear_project(&mut self, cx: &mut Context<Self>) {
+        self.stop_agent_run(cx);
+        if let Some(memory) = self.memory_service.take() {
+            memory.request_shutdown();
+        }
+        self.set_memory_service(None, cx);
         self.explorer_refresh_generation = self.explorer_refresh_generation.wrapping_add(1);
         self.project_load_generation = self.project_load_generation.wrapping_add(1);
         self.project_load_results = None;
@@ -5039,6 +5464,8 @@ impl WorkspaceView {
         self.selected_path = None;
         self.context_menu_selected = 0;
         self.context_submenu_selected = 0;
+        self.queue_agent_history_save(true);
+        self.set_agent_history(Err("Open a workspace to load Agent history".into()));
         self.project = None;
         self.git_state = None;
         self.git_refresh_requested = false;
@@ -7079,12 +7506,22 @@ impl WorkspaceView {
             ) {
                 continue;
             }
+            let content_changed = matches!(
+                &event,
+                axiom_agent::AgentEvent::ContentDelta { .. }
+            );
             if matches!(
                 event,
                 axiom_agent::AgentEvent::ThinkingDelta { .. }
                     | axiom_agent::AgentEvent::ContentDelta { .. }
             ) {
                 apply_agent_message_event(&mut self.agent_messages, &event);
+            }
+            if content_changed {
+                self.agent_history_dirty_since.get_or_insert_with(Instant::now);
+                if self.agent_history_save_state == AgentHistorySaveState::Saved {
+                    self.agent_history_save_state = AgentHistorySaveState::Saving;
+                }
             }
             if let Some(phase) = AgentActivityIndicatorPhase::for_event(&event) {
                 self.agent_activity_phase = phase;
@@ -7093,7 +7530,7 @@ impl WorkspaceView {
                 axiom_agent::AgentEvent::RunStarted { .. }
                 | axiom_agent::AgentEvent::ModelStarted { .. } => {
                     self.agent_ui_state = AgentUiState::Running;
-                    self.agent_status = None;
+                    self.agent_status = Some("Searching memory and applying Skills...".into());
                 }
                 axiom_agent::AgentEvent::ThinkingDelta { .. }
                 | axiom_agent::AgentEvent::ContentDelta { .. } => {}
@@ -7125,7 +7562,7 @@ impl WorkspaceView {
                 }
                 axiom_agent::AgentEvent::Completed { .. } => {
                     self.agent_ui_state = AgentUiState::Completed;
-                    self.agent_status = None;
+                    self.agent_status = Some("Consolidating session learning...".into());
                     self.agent_cancellation = None;
                     self.agent_pending_approval = None;
                     self.agent_activity_animation_phase = 0;
@@ -7284,7 +7721,7 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
-        let registry = if tools_enabled {
+        let mut registry = if tools_enabled {
             let root = root.as_ref().expect("checked above");
             let Ok(read) = axiom_project::project_read::ProjectReadCapability::new(root) else {
                 self.agent_ui_state = AgentUiState::Failed;
@@ -7328,10 +7765,19 @@ impl WorkspaceView {
                 update,
                 delete,
             ).with_symbol_index(root.clone(), self.project_index.clone())
-                .with_semantic_engine(self.semantic_engine.clone()))
+                .with_semantic_engine(self.semantic_engine.clone())
+                .with_terminal_events(self.terminal_command_sender.clone()))
         } else {
             None
         };
+        if let Some(memory) = &self.memory_service {
+            registry = registry.map(|registry| {
+                registry.with_memory_service_in_scope(
+                    memory.boxed(),
+                    axiom_agent::MemoryScope::Workspace,
+                )
+            });
+        }
         let run_id = agent_bridge::next_agent_run_id();
         // Twelve provider turns are available for native tool rounds; the
         // executor reserves one additional bounded turn for finalization.
@@ -7341,7 +7787,7 @@ impl WorkspaceView {
         self.agent_run_id = Some(run_id);
         self.agent_cancellation = Some(cancellation.clone());
         self.agent_ui_state = AgentUiState::Running;
-        self.agent_status = None;
+        self.agent_status = Some("Preparing memory briefing and Skills...".into());
         self.agent_pending_approval = None;
         self.agent_activity_phase = AgentActivityIndicatorPhase::Thinking;
         self.agent_activity_animation_phase = 0;
@@ -7364,6 +7810,7 @@ impl WorkspaceView {
             content: String::new(),
             thinking: Some(String::new()),
         });
+        self.queue_agent_history_save(true);
         self.ai_composer_text.clear();
         let provider_protocol = axiom_ai_provider::provider_protocol(&provider.kind);
         let tools = (tools_enabled
@@ -7372,15 +7819,27 @@ impl WorkspaceView {
             let memory_enabled = registry
                 .as_ref()
                 .is_some_and(|registry| registry.has_memory_tools());
+            let memory_writable = registry
+                .as_ref()
+                .is_some_and(|registry| registry.has_memory_write_tool());
             if provider_protocol == axiom_ai_provider::ProviderProtocol::Google {
-                agent_bridge::gemini_agent_tool_definitions_with_memory(memory_enabled)
+                agent_bridge::gemini_agent_tool_definitions_with_memory(
+                    memory_enabled,
+                    memory_writable,
+                )
             } else {
-                agent_bridge::production_tool_definitions_with_memory(memory_enabled)
+                agent_bridge::production_tool_definitions_with_memory(
+                    memory_enabled,
+                    memory_writable,
+                )
             }
         });
         let request = ProviderChatRequest {
             model: self.model_label.clone(),
-            messages: provider_messages_from_agent_session(&self.agent_messages),
+            messages: provider_messages_from_agent_history(
+                &self.agent_messages,
+                &self.agent_tool_summaries,
+            ),
             think: self
                 .selected_model_supports_thinking()
                 .then_some(self.chat_thinking_enabled),
@@ -7392,7 +7851,10 @@ impl WorkspaceView {
         };
         let queue = self.agent_events.clone();
         let approval_bridge = self.approval_bridge.clone();
+        let memory = self.memory_service.clone();
+        let memory_for_agent = memory.clone();
         let workspace_root = root.clone();
+        let conversation_id = self.active_agent_conversation_id.clone();
         let entity = cx.entity();
         cx.spawn(async move |_, cx| {
             let result = gpui::background_executor()
@@ -7405,14 +7867,36 @@ impl WorkspaceView {
                         provider.base_url,
                         registry,
                         workspace_root,
+                        memory_for_agent,
                         &approval_bridge,
                         &queue,
                     )
                 })
                 .await;
+            let tool_summaries = result
+                .as_ref()
+                .ok()
+                .map(|execution| tool_summaries_from_messages(execution.messages()))
+                .unwrap_or_default();
             let _ = entity.update(cx, |this, cx| {
                 if this.agent_run_id != Some(run_id) {
                     return;
+                }
+                if let Some(writer) = this.agent_history_writer.as_mut()
+                    && conversation_id.as_deref() == this.active_agent_conversation_id.as_deref()
+                    && let Some(conversation_id) = conversation_id.as_deref()
+                {
+                    writer.store_mut().add_tool_summaries(
+                        conversation_id,
+                        &tool_summaries,
+                        now_unix_seconds(),
+                    );
+                    this.agent_tool_summaries = writer
+                        .store()
+                        .conversation(conversation_id)
+                        .map(|conversation| conversation.tool_summaries.clone())
+                        .unwrap_or_default();
+                    this.agent_history_conversations = writer.store().conversations().to_vec();
                 }
                 if let Err(error) = result {
                     let cancelled = matches!(error, axiom_agent::AgentExecutionError::Cancelled);
@@ -7426,7 +7910,17 @@ impl WorkspaceView {
                     } else {
                         this.agent_ui_state = AgentUiState::Failed;
                     }
+                } else if memory
+                    .as_ref()
+                    .is_some_and(|memory| !memory.is_available())
+                {
+                    this.agent_status = Some(
+                        "Agent completed; persistent memory worker is unavailable".into(),
+                    );
+                } else {
+                    this.agent_status = Some("Agent completed".into());
                 }
+                this.queue_agent_history_save(true);
                 cx.notify();
             });
         })
@@ -9456,6 +9950,62 @@ impl WorkspaceView {
             .track_scroll(&self.agent_scroll_handle)
             .p_3()
             .text_color(t.text_secondary)
+            .when_some(
+                agent_history_status_text(
+                    self.active_agent_conversation_id.is_some(),
+                    &self.agent_history_save_state,
+                ),
+                |this, status| {
+                    this.child(
+                        div()
+                            .id("ai-agent-history-save-status")
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_xs()
+                            .text_color(t.text_muted)
+                            .child(status)
+                            .when(
+                                matches!(
+                                    self.agent_history_save_state,
+                                    AgentHistorySaveState::Error(_)
+                                        | AgentHistorySaveState::Unavailable(_)
+                                ),
+                                |this| {
+                                    this.child(
+                                        div()
+                                            .id("ai-agent-history-retry")
+                                            .px_1()
+                                            .cursor(CursorStyle::PointingHand)
+                                            .text_color(t.accent)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.retry_agent_history_save(cx)
+                                            }))
+                                            .child("Retry"),
+                                    )
+                                },
+                            ),
+                    )
+                },
+            )
+            .when_some(
+                self.active_agent_conversation_id
+                    .as_ref()
+                    .and_then(|_| tool_context_message(&self.agent_tool_summaries)),
+                |this, context| {
+                    this.child(
+                        div()
+                            .id("ai-agent-history-tool-context")
+                            .px_2()
+                            .py_1()
+                            .rounded(metrics().border_radius_small)
+                            .bg(t.elevated_surface)
+                            .text_xs()
+                            .text_color(t.text_muted)
+                            .child(context),
+                    )
+                },
+            )
             .when(self.agent_messages.is_empty(), |this| {
                 this.items_center()
                     .justify_center()
@@ -9730,18 +10280,19 @@ impl WorkspaceView {
         }
     }
 
-    /// Injects the provider-neutral memory service used by the read-only UI.
-    /// The service is intentionally optional: an absent or unavailable backend
-    /// is rendered as an explicit unavailable state.
-    #[allow(dead_code)]
     pub fn set_memory_service(
         &mut self,
-        service: Box<dyn axiom_agent::MemoryService>,
+        service: Option<axiom_agent::SharedMemoryService>,
         cx: &mut Context<Self>,
     ) {
-        self.memory_service = Some(Arc::new(Mutex::new(service)));
+        self.memory_service = service;
+        self.memory_ui_generation = self.memory_ui_generation.wrapping_add(1);
+        self.memory_ui_snapshot = None;
         if self.ai_panel_mode == AiPanelMode::Memory {
             self.refresh_memory(cx);
+        } else {
+            self.memory_ui_state = MemoryUiState::Unavailable;
+            cx.notify();
         }
     }
 
@@ -9756,12 +10307,14 @@ impl WorkspaceView {
             let result = background_executor()
                 .spawn(async move {
                     let service = service.ok_or(())?;
-                    let service = service.lock().map_err(|_| ())?;
                     if !service.is_available() {
                         return Err(());
                     }
-                    let recent = service.recent(scope, MAX_MEMORY_UI_RESULTS);
-                    let history = service.history(scope, MAX_MEMORY_UI_RESULTS);
+                    let snapshot = service
+                        .snapshot(scope, MAX_MEMORY_UI_RESULTS)
+                        .map_err(|_| ())?;
+                    let recent = snapshot.recent;
+                    let history = snapshot.history;
                     let decisions = history
                         .iter()
                         .filter(|entry| {
@@ -10046,8 +10599,14 @@ impl WorkspaceView {
                                     .px_1()
                                     .cursor(CursorStyle::PointingHand)
                                     .hover(move |s| s.bg(t.hover))
-                                    .tooltip(|_, cx| tooltip("New chat", cx))
-                                    .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx)))
+                                    .tooltip(|_, cx| tooltip("New conversation", cx))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if this.ai_panel_mode == AiPanelMode::Agent {
+                                            this.new_agent_conversation(cx);
+                                        } else {
+                                            this.new_chat(cx);
+                                        }
+                                    }))
                                     .child("+"),
                             )
                             .child(
@@ -10057,9 +10616,19 @@ impl WorkspaceView {
                                     .cursor(CursorStyle::PointingHand)
                                     .hover(move |s| s.bg(t.hover))
                                     .on_click(
-                                        cx.listener(|this, _, _, cx| this.toggle_chat_history(cx)),
+                                        cx.listener(|this, _, _, cx| {
+                                            if this.ai_panel_mode == AiPanelMode::Agent {
+                                                this.toggle_agent_history(cx);
+                                            } else {
+                                                this.toggle_chat_history(cx);
+                                            }
+                                        }),
                                     )
-                                    .child("History"),
+                                    .child(if self.ai_panel_mode == AiPanelMode::Agent {
+                                        "Agent history"
+                                    } else {
+                                        "History"
+                                    }),
                             ),
                     ),
             )
@@ -10227,6 +10796,86 @@ impl WorkspaceView {
                                             .cursor(CursorStyle::PointingHand)
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.delete_chat(id, cx)
+                                            }))
+                                            .child("×"),
+                                    )
+                            })),
+                    )
+                },
+            )
+            .when(
+                self.agent_history_open && self.ai_panel_mode == AiPanelMode::Agent,
+                |this| {
+                    this.child(
+                        div()
+                            .id("ai-agent-history-list")
+                            .max_h(px(180.))
+                            .overflow_y_scroll()
+                            .p_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .when(self.agent_history_conversations.is_empty(), |this| {
+                                this.child(div().px_2().py_1().text_color(t.text_muted).child(
+                                    "No saved Agent conversations",
+                                ))
+                            })
+                            .children(self.agent_history_conversations.iter().map(|conversation| {
+                                let id = conversation.id.clone();
+                                let open_id = id.clone();
+                                let active = self.active_agent_conversation_id.as_deref()
+                                    == Some(conversation.id.as_str());
+                                div()
+                                    .id(SharedString::from(format!("ai-agent-history-{}", id)))
+                                    .px_2()
+                                    .py_1()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .when(active, |this| {
+                                        this.bg(t.inactive_selection).text_color(t.text_primary)
+                                    })
+                                    .when(!active, |this| this.text_color(t.text_secondary))
+                                    .hover(move |style| style.bg(t.hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_agent_conversation(open_id.clone(), cx)
+                                    }))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(conversation.title.clone())
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_xs()
+                                                    .text_color(t.text_muted)
+                                                    .child(format_timestamp(conversation.updated_at)),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "ai-agent-history-delete-{}",
+                                                id
+                                            )))
+                                            .flex_shrink_0()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded(m.border_radius_small)
+                                            .text_color(t.text_muted)
+                                            .cursor(CursorStyle::PointingHand)
+                                            .hover(move |style| {
+                                                style.bg(t.hover).text_color(t.text_primary)
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.delete_agent_conversation(id.clone(), cx)
                                             }))
                                             .child("×"),
                                     )
@@ -15164,7 +15813,7 @@ impl WorkspaceView {
                     self.terminal_view = Some(view);
                     let id = self.next_terminal_tab_id;
                     self.next_terminal_tab_id += 1;
-                    self.terminal_tabs.push(TerminalTab { id, profile: self.terminal_profile.clone(), session: self.terminal_session.clone(), view: self.terminal_view.clone(), title: self.terminal_profile.label.clone(), starting: false, generation: 0, error: None });
+                    self.terminal_tabs.push(TerminalTab { id, profile: self.terminal_profile.clone(), session: self.terminal_session.clone(), view: self.terminal_view.clone(), title: self.terminal_profile.label.clone(), starting: false, generation: 0, error: None, pending_command_output: String::new() });
                     self.active_terminal_tab = Some(id);
                 }
                 Err(error) => self.status = format!("Terminal failed to start: {error}").into(),
@@ -15174,7 +15823,83 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn poll_terminal_command_events(&mut self, cx: &mut Context<Self>) {
+        loop {
+            let event = self
+                .terminal_command_receiver
+                .lock()
+                .ok()
+                .and_then(|receiver| receiver.try_recv().ok());
+            let Some(event) = event else { break };
+            match event {
+                TerminalCommandEvent::Started { command, cwd, profile } => {
+                    let requested_cwd = cwd.map(PathBuf::from);
+                    let profile = terminal_profile_for_agent_request(
+                        profile.as_deref(),
+                        requested_cwd.as_deref(),
+                    );
+                    self.terminal_visible = true;
+                    if let Some(tab) = self
+                        .terminal_tabs
+                        .iter()
+                        .find(|tab| tab.profile.label == profile.label && tab.session.is_some())
+                    {
+                        self.active_terminal_tab = Some(tab.id);
+                        self.terminal_command_tab = Some(tab.id);
+                        if let Some(session) = &tab.session && let Ok(mut session) = session.lock() {
+                            self.terminal_focus_pending = Some(tab.id);
+                            session.feed_output(format!("\r\n$ {command}\r\n").as_bytes());
+                        }
+                    } else {
+                        self.create_terminal_tab_with_cwd(profile, requested_cwd, cx);
+                        self.terminal_command_tab = self.active_terminal_tab;
+                        if let Some(id) = self.terminal_command_tab
+                            && let Some(tab) = self.terminal_tabs.iter_mut().find(|tab| tab.id == id)
+                        {
+                            tab.pending_command_output = format!("\r\n$ {command}\r\n");
+                        }
+                    }
+                    cx.notify();
+                }
+                TerminalCommandEvent::Output { stderr, text } => {
+                    let Some(id) = self.terminal_command_tab else { continue };
+                    let text = if stderr { format!("[stderr] {text}") } else { text };
+                    if let Some(tab) = self.terminal_tabs.iter_mut().find(|tab| tab.id == id) {
+                        if let Some(session) = &tab.session && let Ok(mut session) = session.lock() {
+                            session.feed_output(text.as_bytes());
+                        } else {
+                            tab.pending_command_output.push_str(&text);
+                        }
+                    }
+                }
+                TerminalCommandEvent::Finished => {
+                    if let Some(id) = self.terminal_command_tab.take() {
+                        self.active_terminal_tab = Some(id);
+                        self.terminal_focus_pending = Some(id);
+                        if let Some(tab) = self.terminal_tabs.iter_mut().find(|tab| tab.id == id) {
+                            if let Some(session) = &tab.session && let Ok(mut session) = session.lock() {
+                                session.feed_output(b"\r\n$ ");
+                            } else {
+                                tab.pending_command_output.push_str("\r\n$ ");
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+            }
+        }
+    }
+
     fn create_terminal_tab(&mut self, profile: TerminalProfile, cx: &mut Context<Self>) {
+        self.create_terminal_tab_with_cwd(profile, None, cx);
+    }
+
+    fn create_terminal_tab_with_cwd(
+        &mut self,
+        profile: TerminalProfile,
+        requested_cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         if self.terminal_tabs.len() >= MAX_TERMINAL_TABS {
             self.status = "Maximum 8 terminal sessions".into();
             cx.notify();
@@ -15184,10 +15909,10 @@ impl WorkspaceView {
         self.next_terminal_tab_id += 1;
         let generation = 1;
         let title = profile.label.clone();
-        self.terminal_tabs.push(TerminalTab { id, profile: profile.clone(), session: None, view: None, title: title.clone(), starting: true, generation, error: None });
+        self.terminal_tabs.push(TerminalTab { id, profile: profile.clone(), session: None, view: None, title: title.clone(), starting: true, generation, error: None, pending_command_output: String::new() });
         self.active_terminal_tab = Some(id);
         self.terminal_visible = true;
-        let cwd = self.project.as_ref().map(|project| project.root_path().to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let cwd = requested_cwd.unwrap_or_else(|| self.project.as_ref().map(|project| project.root_path().to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default()));
         let workspace = cx.entity().downgrade();
         let panel_height = self.terminal_panel_height;
         cx.spawn(async move |_, cx| {
@@ -15204,11 +15929,16 @@ impl WorkspaceView {
                                     tab.starting = false;
                                     cx.notify();
                                 }
+                                this.terminal_focus_pending = Some(id);
                             });
                         });
                         let view = cx.new(|cx| crate::terminal_view::TerminalView::new(session.clone(), panel_height - px(44.), Some(ready_callback), cx));
                         tab.session = Some(session);
                         tab.view = Some(view);
+                        let pending = std::mem::take(&mut tab.pending_command_output);
+                        if !pending.is_empty() && let Some(session) = &tab.session && let Ok(mut session) = session.lock() {
+                            session.feed_output(pending.as_bytes());
+                        }
                     }
                     Err(error) => { tab.starting = false; tab.error = Some(format!("Terminal failed to start: {error}")); }
                 }
@@ -15387,6 +16117,11 @@ impl WorkspaceView {
 impl Drop for WorkspaceView {
     fn drop(&mut self) {
         self.runtime_watch_stop.store(true, Ordering::Relaxed);
+        if let Some(mut writer) = self.agent_history_writer.take()
+            && let Err(error) = writer.shutdown()
+        {
+            tracing::warn!(%error, "Agent history writer did not finish during workspace shutdown");
+        }
     }
 }
 
@@ -15395,6 +16130,12 @@ impl Render for WorkspaceView {
         if self.find_usages_focus_pending {
             self.find_usages_focus_pending = false;
             window.focus(&self.find_usages_focus);
+        }
+        if let Some(id) = self.terminal_focus_pending.take()
+            && let Some(tab) = self.terminal_tabs.iter().find(|tab| tab.id == id)
+            && let Some(view) = &tab.view
+        {
+            window.focus(&view.read(cx).focus_handle(cx));
         }
         let t = theme();
         let m = metrics();
@@ -16926,8 +17667,10 @@ mod chat_history_tests {
 #[cfg(test)]
 mod agent_session_tests {
     use super::{
-        AgentUiMessage, AgentUiState, ChatRole, agent_failure_status, agent_loading_visible,
-        apply_agent_message_event, provider_messages_from_agent_session,
+        AgentHistorySaveState, AgentUiMessage, AgentUiState, AgentToolSummary, ChatRole,
+        agent_failure_status, agent_history_status_text, agent_loading_visible,
+        apply_agent_message_event, provider_messages_from_agent_history,
+        provider_messages_from_agent_session,
     };
     use axiom_agent::{AgentEvent, AgentFailureDiagnostic, AgentFailureKind, AgentRunId};
 
@@ -17015,6 +17758,40 @@ mod agent_session_tests {
                 .all(|message| message.tool_call_id.is_none())
         );
         assert!(provider.iter().all(|message| message.tool_calls.is_empty()));
+    }
+
+    #[test]
+    fn historical_tool_context_is_explicit_and_not_an_executable_call() {
+        let provider = provider_messages_from_agent_history(
+            &session(),
+            &[AgentToolSummary {
+                name: "read_file".into(),
+            }],
+        );
+        assert_eq!(provider.len(), 3);
+        assert_eq!(provider[0].role, ChatRole::System);
+        assert!(provider[0].content.contains("outputs were not retained"));
+        assert!(provider[0].content.contains("not pending tool calls"));
+        assert!(provider[1].content.contains("Inspect axiom-agent"));
+        assert!(provider[2].content.contains("First answer"));
+        assert!(provider.iter().all(|message| message.tool_calls.is_empty()));
+        assert!(provider.iter().all(|message| message.tool_call_id.is_none()));
+        assert!(provider.iter().all(|message| message.reasoning.is_none()));
+    }
+
+    #[test]
+    fn persistence_status_never_calls_pending_or_failed_saves_complete() {
+        assert_eq!(
+            agent_history_status_text(true, &AgentHistorySaveState::Saving).as_deref(),
+            Some("Saving conversation…")
+        );
+        let error = agent_history_status_text(
+            true,
+            &AgentHistorySaveState::Error("disk full".into()),
+        )
+        .unwrap();
+        assert!(error.contains("Not saved"));
+        assert!(error.contains("remain available in this session"));
     }
 
     #[test]

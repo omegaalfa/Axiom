@@ -2,6 +2,8 @@
 //!
 //! This module intentionally contains no persistence or backend protocol.
 
+use std::sync::{Arc, Mutex};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryScope {
     User,
@@ -19,6 +21,9 @@ pub enum MemoryCategory {
     Mutation,
     Validation,
     Outcome,
+    SessionOutcome,
+    FailedApproach,
+    OpenQuestion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +32,33 @@ pub struct MemoryResult {
     pub scope: MemoryScope,
     pub category: Option<MemoryCategory>,
     pub content: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemorySnapshot {
+    pub recent: Vec<MemoryResult>,
+    pub history: Vec<MemoryResult>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemorySnapshotError;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryReadError {
+    Unavailable,
+    StorageFailure,
+    CorruptStore,
+    Timeout,
+    Cancelled,
+    InvalidResponse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryWriteError {
+    Unavailable,
+    Rejected,
+    StorageFailure,
+    Timeout,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +75,10 @@ pub enum MemoryObservation {
     MutationSummary(String),
     Validation(String),
     TaskOutcome(String),
+    SessionOutcome(String),
+    Gotcha(String),
+    FailedApproach(String),
+    OpenQuestion(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -59,8 +95,14 @@ impl MemorySessionId {
 }
 
 pub trait MemoryService: Send {
+    fn request_shutdown(&mut self) {}
+
     fn is_available(&self) -> bool {
         true
+    }
+
+    fn can_remember(&self) -> bool {
+        false
     }
 
     fn session_start(&mut self, scope: MemoryScope) -> MemorySessionId;
@@ -70,15 +112,278 @@ pub trait MemoryService: Send {
     fn briefing(&self, scope: MemoryScope, limit: usize) -> Vec<MemoryResult>;
     fn recent(&self, scope: MemoryScope, limit: usize) -> Vec<MemoryResult>;
     fn history(&self, scope: MemoryScope, limit: usize) -> Vec<MemoryResult>;
+    fn snapshot(
+        &self,
+        scope: MemoryScope,
+        limit: usize,
+    ) -> Result<MemorySnapshot, MemorySnapshotError> {
+        if !self.is_available() {
+            return Err(MemorySnapshotError);
+        }
+        Ok(MemorySnapshot {
+            recent: self.recent(scope, limit),
+            history: self.history(scope, limit),
+        })
+    }
     fn get(&self, _scope: MemoryScope, _id: &str) -> Option<MemoryResult> {
         None
     }
+    fn query_checked(
+        &self,
+        scope: MemoryScope,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        if !self.is_available() {
+            return Err(MemoryReadError::Unavailable);
+        }
+        Ok(self.query(scope, query, limit))
+    }
+    fn briefing_checked(
+        &self,
+        scope: MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        if !self.is_available() {
+            return Err(MemoryReadError::Unavailable);
+        }
+        Ok(self.briefing(scope, limit))
+    }
+    fn recent_checked(
+        &self,
+        scope: MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        if !self.is_available() {
+            return Err(MemoryReadError::Unavailable);
+        }
+        Ok(self.recent(scope, limit))
+    }
+    fn history_checked(
+        &self,
+        scope: MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        if !self.is_available() {
+            return Err(MemoryReadError::Unavailable);
+        }
+        Ok(self.history(scope, limit))
+    }
+    fn get_checked(
+        &self,
+        scope: MemoryScope,
+        id: &str,
+    ) -> Result<Option<MemoryResult>, MemoryReadError> {
+        if !self.is_available() {
+            return Err(MemoryReadError::Unavailable);
+        }
+        Ok(self.get(scope, id))
+    }
     fn handoff(&self, session: MemorySessionId) -> Option<MemoryHandoff>;
 
-    fn remember(&mut self, _scope: MemoryScope, _content: &str) {}
+    fn remember(
+        &self,
+        _scope: MemoryScope,
+        _content: &str,
+    ) -> Result<(), MemoryWriteError> {
+        Err(MemoryWriteError::Unavailable)
+    }
     fn decision(&mut self, _scope: MemoryScope, _content: &str) {}
     fn gotcha(&mut self, _scope: MemoryScope, _content: &str) {}
     fn persist_handoff(&mut self, _handoff: &MemoryHandoff) {}
+}
+
+/// Cloneable handle allowing app surfaces and Agent components to share one service instance.
+#[derive(Clone)]
+pub struct SharedMemoryService(Arc<Mutex<Box<dyn MemoryService>>>);
+
+impl SharedMemoryService {
+    pub fn new(service: Box<dyn MemoryService>) -> Self {
+        Self(Arc::new(Mutex::new(service)))
+    }
+
+    pub fn boxed(&self) -> Box<dyn MemoryService> {
+        Box::new(self.clone())
+    }
+
+    pub fn request_shutdown(&self) {
+        if let Ok(mut service) = self.0.lock() {
+            service.request_shutdown();
+        }
+    }
+}
+
+impl MemoryService for SharedMemoryService {
+    fn request_shutdown(&mut self) {
+        if let Ok(mut service) = self.0.lock() {
+            service.request_shutdown();
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.0
+            .lock()
+            .map(|service| service.is_available())
+            .unwrap_or(false)
+    }
+
+    fn can_remember(&self) -> bool {
+        self.0
+            .lock()
+            .map(|service| service.can_remember())
+            .unwrap_or(false)
+    }
+
+    fn session_start(&mut self, scope: MemoryScope) -> MemorySessionId {
+        self.0
+            .lock()
+            .map(|mut service| service.session_start(scope))
+            .unwrap_or_else(|_| MemorySessionId::new(0))
+    }
+
+    fn observe(&mut self, session: MemorySessionId, observation: MemoryObservation) {
+        if let Ok(mut service) = self.0.lock() {
+            service.observe(session, observation);
+        }
+    }
+
+    fn session_end(&mut self, session: MemorySessionId) {
+        if let Ok(mut service) = self.0.lock() {
+            service.session_end(session);
+        }
+    }
+
+    fn query(&self, scope: MemoryScope, query: &str, limit: usize) -> Vec<MemoryResult> {
+        self.0
+            .lock()
+            .map(|service| service.query(scope, query, limit))
+            .unwrap_or_default()
+    }
+
+    fn query_checked(
+        &self,
+        scope: MemoryScope,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        self.0
+            .lock()
+            .map_err(|_| MemoryReadError::Unavailable)?
+            .query_checked(scope, query, limit)
+    }
+
+    fn briefing(&self, scope: MemoryScope, limit: usize) -> Vec<MemoryResult> {
+        self.0
+            .lock()
+            .map(|service| service.briefing(scope, limit))
+            .unwrap_or_default()
+    }
+
+    fn briefing_checked(
+        &self,
+        scope: MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        self.0
+            .lock()
+            .map_err(|_| MemoryReadError::Unavailable)?
+            .briefing_checked(scope, limit)
+    }
+
+    fn recent(&self, scope: MemoryScope, limit: usize) -> Vec<MemoryResult> {
+        self.0
+            .lock()
+            .map(|service| service.recent(scope, limit))
+            .unwrap_or_default()
+    }
+
+    fn recent_checked(
+        &self,
+        scope: MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        self.0
+            .lock()
+            .map_err(|_| MemoryReadError::Unavailable)?
+            .recent_checked(scope, limit)
+    }
+
+    fn history(&self, scope: MemoryScope, limit: usize) -> Vec<MemoryResult> {
+        self.0
+            .lock()
+            .map(|service| service.history(scope, limit))
+            .unwrap_or_default()
+    }
+
+    fn history_checked(
+        &self,
+        scope: MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        self.0
+            .lock()
+            .map_err(|_| MemoryReadError::Unavailable)?
+            .history_checked(scope, limit)
+    }
+
+    fn snapshot(
+        &self,
+        scope: MemoryScope,
+        limit: usize,
+    ) -> Result<MemorySnapshot, MemorySnapshotError> {
+        self.0
+            .lock()
+            .map_err(|_| MemorySnapshotError)?
+            .snapshot(scope, limit)
+    }
+
+    fn get(&self, scope: MemoryScope, id: &str) -> Option<MemoryResult> {
+        self.0.lock().ok()?.get(scope, id)
+    }
+
+    fn get_checked(
+        &self,
+        scope: MemoryScope,
+        id: &str,
+    ) -> Result<Option<MemoryResult>, MemoryReadError> {
+        self.0
+            .lock()
+            .map_err(|_| MemoryReadError::Unavailable)?
+            .get_checked(scope, id)
+    }
+
+    fn handoff(&self, session: MemorySessionId) -> Option<MemoryHandoff> {
+        self.0.lock().ok()?.handoff(session)
+    }
+
+    fn remember(
+        &self,
+        scope: MemoryScope,
+        content: &str,
+    ) -> Result<(), MemoryWriteError> {
+        self.0
+            .lock()
+            .map_err(|_| MemoryWriteError::Unavailable)?
+            .remember(scope, content)
+    }
+
+    fn decision(&mut self, scope: MemoryScope, content: &str) {
+        if let Ok(mut service) = self.0.lock() {
+            service.decision(scope, content);
+        }
+    }
+
+    fn gotcha(&mut self, scope: MemoryScope, content: &str) {
+        if let Ok(mut service) = self.0.lock() {
+            service.gotcha(scope, content);
+        }
+    }
+
+    fn persist_handoff(&mut self, handoff: &MemoryHandoff) {
+        if let Ok(mut service) = self.0.lock() {
+            service.persist_handoff(handoff);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -117,8 +422,57 @@ impl MemoryService for NoMemory {
         None
     }
 
+    fn query_checked(
+        &self,
+        _scope: MemoryScope,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        Err(MemoryReadError::Unavailable)
+    }
+
+    fn briefing_checked(
+        &self,
+        _scope: MemoryScope,
+        _limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        Err(MemoryReadError::Unavailable)
+    }
+
+    fn recent_checked(
+        &self,
+        _scope: MemoryScope,
+        _limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        Err(MemoryReadError::Unavailable)
+    }
+
+    fn history_checked(
+        &self,
+        _scope: MemoryScope,
+        _limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        Err(MemoryReadError::Unavailable)
+    }
+
+    fn get_checked(
+        &self,
+        _scope: MemoryScope,
+        _id: &str,
+    ) -> Result<Option<MemoryResult>, MemoryReadError> {
+        Err(MemoryReadError::Unavailable)
+    }
+
     fn handoff(&self, _session: MemorySessionId) -> Option<MemoryHandoff> {
         None
+    }
+
+    fn remember(
+        &self,
+        _scope: MemoryScope,
+        _content: &str,
+    ) -> Result<(), MemoryWriteError> {
+        Err(MemoryWriteError::Unavailable)
     }
 }
 
@@ -220,6 +574,10 @@ impl MemoryService for InMemoryMemoryService {
             MemoryObservation::MutationSummary(value) => format!("mutation: {value}"),
             MemoryObservation::Validation(value) => format!("validation: {value}"),
             MemoryObservation::TaskOutcome(value) => format!("outcome: {value}"),
+            MemoryObservation::SessionOutcome(value) => format!("session_outcome: {value}"),
+            MemoryObservation::Gotcha(value) => format!("gotcha: {value}"),
+            MemoryObservation::FailedApproach(value) => format!("failed_approach: {value}"),
+            MemoryObservation::OpenQuestion(value) => format!("open_question: {value}"),
         };
         let content = Self::normalized(&content);
         if !content.is_empty() {
@@ -304,6 +662,9 @@ fn category_from_content(content: &str) -> Option<MemoryCategory> {
         "mutation" => MemoryCategory::Mutation,
         "validation" => MemoryCategory::Validation,
         "outcome" => MemoryCategory::Outcome,
+        "session_outcome" => MemoryCategory::SessionOutcome,
+        "failed_approach" => MemoryCategory::FailedApproach,
+        "open_question" => MemoryCategory::OpenQuestion,
         _ => return None,
     })
 }
@@ -326,6 +687,10 @@ mod tests {
         assert_eq!(first, MemorySessionId::new(0));
         assert_eq!(second, first);
         memory.observe(first, MemoryObservation::Discovery("ignored".into()));
+        assert_eq!(
+            memory.remember(MemoryScope::Project, "not persisted"),
+            Err(MemoryWriteError::Unavailable)
+        );
         memory.session_end(first);
         assert_eq!(memory.session_start(MemoryScope::Workspace), first);
         assert!(memory.query(MemoryScope::Project, "ignored", 10).is_empty());

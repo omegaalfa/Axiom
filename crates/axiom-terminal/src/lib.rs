@@ -112,7 +112,7 @@ impl EventListener for Listener {
 struct Size { cols: usize, rows: usize }
 impl Dimensions for Size { fn total_lines(&self) -> usize { self.rows } fn screen_lines(&self) -> usize { self.rows } fn columns(&self) -> usize { self.cols } }
 
-pub struct TerminalSession { terminal: Arc<FairMutex<Term<Listener>>>, sender: EventLoopSender, child: Option<std::thread::JoinHandle<(EventLoop<tty::Pty, Listener>, alacritty_terminal::event_loop::State)>>, events: Arc<Mutex<Receiver<()>>>, state: Arc<AtomicBool>, size: TerminalSize }
+pub struct TerminalSession { terminal: Arc<FairMutex<Term<Listener>>>, sender: EventLoopSender, child: Option<std::thread::JoinHandle<(EventLoop<tty::Pty, Listener>, alacritty_terminal::event_loop::State)>>, events: Arc<Mutex<Receiver<()>>>, state: Arc<AtomicBool>, size: TerminalSize, feed_output_previous_cr: bool }
 
 impl TerminalSession {
     pub fn spawn(profile: &TerminalProfile, cwd: impl AsRef<Path>) -> io::Result<Self> {
@@ -124,9 +124,16 @@ impl TerminalSession {
         tty::setup_env(); let pty = tty::new(&options, WindowSize { num_lines: size.rows, num_cols: size.cols, cell_width: 0, cell_height: 0 }, 0).map_err(io::Error::other)?;
         let event_loop = EventLoop::new(terminal.clone(), Listener { tx, exited: exited.clone() }, pty, options.drain_on_exit, false).map_err(io::Error::other)?;
         let sender = event_loop.channel(); let child = Some(event_loop.spawn());
-        Ok(Self { terminal, sender, child, events: Arc::new(Mutex::new(events)), state: exited, size })
+        Ok(Self { terminal, sender, child, events: Arc::new(Mutex::new(events)), state: exited, size, feed_output_previous_cr: false })
     }
     pub fn write(&self, bytes: &[u8]) -> io::Result<()> { self.sender.send(Msg::Input(bytes.to_vec().into())).map_err(io::Error::other) }
+    pub fn feed_output(&mut self, bytes: &[u8]) {
+        let bytes = normalize_terminal_newlines(bytes, &mut self.feed_output_previous_cr);
+        let mut processor = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        processor.advance(&mut *self.terminal.lock(), &bytes);
+    }
     pub fn bracketed_paste_enabled(&self) -> bool { self.terminal.lock().mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE) }
     pub fn application_cursor_enabled(&self) -> bool { self.terminal.lock().mode().contains(alacritty_terminal::term::TermMode::APP_CURSOR) }
     pub fn paste(&self, text: &str) -> io::Result<()> { let bytes = if self.bracketed_paste_enabled() { encode_bracketed_paste(text) } else { text.as_bytes().to_vec() }; if bytes.is_empty() { Ok(()) } else { self.write(&bytes) } }
@@ -162,8 +169,35 @@ impl TerminalSession {
     pub fn event_receiver(&self) -> Arc<Mutex<Receiver<()>>> { self.events.clone() }
     pub fn shutdown(&mut self) { let _ = self.sender.send(Msg::Shutdown); if let Some(handle) = self.child.take() { let _ = handle.join(); } }
 }
+fn normalize_terminal_newlines(bytes: &[u8], previous_cr: &mut bool) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    for &byte in bytes {
+        if byte == b'\n' && !*previous_cr { normalized.push(b'\r'); }
+        normalized.push(byte);
+        *previous_cr = byte == b'\r';
+    }
+    normalized
+}
 fn encode_bracketed_paste(text: &str) -> Vec<u8> { let mut bytes = Vec::with_capacity(text.len() + 12); bytes.extend_from_slice(b"\x1b[200~"); bytes.extend_from_slice(text.as_bytes()); bytes.extend_from_slice(b"\x1b[201~"); bytes }
 impl Drop for TerminalSession { fn drop(&mut self) { self.shutdown(); } }
+
+#[cfg(test)]
+mod newline_tests {
+    use super::normalize_terminal_newlines;
+
+    #[test]
+    fn normalizes_lf_without_duplicate_cr() {
+        let mut previous_cr = false;
+        assert_eq!(normalize_terminal_newlines(b"a\nb\r\nc", &mut previous_cr), b"a\r\nb\r\nc");
+    }
+
+    #[test]
+    fn preserves_crlf_across_chunks() {
+        let mut previous_cr = false;
+        assert_eq!(normalize_terminal_newlines(b"a\r", &mut previous_cr), b"a\r");
+        assert_eq!(normalize_terminal_newlines(b"\nb", &mut previous_cr), b"\nb");
+    }
+}
 
 #[cfg(test)]
     mod tests { use super::*; #[test] fn size_is_clamped() { assert_eq!(TerminalSize::new(0, 0), TerminalSize::new(1, 1)); } #[test] fn space_is_encoded_as_one_byte() { assert_eq!(encode_key("space", false, false), Some(vec![0x20])); } #[test] fn special_keys_use_gpui_names() { assert_eq!(encode_key("enter", false, false), Some(b"\r".to_vec())); assert_eq!(encode_key("arrowleft", false, false), Some(b"\x1b[D".to_vec())); } #[test] fn profile_args_are_explicit() { assert_eq!(TerminalProfile::powershell().args, vec!["-NoLogo", "-NoProfile"]); assert!(TerminalProfile::command_prompt().args.is_empty()); assert_eq!(TerminalProfile::wsl_distro("Ubuntu", None).args, vec!["-d", "Ubuntu"]); } #[test] fn wsl_paths_are_arguments_not_shell_text() { assert_eq!(windows_path_str_to_wsl(r"E:\dev\Axiom"), Some("/mnt/e/dev/Axiom".into())); assert_eq!(windows_path_str_to_wsl("C:/Users/Test/My Project"), Some("/mnt/c/Users/Test/My Project".into())); assert_eq!(windows_path_str_to_wsl("E:/á/项目"), Some("/mnt/e/á/项目".into())); assert_eq!(windows_path_str_to_wsl("\\\\server\\share"), None); } #[test] fn distro_output_is_normalized() { assert_eq!(parse_wsl_distro_output(b"Ubuntu\r\nUbuntu\n Debian \r\n\r\n"), vec!["Ubuntu", "Debian"]); } #[cfg(unix)] #[test] fn shell_output_reaches_engine() { let session = TerminalSession::spawn(&TerminalProfile::default(), ".").unwrap(); session.write(b"printf AXIOM_TERMINAL_OK\n").unwrap(); for _ in 0..50 { std::thread::sleep(std::time::Duration::from_millis(20)); if session.try_recv_event() && session.snapshot().cells.iter().flatten().any(|cell| cell.character == 'A') { return; } } panic!("shell output not received"); } }

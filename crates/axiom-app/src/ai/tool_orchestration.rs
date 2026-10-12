@@ -159,6 +159,21 @@ pub(crate) fn memory_get_definition() -> ProviderToolDefinition {
     }
 }
 
+pub(crate) fn memory_remember_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: "memory_remember".into(),
+        description: "Persist one explicit historical observation to the current workspace memory. The content is validated and may be rejected; it is never written to another user or workspace.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "content": { "type": "string", "maxLength": 4096 }
+            },
+            "required": ["content"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 pub(crate) fn chat_tool_definitions() -> Vec<ProviderToolDefinition> {
     vec![
         read_file_definition(),
@@ -244,6 +259,27 @@ pub(crate) fn delete_file_definition() -> ProviderToolDefinition {
                 "expected_fingerprint": { "type": "string", "description": "Canonical sha256:<64 lowercase hex> fingerprint returned by full read_file." }
             },
             "required": ["path", "expected_fingerprint"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub(crate) fn execute_command_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: "execute_command".into(),
+        description: "Execute one explicitly requested command inside the current workspace. This mutating tool requires approval, is terminated after 30 seconds, and returns bounded stdout/stderr.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "Command text to execute." },
+                "cwd": { "type": "string", "description": "Optional directory inside the current workspace." },
+                "profile": {
+                    "type": "string",
+                    "enum": ["PowerShell", "CMD", "WSL", "Ubuntu"],
+                    "description": "Optional shell profile; defaults to the workspace shell."
+                }
+            },
+            "required": ["command"],
             "additionalProperties": false
         }),
     }

@@ -47,6 +47,7 @@ pub enum MemoryStatus {
     Disabled,
     Starting,
     Ready,
+    Stopping,
     Unavailable(MemoryUnavailableReason),
 }
 
@@ -56,6 +57,8 @@ pub enum MemoryUnavailableReason {
     LaunchFailed,
     HealthCheckFailed,
     ShutdownFailed,
+    WorkerFailed,
+    Timeout,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +67,8 @@ pub enum MemoryManagerError {
     LaunchFailed,
     HealthCheckFailed,
     ShutdownFailed,
+    WorkerFailed,
+    Timeout,
 }
 
 impl MemoryManagerError {
@@ -73,6 +78,8 @@ impl MemoryManagerError {
             Self::LaunchFailed => MemoryUnavailableReason::LaunchFailed,
             Self::HealthCheckFailed => MemoryUnavailableReason::HealthCheckFailed,
             Self::ShutdownFailed => MemoryUnavailableReason::ShutdownFailed,
+            Self::WorkerFailed => MemoryUnavailableReason::WorkerFailed,
+            Self::Timeout => MemoryUnavailableReason::Timeout,
         }
     }
 }

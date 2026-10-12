@@ -4,7 +4,10 @@
 //! supported public read surface is available. Callers must execute a real
 //! transport on a background worker; this adapter itself performs no I/O.
 
-use crate::{MemoryHandoff, MemoryResult, MemoryScope, MemoryService, MemorySessionId};
+use crate::{
+    MemoryHandoff, MemoryReadError, MemoryResult, MemoryScope, MemoryService, MemorySessionId,
+    MemoryWriteError,
+};
 
 pub const MAX_BACKEND_RESULTS: usize = 100;
 
@@ -22,14 +25,6 @@ pub struct MemoryReadRequest {
     pub scope: MemoryScope,
     pub query: Option<String>,
     pub limit: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemoryReadError {
-    Unavailable,
-    Timeout,
-    Cancelled,
-    InvalidResponse,
 }
 
 /// Transport seam for a supported public read API.
@@ -74,6 +69,27 @@ impl<T> AiMemoryBackend<T> {
             Err(_) => Vec::new(),
         }
     }
+
+    fn read_checked(
+        &self,
+        operation: MemoryReadOperation,
+        scope: MemoryScope,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError>
+    where
+        T: AiMemoryReadTransport,
+    {
+        let request = MemoryReadRequest {
+            operation,
+            scope,
+            query: query.map(str::to_owned),
+            limit: limit.min(MAX_BACKEND_RESULTS),
+        };
+        let mut results = self.transport.read(&request)?;
+        results.truncate(request.limit);
+        Ok(results)
+    }
 }
 
 impl<T> MemoryService for AiMemoryBackend<T>
@@ -92,8 +108,49 @@ where
         self.read(MemoryReadOperation::Query, scope, Some(query), limit)
     }
 
+    fn query_checked(
+        &self,
+        scope: MemoryScope,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        self.read_checked(MemoryReadOperation::Query, scope, Some(query), limit)
+    }
+
     fn briefing(&self, scope: MemoryScope, limit: usize) -> Vec<MemoryResult> {
         self.read(MemoryReadOperation::Briefing, scope, None, limit)
+    }
+
+    fn briefing_checked(
+        &self,
+        scope: MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        self.read_checked(MemoryReadOperation::Briefing, scope, None, limit)
+    }
+
+    fn recent_checked(
+        &self,
+        scope: MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        self.read_checked(MemoryReadOperation::Recent, scope, None, limit)
+    }
+
+    fn history_checked(
+        &self,
+        scope: MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+        self.read_checked(MemoryReadOperation::History, scope, None, limit)
+    }
+
+    fn get_checked(
+        &self,
+        _scope: MemoryScope,
+        _id: &str,
+    ) -> Result<Option<MemoryResult>, MemoryReadError> {
+        Err(MemoryReadError::Unavailable)
     }
 
     fn recent(&self, scope: MemoryScope, limit: usize) -> Vec<MemoryResult> {
@@ -106,6 +163,14 @@ where
 
     fn handoff(&self, _session: MemorySessionId) -> Option<MemoryHandoff> {
         None
+    }
+
+    fn remember(
+        &self,
+        _scope: MemoryScope,
+        _content: &str,
+    ) -> Result<(), MemoryWriteError> {
+        Err(MemoryWriteError::Unavailable)
     }
 }
 
@@ -192,5 +257,31 @@ mod tests {
             assert!(backend.query(MemoryScope::User, "anything", 10).is_empty());
             assert!(backend.briefing(MemoryScope::User, 10).is_empty());
         }
+    }
+
+    #[test]
+    fn checked_reads_preserve_empty_success_and_surface_transport_failures() {
+        let empty = AiMemoryBackend::new(FakeTransport::default());
+        assert_eq!(
+            empty.query_checked(MemoryScope::Project, "missing", 5),
+            Ok(Vec::new())
+        );
+
+        let unavailable = AiMemoryBackend::new(FakeTransport {
+            error: Some(MemoryReadError::Unavailable),
+            ..Default::default()
+        });
+        assert_eq!(
+            unavailable.query_checked(MemoryScope::Project, "missing", 5),
+            Err(MemoryReadError::Unavailable)
+        );
+        assert_eq!(
+            unavailable.briefing_checked(MemoryScope::Project, 5),
+            Err(MemoryReadError::Unavailable)
+        );
+        assert_eq!(
+            unavailable.get_checked(MemoryScope::Project, "id"),
+            Err(MemoryReadError::Unavailable)
+        );
     }
 }

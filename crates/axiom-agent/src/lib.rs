@@ -6,22 +6,27 @@
 
 mod memory;
 mod memory_backend;
+mod background_memory;
 mod memory_local;
 mod memory_manager;
+mod skills;
 mod system_prompt;
 
 pub use memory::{
     InMemoryMemoryService, MemoryCategory, MemoryHandoff, MemoryObservation, MemoryResult,
-    MemoryScope, MemoryService, MemorySessionId, NoMemory,
+    MemoryReadError, MemoryScope, MemoryService, MemorySessionId, MemorySnapshot,
+    MemorySnapshotError, MemoryWriteError, NoMemory, SharedMemoryService,
 };
 pub use memory_backend::{
-    AiMemoryBackend, AiMemoryReadTransport, MAX_BACKEND_RESULTS, MemoryReadError,
-    MemoryReadOperation, MemoryReadRequest,
+    AiMemoryBackend, AiMemoryReadTransport, MAX_BACKEND_RESULTS, MemoryReadOperation,
+    MemoryReadRequest,
 };
+pub use background_memory::{BackgroundMemoryService, MemoryWorkerDiagnostics};
 pub use memory_local::{
     AxiomMemoryBackend, AxiomMemoryError, AxiomMemoryScopeIds, MAX_LOCAL_MEMORY_RESULTS,
     MAX_RECORD_CONTENT_CHARS,
 };
+pub use skills::{Skill, SkillCatalog, SkillLoadError};
 pub use memory_manager::{
     MemoryBackendConfig, MemoryBackendLauncher, MemoryHealthCheck, MemoryLaunchRequest,
     MemoryManager, MemoryManagerError, MemoryStatus, MemoryUnavailableReason,
@@ -234,7 +239,7 @@ impl ApprovalRequest {
 fn safe_approval_arguments(call: &axiom_ai_provider::ProviderToolCall) -> String {
     if !matches!(
         call.name.as_str(),
-        "write_file" | "update_file" | "delete_file"
+        "write_file" | "update_file" | "delete_file" | "memory_remember"
     ) {
         return bounded_arguments(&call.arguments.to_string());
     }
@@ -650,6 +655,12 @@ impl ToolPolicy for ReadOnlyToolPolicy {
             "write_file" | "update_file" | "delete_file" => ToolPolicyDecision::RequireApproval {
                 reason: "file mutation requires approval".into(),
             },
+            "execute_command" => ToolPolicyDecision::RequireApproval {
+                reason: "terminal command execution requires approval".into(),
+            },
+            "memory_remember" => ToolPolicyDecision::RequireApproval {
+                reason: "persistent memory write requires approval".into(),
+            },
             _ => ToolPolicyDecision::Deny {
                 reason: format!("tool '{}' is not allowed", call.name),
             },
@@ -910,14 +921,19 @@ pub struct AgentExecutor<'a, P, T, Policy = ReadOnlyToolPolicy> {
     policy: Policy,
     memory: Box<dyn MemoryService>,
     memory_scope: MemoryScope,
+    skills: SkillCatalog,
     memory_session: Option<MemorySessionId>,
     memory_observations: usize,
     pending: Option<ExecutionContinuation>,
 }
 
 const MAX_MEMORY_OBSERVATIONS_PER_RUN: usize = 32;
+const MAX_MEMORY_TASK_OUTCOME_CHARS: usize = 1200;
+const MIN_MEMORY_TASK_OUTCOME_CHARS: usize = 32;
+const MEMORY_TASK_OUTCOME_PREFIX: &str =
+    "Agent-reported result (historical; verify current state): ";
 const MAX_MEMORY_BRIEFING_ITEMS: usize = 6;
-const MAX_MEMORY_BRIEFING_ITEM_CHARS: usize = 512;
+const MAX_MEMORY_BRIEFING_ITEM_CHARS: usize = 1400;
 const MAX_MEMORY_BRIEFING_CHARS: usize = 2048;
 
 fn with_agent_system_instruction(
@@ -958,6 +974,22 @@ where
         Self::with_policy_and_memory(provider, tools, policy, Box::new(NoMemory))
     }
 
+    pub fn with_policy_and_skills(
+        provider: &'a mut P,
+        tools: &'a mut T,
+        policy: Policy,
+        skills: SkillCatalog,
+    ) -> Self {
+        Self::with_policy_and_memory_in_scope_and_skills(
+            provider,
+            tools,
+            policy,
+            Box::new(NoMemory),
+            MemoryScope::Workspace,
+            skills,
+        )
+    }
+
     pub fn with_policy_and_memory(
         provider: &'a mut P,
         tools: &'a mut T,
@@ -980,12 +1012,31 @@ where
         memory: Box<dyn MemoryService>,
         memory_scope: MemoryScope,
     ) -> Self {
+        Self::with_policy_and_memory_in_scope_and_skills(
+            provider,
+            tools,
+            policy,
+            memory,
+            memory_scope,
+            SkillCatalog::empty(),
+        )
+    }
+
+    pub fn with_policy_and_memory_in_scope_and_skills(
+        provider: &'a mut P,
+        tools: &'a mut T,
+        policy: Policy,
+        memory: Box<dyn MemoryService>,
+        memory_scope: MemoryScope,
+        skills: SkillCatalog,
+    ) -> Self {
         Self {
             provider,
             tools,
             policy,
             memory,
             memory_scope,
+            skills,
             memory_session: None,
             memory_observations: 0,
             pending: None,
@@ -994,6 +1045,10 @@ where
 
     pub fn memory_service(&self) -> &dyn MemoryService {
         self.memory.as_ref()
+    }
+
+    pub fn available_skills(&self) -> &[Skill] {
+        self.skills.skills()
     }
 
     pub fn execute(
@@ -1008,7 +1063,9 @@ where
             .map_err(AgentExecutionError::Transition)?;
         run.transition(AgentState::RunningModel)
             .map_err(AgentExecutionError::Transition)?;
-        let request = self.inject_memory_briefing(with_agent_system_instruction(request));
+        let request = with_agent_system_instruction(request);
+        let request = self.inject_skill_context(request);
+        let request = self.inject_memory_briefing(request);
         let result = self.drive(
             run,
             ExecutionContinuation {
@@ -1170,9 +1227,34 @@ where
         &mut self,
         mut request: axiom_ai_provider::ProviderChatRequest,
     ) -> axiom_ai_provider::ProviderChatRequest {
-        let results = self
+        if !self.memory.is_available() {
+            return request;
+        }
+        let results = match self
             .memory
-            .briefing(self.memory_scope, MAX_MEMORY_BRIEFING_ITEMS);
+            .briefing_checked(self.memory_scope, MAX_MEMORY_BRIEFING_ITEMS)
+        {
+            Ok(results) => results,
+            Err(error) => {
+                tracing::warn!(?error, "persistent memory briefing could not be read");
+                let position = request
+                    .messages
+                    .iter()
+                    .position(|message| message.role != axiom_ai_provider::ChatRole::System)
+                    .unwrap_or(request.messages.len());
+                request.messages.insert(
+                    position,
+                    axiom_ai_provider::ProviderChatMessage {
+                        role: axiom_ai_provider::ChatRole::System,
+                        content: "Persistent memory briefing could not be read. Relevant memory may exist; do not treat this as a confirmed empty result.".into(),
+                        reasoning: None,
+                        tool_call_id: None,
+                        tool_calls: Vec::new(),
+                    },
+                );
+                return request;
+            }
+        };
         let mut content = String::from(
             "Memory briefing (historical, possibly stale or incomplete). Verify current project state; current deterministic state wins over memory.\n",
         );
@@ -1217,6 +1299,38 @@ where
         request
     }
 
+    fn inject_skill_context(
+        &self,
+        mut request: axiom_ai_provider::ProviderChatRequest,
+    ) -> axiom_ai_provider::ProviderChatRequest {
+        let task = request
+            .messages
+            .iter()
+            .filter(|message| message.role == axiom_ai_provider::ChatRole::User)
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let Some(content) = self.skills.render_active_context(&task) else {
+            return request;
+        };
+        let position = request
+            .messages
+            .iter()
+            .position(|message| message.role != axiom_ai_provider::ChatRole::System)
+            .unwrap_or(request.messages.len());
+        request.messages.insert(
+            position,
+            axiom_ai_provider::ProviderChatMessage {
+                role: axiom_ai_provider::ChatRole::System,
+                content,
+                reasoning: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+        );
+        request
+    }
+
     fn finish_memory_if_terminal(
         &mut self,
         run: &AgentRun,
@@ -1228,18 +1342,69 @@ where
         let Some(session) = self.memory_session else {
             return;
         };
-        let outcome = match result {
-            Ok(_) => "completed successfully",
-            Err(AgentExecutionError::Cancelled) => "cancelled",
+        let observation = match result {
+            Ok(result) => Self::bounded_memory_task_outcome(&result.content)
+                .map(MemoryObservation::TaskOutcome),
+            Err(AgentExecutionError::Cancelled) => {
+                Some(MemoryObservation::SessionOutcome("cancelled".into()))
+            }
             Err(AgentExecutionError::Provider(_))
-            | Err(AgentExecutionError::ProviderProtocol(_)) => "failed due to provider error",
-            Err(AgentExecutionError::Tool(_)) => "failed due to tool error",
-            Err(AgentExecutionError::BudgetExceeded(_)) => "tool budget exhausted",
-            Err(_) => "failed",
+            | Err(AgentExecutionError::ProviderProtocol(_)) => Some(
+                MemoryObservation::SessionOutcome("failed due to provider error".into()),
+            ),
+            Err(AgentExecutionError::Tool(_)) => Some(MemoryObservation::SessionOutcome(
+                "failed due to tool error".into(),
+            )),
+            Err(AgentExecutionError::BudgetExceeded(_)) => Some(
+                MemoryObservation::SessionOutcome("tool budget exhausted".into()),
+            ),
+            Err(_) => Some(MemoryObservation::SessionOutcome("failed".into())),
         };
-        self.observe_memory(MemoryObservation::TaskOutcome(outcome.into()));
+        if let Some(observation) = observation {
+            self.observe_memory(observation);
+        }
+        if let Ok(execution) = result {
+            for insight in extract_automated_memory_insights(
+                execution.messages(),
+                &execution.content,
+            ) {
+                self.observe_memory(insight);
+            }
+        }
         self.memory.session_end(session);
         self.memory_session = None;
+    }
+
+    fn bounded_memory_task_outcome(content: &str) -> Option<String> {
+        let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        let lower = normalized.to_ascii_lowercase();
+        let sensitive = [
+            "authorization:",
+            "bearer ",
+            "password=",
+            "password:",
+            "api_key=",
+            "api-key:",
+            "access_token=",
+            "access-token:",
+            "-----begin private key-----",
+        ];
+        if sensitive.iter().any(|pattern| lower.contains(pattern)) {
+            return None;
+        }
+        if normalized.chars().count() < MIN_MEMORY_TASK_OUTCOME_CHARS
+            || matches!(
+                lower.as_str(),
+                "done" | "completed" | "completed successfully" | "success" | "task complete"
+            )
+        {
+            return None;
+        }
+        let content_limit = MAX_MEMORY_TASK_OUTCOME_CHARS
+            .saturating_sub(MEMORY_TASK_OUTCOME_PREFIX.chars().count());
+        let skip = normalized.chars().count().saturating_sub(content_limit);
+        let summary = normalized.chars().skip(skip).collect::<String>();
+        Some(format!("{MEMORY_TASK_OUTCOME_PREFIX}{summary}"))
     }
 
     fn observe_memory(&mut self, observation: MemoryObservation) {
@@ -1251,42 +1416,6 @@ where
         }
         self.memory_observations += 1;
         self.memory.observe(session, observation);
-    }
-
-    fn observe_tool_event(&mut self, call: &axiom_ai_provider::ProviderToolCall, succeeded: bool) {
-        if !succeeded {
-            return;
-        }
-        let observation = if matches!(
-            call.name.as_str(),
-            "write_file" | "update_file" | "delete_file"
-        ) {
-            Some(MemoryObservation::MutationSummary(format!(
-                "{} completed",
-                call.name
-            )))
-        } else if matches!(
-            call.name.as_str(),
-            "run_tests" | "run_test" | "validate" | "check" | "cargo_check"
-        ) {
-            Some(MemoryObservation::Validation(format!(
-                "{} completed successfully",
-                call.name
-            )))
-        } else if matches!(
-            call.name.as_str(),
-            "list_directory" | "find_files" | "find_symbol" | "find_references"
-        ) {
-            Some(MemoryObservation::Discovery(format!(
-                "{} completed",
-                call.name
-            )))
-        } else {
-            None
-        };
-        if let Some(observation) = observation {
-            self.observe_memory(observation);
-        }
     }
 
     fn drive(
@@ -1562,7 +1691,6 @@ where
                     });
                 }
             };
-            self.observe_tool_event(&call, matches!(&outcome, ToolOutcome::Success(_)));
             match outcome {
                 ToolOutcome::Success(result) => {
                     tracing::info!(
@@ -1654,6 +1782,178 @@ where
         });
         error
     }
+}
+
+const MAX_AUTOMATED_MEMORY_INSIGHTS: usize = 3;
+const MAX_AUTOMATED_MEMORY_INSIGHT_CHARS: usize = 512;
+const MIN_AUTOMATED_MEMORY_INSIGHT_CHARS: usize = 20;
+
+fn extract_automated_memory_insights(
+    messages: &[axiom_ai_provider::ProviderChatMessage],
+    final_content: &str,
+) -> Vec<MemoryObservation> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let mut ordinal = 0usize;
+    let contents = messages
+        .iter()
+        .filter(|message| message.role != axiom_ai_provider::ChatRole::System)
+        .map(|message| message.content.as_str())
+        .chain(std::iter::once(final_content));
+
+    for content in contents {
+        for line in content.lines() {
+            let Some((kind, body, priority)) = classify_automated_memory_line(line) else {
+                continue;
+            };
+            let Some(body) = sanitize_automated_memory_insight(body) else {
+                continue;
+            };
+            let key = body
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            if !seen.insert(key) {
+                continue;
+            }
+            candidates.push(AutomatedMemoryCandidate {
+                kind,
+                body,
+                priority,
+                ordinal,
+            });
+            ordinal += 1;
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.ordinal.cmp(&right.ordinal))
+    });
+    candidates
+        .into_iter()
+        .take(MAX_AUTOMATED_MEMORY_INSIGHTS)
+        .map(|candidate| match candidate.kind {
+            AutomatedMemoryInsightKind::Decision => MemoryObservation::Decision(candidate.body),
+            AutomatedMemoryInsightKind::Gotcha => MemoryObservation::Gotcha(candidate.body),
+            AutomatedMemoryInsightKind::Validation => {
+                MemoryObservation::Validation(candidate.body)
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum AutomatedMemoryInsightKind {
+    Decision,
+    Gotcha,
+    Validation,
+}
+
+struct AutomatedMemoryCandidate {
+    kind: AutomatedMemoryInsightKind,
+    body: String,
+    priority: u8,
+    ordinal: usize,
+}
+
+fn classify_automated_memory_line(
+    line: &str,
+) -> Option<(AutomatedMemoryInsightKind, &str, u8)> {
+    let line = line.trim().trim_start_matches(['-', '*', '`', '#', ' ']);
+    let lower = line.to_ascii_lowercase();
+    for (label, kind) in [
+        ("decision:", AutomatedMemoryInsightKind::Decision),
+        ("decision -", AutomatedMemoryInsightKind::Decision),
+        ("decision —", AutomatedMemoryInsightKind::Decision),
+        ("gotcha:", AutomatedMemoryInsightKind::Gotcha),
+        ("pitfall:", AutomatedMemoryInsightKind::Gotcha),
+        ("constraint:", AutomatedMemoryInsightKind::Gotcha),
+        ("bug:", AutomatedMemoryInsightKind::Gotcha),
+        ("validation:", AutomatedMemoryInsightKind::Validation),
+        ("validated:", AutomatedMemoryInsightKind::Validation),
+        ("verification:", AutomatedMemoryInsightKind::Validation),
+    ] {
+        if lower.starts_with(label) {
+            let body = &line[label.len()..];
+            if matches!(kind, AutomatedMemoryInsightKind::Validation)
+                && !has_successful_validation_evidence(body)
+            {
+                return None;
+            }
+            return Some((kind, body, 2));
+        }
+    }
+    let is_validation = ["cargo", "test", "check", "phpstan", "pest"]
+        .iter()
+        .any(|term| lower.contains(term))
+        && has_successful_validation_evidence(line);
+    is_validation.then_some((AutomatedMemoryInsightKind::Validation, line, 1))
+}
+
+fn has_successful_validation_evidence(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if [
+        "failed",
+        "failure",
+        "error",
+        "erro",
+        "unknown",
+        "not run",
+        "did not run",
+        "should pass",
+        "will pass",
+        "must pass",
+        "in progress",
+        "pending",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+    [
+        "passed",
+        "passou",
+        "successfully",
+        "successful",
+        "succeeded",
+        "all tests pass",
+        "build succeeded",
+        "sucesso",
+        "aprovado",
+        "aprovados",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn sanitize_automated_memory_insight(value: &str) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = normalized.to_ascii_lowercase();
+    if normalized.chars().count() < MIN_AUTOMATED_MEMORY_INSIGHT_CHARS
+        || lower.contains("temporary")
+        || lower.contains("for now")
+        || matches!(lower.as_str(), "done" | "okay" | "ok" | "completed")
+        || [
+            "authorization:",
+            "bearer ",
+            "password=",
+            "password:",
+            "api_key=",
+            "api-key:",
+            "access_token=",
+            "access-token:",
+            "-----begin private key-----",
+        ]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return None;
+    }
+    Some(normalized.chars().take(MAX_AUTOMATED_MEMORY_INSIGHT_CHARS).collect())
 }
 
 fn tool_message(id: Option<String>, content: String) -> axiom_ai_provider::ProviderChatMessage {
@@ -2011,6 +2311,7 @@ mod tests {
         log: MemoryLog,
         next: u64,
         briefing_results: Vec<MemoryResult>,
+        briefing_error: bool,
     }
 
     impl RecordingMemory {
@@ -2019,6 +2320,7 @@ mod tests {
                 log,
                 next: 0,
                 briefing_results: Vec::new(),
+                briefing_error: false,
             }
         }
 
@@ -2027,6 +2329,16 @@ mod tests {
                 log,
                 next: 0,
                 briefing_results,
+                briefing_error: false,
+            }
+        }
+
+        fn with_briefing_error(log: MemoryLog) -> Self {
+            Self {
+                log,
+                next: 0,
+                briefing_results: Vec::new(),
+                briefing_error: true,
             }
         }
     }
@@ -2066,6 +2378,25 @@ mod tests {
         fn briefing(&self, _: MemoryScope, _: usize) -> Vec<MemoryResult> {
             *self.log.briefings.lock().unwrap() += 1;
             self.briefing_results.clone()
+        }
+
+        fn briefing_checked(
+            &self,
+            scope: MemoryScope,
+            limit: usize,
+        ) -> Result<Vec<MemoryResult>, MemoryReadError> {
+            *self.log.briefings.lock().unwrap() += 1;
+            if self.briefing_error {
+                Err(MemoryReadError::StorageFailure)
+            } else {
+                Ok(self
+                    .briefing_results
+                    .iter()
+                    .filter(|result| result.scope == scope)
+                    .take(limit)
+                    .cloned()
+                    .collect())
+            }
         }
 
         fn handoff(&self, _: MemorySessionId) -> Option<MemoryHandoff> {
@@ -2146,7 +2477,9 @@ mod tests {
         let log = MemoryLog::default();
         let mut provider = FakeProvider {
             scripts: vec![Ok(vec![
-                ProviderChatStreamEvent::ContentDelta("done".into()),
+                ProviderChatStreamEvent::ContentDelta(
+                    "The project uses Pest for its test suite.".into(),
+                ),
                 ProviderChatStreamEvent::Done,
             ])],
             calls: 0,
@@ -2173,8 +2506,340 @@ mod tests {
         assert_eq!(log.sessions_ended.lock().unwrap().len(), 1);
         assert!(log.events.lock().unwrap().iter().any(|event| matches!(
             event,
-            MemoryObservation::TaskOutcome(value) if value == "completed successfully"
+            MemoryObservation::TaskOutcome(value)
+                if value == "Agent-reported result (historical; verify current state): The project uses Pest for its test suite."
         )));
+    }
+
+    #[test]
+    fn automated_extraction_discards_trivial_content_and_caps_at_three() {
+        let messages = vec![message(
+            ChatRole::Assistant,
+            "done\nDecision: Use the existing repository abstraction for memory access.\nGotcha: SQLite writes must remain derived from canonical JSON.\nValidation: cargo test --locked -p axiom-agent passed.\nDecision: This fourth insight must be discarded.\nGotcha: password=secret must never persist.",
+        )];
+        let insights = extract_automated_memory_insights(&messages, "");
+        assert_eq!(insights.len(), 3);
+        assert!(matches!(insights[0], MemoryObservation::Decision(_)));
+        assert!(matches!(insights[1], MemoryObservation::Gotcha(_)));
+        assert!(matches!(insights[2], MemoryObservation::Validation(_)));
+        assert!(insights.iter().all(|insight| {
+            !format!("{insight:?}").contains("fourth")
+                && !format!("{insight:?}").contains("password")
+        }));
+    }
+
+    #[test]
+    fn automated_extraction_requires_success_evidence_for_validation() {
+        let messages = vec![message(
+            ChatRole::Assistant,
+            "Validation: run cargo test.
+             Validation: cargo test started.
+             Validation: cargo test failed with an error.
+             Validation: cargo test passed with 12 tests.",
+        )];
+        let insights = extract_automated_memory_insights(&messages, "");
+        assert_eq!(insights.len(), 1);
+        assert!(matches!(
+            &insights[0],
+            MemoryObservation::Validation(value) if value.contains("cargo test passed")
+        ));
+    }
+
+    #[test]
+    fn automated_extraction_prioritizes_explicit_candidates_before_implicit_validation() {
+        let messages = vec![message(
+            ChatRole::Assistant,
+            "cargo test passed.
+             Decision: Keep the canonical JSON file as the source of truth.
+             Gotcha: FTS failures must fall back to canonical JSON.
+             Decision: Memory writes require explicit approval.",
+        )];
+        let insights = extract_automated_memory_insights(&messages, "");
+        assert_eq!(insights.len(), 3);
+        assert!(matches!(insights[0], MemoryObservation::Decision(_)));
+        assert!(matches!(insights[1], MemoryObservation::Gotcha(_)));
+        assert!(matches!(insights[2], MemoryObservation::Decision(_)));
+    }
+
+    #[test]
+    fn active_workspace_skill_is_injected_without_spilling_between_catalogs() {
+        let root_a = std::env::temp_dir().join(format!(
+            "axiom-agent-skill-a-{}",
+            APPROVAL_WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root_b = std::env::temp_dir().join(format!(
+            "axiom-agent-skill-b-{}",
+            APPROVAL_WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        for (root, name, trigger, instruction) in [
+            (&root_a, "Workspace A", "review-a", "Use workspace A review procedure."),
+            (&root_b, "Workspace B", "review-b", "Use workspace B review procedure."),
+        ] {
+            let directory = root.join(".axiom").join("skills");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("review.md"),
+                format!(
+                    "---\nname: {name}\ndescription: review\ntriggers: {trigger}\n---\n{instruction}"
+                ),
+            )
+            .unwrap();
+        }
+
+        let mut provider = FakeProvider {
+            scripts: vec![Ok(vec![
+                ProviderChatStreamEvent::ContentDelta("completed".into()),
+                ProviderChatStreamEvent::Done,
+            ])],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: Vec::new(),
+            calls: Vec::new(),
+        };
+        let mut task = request();
+        task.messages[0].content = "Please review-a this workspace".into();
+        let mut executor = AgentExecutor::with_policy_and_skills(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            SkillCatalog::discover(&root_a),
+        );
+        let mut run = AgentRun::new(AgentRunId::new(110), budget());
+        executor.execute(&mut run, task, &mut |_| {}).unwrap();
+        assert_eq!(executor.available_skills().len(), 1);
+        drop(executor);
+        let first_request = &provider.requests[0];
+        assert!(first_request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("workspace A review procedure")));
+        assert!(!first_request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("workspace B review procedure")));
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[test]
+    fn completed_run_extracts_insights_and_synchronizes_fts() {
+        let directory = std::env::temp_dir().join(format!(
+            "axiom-agent-closed-loop-{}-{}",
+            std::process::id(),
+            APPROVAL_WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let scopes = AxiomMemoryScopeIds::new("user", "workspace", "project");
+        let backend = AxiomMemoryBackend::new(&directory, scopes);
+        backend.initialize_storage().unwrap();
+        let shared = SharedMemoryService::new(Box::new(backend));
+        let mut provider = FakeProvider {
+            scripts: vec![Ok(vec![
+                ProviderChatStreamEvent::ContentDelta(
+                    "Decision: Use the existing repository abstraction for memory access.\n\
+                     Decision: use the existing repository abstraction for memory access.\n\
+                     Gotcha: SQLite writes must remain derived from canonical JSON.\n\
+                     Validation: cargo test --locked -p axiom-agent passed."
+                        .into(),
+                ),
+                ProviderChatStreamEvent::Done,
+            ])],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: Vec::new(),
+            calls: Vec::new(),
+        };
+        let mut executor = AgentExecutor::with_policy_and_memory(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            shared.boxed(),
+        );
+        let mut run = AgentRun::new(AgentRunId::new(109), budget());
+        executor.execute(&mut run, request(), &mut |_| {}).unwrap();
+        drop(executor);
+
+        let decisions = shared.query(MemoryScope::Workspace, "repository abstraction", 10);
+        let gotchas = shared.query(MemoryScope::Workspace, "SQLite derived canonical JSON", 10);
+        let validations = shared.query(MemoryScope::Workspace, "cargo test axiom-agent passed", 10);
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|result| result.category == Some(MemoryCategory::Decision))
+                .count(),
+            1
+        );
+        assert_eq!(
+            gotchas
+                .iter()
+                .filter(|result| result.category == Some(MemoryCategory::Gotcha))
+                .count(),
+            1
+        );
+        assert_eq!(
+            validations
+                .iter()
+                .filter(|result| result.category == Some(MemoryCategory::Validation))
+                .count(),
+            1
+        );
+        assert!(decisions
+            .iter()
+            .any(|result| result.content.contains("existing repository abstraction")));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn completed_run_combines_skill_briefing_and_memory_extraction() {
+        let workspace = std::env::temp_dir().join(format!(
+            "axiom-agent-m12-cycle-{}-{}",
+            std::process::id(),
+            APPROVAL_WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let skill_directory = workspace.join(".axiom").join("skills");
+        std::fs::create_dir_all(&skill_directory).unwrap();
+        std::fs::write(
+            skill_directory.join("architecture.md"),
+            "---\nname: Architecture Review\ndescription: review architecture\ntriggers: architecture\n---\nUse the architecture review checklist.",
+        )
+        .unwrap();
+
+        let scopes = AxiomMemoryScopeIds::new("user", "workspace", "project");
+        let backend = AxiomMemoryBackend::new(&workspace, scopes);
+        backend.initialize_storage().unwrap();
+        let shared = SharedMemoryService::new(Box::new(backend));
+        shared
+            .remember(
+                MemoryScope::Workspace,
+                "Decision: preserve canonical JSON as the source of truth.",
+            )
+            .unwrap();
+
+        let mut provider = FakeProvider {
+            scripts: vec![Ok(vec![
+                ProviderChatStreamEvent::ContentDelta(
+                    "Decision: apply the architecture review checklist.\n\
+                     Gotcha: derived indexes must not become canonical storage.\n\
+                     Validation: cargo test --locked -p axiom-agent passed."
+                        .into(),
+                ),
+                ProviderChatStreamEvent::Done,
+            ])],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: Vec::new(),
+            calls: Vec::new(),
+        };
+        let mut task = request();
+        task.messages[0].content = "Review the architecture".into();
+        let mut executor = AgentExecutor::with_policy_and_memory_in_scope_and_skills(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            shared.boxed(),
+            MemoryScope::Workspace,
+            SkillCatalog::discover(&workspace),
+        );
+        let mut run = AgentRun::new(AgentRunId::new(111), budget());
+        executor.execute(&mut run, task, &mut |_| {}).unwrap();
+        drop(executor);
+
+        assert!(provider.requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("architecture review checklist")));
+        assert!(shared
+            .query(MemoryScope::Workspace, "derived indexes canonical storage", 10)
+            .iter()
+            .any(|result| result.category == Some(MemoryCategory::Gotcha)));
+        assert!(shared
+            .query(MemoryScope::Workspace, "cargo test axiom-agent passed", 10)
+            .iter()
+            .any(|result| result.category == Some(MemoryCategory::Validation)));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn final_agent_result_persists_semantic_knowledge_for_the_next_run() {
+        let directory = std::env::temp_dir().join(format!(
+            "axiom-agent-semantic-memory-{}-{}",
+            std::process::id(),
+            APPROVAL_WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let scopes = AxiomMemoryScopeIds::new("user", "workspace", "project");
+        let backend = AxiomMemoryBackend::new(&directory, scopes.clone());
+        backend.initialize_storage().unwrap();
+        let mut provider = FakeProvider {
+            scripts: vec![
+                Ok(vec![
+                    ProviderChatStreamEvent::ThinkingDelta(
+                        "hidden reasoning must not enter memory".into(),
+                    ),
+                    tool_call("readme", "list_directory"),
+                    ProviderChatStreamEvent::Done,
+                ]),
+                Ok(vec![
+                    ProviderChatStreamEvent::ContentDelta(
+                        "Axiom is a modern PHP IDE written in Rust. Its workspace uses focused crates for editor, syntax, project indexing, PHP, LSP, and terminal responsibilities. Navigation combines deterministic local intelligence with optional LSP support.".into(),
+                    ),
+                    ProviderChatStreamEvent::Done,
+                ]),
+            ],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: vec![Ok(ToolOutcome::Success(
+                "README raw contents and functionResponse protocol must not be copied".into(),
+            ))],
+            calls: Vec::new(),
+        };
+        let mut executor = AgentExecutor::with_policy_and_memory(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            Box::new(backend),
+        );
+        let mut run = AgentRun::new(AgentRunId::new(108), AgentBudget::new(2, 2));
+        let result = executor.execute(&mut run, request(), &mut |_| {}).unwrap();
+        assert!(result.content.contains("Axiom is a modern PHP IDE"));
+        drop(executor);
+
+        let restarted = AxiomMemoryBackend::new(&directory, scopes);
+        let briefing = restarted.briefing(MemoryScope::Workspace, 10);
+        let matches = restarted.query(MemoryScope::Workspace, "PHP IDE written in Rust", 10);
+        assert_eq!(briefing.len(), 1);
+        assert_eq!(matches.len(), 1);
+        assert!(briefing[0].content.contains("Axiom is a modern PHP IDE"));
+        assert!(briefing[0].content.contains("focused crates"));
+        assert!(!briefing[0].content.contains("list_directory completed"));
+        assert!(!briefing[0].content.contains("raw contents"));
+        assert!(!briefing[0].content.contains("functionResponse"));
+        assert!(!briefing[0].content.contains("hidden reasoning"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn final_memory_outcome_is_bounded_normalized_and_rejects_secrets() {
+        let summary = AgentExecutor::<FakeProvider, FakeTools, ReadOnlyToolPolicy>::
+            bounded_memory_task_outcome(&"meaningful ".repeat(1000))
+            .unwrap();
+        assert!(summary.chars().count() <= MAX_MEMORY_TASK_OUTCOME_CHARS);
+        assert!(!summary.contains('\n'));
+        assert!(AgentExecutor::<FakeProvider, FakeTools, ReadOnlyToolPolicy>::
+            bounded_memory_task_outcome("Authorization: Bearer secret")
+            .is_none());
+        assert!(AgentExecutor::<FakeProvider, FakeTools, ReadOnlyToolPolicy>::
+            bounded_memory_task_outcome("completed successfully")
+            .is_none());
+        assert!(AgentExecutor::<FakeProvider, FakeTools, ReadOnlyToolPolicy>::
+            bounded_memory_task_outcome("  \n \t ")
+            .is_none());
     }
 
     #[test]
@@ -2233,7 +2898,88 @@ mod tests {
     }
 
     #[test]
-    fn multiple_provider_turns_keep_one_session_and_capture_semantic_events() {
+    fn briefing_read_failure_is_observable_and_does_not_stop_agent_execution() {
+        let log = MemoryLog::default();
+        let mut provider = FakeProvider {
+            scripts: vec![Ok(vec![
+                ProviderChatStreamEvent::ContentDelta("task completed".into()),
+                ProviderChatStreamEvent::Done,
+            ])],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: Vec::new(),
+            calls: Vec::new(),
+        };
+        let mut executor = AgentExecutor::with_policy_and_memory(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            Box::new(RecordingMemory::with_briefing_error(log.clone())),
+        );
+        let mut run = AgentRun::new(AgentRunId::new(107), budget());
+        let result = executor.execute(&mut run, request(), &mut |_| {}).unwrap();
+        assert_eq!(result.content, "task completed");
+        assert_eq!(*log.briefings.lock().unwrap(), 1);
+        assert!(provider.requests[0].messages.iter().any(|message| {
+            message.content.contains("could not be read")
+                && message.content.contains("not treat this as a confirmed empty result")
+        }));
+    }
+
+    #[test]
+    fn briefing_preserves_all_architecture_components_and_functions() {
+        let architecture = format!(
+            "{}\naxiom-app: GPUI application shell and user interface.\n\
+             axiom-syntax: Tree-sitter parsing, tokens, syntax highlighting, and diagnostics.\n\
+             axiom-project: project lifecycle, filesystem model, Composer metadata, and PSR-4 resolution.",
+            "Axiom architecture context. ".repeat(18)
+        );
+        let log = MemoryLog::default();
+        let mut provider = FakeProvider {
+            scripts: vec![Ok(vec![ProviderChatStreamEvent::Done])],
+            calls: 0,
+            requests: Vec::new(),
+        };
+        let mut tools = FakeTools {
+            outcomes: Vec::new(),
+            calls: Vec::new(),
+        };
+        let mut executor = AgentExecutor::with_policy_and_memory_in_scope(
+            &mut provider,
+            &mut tools,
+            ReadOnlyToolPolicy::default(),
+            Box::new(RecordingMemory::with_briefing(
+                log,
+                vec![MemoryResult {
+                    id: Some("architecture".into()),
+                    scope: MemoryScope::Workspace,
+                    category: None,
+                    content: architecture,
+                }],
+            )),
+            MemoryScope::Workspace,
+        );
+        let mut run = AgentRun::new(AgentRunId::new(106), budget());
+        executor.execute(&mut run, request(), &mut |_| {}).unwrap();
+        let briefing = provider.requests[0]
+            .messages
+            .iter()
+            .find(|message| message.content.contains("Memory briefing"))
+            .unwrap();
+        assert!(briefing.content.chars().count() <= MAX_MEMORY_BRIEFING_CHARS);
+        for detail in [
+            "axiom-app: GPUI application shell and user interface",
+            "axiom-syntax: Tree-sitter parsing, tokens, syntax highlighting, and diagnostics",
+            "axiom-project: project lifecycle, filesystem model, Composer metadata, and PSR-4 resolution",
+        ] {
+            assert!(briefing.content.contains(detail), "missing {detail}");
+        }
+    }
+
+    #[test]
+    fn multiple_provider_turns_keep_one_session_without_tool_completion_noise() {
         let log = MemoryLog::default();
         let mut provider = FakeProvider {
             scripts: vec![
@@ -2295,14 +3041,8 @@ mod tests {
             assert!(!briefings[0].content.contains("must not leak"));
             assert_eq!(briefings[0].role, ChatRole::System);
         }
-        assert!(log.events.lock().unwrap().iter().any(|event| matches!(
-            event,
-            MemoryObservation::Discovery(value) if value == "list_directory completed"
-        )));
-        assert!(!log.events.lock().unwrap().iter().any(|event| matches!(
-            event,
-            MemoryObservation::Discovery(value) if value.contains("raw listing")
-        )));
+        let observations = log.events.lock().unwrap();
+        assert!(observations.is_empty());
     }
 
     #[test]
@@ -2381,8 +3121,16 @@ mod tests {
         assert_eq!(log.sessions_ended.lock().unwrap().len(), 1);
         assert!(log.events.lock().unwrap().iter().any(|event| matches!(
             event,
-            MemoryObservation::TaskOutcome(value) if value == "failed due to provider error"
+            MemoryObservation::SessionOutcome(value) if value == "failed due to provider error"
         )));
+        assert!(!log.events.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                MemoryObservation::Decision(_)
+                    | MemoryObservation::Gotcha(_)
+                    | MemoryObservation::Validation(_)
+            )
+        }));
 
         let cancellation = Cancellation::default();
         let mut provider = CancellingProvider {
@@ -2399,6 +3147,14 @@ mod tests {
         let mut run = AgentRun::new(AgentRunId::new(103), budget());
         assert!(executor.execute(&mut run, request(), &mut |_| {}).is_err());
         assert_eq!(log.sessions_ended.lock().unwrap().len(), 1);
+        assert!(!log.events.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                MemoryObservation::Decision(_)
+                    | MemoryObservation::Gotcha(_)
+                    | MemoryObservation::Validation(_)
+            )
+        }));
     }
 
     #[test]
@@ -3456,6 +4212,15 @@ mod tests {
                 ToolPolicyContext {
                     run_id: AgentRunId::new(1)
                 },
+                &call("execute_command")
+            ),
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
+        assert!(matches!(
+            policy.decide(
+                ToolPolicyContext {
+                    run_id: AgentRunId::new(1)
+                },
                 &call("update_file")
             ),
             ToolPolicyDecision::RequireApproval { .. }
@@ -3466,6 +4231,15 @@ mod tests {
                     run_id: AgentRunId::new(1)
                 },
                 &call("delete_file")
+            ),
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
+        assert!(matches!(
+            policy.decide(
+                ToolPolicyContext {
+                    run_id: AgentRunId::new(1)
+                },
+                &call("memory_remember")
             ),
             ToolPolicyDecision::RequireApproval { .. }
         ));
@@ -3507,6 +4281,30 @@ mod tests {
             preview["expected_fingerprint"],
             "sha256:0000000000000000000000000000000000000000000000000000000000000000"
         );
+    }
+
+    #[test]
+    fn memory_remember_approval_preview_excludes_observation_content() {
+        let call = ProviderToolCall {
+            id: Some("remember-1".into()),
+            name: "memory_remember".into(),
+            arguments: serde_json::json!({
+                "content": "private observation that must not appear in approval preview"
+            }),
+        };
+        let request = ApprovalRequest::from_call(
+            AgentRunId::new(1),
+            ApprovalId::new(2),
+            &call,
+            "persistent memory write requires approval",
+        );
+        assert!(!request
+            .arguments
+            .contains("private observation that must not appear"));
+        let preview: serde_json::Value = serde_json::from_str(&request.arguments).unwrap();
+        assert_eq!(preview["tool"], "memory_remember");
+        assert_eq!(preview["content_bytes"], 60);
+        assert!(preview.get("content").is_none());
     }
 
     #[test]
