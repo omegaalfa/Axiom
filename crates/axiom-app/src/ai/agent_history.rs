@@ -531,16 +531,15 @@ fn write_snapshot(
         std::process::id(),
         TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut file = File::options()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|error| error.to_string())?;
     let write_result = (|| {
+        let mut file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::hard_link(&temp_path, &final_path)?;
-        fs::remove_file(&temp_path)?;
+        drop(file);
+        fs::rename(&temp_path, &final_path)?;
         Ok::<(), std::io::Error>(())
     })();
     if let Err(error) = write_result {

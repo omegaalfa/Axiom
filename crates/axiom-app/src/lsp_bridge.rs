@@ -719,14 +719,19 @@ mod tests {
 impl Drop for LspBridge {
     fn drop(&mut self) {
         self.close_did_change_queue();
-        if let Some(server) = &self.server {
-            let server = server.lock().expect("LSP lock poisoned");
-            if let Err(error) = server.shutdown() {
-                tracing::warn!("language server shutdown failed: {error}");
-            }
-            if let Err(error) = server.wait() {
-                tracing::warn!("language server wait failed: {error}");
-            }
+        if let Some(server) = self.server.take() {
+            let _ = std::thread::Builder::new()
+                .name("axiom-lsp-shutdown".into())
+                .spawn(move || {
+                    let server = server.lock().expect("LSP lock poisoned");
+                    if let Err(error) = server.shutdown() {
+                        tracing::warn!("language server shutdown failed: {error}");
+                        let _ = server.kill();
+                    }
+                    if let Err(error) = server.wait() {
+                        tracing::warn!("language server wait failed: {error}");
+                    }
+                });
         }
     }
 }

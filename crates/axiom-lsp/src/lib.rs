@@ -482,6 +482,11 @@ impl LanguageServer {
         Ok(())
     }
 
+    pub fn kill(&self) -> Result<(), LspError> {
+        self.child.lock().expect("child lock poisoned").kill()?;
+        Ok(())
+    }
+
     fn write(&self, value: &Value) -> Result<(), LspError> {
         write_message(
             &mut *self.writer.lock().expect("writer lock poisoned"),
