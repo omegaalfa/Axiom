@@ -588,9 +588,30 @@ pub fn extract_symbols(text: &str, file: &Path, extension: &str) -> Result<Vec<S
     let had_errors = syntax.has_errors();
     let root = syntax.tree().root_node();
     let mut symbols = Vec::new();
+    let mut current_namespace: Option<String> = None;
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        visit_node(child, text, file, extension, None, None, &mut symbols);
+        if child.kind() == "namespace_definition" {
+            let ns = child
+                .child_by_field_name("name")
+                .map(|name| node_text(name, text).trim_matches('\\').to_owned())
+                .filter(|name| !name.is_empty());
+            if child.child_by_field_name("body").is_some() {
+                visit_node(child, text, file, extension, ns.as_deref(), None, &mut symbols);
+            } else {
+                current_namespace = ns;
+            }
+        } else {
+            visit_node(
+                child,
+                text,
+                file,
+                extension,
+                current_namespace.as_deref(),
+                None,
+                &mut symbols,
+            );
+        }
     }
     // PHP distributions frequently ship stubs containing newer attributes or
     // annotations that an older grammar flags while still producing valid

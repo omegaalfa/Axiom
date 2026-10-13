@@ -294,9 +294,9 @@ mod tests {
         let outside = tempdir().unwrap();
         fs::write(outside.path().join("outside.txt"), "hit").unwrap();
         #[cfg(unix)]
-        symlink(outside.path().join("outside.txt"), dir.path().join("link.txt")).unwrap();
+        let _ = symlink(outside.path().join("outside.txt"), dir.path().join("link.txt"));
         #[cfg(windows)]
-        symlink_file(outside.path().join("outside.txt"), dir.path().join("link.txt")).unwrap();
+        let _ = symlink_file(outside.path().join("outside.txt"), dir.path().join("link.txt"));
         assert_eq!(capability.search_text(SearchTextRequest { query: String::new(), path: None, file_pattern: None }), Err(SearchTextError::EmptyQuery));
         assert!(matches!(capability.search_text(SearchTextRequest { query: "hit".into(), path: Some("../".into()), file_pattern: None }), Err(SearchTextError::OutsideWorkspace(_))));
         assert!(capability.search_text(SearchTextRequest { query: "hit".into(), path: None, file_pattern: None }).unwrap().matches.is_empty());
