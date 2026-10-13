@@ -19,11 +19,15 @@ fn warm_cache_preserves_hit_and_tracks_changed_new_and_removed_files() {
     assert_eq!(first.files, 1);
     assert!(index.find_class("Existing").is_some());
 
+    let mut published = axiom_index::load_project_cache(&cache)
+        .unwrap()
+        .expect("cache can be restored without a project walk");
+    assert!(published.find_class("Existing").is_some());
+
     // A metadata-identical second scan must reuse the cached declaration.
-    let mut warm = ProjectSymbolIndex::new();
-    let hit = warm.index_project_cached(project.path(), &cache).unwrap();
+    let hit = published.index_project_cached(project.path(), &cache).unwrap();
     assert_eq!(hit.files, 1);
-    assert!(warm.find_class("Existing").is_some());
+    assert!(published.find_class("Existing").is_some());
 
     // Changing the file must invalidate only that cache entry.
     write_php(&src, "Changed");
@@ -51,6 +55,31 @@ fn warm_cache_preserves_hit_and_tracks_changed_new_and_removed_files() {
     assert_eq!(removed_report.files, 1);
     assert!(removed.find_class("Changed").is_none());
     assert!(removed.find_class("NewClass").is_some());
+}
+
+#[test]
+fn background_reconciliation_preserves_a_newer_dirty_buffer() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = project.path().join(".cache/project.json");
+    let source = project.path().join("src/Existing.php");
+    write_php(&source, "DiskBefore");
+    let mut initial = ProjectSymbolIndex::new();
+    initial.index_project_cached(project.path(), &cache).unwrap();
+    let mut active = axiom_index::load_project_cache(&cache).unwrap().unwrap();
+
+    write_php(&source, "DiskAfter");
+    write_php(&project.path().join("src/New.php"), "NewOnDisk");
+    let mut refreshed = active.clone();
+    refreshed.index_project_cached(project.path(), &cache).unwrap();
+
+    active
+        .index_file_text(&source, "<?php class DirtyBuffer {}")
+        .unwrap();
+    active.apply_reconciled_index(&refreshed);
+
+    assert!(active.find_class("DirtyBuffer").is_some());
+    assert!(active.find_class("DiskAfter").is_none());
+    assert!(active.find_class("NewOnDisk").is_some());
 }
 
 #[test]

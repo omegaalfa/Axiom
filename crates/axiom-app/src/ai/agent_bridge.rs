@@ -1106,6 +1106,7 @@ fn publish_event(handle: &ApprovalRunHandle, queue: &AgentEventQueue, event: Age
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axiom_ai_provider::{ProviderChatMessage, ProviderToolDefinition};
     use axiom_project::{
         project_directory::ProjectDirectoryCapability, project_read::ProjectReadCapability,
         project_update::ProjectUpdateCapability,

@@ -1976,7 +1976,11 @@ type ProjectLoadPayload = (
     Option<axiom_agent::SharedMemoryService>,
     Result<(PathBuf, AgentHistoryStore), String>,
 );
-type SemanticIndexPayload = (ProjectSymbolIndex, Arc<SemanticEngine>);
+type SemanticIndexPayload = (
+    Arc<RwLock<ProjectSymbolIndex>>,
+    Arc<SemanticEngine>,
+    axiom_index::IndexReport,
+);
 type ExplorerStructureResult = (u64, Result<Vec<ProjectEntry>, String>);
 type GitRefreshResult = (u64, Result<Option<GitRepositoryState>, String>);
 type GitDiffResult = (u64, PathBuf, GitDiffTarget, Result<GitFileDiff, String>);
@@ -2326,7 +2330,8 @@ pub struct WorkspaceView {
     definition_cache: HashMap<String, DefinitionTarget>,
     project_index: Option<Arc<RwLock<ProjectSymbolIndex>>>,
     index_generation: u64,
-    index_results: Option<Receiver<(u64, Result<SemanticIndexPayload, String>)>>,
+    index_results: Option<Receiver<(u64, bool, Result<SemanticIndexPayload, String>)>>,
+    show_indexing_modal: bool,
     semantic_engine: Option<Arc<SemanticEngine>>,
     semantic_update_sender: mpsc::Sender<(u64, PathBuf, String, bool)>,
     semantic_update_receiver: Receiver<(u64, PathBuf, String, bool)>,
@@ -2334,6 +2339,8 @@ pub struct WorkspaceView {
     project_semantic_generation: u64,
     semantic_update_results: Option<Receiver<(u64, u64, Result<Arc<SemanticSnapshot>, String>)>>,
     pending_semantic_fs_changes: Vec<(PathBuf, Option<(PathBuf, String)>)>,
+    project_fs_watch_stop: Option<Arc<AtomicBool>>,
+    project_fs_watch_events: Option<Receiver<Vec<(PathBuf, Option<(PathBuf, String)>)>>>,
     vendor_index: Option<Arc<RwLock<VendorSymbolIndex>>>,
     vendor_index_generation: u64,
     vendor_index_results: Option<Receiver<(u64, Result<VendorSymbolIndex, String>)>>,
@@ -3841,6 +3848,7 @@ impl WorkspaceView {
             project_index: None,
             index_generation: 0,
             index_results: None,
+            show_indexing_modal: false,
             semantic_engine: None,
             semantic_update_sender,
             semantic_update_receiver,
@@ -3848,6 +3856,8 @@ impl WorkspaceView {
             project_semantic_generation: 0,
             semantic_update_results: None,
             pending_semantic_fs_changes: Vec::new(),
+            project_fs_watch_stop: None,
+            project_fs_watch_events: None,
             vendor_index: None,
             vendor_index_generation: 0,
             vendor_index_results: None,
@@ -4023,7 +4033,7 @@ impl WorkspaceView {
                         this.poll_agent_history(cx);
                         this.poll_terminal_command_events(cx);
                         let lsp_us = poll_started.elapsed().as_micros();
-                        if this.index_results.is_some() {
+                        if this.show_indexing_modal {
                             this.indexing_phase = this.indexing_phase.wrapping_add(6) % 100;
                             cx.notify();
                         }
@@ -4312,6 +4322,92 @@ impl WorkspaceView {
             }
         });
         cx.notify();
+    }
+
+    fn start_project_fs_watcher(&mut self, root: PathBuf) {
+        if let Some(stop) = self.project_fs_watch_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.project_fs_watch_stop = Some(stop);
+        self.project_fs_watch_events = Some(receiver);
+        thread::spawn(move || {
+            let mut previous = axiom_index::project_php_file_metadata(&root).unwrap_or_default();
+            while !worker_stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(450));
+                if worker_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut current) = axiom_index::project_php_file_metadata(&root) else {
+                    continue;
+                };
+                if current == previous {
+                    continue;
+                }
+                thread::sleep(Duration::from_millis(120));
+                if worker_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Ok(settled) = axiom_index::project_php_file_metadata(&root) {
+                    current = settled;
+                }
+                let mut changes = Vec::new();
+                let changed_paths: Vec<PathBuf> = current
+                    .iter()
+                    .filter(|(path, stamp)| previous.get(*path) != Some(*stamp))
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                for path in changed_paths {
+                    match fs::read_to_string(&path) {
+                        Ok(text) => changes.push((path.clone(), Some((path.clone(), text)))),
+                        Err(_) => {
+                            if let Some(old_stamp) = previous.get(&path) {
+                                current.insert(path.clone(), *old_stamp);
+                            } else {
+                                current.remove(&path);
+                            }
+                        }
+                    }
+                }
+                for path in previous.keys() {
+                    if !current.contains_key(path) {
+                        changes.push((path.clone(), None));
+                    }
+                }
+                if !changes.is_empty() {
+                    if sender.send(changes).is_err() {
+                        break;
+                    }
+                }
+                previous = current;
+            }
+        });
+    }
+
+    fn poll_project_fs_watcher(&mut self, cx: &App) {
+        if self.semantic_engine.is_none() {
+            return;
+        }
+        let Some(receiver) = self.project_fs_watch_events.as_ref() else {
+            return;
+        };
+        while let Ok(changes) = receiver.try_recv() {
+            self.pending_semantic_fs_changes.extend(changes.into_iter().map(
+                |(old_path, replacement)| {
+                    if let Some(tab) = self.tabs.iter().find(|tab| tab.path == old_path)
+                        && tab.editor.read(cx).is_dirty()
+                    {
+                        return (
+                            old_path.clone(),
+                            Some((old_path, tab.editor.read(cx).document_content())),
+                        );
+                    }
+                    (old_path, replacement)
+                },
+            ));
+        }
     }
 
     fn poll_runtime_watcher(&mut self, cx: &mut Context<Self>) {
@@ -5076,6 +5172,9 @@ impl WorkspaceView {
         self.semantic_update_generation = 0;
         self.semantic_update_results = None;
         self.pending_semantic_fs_changes.clear();
+        if let Some(stop) = self.project_fs_watch_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
         let (semantic_update_sender, semantic_update_receiver) = mpsc::channel();
         self.semantic_update_sender = semantic_update_sender;
         self.semantic_update_receiver = semantic_update_receiver;
@@ -5087,23 +5186,87 @@ impl WorkspaceView {
         self.project_index = None;
         self.semantic_engine = None;
         self.vendor_index = None;
-        self.status = "Project opened — indexing...".into();
+        self.show_indexing_modal = false;
+        self.status = "Project opened — preparing symbols...".into();
         let index_root = root.clone();
-        thread::spawn(move || {
-            let mut index = ProjectSymbolIndex::new();
-            let result = project_symbol_cache_path(&index_root)
-                .map(|cache| index.index_project_cached(&index_root, cache))
-                .unwrap_or_else(|| index.index_project(&index_root))
-                .map(|_| {
-                    let snapshot = axiom_index::SemanticSnapshot::from_project_index(
-                        &index,
-                        SemanticRevision(generation),
-                    );
-                    (index, Arc::new(SemanticEngine::from_snapshot(snapshot)))
-                })
-                .map_err(|error| error.to_string());
-            let _ = sender.send((generation, result));
-        });
+        background_executor().spawn(async move {
+            let index = Arc::new(RwLock::new(ProjectSymbolIndex::new()));
+            let cache_path = project_symbol_cache_path(&index_root);
+            let cached = cache_path
+                .as_ref()
+                .and_then(|cache| axiom_index::load_project_cache(cache).ok().flatten());
+            if let Some(cached) = cached {
+                let mut refreshed = cached.clone();
+                let (snapshot, report) = {
+                    let mut active = index.write().expect("project index lock poisoned");
+                    *active = cached;
+                    (
+                        axiom_index::SemanticSnapshot::from_project_index(
+                            &active,
+                            SemanticRevision(generation),
+                        ),
+                        active.report(),
+                    )
+                };
+                let _ = sender.send((
+                    generation,
+                    false,
+                    Ok((
+                        index.clone(),
+                        Arc::new(SemanticEngine::from_snapshot(snapshot)),
+                        report,
+                    )),
+                ));
+
+                let reconciled = cache_path
+                    .map(|cache| refreshed.index_project_cached(&index_root, cache))
+                    .unwrap_or_else(|| refreshed.index_project(&index_root));
+                let result = reconciled
+                    .map_err(|error| error.to_string())
+                    .map(|_| {
+                        let (snapshot, report) = {
+                            let mut active = index.write().expect("project index lock poisoned");
+                            active.apply_reconciled_index(&refreshed);
+                            (
+                                axiom_index::SemanticSnapshot::from_project_index(
+                                    &active,
+                                    SemanticRevision(generation),
+                                ),
+                                active.report(),
+                            )
+                        };
+                        (
+                            index.clone(),
+                            Arc::new(SemanticEngine::from_snapshot(snapshot)),
+                            report,
+                        )
+                    });
+                let _ = sender.send((generation, true, result));
+            } else {
+                let mut built = ProjectSymbolIndex::new();
+                let indexed = cache_path
+                    .map(|cache| built.index_project_cached(&index_root, cache))
+                    .unwrap_or_else(|| built.index_project(&index_root));
+                let result = indexed
+                    .map_err(|error| error.to_string())
+                    .map(|_| {
+                        let snapshot = axiom_index::SemanticSnapshot::from_project_index(
+                            &built,
+                            SemanticRevision(generation),
+                        );
+                        let report = built.report();
+                        *index.write().expect("project index lock poisoned") = built;
+                        (
+                            index.clone(),
+                            Arc::new(SemanticEngine::from_snapshot(snapshot)),
+                            report,
+                        )
+                    });
+                let _ = sender.send((generation, true, result));
+            }
+        })
+        .detach();
+        self.start_project_fs_watcher(root.clone());
         self.vendor_index_generation = self.vendor_index_generation.wrapping_add(1);
         let vendor_generation = self.vendor_index_generation;
         let (vendor_sender, vendor_receiver) = mpsc::channel();
@@ -5126,7 +5289,7 @@ impl WorkspaceView {
             })
             .collect();
         self.expanded.clear();
-        self.status = "Project opened — indexing...".into();
+        self.show_indexing_modal = false;
         self.project = Some(project);
         self.set_memory_service(memory, cx);
         self.queue_agent_history_save(true);
@@ -5200,17 +5363,18 @@ impl WorkspaceView {
                 return;
             }
         };
-        self.index_results = None;
-        let (generation, result) = result;
+        let (generation, finished, result) = result;
+        if finished {
+            self.index_results = None;
+        }
         if generation != self.index_generation || self.project.is_none() {
             return;
         }
         match result {
             Ok(index) => {
                 let publish_started = Instant::now();
-                let (index, semantic_engine) = index;
-                let report = index.report();
-                let shared = Arc::new(RwLock::new(index));
+                let (index, semantic_engine, report) = index;
+                let shared = index;
                 self.project_index = Some(shared.clone());
                 self.semantic_engine = Some(semantic_engine);
                 if let Some(engine) = &self.semantic_engine {
@@ -5254,6 +5418,7 @@ impl WorkspaceView {
     fn poll_semantic_updates(&mut self, cx: &mut Context<Self>) {
         let _stage =
             crate::editor_view::UiStageGuard::new(crate::editor_view::UI_STAGE_POLL_SEMANTIC);
+        self.poll_project_fs_watcher(cx);
         let ui_started = Instant::now();
         let mut receive_us = 0u128;
         let mut publish_us = 0u128;
@@ -5501,6 +5666,10 @@ impl WorkspaceView {
 
     fn clear_project(&mut self, cx: &mut Context<Self>) {
         self.stop_agent_run(cx);
+        if let Some(stop) = self.project_fs_watch_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.project_fs_watch_events = None;
         if let Some(memory) = self.memory_service.take() {
             memory.request_shutdown();
         }
@@ -16485,6 +16654,9 @@ impl WorkspaceView {
 impl Drop for WorkspaceView {
     fn drop(&mut self) {
         self.runtime_watch_stop.store(true, Ordering::Relaxed);
+        if let Some(stop) = self.project_fs_watch_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
         if let Some(mut writer) = self.agent_history_writer.take()
             && let Err(error) = writer.shutdown()
         {
@@ -16910,7 +17082,7 @@ impl Render for WorkspaceView {
                         .child("INPUT TEST ACTIVE"),
                 )
             })
-            .when(self.index_results.is_some(), |this| {
+            .when(self.show_indexing_modal, |this| {
                 this.child(
                     div()
                         .id("project-indexing-overlay")

@@ -481,6 +481,27 @@ impl RuntimeSymbolIndex {
             .collect()
     }
 
+    /// Searches only class-like runtime declarations, without resolving
+    /// matching global function or constant symbols from the shared prefix index.
+    pub fn search_type_prefix(&self, prefix: &str) -> Vec<&Symbol> {
+        let prefix = fold_name(prefix);
+        let upper = format!("{prefix}\u{10ffff}");
+        let mut seen = std::collections::HashSet::new();
+        self.prefix_symbols
+            .range(prefix..=upper)
+            .flat_map(|(_, references)| references)
+            .filter(|reference| matches!(reference.bucket, RuntimeSymbolBucket::Classes))
+            .filter(|reference| {
+                seen.insert((reference.key.clone(), reference.index))
+            })
+            .filter_map(|reference| {
+                self.classes
+                    .get(&reference.key)
+                    .and_then(|symbols| symbols.get(reference.index))
+            })
+            .collect()
+    }
+
     fn insert_prefix_reference(
         &mut self,
         name_key: String,
@@ -1070,6 +1091,20 @@ namespace {
                 .methods_of("ArrayIterator")
                 .any(|symbol| symbol.name == "current")
         );
+    }
+
+    #[test]
+    fn type_prefix_search_never_returns_global_function_stubs() {
+        let (index, _) = load_fixture();
+        assert!(index
+            .search_prefix("strlen")
+            .iter()
+            .any(|symbol| symbol.kind == SymbolKind::Function));
+        assert!(index.search_type_prefix("strlen").is_empty());
+        assert!(index
+            .search_type_prefix("PDO")
+            .iter()
+            .any(|symbol| symbol.kind == SymbolKind::Class));
     }
 
     #[test]

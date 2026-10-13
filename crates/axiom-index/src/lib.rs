@@ -100,12 +100,13 @@ pub struct IndexReport {
     pub duplicates: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ProjectSymbolIndex {
     files: BTreeMap<PathBuf, Arc<str>>,
     symbols: Vec<ProjectSymbol>,
     prefix_names: BTreeMap<String, Vec<usize>>,
     prefix_fqns: BTreeMap<String, Vec<usize>>,
+    file_stamps: BTreeMap<PathBuf, (u64, u128)>,
     ready: bool,
 }
 
@@ -117,6 +118,95 @@ const PROJECT_CACHE_SCHEMA: u32 = 5;
 struct ProjectCacheFile {
     schema_version: u32,
     files: BTreeMap<PathBuf, (u64, u128, Vec<ProjectSymbol>)>,
+}
+
+/// Reads a project-symbol cache without walking the project tree. The caller
+/// can publish this snapshot immediately and reconcile it in the background.
+pub fn load_project_cache(cache_path: impl AsRef<Path>) -> io::Result<Option<ProjectSymbolIndex>> {
+    let text = match fs::read_to_string(cache_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let cache: ProjectCacheFile = match serde_json::from_str::<ProjectCacheFile>(&text) {
+        Ok(cache) if cache.schema_version == PROJECT_CACHE_SCHEMA => cache,
+        _ => return Ok(None),
+    };
+    let mut index = ProjectSymbolIndex::new();
+    for (path, (size, modified, symbols)) in cache.files {
+        index.files.insert(path.clone(), Arc::from(""));
+        index.file_stamps.insert(path, (size, modified));
+        index.symbols.extend(symbols);
+    }
+    index.rebuild_prefix_index();
+    index.ready = true;
+    Ok(Some(index))
+}
+
+/// Returns metadata for all PHP sources using the same exclusions and
+/// canonical paths as the project indexer.
+pub fn project_php_file_metadata(root: impl AsRef<Path>) -> io::Result<BTreeMap<PathBuf, (u64, u128)>> {
+    let mut discovered = Vec::new();
+    collect_php_files(root.as_ref(), &mut discovered, &mut DiscoveryStats::default())?;
+    let mut files = BTreeMap::new();
+    for file in discovered {
+        files.insert(canonical_or(file.path), (file.size, file.modified));
+    }
+    Ok(files)
+}
+
+fn write_cache_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    static NEXT_TEMP_FILE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = parent.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_file_atomically(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    unsafe extern "system" {
+        fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+    }
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Composer metadata index. It records class locations without walking all of
@@ -1084,62 +1174,61 @@ impl ProjectSymbolIndex {
             .collect();
         let canonicalize_us = canonicalize_started.elapsed().as_micros();
         let cache_read_started = Instant::now();
-        let cache_text = fs::read_to_string(cache_path.as_ref()).ok();
+        let mut cache_hit = false;
+        if self.files.is_empty() {
+            if let Some(cached) = load_project_cache(cache_path.as_ref()).ok().flatten() {
+                cache_hit = true;
+                *self = cached;
+            }
+        }
         let cache_read_us = cache_read_started.elapsed().as_micros();
-        let cache_deserialize_started = Instant::now();
-        let cached = cache_text
-            .and_then(|text| serde_json::from_str::<ProjectCacheFile>(&text).ok())
-            .filter(|cache| cache.schema_version == PROJECT_CACHE_SCHEMA);
-        let cache_deserialize_us = cache_deserialize_started.elapsed().as_micros();
-        let cache_validation_started = Instant::now();
-        let cached_files = cached
-            .as_ref()
-            .map(|cache| cache.files.len())
-            .unwrap_or_default();
-        let cache_validation_us = cache_validation_started.elapsed().as_micros();
+        let cached_files = self.files.len();
         let snapshot_started = Instant::now();
-        self.files.clear();
-        self.symbols.clear();
         self.ready = false;
         let mut reparsed = 0usize;
         let metadata_us = discovery.metadata_us;
         let metadata_calls = discovery.metadata_calls;
         let mut changed_detection_us = 0u128;
-        let mut files_read = 1usize;
+        let mut files_read = 0usize;
+        let discovered_paths: HashSet<PathBuf> = discovered.iter().map(|file| file.path.clone()).collect();
+        let removed_paths: Vec<PathBuf> = self.files.keys()
+            .filter(|path| !discovered_paths.contains(*path))
+            .cloned()
+            .collect();
+        for path in removed_paths {
+            self.remove_file(&path);
+            self.file_stamps.remove(&path);
+        }
         for file in &discovered {
-            let path = &file.path;
+            let path = canonical_or(file.path.clone());
             let modified = file.modified;
             let changed_started = Instant::now();
-            let reused = cached
-                .as_ref()
-                .and_then(|cache| cache.files.get(path))
-                .filter(|(size, stamp, _)| *size == file.size && *stamp == modified);
+            let unchanged = self.files.contains_key(&path)
+                && self.file_stamps.get(&path) == Some(&(file.size, modified));
             changed_detection_us += changed_started.elapsed().as_micros();
-            if let Some((_, _, symbols)) = reused {
-                self.files.insert(path.clone(), Arc::from(""));
-                self.symbols.extend(symbols.clone());
-            } else {
-                let text = fs::read_to_string(path)?;
+            if !unchanged {
+                let text = fs::read_to_string(&path)?;
                 files_read += 1;
                 self.index_file_text_at_path(path.clone(), text, "InitialProjectScan")?;
                 reparsed += 1;
             }
+            self.file_stamps.insert(path, (file.size, modified));
         }
         let snapshot_restore_us = snapshot_started.elapsed().as_micros();
-        let removed = cached_files.saturating_sub(discovered.len());
+        let removed = cached_files.saturating_sub(self.files.len());
         self.rebuild_prefix_index();
         self.ready = true;
         let mut files = BTreeMap::new();
         for file in &discovered {
-            let path = &file.path;
+            let path = canonical_or(file.path.clone());
             let modified = file.modified;
             let symbols = self
                 .symbols
                 .iter()
-                .filter(|symbol| &symbol.file == path)
+                .filter(|symbol| symbol.file == path)
                 .cloned()
                 .collect();
-            files.insert(path.clone(), (file.size, modified, symbols));
+            files.insert(path, (file.size, modified, symbols));
         }
         if let Some(parent) = cache_path.as_ref().parent() {
             let _ = fs::create_dir_all(parent);
@@ -1148,12 +1237,14 @@ impl ProjectSymbolIndex {
             schema_version: PROJECT_CACHE_SCHEMA,
             files,
         };
-        let _ = fs::write(cache_path, serde_json::to_vec(&cache).unwrap_or_default());
+        if let Ok(bytes) = serde_json::to_vec(&cache) {
+            let _ = write_cache_atomic(cache_path.as_ref(), &bytes);
+        }
         if std::env::var_os("AXIOM_DEBUG_INPUT").is_some() {
             eprintln!(
                 "[PROJECT CACHE] hit={} reason={} load_ms={}",
-                cached.is_some() && reparsed == 0,
-                if cached.is_some() {
+                cache_hit && reparsed == 0,
+                if cache_hit {
                     "metadata"
                 } else {
                     "missing"
@@ -1169,12 +1260,10 @@ impl ProjectSymbolIndex {
                 started.elapsed().as_millis()
             );
             eprintln!(
-                "[PROJECT STARTUP PROFILE] cache_read_us={} cache_deserialize_us={} discovery_us={} metadata_us={} cache_validation_us={} changed_file_detection_us={} snapshot_restore_us={} publish_ui_us=0 canonicalize_us={} directories_visited={} metadata_calls={} canonicalize_calls={} files_opened_read={} total_us={}",
+                "[PROJECT STARTUP PROFILE] cache_read_us={} discovery_us={} metadata_us={} changed_file_detection_us={} snapshot_restore_us={} publish_ui_us=0 canonicalize_us={} directories_visited={} metadata_calls={} canonicalize_calls={} files_opened_read={} total_us={}",
                 cache_read_us,
-                cache_deserialize_us,
                 discovery_us,
                 metadata_us,
-                cache_validation_us,
                 changed_detection_us,
                 snapshot_restore_us,
                 canonicalize_us,
@@ -1232,6 +1321,7 @@ impl ProjectSymbolIndex {
         text: String,
         source: &str,
     ) -> io::Result<usize> {
+        self.file_stamps.remove(&path);
         self.files.remove(&path);
         self.symbols.retain(|symbol| symbol.file != path);
         let syntax = PhpSyntax::parse(text.clone())
@@ -1255,9 +1345,59 @@ impl ProjectSymbolIndex {
         Ok(count)
     }
 
+    /// Merges a disk-reconciled snapshot without replacing newer in-memory
+    /// buffer updates already applied to this index.
+    pub fn apply_reconciled_index(&mut self, refreshed: &ProjectSymbolIndex) {
+        let paths: HashSet<PathBuf> = self
+            .files
+            .keys()
+            .chain(refreshed.files.keys())
+            .cloned()
+            .collect();
+        let mut changed = HashSet::new();
+        for path in paths {
+            let is_dirty_buffer = self.files.contains_key(&path)
+                && !self.file_stamps.contains_key(&path);
+            if is_dirty_buffer {
+                continue;
+            }
+            match refreshed.file_stamps.get(&path) {
+                Some(stamp) if self.file_stamps.get(&path) != Some(stamp) => {
+                    self.files.insert(
+                        path.clone(),
+                        refreshed
+                            .files
+                            .get(&path)
+                            .cloned()
+                            .unwrap_or_else(|| Arc::from("")),
+                    );
+                    self.file_stamps.insert(path.clone(), *stamp);
+                    changed.insert(path);
+                }
+                None => {
+                    self.files.remove(&path);
+                    self.file_stamps.remove(&path);
+                    changed.insert(path);
+                }
+                _ => {}
+            }
+        }
+        self.symbols.retain(|symbol| !changed.contains(&symbol.file));
+        self.symbols.extend(
+            refreshed
+                .symbols
+                .iter()
+                .filter(|symbol| changed.contains(&symbol.file))
+                .cloned(),
+        );
+        self.rebuild_prefix_index();
+        self.ready = true;
+    }
+
     pub fn remove_file(&mut self, path: impl AsRef<Path>) -> usize {
         let path = fs::canonicalize(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
         self.files.remove(&path);
+        self.file_stamps.remove(&path);
         let before = self.symbols.len();
         self.symbols.retain(|symbol| symbol.file != path);
         self.rebuild_prefix_index();
