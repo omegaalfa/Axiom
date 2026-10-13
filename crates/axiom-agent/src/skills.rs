@@ -214,6 +214,7 @@ impl Skill {
             return Err("skill must start with YAML-like front matter".into());
         }
         let mut fields = std::collections::BTreeMap::<String, Vec<String>>::new();
+        let mut list_field: Option<String> = None;
         let mut front_matter_closed = false;
         for line in &mut lines {
             let line = line.trim();
@@ -221,15 +222,32 @@ impl Skill {
                 front_matter_closed = true;
                 break;
             }
+            if let Some(item) = line.strip_prefix("- ") {
+                let item = item.trim().trim_matches(['"', '\'']).trim();
+                let Some(key) = list_field.as_ref() else {
+                    return Err("list item must follow a supported list field".into());
+                };
+                if item.is_empty() {
+                    return Err("front matter list items must not be empty".into());
+                }
+                fields.entry(key.clone()).or_default().push(item.to_owned());
+                continue;
+            }
             let Some((key, value)) = line.split_once(':') else {
                 return Err("invalid front matter line".into());
             };
             let key = key.trim().to_ascii_lowercase();
             let value = value.trim().trim_matches(['"', '\'']).trim().to_string();
-            if key.is_empty() || value.is_empty() {
+            let supports_multiline_list = matches!(key.as_str(), "triggers" | "parameter_constraints");
+            if key.is_empty() || (value.is_empty() && !supports_multiline_list) {
                 return Err("front matter fields must not be empty".into());
             }
-            fields.entry(key).or_default().push(value);
+            if value.is_empty() {
+                list_field = Some(key);
+            } else {
+                list_field = None;
+                fields.entry(key).or_default().push(value);
+            }
         }
         if !front_matter_closed {
             return Err("skill front matter is not closed".into());
@@ -321,6 +339,17 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_multiline_yaml_lists_in_front_matter() {
+        let parsed = Skill::parse(
+            "---\nname: Listed\ndescription: procedure\ntriggers:\n  - review\n  - tests\nparameter_constraints:\n  - php\n---\nInspect files.",
+            PathBuf::from("listed.md"),
+        )
+        .unwrap();
+        assert_eq!(parsed.triggers, vec!["review", "tests"]);
+        assert_eq!(parsed.parameter_constraints, vec!["php"]);
     }
 
     #[test]

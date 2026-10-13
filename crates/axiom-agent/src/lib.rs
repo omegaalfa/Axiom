@@ -579,13 +579,14 @@ pub struct ApprovalScope {
     pub canonical_workspace_path: PathBuf,
 }
 
+/// Allows safe reads directly and requires approval for mutations and commands.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReadOnlyToolPolicy {
+pub struct StandardToolPolicy {
     workspace_root: Option<PathBuf>,
     run_scoped_approvals: HashSet<ApprovalScope>,
 }
 
-impl ReadOnlyToolPolicy {
+impl StandardToolPolicy {
     pub fn with_workspace_root(root: PathBuf) -> Self {
         Self {
             workspace_root: Some(root),
@@ -611,7 +612,7 @@ impl ReadOnlyToolPolicy {
     }
 }
 
-impl ToolPolicy for ReadOnlyToolPolicy {
+impl ToolPolicy for StandardToolPolicy {
     fn is_run_scoped_allowed(
         &mut self,
         context: ToolPolicyContext,
@@ -668,7 +669,9 @@ impl ToolPolicy for ReadOnlyToolPolicy {
     }
 }
 
-pub type ProductionToolPolicy = ReadOnlyToolPolicy;
+/// Backwards-compatible name retained for downstream users.
+pub type ReadOnlyToolPolicy = StandardToolPolicy;
+pub type ProductionToolPolicy = StandardToolPolicy;
 
 #[derive(Debug)]
 pub enum AgentExecutionError {
@@ -915,7 +918,7 @@ enum ToolProcessing {
     },
 }
 
-pub struct AgentExecutor<'a, P, T, Policy = ReadOnlyToolPolicy> {
+pub struct AgentExecutor<'a, P, T, Policy = StandardToolPolicy> {
     provider: &'a mut P,
     tools: &'a mut T,
     policy: Policy,
@@ -954,13 +957,13 @@ fn with_agent_system_instruction(
     request
 }
 
-impl<'a, P, T> AgentExecutor<'a, P, T, ReadOnlyToolPolicy>
+impl<'a, P, T> AgentExecutor<'a, P, T, StandardToolPolicy>
 where
     P: ProviderExecutor,
     T: ToolExecutor,
 {
     pub fn new(provider: &'a mut P, tools: &'a mut T) -> Self {
-        Self::with_policy(provider, tools, ReadOnlyToolPolicy::default())
+        Self::with_policy(provider, tools, StandardToolPolicy::default())
     }
 }
 

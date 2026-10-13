@@ -9,7 +9,7 @@ use super::tool_orchestration::{
 use super::tools::{ToolArguments, ToolError, ToolName, ToolRegistry, ToolRequest};
 use axiom_agent::{
     AgentEvent, AgentExecutionError, AgentExecutor, AgentRun, AgentRunId, ApprovalId,
-    ApprovalRequest, Cancellation, ProductionToolPolicy, ProviderExecutor, ToolExecutor,
+    ApprovalRequest, Cancellation, StandardToolPolicy, ProviderExecutor, ToolExecutor,
     SkillCatalog, ToolInfrastructureError, ToolOutcome, ToolPolicy,
 };
 use axiom_ai_provider::{
@@ -904,7 +904,7 @@ pub(crate) fn execute_agent_run(
         &mut tools,
         workspace_root
             .as_ref()
-            .map(|root| ProductionToolPolicy::with_workspace_root(root.clone()))
+            .map(|root| StandardToolPolicy::with_workspace_root(root.clone()))
             .unwrap_or_default(),
         memory,
         workspace_root
@@ -1692,7 +1692,7 @@ mod approval_bridge_tests {
             request(),
             &mut provider,
             &mut tools,
-            ProductionToolPolicy::default(),
+            StandardToolPolicy::default(),
             Some(memory.clone()),
             None,
             &bridge,
@@ -1728,7 +1728,7 @@ mod approval_bridge_tests {
         };
         let mut run = AgentRun::new(AgentRunId::new(501), axiom_agent::AgentBudget::new(2, 1));
         let mut executor =
-            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
+            AgentExecutor::with_policy(&mut provider, &mut tools, StandardToolPolicy::default());
         let error = executor
             .execute(&mut run, request(), &mut |_| {})
             .unwrap_err();
@@ -1789,7 +1789,7 @@ mod approval_bridge_tests {
         };
         let mut run = AgentRun::new(AgentRunId::new(503), axiom_agent::AgentBudget::new(1, 1));
         let mut executor =
-            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
+            AgentExecutor::with_policy(&mut provider, &mut tools, StandardToolPolicy::default());
         let error = executor
             .execute(&mut run, request(), &mut |_| {})
             .unwrap_err();
@@ -1828,7 +1828,7 @@ mod approval_bridge_tests {
         };
         let mut run = AgentRun::new(AgentRunId::new(503), axiom_agent::AgentBudget::new(2, 1));
         let mut executor =
-            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
+            AgentExecutor::with_policy(&mut provider, &mut tools, StandardToolPolicy::default());
         let error = executor
             .execute(&mut run, request(), &mut |_| {})
             .unwrap_err();
@@ -1918,7 +1918,7 @@ mod approval_bridge_tests {
         let mut run = AgentRun::new(AgentRunId::new(505), axiom_agent::AgentBudget::new(2, 1));
         assert_eq!(tools.update_calls, 0);
         let mut executor =
-            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
+            AgentExecutor::with_policy(&mut provider, &mut tools, StandardToolPolicy::default());
         let error = executor
             .execute(&mut run, request(), &mut |_| {})
             .unwrap_err();
@@ -1980,7 +1980,7 @@ mod approval_bridge_tests {
         };
         let mut run = AgentRun::new(AgentRunId::new(504), axiom_agent::AgentBudget::new(2, 1));
         let mut executor =
-            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
+            AgentExecutor::with_policy(&mut provider, &mut tools, StandardToolPolicy::default());
         let error = executor
             .execute(&mut run, request(), &mut |_| {})
             .unwrap_err();
@@ -2032,7 +2032,7 @@ mod approval_bridge_tests {
         };
         let mut run = AgentRun::new(AgentRunId::new(502), axiom_agent::AgentBudget::new(2, 1));
         let mut executor =
-            AgentExecutor::with_policy(&mut provider, &mut tools, ProductionToolPolicy::default());
+            AgentExecutor::with_policy(&mut provider, &mut tools, StandardToolPolicy::default());
         let error = executor
             .execute(&mut run, request(), &mut |_| {})
             .unwrap_err();

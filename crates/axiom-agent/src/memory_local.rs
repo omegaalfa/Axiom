@@ -730,7 +730,10 @@ impl AxiomMemoryBackend {
             }
         };
         connection
-            .busy_timeout(std::time::Duration::from_millis(250))
+            .busy_timeout(std::time::Duration::from_millis(2_500))
+            .map_err(sqlite_error)?;
+        connection
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
             .map_err(sqlite_error)?;
         let transaction = connection.transaction().map_err(sqlite_error)?;
         transaction
@@ -843,7 +846,10 @@ impl AxiomMemoryBackend {
     fn vacuum_index(&self) -> Result<(), AxiomMemoryError> {
         let connection = Connection::open(self.index_path()?).map_err(sqlite_error)?;
         connection
-            .busy_timeout(std::time::Duration::from_millis(250))
+            .busy_timeout(std::time::Duration::from_millis(2_500))
+            .map_err(sqlite_error)?;
+        connection
+            .execute_batch("PRAGMA synchronous = NORMAL;")
             .map_err(sqlite_error)?;
         connection
             .execute("INSERT INTO memory_fts(memory_fts) VALUES('optimize')", [])
@@ -863,6 +869,12 @@ impl AxiomMemoryBackend {
             return Err(AxiomMemoryError::Io(io::Error::other("memory FTS unavailable")));
         }
         let connection = Connection::open(self.index_path()?).map_err(sqlite_error)?;
+        connection
+            .busy_timeout(std::time::Duration::from_millis(2_500))
+            .map_err(sqlite_error)?;
+        connection
+            .execute_batch("PRAGMA synchronous = NORMAL;")
+            .map_err(sqlite_error)?;
         let mut statement = connection
             .prepare(
                 "SELECT record_key FROM memory_fts
@@ -1592,6 +1604,18 @@ mod tests {
         assert!(backend
             .query(MemoryScope::Workspace, "memory payload", 10)
             .is_empty());
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn local_memory_index_uses_wal_journal_mode() {
+        let (backend, path) = backend();
+        backend.initialize_storage().unwrap();
+        let connection = Connection::open(path.join("memory_index.sqlite")).unwrap();
+        let journal_mode = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
         let _ = fs::remove_dir_all(path);
     }
 
