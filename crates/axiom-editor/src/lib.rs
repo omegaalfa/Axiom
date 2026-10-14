@@ -20,6 +20,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod php_format;
+pub use php_format::format_php;
+
 /// Incremental document edit. All ranges are UTF-8 byte offsets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentEdit {

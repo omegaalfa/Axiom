@@ -44,6 +44,13 @@ pub enum SymbolOrigin {
     PhpRuntime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PropertyVisibility {
+    Public,
+    Protected,
+    Private,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceLocation {
     pub file: PathBuf,
@@ -100,6 +107,16 @@ pub struct Symbol {
     pub location: SourceLocation,
     /// Declared type for typed properties and typed constants.
     pub declared_type: Option<String>,
+    #[serde(default)]
+    pub read_visibility: Option<PropertyVisibility>,
+    #[serde(default)]
+    pub write_visibility: Option<PropertyVisibility>,
+    #[serde(default)]
+    pub has_get_hook: bool,
+    #[serde(default)]
+    pub has_set_hook: bool,
+    #[serde(default)]
+    pub is_virtual: bool,
     pub signature: Option<Signature>,
     pub documentation: Option<PhpDoc>,
     pub availability: Availability,
@@ -684,6 +701,11 @@ fn visit_node(
                 range: name_node.byte_range(),
             },
             declared_type: None,
+            read_visibility: None,
+            write_visibility: None,
+            has_get_hook: false,
+            has_set_hook: false,
+            is_virtual: false,
             signature,
             documentation,
             availability: extract_availability(node_text(node, text)),
@@ -702,9 +724,13 @@ fn visit_node(
     }
 
     if node.kind() == "property_declaration" {
+        let source = &text[node.start_byte()..node.end_byte().min(text.len())];
+        let hook_metadata = property_hook_metadata(source);
         let declared_type = node
             .child_by_field_name("type")
-            .map(|node| node_text(node, text).to_owned());
+            .map(|node| node_text(node, text).to_owned())
+            .or_else(|| infer_property_hook_type(source));
+        let (read_visibility, write_visibility) = property_visibilities(node, text);
         let documentation = preceding_phpdoc(node, text).map(parse_phpdoc);
         let mut cursor = node.walk();
         for child in node
@@ -724,6 +750,11 @@ fn visit_node(
                     extension,
                     documentation.clone(),
                     declared_type.clone(),
+                    read_visibility,
+                    write_visibility,
+                    hook_metadata.0,
+                    hook_metadata.1,
+                    hook_metadata.2,
                 ));
             }
         }
@@ -761,6 +792,11 @@ fn visit_node(
                     declared_type: node
                         .child_by_field_name("type")
                         .map(|node| node_text(node, text).to_owned()),
+                    read_visibility: None,
+                    write_visibility: None,
+                    has_get_hook: false,
+                    has_set_hook: false,
+                    is_virtual: false,
                     signature: None,
                     documentation: preceding_phpdoc(node, text).map(parse_phpdoc),
                     availability: extract_availability(node_text(node, text)),
@@ -786,6 +822,11 @@ fn member_symbol(
     extension: &str,
     documentation: Option<PhpDoc>,
     declared_type: Option<String>,
+    read_visibility: PropertyVisibility,
+    write_visibility: PropertyVisibility,
+    has_get_hook: bool,
+    has_set_hook: bool,
+    is_virtual: bool,
 ) -> Symbol {
     Symbol {
         fqn: format!("{}::{name}", owner.unwrap_or("")),
@@ -798,11 +839,91 @@ fn member_symbol(
             range: name_node.byte_range(),
         },
         declared_type,
+        read_visibility: Some(read_visibility),
+        write_visibility: Some(write_visibility),
+        has_get_hook,
+        has_set_hook,
+        is_virtual,
         signature: None,
         documentation,
         availability: Availability::default(),
         is_static: false,
     }
+}
+
+fn property_hook_metadata(source: &str) -> (bool, bool, bool) {
+    let mut has_get = false;
+    let mut has_set = false;
+    for word in source.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
+        match word {
+            "get" => has_get = true,
+            "set" => has_set = true,
+            _ => {}
+        }
+    }
+    let has_hooks = has_get || has_set;
+    (has_get, has_set, has_hooks && !source.contains("$this->"))
+}
+
+fn infer_property_hook_type(source: &str) -> Option<String> {
+    if let Some(setter) = source.find("set") {
+        let after_set = &source[setter + 3..];
+        if let Some(open) = after_set.find('(') {
+            let parameter = after_set[open + 1..].split(['$', ')']).next()?.trim();
+            if !parameter.is_empty() {
+                return Some(parameter.trim_start_matches('?').to_owned());
+            }
+        }
+    }
+    let expression = source
+        .split_once("=>")
+        .map(|(_, expression)| expression)
+        .or_else(|| source.split_once("return").map(|(_, expression)| expression))?
+        .trim_start();
+    if expression.starts_with(['\'', '"']) {
+        Some("string".into())
+    } else if expression.starts_with("true") || expression.starts_with("false") {
+        Some("bool".into())
+    } else if expression.starts_with("[ ") || expression.starts_with("[") {
+        Some("array".into())
+    } else if expression
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_digit() || ch == '-')
+    {
+        let literal = expression
+            .split(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '.' | '-')))
+            .next()?;
+        Some(if literal.contains('.') { "float" } else { "int" }.into())
+    } else {
+        None
+    }
+}
+
+fn property_visibilities(
+    node: Node<'_>,
+    text: &str,
+) -> (PropertyVisibility, PropertyVisibility) {
+    let source = &text[node.start_byte()..node.end_byte().min(text.len())];
+    let tokens = source.split_whitespace().collect::<Vec<_>>();
+    let read = [
+        ("private", PropertyVisibility::Private),
+        ("protected", PropertyVisibility::Protected),
+        ("public", PropertyVisibility::Public),
+        ("var", PropertyVisibility::Public),
+    ]
+    .into_iter()
+    .find_map(|(word, visibility)| tokens.iter().any(|part| *part == word).then_some(visibility))
+    .unwrap_or(PropertyVisibility::Public);
+    let write = [
+        ("private(set)", PropertyVisibility::Private),
+        ("protected(set)", PropertyVisibility::Protected),
+        ("public(set)", PropertyVisibility::Public),
+    ]
+    .into_iter()
+    .find_map(|(word, visibility)| tokens.iter().any(|part| *part == word).then_some(visibility))
+    .unwrap_or(read);
+    (read, write)
 }
 
 fn extract_signature(node: Node<'_>, text: &str, phpdoc: Option<&PhpDoc>) -> Signature {
@@ -1164,6 +1285,53 @@ namespace {
                 .any(|symbol| symbol.kind == SymbolKind::ClassConstant && symbol.name == "ATOM")
         );
         assert!(index.find_constant("PHP_VERSION_ID").is_some());
+    }
+
+    #[test]
+    fn extracts_php84_asymmetric_property_read_and_write_visibility() {
+        let symbols = extract_symbols(
+            "<?php class Asymmetric { public private(set) string $name; protected private(set) ?int $id; public(set) private string $title; public readonly private(set) string $code; }",
+            Path::new("Asymmetric.php"),
+            "Core",
+        )
+        .unwrap();
+        for (name, read, write) in [
+            ("name", PropertyVisibility::Public, PropertyVisibility::Private),
+            ("id", PropertyVisibility::Protected, PropertyVisibility::Private),
+            ("title", PropertyVisibility::Private, PropertyVisibility::Public),
+            ("code", PropertyVisibility::Public, PropertyVisibility::Private),
+        ] {
+            let property = symbols
+                .iter()
+                .find(|symbol| symbol.kind == SymbolKind::Property && symbol.name == name)
+                .unwrap();
+            assert_eq!(property.read_visibility, Some(read), "property {name}");
+            assert_eq!(property.write_visibility, Some(write), "property {name}");
+        }
+        assert_eq!(
+            symbols.iter().find(|symbol| symbol.name == "name").unwrap().declared_type.as_deref(),
+            Some("string")
+        );
+    }
+
+    #[test]
+    fn extracts_property_hook_metadata_and_setter_type() {
+        let symbols = extract_symbols(
+            "<?php class Hooks { public string $name { get => $this->_name; set => strtolower($value); } public $title { get { return 'title'; } } public $count { set(int $value) { $this->_count = $value; } } }",
+            Path::new("Hooks.php"),
+            "Core",
+        )
+        .unwrap();
+        let name = symbols.iter().find(|symbol| symbol.name == "name").unwrap();
+        assert!(name.has_get_hook && name.has_set_hook);
+        assert!(!name.is_virtual);
+        assert_eq!(name.declared_type.as_deref(), Some("string"));
+        let title = symbols.iter().find(|symbol| symbol.name == "title").unwrap();
+        assert!(title.has_get_hook && title.is_virtual);
+        assert_eq!(title.declared_type.as_deref(), Some("string"));
+        let count = symbols.iter().find(|symbol| symbol.name == "count").unwrap();
+        assert!(count.has_set_hook && !count.has_get_hook);
+        assert_eq!(count.declared_type.as_deref(), Some("int"));
     }
 
     #[test]

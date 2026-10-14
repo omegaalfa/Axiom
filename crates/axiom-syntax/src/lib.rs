@@ -28,6 +28,7 @@ pub enum HighlightKind {
     Operator,
     Punctuation,
     Attribute,
+    PropertyHook,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +98,7 @@ pub struct PhpSyntax {
     highlights: Vec<HighlightSpan>,
     highlight_prefix_max_end: Vec<usize>,
     symbols: Vec<SyntaxSymbol>,
+    pipe_operator_ranges: Vec<Range<usize>>,
 }
 
 /// Timings for one syntax update.
@@ -123,8 +125,11 @@ impl PhpSyntax {
             RUSTSTORM_HIGHLIGHTS_QUERY
         );
         let query = Query::new(&language, &highlight_query).map_err(SyntaxError::Query)?;
+        let (asymmetric_text, _) = normalize_asymmetric_visibility(&text);
+        let (hooks_text, _) = normalize_property_hooks(&text, &asymmetric_text);
+        let (parse_text, pipe_operator_ranges) = normalize_php85_pipe_operator(&text, &hooks_text);
         let tree = parser
-            .parse(text.as_bytes(), None)
+            .parse(parse_text.as_bytes(), None)
             .ok_or(SyntaxError::ParseCancelled)?;
         let mut syntax = Self {
             parser,
@@ -134,6 +139,7 @@ impl PhpSyntax {
             highlights: Vec::new(),
             highlight_prefix_max_end: Vec::new(),
             symbols: Vec::new(),
+            pipe_operator_ranges,
         };
         syntax.refresh_derived_data();
         Ok(syntax)
@@ -223,6 +229,12 @@ impl PhpSyntax {
         self.tree.root_node().has_error()
     }
 
+    /// Byte ranges of PHP 8.5 pipe operators in the original, unnormalized
+    /// source. Tree-sitter-php 0.24 parses these as same-width `||` tokens.
+    pub fn pipe_operator_ranges(&self) -> Vec<Range<usize>> {
+        self.pipe_operator_ranges.clone()
+    }
+
     pub fn highlights(&self) -> &[HighlightSpan] {
         &self.highlights
     }
@@ -284,10 +296,15 @@ impl PhpSyntax {
         let edit_span_bytes = old_range.end.saturating_sub(old_range.start);
         self.text.replace_range(old_range, replacement);
         let parse_started = std::time::Instant::now();
+        let (asymmetric_text, _) = normalize_asymmetric_visibility(&self.text);
+        let (hooks_text, _) = normalize_property_hooks(&self.text, &asymmetric_text);
+        let (parse_text, pipe_operator_ranges) =
+            normalize_php85_pipe_operator(&self.text, &hooks_text);
         self.tree = self
             .parser
-            .parse(self.text.as_bytes(), Some(&self.tree))
+            .parse(parse_text.as_bytes(), Some(&self.tree))
             .ok_or(SyntaxError::ParseCancelled)?;
+        self.pipe_operator_ranges = pipe_operator_ranges;
         let parse_us = parse_started.elapsed().as_micros();
         let derived_started = std::time::Instant::now();
         self.refresh_derived_data();
@@ -337,6 +354,25 @@ impl PhpSyntax {
 
     fn refresh_derived_data(&mut self) {
         self.highlights = collect_highlights(&self.query, &self.tree, &self.text);
+        let (asymmetric_text, asymmetric_visibility_ranges) =
+            normalize_asymmetric_visibility(&self.text);
+        self.highlights.extend(asymmetric_visibility_ranges.into_iter().map(|range| {
+            HighlightSpan {
+                start_byte: range.start,
+                end_byte: range.end,
+                kind: HighlightKind::Keyword,
+            }
+        }));
+        let (_, property_hook_ranges) = normalize_property_hooks(&self.text, &asymmetric_text);
+        self.highlights.extend(property_hook_ranges.into_iter().map(|range| {
+            HighlightSpan {
+                start_byte: range.start,
+                end_byte: range.end,
+                kind: HighlightKind::PropertyHook,
+            }
+        }));
+        self.highlights.sort_by_key(|span| (span.start_byte, span.end_byte));
+        self.highlights.dedup();
         self.highlight_prefix_max_end = self
             .highlights
             .iter()
@@ -347,6 +383,424 @@ impl PhpSyntax {
             .collect();
         self.symbols = collect_symbols(&self.tree, &self.text);
     }
+}
+
+/// Tree-sitter-php 0.24 predates PHP 8.4 asymmetric property visibility.
+/// Replace only the `(set)` suffix in PHP code with equal-length whitespace so
+/// its existing repeated visibility-modifier production can parse the property
+/// while every node range continues to address the original source.
+fn normalize_asymmetric_visibility(text: &str) -> (String, Vec<Range<usize>>) {
+    const VISIBILITIES: [&[u8]; 3] = [b"public", b"protected", b"private"];
+    let source = text.as_bytes();
+    let mut normalized = source.to_vec();
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let has_php_open_tag = source.windows(2).any(|window| window == b"<?");
+    let mut in_php = !has_php_open_tag;
+
+    while offset < source.len() {
+        let byte = source[offset];
+        if !in_php {
+            if source[offset..].starts_with(b"<?") {
+                in_php = true;
+                offset += 2;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if source[offset..].starts_with(b"?>") {
+            in_php = false;
+            offset += 2;
+            continue;
+        }
+        if line_comment {
+            if byte == b'\n' {
+                line_comment = false;
+            }
+            offset += 1;
+            continue;
+        }
+        if block_comment {
+            if source[offset..].starts_with(b"*/") {
+                block_comment = false;
+                offset += 2;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                offset = (offset + 2).min(source.len());
+            } else if byte == delimiter {
+                quote = None;
+                offset += 1;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if source[offset..].starts_with(b"//") || (byte == b'#' && !source[offset..].starts_with(b"#[")) {
+            line_comment = true;
+            offset += if byte == b'#' { 1 } else { 2 };
+            continue;
+        }
+        if source[offset..].starts_with(b"/*") {
+            block_comment = true;
+            offset += 2;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            offset += 1;
+            continue;
+        }
+
+        let visibility = VISIBILITIES.iter().find(|word| {
+            source[offset..].starts_with(word)
+                && (offset == 0
+                    || !source[offset - 1].is_ascii_alphanumeric() && source[offset - 1] != b'_')
+        });
+        if let Some(visibility) = visibility {
+            let suffix_start = offset + visibility.len();
+            let suffix_end = suffix_start + b"(set)".len();
+            let next_is_boundary = source
+                .get(suffix_end)
+                .is_none_or(|next| next.is_ascii_whitespace() || matches!(next, b'$' | b';' | b'='));
+            if source.get(suffix_start..suffix_end) == Some(b"(set)")
+                && next_is_boundary
+            {
+                normalized[suffix_start..suffix_end].fill(b' ');
+                ranges.push(suffix_start..suffix_end);
+                offset = suffix_end;
+                continue;
+            }
+        }
+        offset += 1;
+    }
+    (String::from_utf8(normalized).expect("replacing ASCII bytes preserves UTF-8"), ranges)
+}
+
+/// Tree-sitter-php 0.24 predates PHP 8.5's pipe token. Preserve all byte
+/// offsets and expression structure by parsing `|>` as the same-width `||`;
+/// the source text remains untouched for highlighting and semantic consumers.
+fn normalize_php85_pipe_operator(
+    original: &str,
+    parse_text: &str,
+) -> (String, Vec<Range<usize>>) {
+    let source = original.as_bytes();
+    let mut normalized = parse_text.as_bytes().to_vec();
+    let mut offset = 0;
+    let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut in_php = !source.windows(2).any(|window| window == b"<?");
+    let mut ranges = Vec::new();
+
+    while offset < source.len() {
+        let byte = source[offset];
+        if !in_php {
+            if source[offset..].starts_with(b"<?") {
+                in_php = true;
+                offset += 2;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if source[offset..].starts_with(b"?>") {
+            in_php = false;
+            offset += 2;
+            continue;
+        }
+        if line_comment {
+            line_comment = byte != b'\n';
+            offset += 1;
+            continue;
+        }
+        if block_comment {
+            if source[offset..].starts_with(b"*/") {
+                block_comment = false;
+                offset += 2;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                offset = (offset + 2).min(source.len());
+            } else {
+                if byte == delimiter {
+                    quote = None;
+                }
+                offset += 1;
+            }
+            continue;
+        }
+        if source[offset..].starts_with(b"//")
+            || (byte == b'#' && !source[offset..].starts_with(b"#["))
+        {
+            line_comment = true;
+            offset += if byte == b'#' { 1 } else { 2 };
+        } else if source[offset..].starts_with(b"/*") {
+            block_comment = true;
+            offset += 2;
+        } else if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            offset += 1;
+        } else if source[offset..].starts_with(b"|>") {
+            normalized[offset + 1] = b'|';
+            ranges.push(offset..offset + 2);
+            offset += 2;
+        } else {
+            offset += 1;
+        }
+    }
+    (
+        String::from_utf8(normalized).expect("replacing ASCII bytes preserves UTF-8"),
+        ranges,
+    )
+}
+
+/// Tree-sitter-php 0.24 does not parse PHP 8.4 property hook blocks. Keep the
+/// property declaration in the tree by replacing each hook block with an
+/// equal-length whitespace span ending in a semicolon. Original byte offsets
+/// remain valid for indexing and diagnostics.
+fn normalize_property_hooks(original: &str, parse_text: &str) -> (String, Vec<Range<usize>>) {
+    let source = original.as_bytes();
+    let mut normalized = parse_text.as_bytes().to_vec();
+    let mut hook_ranges = Vec::new();
+    let mut offset = 0;
+    let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut in_php = !source.windows(2).any(|window| window == b"<?");
+
+    while offset < source.len() {
+        let byte = source[offset];
+        if !in_php {
+            if source[offset..].starts_with(b"<?") {
+                in_php = true;
+                offset += 2;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if source[offset..].starts_with(b"?>") {
+            in_php = false;
+            offset += 2;
+            continue;
+        }
+        if line_comment {
+            if byte == b'\n' {
+                line_comment = false;
+            }
+            offset += 1;
+            continue;
+        }
+        if block_comment {
+            if source[offset..].starts_with(b"*/") {
+                block_comment = false;
+                offset += 2;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                offset = (offset + 2).min(source.len());
+            } else if byte == delimiter {
+                quote = None;
+                offset += 1;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if source[offset..].starts_with(b"//")
+            || (byte == b'#' && !source[offset..].starts_with(b"#["))
+        {
+            line_comment = true;
+            offset += if byte == b'#' { 1 } else { 2 };
+            continue;
+        }
+        if source[offset..].starts_with(b"/*") {
+            block_comment = true;
+            offset += 2;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            offset += 1;
+            continue;
+        }
+
+        if byte == b'{' && property_hook_prefix(&original[..offset]) {
+            if let Some(close) = matching_brace(source, offset)
+                && let Some(ranges) = property_hook_keywords(source, offset + 1, close)
+            {
+                hook_ranges.extend(ranges);
+                normalized[offset..=close].fill(b' ');
+                normalized[close] = b';';
+                offset = close + 1;
+                continue;
+            }
+        }
+        offset += 1;
+    }
+
+    (
+        String::from_utf8(normalized).expect("replacing ASCII bytes preserves UTF-8"),
+        hook_ranges,
+    )
+}
+
+fn property_hook_prefix(prefix: &str) -> bool {
+    let declaration_start = prefix
+        .rfind([';', '{', '}'])
+        .map_or(0, |offset| offset + 1);
+    let declaration = &prefix[declaration_start..];
+    let Some(variable_start) = declaration.rfind('$') else {
+        return false;
+    };
+    let variable_tail = &declaration[variable_start + 1..];
+    let name_len = variable_tail
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    name_len > 0
+        && variable_tail[name_len..].trim().is_empty()
+        && !declaration[..variable_start].contains("function")
+        && !declaration[..variable_start].contains("fn(")
+}
+
+fn matching_brace(source: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut offset = open + 1;
+    let mut quote = None;
+    while offset < source.len() {
+        let byte = source[offset];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                offset = (offset + 2).min(source.len());
+            } else {
+                if byte == delimiter {
+                    quote = None;
+                }
+                offset += 1;
+            }
+        } else if source[offset..].starts_with(b"//")
+            || (byte == b'#' && !source[offset..].starts_with(b"#["))
+        {
+            offset += if byte == b'#' { 1 } else { 2 };
+            while offset < source.len() && source[offset] != b'\n' {
+                offset += 1;
+            }
+        } else if source[offset..].starts_with(b"/*") {
+            offset += 2;
+            while offset + 1 < source.len() && !source[offset..].starts_with(b"*/") {
+                offset += 1;
+            }
+            offset = (offset + 2).min(source.len());
+        } else if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            offset += 1;
+        } else {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(offset);
+                    }
+                }
+                _ => {}
+            }
+            offset += 1;
+        }
+    }
+    None
+}
+
+fn property_hook_keywords(source: &[u8], start: usize, end: usize) -> Option<Vec<Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut offset = start;
+    let mut nested = 0usize;
+    let mut quote = None;
+    while offset < end {
+        let byte = source[offset];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                offset = (offset + 2).min(end);
+            } else {
+                if byte == delimiter {
+                    quote = None;
+                }
+                offset += 1;
+            }
+            continue;
+        }
+        if source[offset..].starts_with(b"//")
+            || (byte == b'#' && !source[offset..].starts_with(b"#["))
+        {
+            while offset < end && source[offset] != b'\n' {
+                offset += 1;
+            }
+            continue;
+        }
+        if source[offset..].starts_with(b"/*") {
+            offset += 2;
+            while offset + 1 < end && !source[offset..].starts_with(b"*/") {
+                offset += 1;
+            }
+            offset = (offset + 2).min(end);
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            offset += 1;
+            continue;
+        }
+        match byte {
+            b'{' => nested += 1,
+            b'}' => nested = nested.saturating_sub(1),
+            _ => {}
+        }
+        if nested == 0 {
+            for keyword in [&b"get"[..], &b"set"[..]] {
+                let keyword_end = offset + keyword.len();
+                let previous_boundary = offset == start
+                    || !(source[offset - 1].is_ascii_alphanumeric()
+                        || source[offset - 1] == b'_');
+                let next_boundary = keyword_end <= end
+                    && (keyword_end == end
+                        || !(source[keyword_end].is_ascii_alphanumeric()
+                            || source[keyword_end] == b'_'));
+                if source[offset..].starts_with(keyword) && previous_boundary && next_boundary {
+                    let mut after = keyword_end;
+                    while after < end && source[after].is_ascii_whitespace() {
+                        after += 1;
+                    }
+                    if after < end && (source[after..].starts_with(b"=>")
+                        || source[after] == b'{' || source[after] == b'(')
+                    {
+                        ranges.push(offset..keyword_end);
+                        offset = keyword_end;
+                        break;
+                    }
+                }
+            }
+        }
+        offset += 1;
+    }
+    (!ranges.is_empty()).then_some(ranges)
 }
 
 fn point_at(text: &str, byte: usize) -> Point {
@@ -511,10 +965,137 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_highlights_php84_asymmetric_property_visibility() {
+        let source = "<?php class Asymmetric { public private(set) string $name; protected private(set) ?int $id; public(set) private string $title; public readonly private(set) string $code; }";
+        let syntax = assert_clean(source);
+        let setter_tokens = source.match_indices("(set)").collect::<Vec<_>>();
+        assert_eq!(setter_tokens.len(), 4);
+        for (start, token) in setter_tokens {
+            assert!(syntax.highlights().iter().any(|span| {
+                span.kind == HighlightKind::Keyword
+                    && span.start_byte == start
+                    && span.end_byte == start + token.len()
+            }));
+        }
+        assert_eq!(syntax.symbols().iter().filter(|symbol| symbol.kind == SymbolKind::Class).count(), 1);
+    }
+
+    #[test]
+    fn asymmetric_visibility_text_in_comments_and_strings_is_not_highlighted_as_modifier() {
+        let source = "<p>public(set)</p><?php // private(set)\n$value = 'protected(set)'; class Clean {}";
+        let syntax = assert_clean(source);
+        assert!(!syntax.highlights().iter().any(|span| {
+            span.kind == HighlightKind::Keyword
+                && source.get(span.start_byte..span.end_byte) == Some("(set)")
+        }));
+    }
+
+    #[test]
+    fn incremental_edit_reparses_asymmetric_visibility_without_errors() {
+        let mut syntax = assert_clean("<?php class C { public string $name; }");
+        let start = syntax.text().find("public").unwrap();
+        syntax
+            .apply_edit(start..start + "public".len(), "public private(set)")
+            .unwrap();
+        assert!(!syntax.has_errors(), "{}", syntax.tree().root_node().to_sexp());
+        assert!(syntax.highlights().iter().any(|span| {
+            span.kind == HighlightKind::Keyword
+                && syntax.text().get(span.start_byte..span.end_byte) == Some("(set)")
+        }));
+    }
+
+    #[test]
+    fn parses_php84_property_hooks_and_highlights_hook_keywords() {
+        let source = "<?php class C { public string $name { get => $this->_name; set => strtolower($value); } public string $title { get { return ucfirst($this->_title); } } public private(set) string $code { get => $this->_code; } public $virtual { get => 42; } }";
+        let syntax = assert_clean(source);
+        let hooks = source
+            .match_indices("get")
+            .chain(source.match_indices("set =>" ).map(|(offset, _)| (offset, "set")))
+            .collect::<Vec<_>>();
+        assert_eq!(hooks.len(), 5);
+        for (offset, keyword) in hooks {
+            assert!(syntax.highlights().iter().any(|span| {
+                span.kind == HighlightKind::PropertyHook
+                    && span.start_byte == offset
+                    && span.end_byte == offset + keyword.len()
+            }));
+        }
+        let mut properties = Vec::new();
+        let mut nodes = vec![syntax.tree().root_node()];
+        while let Some(node) = nodes.pop() {
+            if node.kind() == "property_declaration" {
+                properties.push(node);
+            }
+            nodes.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+        }
+        assert_eq!(properties.len(), 4);
+        assert!(properties.iter().all(|node| {
+            source
+                .get(node.start_byte()..node.end_byte())
+                .is_some_and(|raw| raw.contains("get") || raw.contains("set"))
+        }));
+    }
+
+    #[test]
+    fn property_hook_words_in_strings_and_comments_are_not_highlighted() {
+        let source = "<?php class C { public string $name { get => 'set'; /* get => */ } }";
+        let syntax = assert_clean(source);
+        let expected = source.find("get => '").unwrap();
+        assert!(syntax.highlights().iter().any(|span| {
+            span.kind == HighlightKind::PropertyHook && span.start_byte == expected
+        }));
+        let string_set = source.find("'set'").unwrap() + 1;
+        let comment_get = source.find("/* get").unwrap() + 3;
+        assert!(!syntax.highlights().iter().any(|span| {
+            span.kind == HighlightKind::PropertyHook
+                && (span.start_byte == string_set || span.start_byte == comment_get)
+        }));
+    }
+
+    #[test]
     fn parses_php_mixed_with_html() {
         assert_clean(
             "<!DOCTYPE html><html><body><?php if ($user): ?><h1><?= htmlspecialchars($user->name) ?></h1><?php endif; ?></body></html>",
         );
+    }
+
+    #[test]
+    fn parses_arrow_function_expression_without_syntax_errors() {
+        let syntax = assert_clean(
+            "<?php $callback = fn($value) => $value + 1; consume(fn($item) => $item); return fn() => true;",
+        );
+        let mut stack = vec![syntax.tree().root_node()];
+        let mut arrow_functions = 0;
+        while let Some(node) = stack.pop() {
+            arrow_functions += usize::from(node.kind() == "arrow_function");
+            stack.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+        }
+        assert_eq!(arrow_functions, 3);
+    }
+
+    #[test]
+    fn parses_php85_pipe_chains_without_errors_and_ignores_pipe_text() {
+        let text = "<?php $title = ' PHP 8.5 Released '; $slug = $title |> trim(...) |> (fn($str) => str_replace(' ', '-', $str)) |> strtolower(...); // |> in comment\n$literal = '|>';";
+        let syntax = PhpSyntax::parse(text).unwrap();
+        assert!(!syntax.has_errors(), "{:?}", syntax.diagnostics());
+        assert_eq!(syntax.text(), text);
+        assert_eq!(syntax.pipe_operator_ranges().len(), 3);
+    }
+
+    #[test]
+    fn recognizes_pipe_operator_before_incomplete_rhs_completion() {
+        let text = "<?php $value = 'text'\n    |> ";
+        let syntax = PhpSyntax::parse(text).unwrap();
+        assert_eq!(syntax.pipe_operator_ranges().len(), 1);
+        let range = &syntax.pipe_operator_ranges()[0];
+        assert_eq!(&text[range.clone()], "|>");
+    }
+
+    #[test]
+    fn parses_closures_and_first_class_callables_in_attribute_arguments() {
+        let text = "<?php final class PostsController { #[AccessControl(static function (Request $request, Post $post): bool { return $request->user === $post->getAuthor(); })] public function update(Request $request, Post $post): Response {} #[Callback(trim(...))] public const CALLBACK = static function () {}; }";
+        let syntax = PhpSyntax::parse(text).unwrap();
+        assert!(!syntax.has_errors(), "{:?}", syntax.diagnostics());
     }
 
     #[test]

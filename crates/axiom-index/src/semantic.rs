@@ -525,6 +525,14 @@ pub struct SemanticSymbol {
     pub range: std::ops::Range<usize>,
     pub namespace: String,
     pub visibility: Visibility,
+    #[serde(default)]
+    pub write_visibility: Option<Visibility>,
+    #[serde(default)]
+    pub has_get_hook: bool,
+    #[serde(default)]
+    pub has_set_hook: bool,
+    #[serde(default)]
+    pub is_virtual: bool,
     pub modifiers: Vec<String>,
     pub parameters: Option<String>,
     #[serde(default)]
@@ -688,6 +696,14 @@ pub enum Expression {
         name: String,
         access: MemberAccess,
     },
+    Pipe {
+        input: Box<Expression>,
+        callable: Box<Expression>,
+    },
+    Closure {
+        parameter: Option<String>,
+        body: Box<Expression>,
+    },
     Parenthesized(Box<Expression>),
     Special(String),
 }
@@ -744,6 +760,18 @@ impl<'a> ExpressionResolver<'a> {
                 };
                 self.return_type_of(id)
             }
+            Expression::Pipe { input, callable } => {
+                let input_type = self.infer_expression_type(input);
+                match callable.as_ref() {
+                    Expression::Closure { parameter, body }
+                        if parameter.as_ref().is_some_and(|parameter| {
+                            matches!(body.as_ref(), Expression::Variable(name) if name == parameter)
+                        }) => input_type,
+                    Expression::Closure { body, .. } => self.infer_expression_type(body),
+                    other => self.infer_expression_type(other),
+                }
+            }
+            Expression::Closure { .. } => None,
         }
     }
 
@@ -920,6 +948,35 @@ fn expression_from_ast(node: tree_sitter::Node<'_>, text: &str) -> Option<Expres
                 Some(Expression::FunctionCall(name.to_owned()))
             }
         }),
+        "arrow_function" | "anonymous_function" => {
+            let parameters = node.child_by_field_name("parameters");
+            let parameter = parameters.and_then(|parameters| {
+                parameters
+                    .named_children(&mut parameters.walk())
+                    .find(|child| child.kind() == "simple_parameter")
+                    .and_then(|parameter| parameter.child_by_field_name("name"))
+                    .map(|name| node_text(name, text).trim().to_owned())
+            });
+            let body = node.child_by_field_name("body")?;
+            Some(Expression::Closure {
+                parameter,
+                body: Box::new(expression_from_ast(body, text)?),
+            })
+        }
+        "binary_expression" => {
+            let left = node.child_by_field_name("left")?;
+            let right = node.child_by_field_name("right")?;
+            let has_pipe = (0..node.child_count()).filter_map(|index| node.child(index)).any(
+                |child| node_text(child, text).trim() == "|>",
+            );
+            if !has_pipe {
+                return None;
+            }
+            Some(Expression::Pipe {
+                input: Box::new(expression_from_ast(left, text)?),
+                callable: Box::new(expression_from_ast(right, text)?),
+            })
+        }
         _ => None,
     }
 }
@@ -3618,6 +3675,10 @@ impl SnapshotBuilder {
                 range: source.range,
                 namespace: source.namespace,
                 visibility: source.visibility,
+                write_visibility: source.write_visibility,
+                has_get_hook: source.has_get_hook,
+                has_set_hook: source.has_set_hook,
+                is_virtual: source.is_virtual,
                 modifiers: source.modifiers,
                 parameters: source.parameters,
                 structured_parameters: source
@@ -4340,6 +4401,10 @@ impl SnapshotBuilder {
                 range: source.range,
                 namespace: source.namespace,
                 visibility: source.visibility,
+                write_visibility: source.write_visibility,
+                has_get_hook: source.has_get_hook,
+                has_set_hook: source.has_set_hook,
+                is_virtual: source.is_virtual,
                 modifiers: source.modifiers,
                 parameters: source.parameters,
                 structured_parameters: Vec::new(),
@@ -9008,6 +9073,47 @@ namespace Probe\Models { use Probe\TraitsA\HasUuid; class User { use HasUuid; } 
     }
 
     #[test]
+    fn expression_resolver_infers_php84_new_chains_and_php85_pipe_output() {
+        let text = "<?php namespace App; class PhpVersion { public function getVersion(): string { return ''; } } function normalize(string $value): string { return $value; } function run(): void { $version = new PhpVersion()->getVersion(); $slug = 'text' |> normalize(...); }";
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("features.php"), text).unwrap();
+        let mut index = ProjectSymbolIndex::new();
+        index.index_project(directory.path()).unwrap();
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(2));
+        let syntax = PhpSyntax::parse(text).unwrap();
+        let mut stack = vec![syntax.tree().root_node()];
+        let mut inferred = Vec::new();
+        while let Some(node) = stack.pop() {
+            let node_source = node_text(node, text);
+            if (node.kind() == "member_call_expression"
+                && node_source.starts_with("new PhpVersion()->getVersion()"))
+                || (node.kind() == "binary_expression" && node_source.contains("|>"))
+            {
+                let scope = snapshot
+                    .scopes
+                    .records
+                    .iter()
+                    .filter(|scope| {
+                        scope.span.start <= node.start_byte()
+                            && node.end_byte() <= scope.span.end
+                    })
+                    .min_by_key(|scope| scope.span.end - scope.span.start)
+                    .unwrap();
+                let resolver = ExpressionResolver::new(&snapshot, scope.id);
+                inferred.push(resolver.infer_ast_expression_type(node, text));
+            }
+            stack.extend(node.named_children(&mut node.walk()));
+        }
+        assert_eq!(
+            inferred,
+            vec![
+                Some(DeclaredType::Builtin(BuiltinType::String)),
+                Some(DeclaredType::Builtin(BuiltinType::String)),
+            ]
+        );
+    }
+
+    #[test]
     fn simple_new_assignment_registers_local_receiver_type() {
         let text = "<?php namespace App; class Future { public function await() {} } function run() { $future = new Future(); return $future; }";
         let snapshot =
@@ -9992,6 +10098,10 @@ function run(User $user): void { foo(); echo $user->name; $user->name = 'A'; ech
             range: 0..6,
             namespace: "App".to_owned(),
             visibility: Visibility::Unknown,
+            write_visibility: None,
+            has_get_hook: false,
+            has_set_hook: false,
+            is_virtual: false,
             modifiers: Vec::new(),
             parameters: None,
             structured_parameters: Vec::new(),

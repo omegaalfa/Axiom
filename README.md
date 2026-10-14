@@ -32,6 +32,9 @@ not production-ready and not yet finally validated on Windows GUI.
 - **Implemented:** integrated terminal over a PTY, project working directory,
   terminal file/line links, Ctrl+Click link navigation, and terminal context
   integration.
+- **Implemented:** Axiom AI chat and Agent runtime with HTTP model providers,
+  streaming responses, registered project tools, approval-gated mutations, and
+  optional persistent memory.
 
 Full PHP type inference, debugger, complete Git UI, deep framework intelligence,
 database tools, plugin marketplace, and final installer remain roadmap items.
@@ -58,12 +61,25 @@ metadata, PHP Runtime Stubs, and optional LSP providers. This layered design
 keeps core navigation useful without requiring an LSP, while allowing
 Intelephense or another compatible server to add richer assistance.
 
-## Axiom AI — Planned
+## Axiom AI Agent
 
-AI-assisted development is a future direction, not an implemented feature.
-Planned work includes an agent panel, Hermes Agent integration, semantic IDE
-tools, diff review/apply, explicit permissions, Skills, session traces, and a
-closed learning loop: `Execute → Evaluate → Extract → Retrieve`.
+The Axiom AI panel and Agent runtime are implemented. The runtime supports
+streaming HTTP model providers and twelve tool capability groups: `read_file`,
+`list_directory`, `find_files`, `search_text`, `find_symbol`,
+`find_references`, `fetch_url`, `write_file`, `update_file`, `delete_file`,
+`execute_command`, and persistent memory. The memory group provides
+`memory_search` and `memory_get`, with `memory_remember` exposed only when
+memory writing is available. Memory operations are otherwise conditional on
+backend availability.
+
+`StandardToolPolicy` allows safe reads and requires approval for file mutations,
+terminal commands, and persistent-memory writes. `ApprovalBridge` pauses a run
+for a user decision and resumes or denies the requested operation. Local
+persistent memory uses SQLite with an FTS5 index in WAL mode.
+
+Further provider integrations and Agent capabilities remain under development;
+that ongoing work does not mean the existing Agent runtime and tools are only
+planned.
 
 ## Requirements and build
 
@@ -96,8 +112,8 @@ fallbacks; they are not the primary configuration interface.
 ## Roadmap
 
 Near-term direction includes a PHP type engine, PHPDoc/type inference, deeper
-inspections, refactorings, Windows-native validation, an AI agent foundation,
-and a future plugin architecture. See the [project roadmap](docs/ROADMAP.md).
+inspections, refactorings, Windows-native validation, continued AI Agent
+improvements, and a future plugin architecture. See the [project roadmap](docs/ROADMAP.md).
 
 # Compilar em debug
 ```

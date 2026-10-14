@@ -34,6 +34,7 @@ pub struct AxiomTheme {
     pub scrollbar: Rgba,
     pub scrollbar_hover: Rgba,
     pub syntax_keyword: Rgba,
+    pub syntax_property_hook: Rgba,
     pub syntax_string: Rgba,
     pub syntax_comment: Rgba,
     pub syntax_number: Rgba,
@@ -43,6 +44,7 @@ pub struct AxiomTheme {
     pub syntax_constant: Rgba,
     pub syntax_namespace: Rgba,
     pub syntax_operator: Rgba,
+    pub syntax_punctuation: Rgba,
     pub syntax_attribute: Rgba,
 }
 
@@ -78,6 +80,7 @@ pub fn theme() -> &'static AxiomTheme {
         scrollbar: rgb(0x3a3e47),
         scrollbar_hover: rgb(0x525865),
         syntax_keyword: rgb(0xc397d8),
+        syntax_property_hook: rgb(0x56b6c2),
         syntax_string: rgb(0xa8c88a),
         syntax_comment: rgb(0x7c8491),
         syntax_number: rgb(0xd9a06f),
@@ -87,6 +90,7 @@ pub fn theme() -> &'static AxiomTheme {
         syntax_constant: rgb(0xd9a06f),
         syntax_namespace: rgb(0x82b9a4),
         syntax_operator: rgb(0xaeb5c0),
+        syntax_punctuation: rgb(0x91a9c8),
         syntax_attribute: rgb(0xd4b477),
     })
 }
@@ -102,5 +106,8 @@ mod tests {
         assert_ne!(theme.hover, theme.pressed);
         assert_ne!(theme.text_primary, theme.text_muted);
         assert_ne!(theme.error, theme.warning);
+        assert_ne!(theme.syntax_punctuation, theme.syntax_operator);
+        assert_ne!(theme.syntax_punctuation, theme.syntax_keyword);
+        assert_ne!(theme.syntax_property_hook, theme.syntax_keyword);
     }
 }

@@ -567,6 +567,11 @@ namespace {
                 range: 10..13,
             },
             declared_type: None,
+            read_visibility: None,
+            write_visibility: None,
+            has_get_hook: false,
+            has_set_hook: false,
+            is_virtual: false,
             signature: Some(Signature {
                 parameters: vec![Parameter {
                     name: "name".into(),

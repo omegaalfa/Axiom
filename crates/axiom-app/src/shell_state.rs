@@ -43,6 +43,8 @@ pub struct UiSettings {
     pub thinking_preferences: Vec<(String, String, bool)>,
     #[serde(default)]
     pub thinking_level_preferences: Vec<(String, String, axiom_ai_provider::ThinkingLevel)>,
+    #[serde(default)]
+    pub php_version_overrides: Vec<(PathBuf, axiom_project::PhpVersion)>,
 }
 fn default_model_label() -> String {
     "Model".to_owned()
@@ -67,6 +69,7 @@ impl Default for UiSettings {
             provider_configs: Vec::new(),
             thinking_preferences: Vec::new(),
             thinking_level_preferences: Vec::new(),
+            php_version_overrides: Vec::new(),
         }
     }
 }
@@ -351,5 +354,22 @@ mod tests {
         assert_eq!(RecentProjects::load(&config), recent);
         fs::write(&config, "not json").unwrap();
         assert_eq!(RecentProjects::load(&config), RecentProjects::default());
+    }
+
+    #[test]
+    fn ui_settings_round_trip_php_version_overrides_per_project() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("ui-settings.json");
+        let project = root.path().join("workspace");
+        let mut settings = UiSettings::default();
+        settings
+            .php_version_overrides
+            .push((project.clone(), axiom_project::PhpVersion::Php84));
+        settings.save(&config).unwrap();
+
+        assert_eq!(
+            UiSettings::load(&config).php_version_overrides,
+            vec![(project, axiom_project::PhpVersion::Php84)]
+        );
     }
 }

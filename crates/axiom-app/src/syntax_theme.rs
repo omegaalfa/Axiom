@@ -30,6 +30,7 @@ fn style(kind: HighlightKind) -> HighlightStyle {
     let theme = theme();
     let color = match kind {
         HighlightKind::Keyword => theme.syntax_keyword,
+        HighlightKind::PropertyHook => theme.syntax_property_hook,
         HighlightKind::String => theme.syntax_string,
         HighlightKind::Comment => theme.syntax_comment,
         HighlightKind::Number => theme.syntax_number,
@@ -38,7 +39,8 @@ fn style(kind: HighlightKind) -> HighlightStyle {
         HighlightKind::Variable | HighlightKind::Property => theme.syntax_variable,
         HighlightKind::Constant => theme.syntax_constant,
         HighlightKind::Namespace => theme.syntax_namespace,
-        HighlightKind::Operator | HighlightKind::Punctuation => theme.syntax_operator,
+        HighlightKind::Operator => theme.syntax_operator,
+        HighlightKind::Punctuation => theme.syntax_punctuation,
         HighlightKind::Attribute => theme.syntax_attribute,
     };
     HighlightStyle {

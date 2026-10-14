@@ -1,5 +1,6 @@
 use super::EditorView;
 use super::*;
+use axiom_project::PhpVersion;
 
 #[derive(Clone)]
 pub(super) struct ByteDiagnostic {
@@ -18,6 +19,7 @@ pub(super) struct NativeInspectionWorkItem {
     pub(super) document_session: DocumentSessionId,
     pub(super) generation: u64,
     pub(super) latest_generation: Arc<AtomicU64>,
+    pub(super) target_php_version: PhpVersion,
     pub(super) unknown_class: UnknownClassInspectionInput,
     pub(super) unknown_constant: UnknownConstantInspectionInput,
     pub(super) duplicate_class: DuplicateClassInspectionInput,
@@ -733,7 +735,15 @@ impl EditorView {
                     work.generation,
                     || {
                         syntax.as_ref().map_or_else(Vec::new, |syntax| {
-                            compute_unknown_class_inspections(&work.unknown_class, syntax)
+                            let mut diagnostics = Self::compute_php_version_diagnostics(
+                                syntax,
+                                work.target_php_version,
+                            );
+                            diagnostics.extend(compute_unknown_class_inspections(
+                                &work.unknown_class,
+                                syntax,
+                            ));
+                            diagnostics
                         })
                     },
                     || {
@@ -843,6 +853,7 @@ impl EditorView {
             document_session: session,
             generation,
             latest_generation: self.native_inspection_latest_generation.clone(),
+            target_php_version: self.target_php_version,
             unknown_class: UnknownClassInspectionInput {
                 text: text.clone(),
                 project_classes,
@@ -868,6 +879,94 @@ impl EditorView {
                 file_key,
             },
         })
+    }
+
+    pub(super) fn compute_php_version_diagnostics(
+        syntax: &PhpSyntax,
+        target: PhpVersion,
+    ) -> Vec<ByteDiagnostic> {
+        let mut diagnostics = Vec::new();
+        if !target.supports_arrow_functions() {
+            let mut nodes = vec![syntax.tree().root_node()];
+            while let Some(node) = nodes.pop() {
+                if node.kind() == "arrow_function" {
+                    diagnostics.push(ByteDiagnostic {
+                        range: node.start_byte()..node.end_byte(),
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        message: "Arrow functions require PHP 7.4 or newer".to_owned(),
+                    });
+                }
+                nodes.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+            }
+        }
+        if !target.supports_asymmetric_visibility() {
+            diagnostics.extend(
+                syntax
+                    .highlights()
+                    .iter()
+                    .filter(|span| {
+                        span.kind == axiom_syntax::HighlightKind::Keyword
+                            && syntax.text().get(span.start_byte..span.end_byte) == Some("(set)")
+                    })
+                    .map(|span| ByteDiagnostic {
+                        range: span.start_byte..span.end_byte,
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        message: "Asymmetric property visibility requires PHP 8.4 or newer"
+                            .to_owned(),
+                    }),
+            );
+        }
+        if !target.supports_property_hooks() {
+            diagnostics.extend(
+                syntax
+                    .highlights()
+                    .iter()
+                    .filter(|span| span.kind == axiom_syntax::HighlightKind::PropertyHook)
+                    .map(|span| ByteDiagnostic {
+                        range: span.start_byte..span.end_byte,
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        message: "Property hooks require PHP 8.4 or newer".to_owned(),
+                    }),
+            );
+        }
+        if !target.supports_pipe_operator() {
+            diagnostics.extend(syntax.pipe_operator_ranges().into_iter().map(|range| {
+                ByteDiagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    message: "Pipe operator '|>' requires PHP 8.5 or newer".to_owned(),
+                }
+            }));
+        }
+        if !target.supports_fcc_in_const_expr() {
+            let text = syntax.text();
+            let mut nodes = vec![(syntax.tree().root_node(), false)];
+            while let Some((node, in_attribute)) = nodes.pop() {
+                let in_attribute = in_attribute || node.kind() == "attribute";
+                let is_closure = matches!(node.kind(), "anonymous_function" | "arrow_function");
+                let is_fcc = in_attribute
+                    && matches!(
+                        node.kind(),
+                        "function_call_expression" | "scoped_call_expression" | "static_call_expression"
+                    )
+                    && text
+                        .get(node.byte_range())
+                        .is_some_and(|source| source.trim_end().ends_with("(...)") );
+                if in_attribute && (is_closure || is_fcc) {
+                    diagnostics.push(ByteDiagnostic {
+                        range: node.byte_range(),
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        message: "Closures and First-Class Callables in constant expressions require PHP 8.5 or newer".to_owned(),
+                    });
+                }
+                nodes.extend(
+                    (0..node.child_count())
+                        .filter_map(|index| node.child(index))
+                        .map(|child| (child, in_attribute)),
+                );
+            }
+        }
+        diagnostics
     }
 
     pub(super) fn poll_native_inspection_results(&mut self, cx: &mut Context<Self>) {
@@ -1223,6 +1322,41 @@ impl EditorView {
             )
         });
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod php_version_inspection_tests {
+    use super::*;
+
+    #[test]
+    fn reports_versioned_syntax_without_parser_errors_for_supported_php() {
+        let text = "<?php $f = fn($x) => $x; class C { public private(set) string $name; public string $title { get => $this->_title; } }";
+        let syntax = PhpSyntax::parse(text).expect("PHP syntax parses");
+        assert!(!syntax.has_errors());
+        let old_target = EditorView::compute_php_version_diagnostics(&syntax, PhpVersion::Php73);
+        assert!(old_target.iter().any(|diagnostic| {
+            diagnostic.message.contains("Arrow functions")
+                && diagnostic.severity == Some(DiagnosticSeverity::WARNING)
+        }));
+        assert!(old_target.iter().any(|diagnostic| {
+            diagnostic.message.contains("asymmetric property visibility")
+        }));
+        assert!(old_target.iter().any(|diagnostic| {
+            diagnostic.message.contains("Property hooks")
+        }));
+        assert!(EditorView::compute_php_version_diagnostics(&syntax, PhpVersion::Php84).is_empty());
+    }
+
+    #[test]
+    fn reports_php85_pipe_and_attribute_closure_compatibility() {
+        let text = "<?php $slug = ' A ' |> trim(...); #[Callback(static function () {})] class C {} #[Callback(trim(...))] class D {}";
+        let syntax = PhpSyntax::parse(text).expect("PHP 8.5 syntax parses");
+        assert!(!syntax.has_errors());
+        let older = EditorView::compute_php_version_diagnostics(&syntax, PhpVersion::Php84);
+        assert!(older.iter().any(|item| item.message.contains("Pipe operator '|>'")));
+        assert!(older.iter().any(|item| item.message.contains("Closures and First-Class Callables")));
+        assert!(EditorView::compute_php_version_diagnostics(&syntax, PhpVersion::Php85).is_empty());
     }
 }
 pub(super) fn emit_project_type_diagnostics(

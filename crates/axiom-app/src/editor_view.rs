@@ -18,7 +18,7 @@ use axiom_index::{
 };
 use axiom_lsp::{PositionCodec, PositionEncoding, path_to_uri};
 use axiom_php::{RuntimeSymbolIndex, Symbol as RuntimeSymbol, SymbolKind as RuntimeKind};
-use axiom_project::is_php_file;
+use axiom_project::{PhpVersion, is_php_file};
 use axiom_syntax::PhpSyntax;
 use gpui::background_executor;
 use gpui::{
@@ -404,6 +404,7 @@ pub struct EditorView {
     navigation_highlight_line: Option<usize>,
     selecting: bool,
     file_path: PathBuf,
+    target_php_version: PhpVersion,
     status: Option<SharedString>,
     lsp: Option<Arc<LspBridge>>,
     lsp_uri: Option<Uri>,
@@ -699,6 +700,7 @@ impl EditorView {
             navigation_highlight_line: None,
             selecting: false,
             file_path: path.clone(),
+            target_php_version: PhpVersion::default(),
             status: None,
             lsp,
             lsp_uri,
@@ -975,6 +977,10 @@ impl EditorView {
                 name_position: None,
                 namespace: s.namespace.clone(),
                 visibility: s.visibility,
+                write_visibility: s.write_visibility,
+                has_get_hook: s.has_get_hook,
+                has_set_hook: s.has_set_hook,
+                is_virtual: s.is_virtual,
                 modifiers: s.modifiers.clone(),
                 parameters: s.parameters.clone(),
                 return_type: s.return_type.clone(),
@@ -1288,6 +1294,22 @@ impl EditorView {
     pub fn set_runtime_symbols(&mut self, symbols: Arc<RuntimeSymbolIndex>) {
         self.runtime_symbols = Some(symbols);
         self.sync_syntax();
+    }
+
+    pub(crate) fn set_target_php_version(&mut self, version: PhpVersion) {
+        self.target_php_version = version;
+    }
+
+    pub(crate) fn set_target_php_version_and_reinspect(
+        &mut self,
+        version: PhpVersion,
+        cx: &mut Context<Self>,
+    ) {
+        if self.target_php_version == version {
+            return;
+        }
+        self.target_php_version = version;
+        self.schedule_native_inspections("target PHP version changed", cx);
     }
 
     pub fn set_project_symbols(
@@ -1993,9 +2015,13 @@ impl EditorView {
         if !self.completions.is_empty() {
             self.accept_completion(cx);
         } else if self.document.selection_offsets().is_some() {
+            self.suppress_completion_refresh_once = true;
             self.transform_selected_lines(true, cx);
         } else {
             self.document.insert_text("    ");
+            // Indentation is structural input, not a completion trigger. Keep
+            // `after_edit`'s syntax/LSP synchronization but skip its popup pass.
+            self.suppress_completion_refresh_once = true;
             self.after_edit(cx);
         }
     }
@@ -3601,187 +3627,11 @@ struct PhpTypeCompletionSite {
 }
 
 fn native_format_php(text: &str) -> String {
-    let mut result = String::with_capacity(text.len() + text.len() / 4);
-    let mut indent = 0usize;
-    let mut block_comment = false;
-    let mut quote: Option<char> = None;
-    let mut heredoc: Option<String> = None;
-    for (line_index, raw_line) in text.lines().enumerate() {
-        let trimmed = raw_line.trim();
-        if let Some(delimiter) = heredoc.as_ref() {
-            if line_index > 0 {
-                result.push('\n');
-            }
-            result.push_str(raw_line);
-            if trimmed == delimiter || trimmed == format!("{delimiter};") {
-                heredoc = None;
-            }
-            continue;
-        }
-        let preserves_quoted_text = quote.is_some();
-        if trimmed.is_empty() && !preserves_quoted_text {
-            if line_index > 0 {
-                result.push('\n');
-            }
-            continue;
-        }
-        let heredoc_start = (!preserves_quoted_text)
-            .then(|| php_heredoc_delimiter(trimmed))
-            .flatten();
-        let closes = !preserves_quoted_text
-            && (trimmed.starts_with('}') || trimmed.starts_with(']') || trimmed.starts_with(')'));
-        if closes {
-            indent = indent.saturating_sub(1);
-        }
-        if line_index > 0 {
-            result.push('\n');
-        }
-        if preserves_quoted_text {
-            result.push_str(raw_line);
-        } else {
-            result.push_str(&"    ".repeat(indent));
-            result.push_str(&normalize_php_line(trimmed));
-        }
-        if let Some(delimiter) = heredoc_start.filter(|delimiter| !delimiter.is_empty()) {
-            heredoc = Some(delimiter);
-            continue;
-        }
-        let mut chars = if preserves_quoted_text {
-            raw_line
-        } else {
-            trimmed
-        }
-        .chars()
-        .peekable();
-        let mut opens = 0usize;
-        let mut closes_on_line = 0usize;
-        while let Some(ch) = chars.next() {
-            if block_comment {
-                if ch == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    block_comment = false;
-                }
-                continue;
-            }
-            if let Some(active_quote) = quote {
-                if ch == '\\' {
-                    chars.next();
-                } else if ch == active_quote {
-                    quote = None;
-                }
-                continue;
-            }
-            if ch == '/' && chars.peek() == Some(&'*') {
-                chars.next();
-                block_comment = true;
-            } else if (ch == '/' && chars.peek() == Some(&'/')) || ch == '#' {
-                break;
-            } else if matches!(ch, '\'' | '"' | '`') {
-                quote = Some(ch);
-            } else if matches!(ch, '{' | '[' | '(') {
-                opens += 1;
-            } else if matches!(ch, '}' | ']' | ')') {
-                closes_on_line += 1;
-            }
-        }
-        indent = indent.saturating_add(opens);
-        indent = indent.saturating_sub(closes_on_line.saturating_sub(usize::from(closes)));
-    }
-    if text.ends_with('\n') {
-        result.push('\n');
-    }
-    result
+    axiom_editor::format_php(text)
 }
 
 fn supports_native_format(path: &Path) -> bool {
     is_php_file(path)
-}
-
-fn normalize_php_line(line: &str) -> String {
-    if line.contains(['\'', '"', '`']) || line.contains("//") || line.contains("/*") {
-        return line.to_owned();
-    }
-    let mut out = String::new();
-    let mut code = String::new();
-    let mut quote = None;
-    let flush = |out: &mut String, code: &mut String| {
-        if !code.is_empty() {
-            let mut s = code.split_whitespace().collect::<Vec<_>>().join(" ");
-            for op in ["===", "??", "=", "+"] {
-                let spaced = format!(" {op} ");
-                s = s
-                    .replace(op, &spaced)
-                    .replace(&format!("  {op}  "), &spaced);
-            }
-            s = s
-                .replace(" ? - > ", "?->")
-                .replace(" ?-> ", "?->")
-                .replace(" -> ", "->")
-                .replace(" :: ", "::")
-                .replace(" - > ", "->")
-                .replace(" : : ", "::")
-                .replace(" ( ", "(")
-                .replace(" )", ")")
-                .replace(" ,", ",")
-                .replace(",  ", ", ");
-            out.push_str(&s);
-            code.clear();
-        }
-    };
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if let Some(q) = quote {
-            out.push(ch);
-            if ch == '\\' {
-                if let Some(n) = chars.next() {
-                    out.push(n);
-                }
-            } else if ch == q {
-                quote = None;
-            }
-            continue;
-        }
-        if matches!(ch, '\'' | '"' | '`') {
-            flush(&mut out, &mut code);
-            quote = Some(ch);
-            out.push(ch);
-            continue;
-        }
-        if ch == '/' && chars.peek() == Some(&'/') {
-            flush(&mut out, &mut code);
-            out.push(ch);
-            out.push(chars.next().unwrap());
-            out.extend(chars);
-            break;
-        }
-        code.push(ch);
-    }
-    flush(&mut out, &mut code);
-    out
-}
-
-fn php_heredoc_delimiter(line: &str) -> Option<String> {
-    let marker = line.find("<<<")?;
-    let value = line[marker + 3..].trim_start();
-    let (delimiter, rest) = match value.chars().next()? {
-        quote @ ('\'' | '"') => {
-            let value = &value[quote.len_utf8()..];
-            let end = value.find(quote)?;
-            (&value[..end], &value[end + quote.len_utf8()..])
-        }
-        _ => {
-            let end = value
-                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-                .unwrap_or(value.len());
-            (&value[..end], &value[end..])
-        }
-    };
-    (!delimiter.is_empty()
-        && delimiter
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        && rest.trim().is_empty())
-    .then(|| delimiter.to_owned())
 }
 
 fn utf16_offset_to_byte(text: &str, offset: usize) -> usize {
@@ -5849,6 +5699,7 @@ fn matching_paren(text: &str, open: usize) -> Option<usize> {
 fn php_live_template_completions(
     text: &str,
     cursor: usize,
+    target_php_version: PhpVersion,
 ) -> Option<(Range<usize>, Vec<CompletionItem>)> {
     let before = &text[..cursor.min(text.len())];
     let line_start = before.rfind('\n').map_or(0, |offset| offset + 1);
@@ -5888,6 +5739,34 @@ fn php_live_template_completions(
         .take_while(|ch| ch.is_whitespace())
         .collect::<String>();
     let body_indent = format!("{indent}    ");
+    let mut items = Vec::new();
+    if target_php_version.supports_arrow_functions()
+        && prefix.starts_with("fn")
+        && php_arrow_expression_context(trimmed)
+    {
+        items.push(CompletionItem {
+            label: "fn".to_owned(),
+            detail: Some("PHP arrow function snippet".to_owned()),
+            kind: Some(CompletionItemKind::SNIPPET),
+            insert_text: Some("fn(${1:$val}) => ${2}".to_owned()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        });
+    }
+    let anonymous_function_context = "function".starts_with(prefix)
+        && php_arrow_expression_context(trimmed);
+    if anonymous_function_context {
+        items.push(CompletionItem {
+            label: "function".to_owned(),
+            detail: Some("PHP anonymous function snippet".to_owned()),
+            kind: Some(CompletionItemKind::SNIPPET),
+            insert_text: Some(format!(
+                "function(${{1}}) {{\n{body_indent}${{2}}\n{indent}}}"
+            )),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        });
+    }
     let templates = [
         (
             "foreach",
@@ -5922,34 +5801,49 @@ fn php_live_template_completions(
             format!("class ${{1:Name}}\n{indent}{{\n{body_indent}$0\n{indent}}}"),
         ),
     ];
-    let items = templates
-        .into_iter()
-        .filter(|(label, _)| {
-            label.starts_with(prefix)
-                && (*label != "class" || !is_inside_class_body(&text[..start]))
-        })
-        .map(|(label, insert_text)| CompletionItem {
-            label: label.to_owned(),
-            detail: Some("PHP live template".to_owned()),
-            kind: Some(CompletionItemKind::SNIPPET),
-            insert_text: Some(insert_text),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
-            ..Default::default()
-        })
-        .collect::<Vec<_>>();
+    items.extend(
+        templates
+            .into_iter()
+            .filter(|(label, _)| {
+                statement_start
+                    && label.starts_with(prefix)
+                    && !(anonymous_function_context && *label == "function")
+                    && (*label != "class" || !is_inside_class_body(&text[..start]))
+            })
+            .map(|(label, insert_text)| CompletionItem {
+                label: label.to_owned(),
+                detail: Some("PHP live template".to_owned()),
+                kind: Some(CompletionItemKind::SNIPPET),
+                insert_text: Some(insert_text),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            }),
+    );
     (!items.is_empty()).then_some((start..cursor, items))
+}
+
+fn php_arrow_expression_context(before_prefix: &str) -> bool {
+    let before_prefix = before_prefix.trim_end();
+    before_prefix.is_empty()
+        || before_prefix.ends_with('=')
+        || before_prefix.ends_with('(')
+        || before_prefix.ends_with(',')
+        || before_prefix == "return"
+        || before_prefix.ends_with(" return")
+        || before_prefix.ends_with("=>")
 }
 
 #[cfg(test)]
 mod php_live_template_tests {
-    use super::php_live_template_completions;
+    use super::{php_live_template_completions, PhpVersion};
     use lsp_types::InsertTextFormat;
 
     #[test]
     fn templates_are_snippets_only_in_statement_context() {
         for trigger in ["fore", "i", "tr"] {
             let source = format!("<?php\n{trigger}");
-            let (range, items) = php_live_template_completions(&source, source.len()).unwrap();
+            let (range, items) =
+                php_live_template_completions(&source, source.len(), PhpVersion::Php84).unwrap();
             assert_eq!(&source[range], trigger);
             assert!(items.iter().all(|item| {
                 item.insert_text_format == Some(InsertTextFormat::SNIPPET)
@@ -5967,26 +5861,87 @@ mod php_live_template_tests {
             "<?php\n/** fore",
         ] {
             assert!(
-                php_live_template_completions(source, source.len()).is_none(),
+                php_live_template_completions(source, source.len(), PhpVersion::Php84).is_none(),
                 "{source}"
             );
         }
         let source = "<?php\n";
-        let (_, items) = php_live_template_completions(&format!("{source}wh"), source.len() + 2)
-            .expect("while template");
+        let (_, items) = php_live_template_completions(
+            &format!("{source}wh"),
+            source.len() + 2,
+            PhpVersion::Php84,
+        )
+        .expect("while template");
         assert_eq!(items[0].label, "while");
-        let (_, items) = php_live_template_completions(&format!("{source}sw"), source.len() + 2)
-            .expect("switch template");
+        let (_, items) = php_live_template_completions(
+            &format!("{source}sw"),
+            source.len() + 2,
+            PhpVersion::Php84,
+        )
+        .expect("switch template");
         assert_eq!(items[0].label, "switch");
-        let (_, items) = php_live_template_completions(&format!("{source}fun"), source.len() + 3)
-            .expect("function template");
+        let (_, items) = php_live_template_completions(
+            &format!("{source}fun"),
+            source.len() + 3,
+            PhpVersion::Php84,
+        )
+        .expect("function template");
         assert_eq!(items[0].label, "function");
-        let (_, items) = php_live_template_completions(&format!("{source}cla"), source.len() + 3)
-            .expect("class template");
+        let (_, items) = php_live_template_completions(
+            &format!("{source}cla"),
+            source.len() + 3,
+            PhpVersion::Php84,
+        )
+        .expect("class template");
         assert_eq!(items[0].label, "class");
-        let (_, items) = php_live_template_completions(&format!("{source}fo"), source.len() + 2)
-            .expect("foreach remains available for partial prefix");
+        let (_, items) = php_live_template_completions(
+            &format!("{source}fo"),
+            source.len() + 2,
+            PhpVersion::Php84,
+        )
+        .expect("foreach remains available for partial prefix");
         assert!(items.iter().all(|item| item.label != "for"));
+    }
+
+    #[test]
+    fn arrow_function_snippet_is_version_gated_and_selects_parameter() {
+        for source in [
+            "<?php\n$callback = fn",
+            "<?php\narray_map(fn",
+            "<?php\nreturn fn",
+        ] {
+            let (range, items) =
+                php_live_template_completions(source, source.len(), PhpVersion::Php74).unwrap();
+            assert_eq!(&source[range], "fn");
+            assert_eq!(items[0].label, "fn");
+            let snippet = &items[0];
+            assert_eq!(
+                snippet.insert_text.as_deref(),
+                Some("fn(${1:$val}) => ${2}")
+            );
+            assert_eq!(
+                crate::snippet::expand(snippet.insert_text.as_deref().unwrap())
+                    .placeholders[0]
+                    .index,
+                1
+            );
+        }
+        let source = "<?php\n$value = fn";
+        assert!(php_live_template_completions(source, source.len(), PhpVersion::Php73).is_none());
+    }
+
+    #[test]
+    fn anonymous_function_expression_has_parameter_and_body_tabstops() {
+        let source = "<?php\n$callback = function";
+        let (_, items) =
+            php_live_template_completions(source, source.len(), PhpVersion::Php84).unwrap();
+        assert_eq!(items[0].label, "function");
+        assert_eq!(
+            items[0].insert_text.as_deref(),
+            Some("function(${1}) {\n    ${2}\n}")
+        );
+        let expanded = crate::snippet::expand(items[0].insert_text.as_deref().unwrap());
+        assert_eq!(expanded.placeholders.iter().map(|p| p.index).collect::<Vec<_>>(), [1, 2]);
     }
 }
 
@@ -6035,8 +5990,9 @@ impl ShapedLineMouseHitTest for gpui::ShapedLine {
 #[cfg(test)]
 mod completion_ranking_tests {
     use super::{
-        TypeCompletionContext, filter_new_completion_items, rank_new_completion_items,
-        runtime_global_kind_allowed, type_completion_context, type_kind_allowed,
+        TypeCompletionContext, filter_new_completion_items, php_class_member_completions,
+        rank_new_completion_items, runtime_global_kind_allowed, type_completion_context,
+        type_kind_allowed,
     };
     use axiom_php::SymbolKind as RuntimeKind;
     use lsp_types::{CompletionItem, CompletionItemKind};
@@ -6167,6 +6123,21 @@ mod completion_ranking_tests {
         ];
         rank_new_completion_items(&mut items, "A");
         assert_eq!(items[0].label, "A");
+    }
+
+    #[test]
+    fn asymmetric_visibility_modifiers_are_suggested_in_property_context() {
+        let after_visibility = "<?php class C {\n    public pri";
+        let (_, items) = php_class_member_completions(after_visibility, after_visibility.len())
+            .expect("class member completions");
+        assert!(items.iter().any(|item| item.label == "private(set)"));
+
+        let class_scope = "<?php class C {\n    pub";
+        let (_, items) = php_class_member_completions(class_scope, class_scope.len())
+            .expect("class member completions");
+        assert!(items.iter().any(|item| item.label == "public"));
+        assert!(items.iter().any(|item| item.label == "public function"));
+        assert!(items.iter().any(|item| item.label == "public private(set)"));
     }
 
     #[test]
@@ -8481,30 +8452,6 @@ mod formatter_tests {
     }
 
     #[test]
-    fn formatter_normalizes_object_operator_spacing() {
-        assert_eq!(
-            normalize_php_line("$service   ->   local ( );"),
-            "$service->local();"
-        );
-    }
-
-    #[test]
-    fn formatter_normalizes_static_operator_spacing() {
-        assert_eq!(
-            normalize_php_line("Service   ::   create ( );"),
-            "Service::create();"
-        );
-    }
-
-    #[test]
-    fn formatter_normalizes_nullsafe_operator_spacing() {
-        assert_eq!(
-            normalize_php_line("$service  ?->  local ( );"),
-            "$service?->local();"
-        );
-    }
-
-    #[test]
     fn document_find_covers_single_multiple_zero_and_boundary_matches() {
         let mut find = FindState {
             input: crate::ui::input_line::TextInput {
@@ -10163,6 +10110,10 @@ mod diagnostic_store_tests {
                 name_position: None,
                 namespace: String::new(),
                 visibility: axiom_index::Visibility::Public,
+                write_visibility: None,
+                has_get_hook: false,
+                has_set_hook: false,
+                is_virtual: false,
                 modifiers: Vec::new(),
                 parameters: Some("(int $value)".into()),
                 return_type: None,
@@ -10194,6 +10145,10 @@ mod diagnostic_store_tests {
                     name_position: None,
                     namespace: String::new(),
                     visibility: axiom_index::Visibility::Public,
+                    write_visibility: None,
+                    has_get_hook: false,
+                    has_set_hook: false,
+                    is_virtual: false,
                     modifiers: Vec::new(),
                     parameters: Some("(int $value)".into()),
                     return_type: None,
@@ -10211,6 +10166,10 @@ mod diagnostic_store_tests {
                     name_position: None,
                     namespace: String::new(),
                     visibility: axiom_index::Visibility::Public,
+                    write_visibility: None,
+                    has_get_hook: false,
+                    has_set_hook: false,
+                    is_virtual: false,
                     modifiers: Vec::new(),
                     parameters: Some("(int $a, int $b)".into()),
                     return_type: None,

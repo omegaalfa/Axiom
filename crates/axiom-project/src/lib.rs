@@ -6,7 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub mod project_delete;
 pub mod project_directory;
@@ -15,6 +15,95 @@ pub mod project_read;
 pub mod project_search;
 pub mod project_update;
 pub mod project_write;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+pub enum PhpVersion {
+    Php73,
+    Php74,
+    Php80,
+    Php81,
+    Php82,
+    #[default]
+    Php83,
+    Php84,
+    Php85,
+    Php86,
+}
+
+impl PhpVersion {
+    pub fn supports_arrow_functions(self) -> bool {
+        self >= Self::Php74
+    }
+
+    pub fn supports_asymmetric_visibility(self) -> bool {
+        self >= Self::Php84
+    }
+
+    pub fn supports_property_hooks(self) -> bool {
+        self >= Self::Php84
+    }
+
+    pub fn supports_enums(self) -> bool {
+        self >= Self::Php81
+    }
+
+    pub fn supports_readonly_properties(self) -> bool {
+        self >= Self::Php81
+    }
+
+    pub fn supports_pipe_operator(self) -> bool {
+        self >= Self::Php85
+    }
+
+    pub fn supports_fcc_in_const_expr(self) -> bool {
+        self >= Self::Php85
+    }
+
+    pub fn supports_pattern_matching(self) -> bool {
+        self >= Self::Php86
+    }
+
+    pub fn supports_guard_clauses(self) -> bool {
+        self >= Self::Php86
+    }
+
+    fn from_constraint(constraint: &str) -> Option<Self> {
+        let bytes = constraint.as_bytes();
+        let mut i = 0;
+        let mut versions = Vec::new();
+        while i + 2 < bytes.len() {
+            if !bytes[i].is_ascii_digit() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+            if bytes.get(i) != Some(&b'.') { continue; }
+            i += 1;
+            let minor_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+            if minor_start == i { continue; }
+            let major = constraint[start..minor_start - 1].parse::<u16>().ok()?;
+            let minor = constraint[minor_start..i].parse::<u16>().ok()?;
+            let version = match (major, minor) {
+                (0..=6, _) | (7, 0..=3) => Some(Self::Php73),
+                (7, 4) => Some(Self::Php74),
+                (8, 0) => Some(Self::Php80),
+                (8, 1) => Some(Self::Php81),
+                (8, 2) => Some(Self::Php82),
+                (8, 3) => Some(Self::Php83),
+                (8, 4) => Some(Self::Php84),
+                (8, 5) => Some(Self::Php85),
+                (8, 6) => Some(Self::Php86),
+                _ => None,
+            };
+            if let Some(version) = version {
+                versions.push(version);
+            }
+        }
+        versions.into_iter().min()
+    }
+}
 
 #[derive(Debug)]
 pub enum ProjectError {
@@ -108,9 +197,22 @@ pub struct ComposerProject {
     #[serde(default, rename = "require-dev")]
     pub require_dev: BTreeMap<String, String>,
     #[serde(default)]
+    config: ComposerConfig,
+    #[serde(default)]
     autoload: ComposerAutoload,
     #[serde(default, rename = "autoload-dev")]
     autoload_dev: ComposerAutoload,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ComposerConfig {
+    #[serde(default)]
+    platform: ComposerPlatform,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ComposerPlatform {
+    php: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +227,7 @@ pub struct Project {
     root_path: PathBuf,
     composer: Option<ComposerProject>,
     composer_error: Option<String>,
+    php_version: PhpVersion,
     psr4: Vec<Psr4Mapping>,
 }
 
@@ -150,10 +253,28 @@ impl Project {
             .as_ref()
             .map(|composer| collect_mappings(&root_path, composer))
             .unwrap_or_default();
+        let php_version = composer
+            .as_ref()
+            .and_then(|composer| {
+                composer
+                    .config
+                    .platform
+                    .php
+                    .as_deref()
+                    .and_then(PhpVersion::from_constraint)
+                    .or_else(|| {
+                        composer
+                            .require
+                            .get("php")
+                            .and_then(|constraint| PhpVersion::from_constraint(constraint))
+                    })
+            })
+            .unwrap_or_default();
         Ok(Self {
             root_path,
             composer,
             composer_error,
+            php_version,
             psr4,
         })
     }
@@ -175,6 +296,10 @@ impl Project {
 
     pub fn composer_error(&self) -> Option<&str> {
         self.composer_error.as_deref()
+    }
+
+    pub fn php_version(&self) -> PhpVersion {
+        self.php_version
     }
 
     pub fn psr4_mappings(&self) -> &[Psr4Mapping] {
@@ -536,6 +661,43 @@ mod tests {
         assert_eq!(composer.package_type.as_deref(), Some("project"));
         assert!(composer.require.contains_key("php"));
         assert!(project.composer_error().is_none());
+        assert_eq!(project.php_version(), PhpVersion::Php83);
+    }
+
+    #[test]
+    fn detects_php_target_from_platform_then_requirement_and_defaults_to_83() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("composer.json"),
+            r#"{"require":{"php":"^8.1 || ^8.4"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Project::open(root.path()).unwrap().php_version(),
+            PhpVersion::Php81
+        );
+
+        fs::write(
+            root.path().join("composer.json"),
+            r#"{"require":{"php":"^8.1"},"config":{"platform":{"php":"8.4.2"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Project::open(root.path()).unwrap().php_version(),
+            PhpVersion::Php84
+        );
+
+        fs::remove_file(root.path().join("composer.json")).unwrap();
+        let project = Project::open(root.path()).unwrap();
+        assert_eq!(project.php_version(), PhpVersion::Php83);
+        assert!(PhpVersion::Php74.supports_arrow_functions());
+        assert!(!PhpVersion::Php83.supports_asymmetric_visibility());
+        assert!(PhpVersion::Php81.supports_enums());
+        assert!(PhpVersion::Php81.supports_readonly_properties());
+        assert!(PhpVersion::Php85.supports_pipe_operator());
+        assert!(PhpVersion::Php85.supports_fcc_in_const_expr());
+        assert!(PhpVersion::Php86.supports_pattern_matching());
+        assert!(PhpVersion::Php86.supports_guard_clauses());
     }
 
     #[test]

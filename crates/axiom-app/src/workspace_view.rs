@@ -42,7 +42,7 @@ use axiom_index::{
 };
 use axiom_lsp::{PositionCodec, ServerStatus, uri_to_path};
 use axiom_php::{RuntimeStubProvider, RuntimeSymbolIndex};
-use axiom_project::{EntryKind, FileContent, Project, ProjectEntry, read_file_content};
+use axiom_project::{EntryKind, FileContent, PhpVersion, Project, ProjectEntry, read_file_content};
 use axiom_terminal::{discover_wsl_distros, TerminalProfile, TerminalSession};
 use gpui::{
     Action, App, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
@@ -2106,6 +2106,9 @@ pub struct WorkspaceView {
     recent_projects: RecentProjects,
     recent_path: Option<PathBuf>,
     open_menu: Option<MenuKind>,
+    php_version_override: Option<PhpVersion>,
+    php_version_overrides: HashMap<PathBuf, PhpVersion>,
+    php_version_picker_open: bool,
     menu_anchor_x: Pixels,
     pending_operation: Option<PendingOperation>,
     show_about: bool,
@@ -2522,7 +2525,44 @@ fn render_markdown_inline(text: &str, color: gpui::Rgba) -> gpui::Div {
     div().w_full().min_w_0().text_color(color).child(visible)
 }
 
+fn php_version_label(version: PhpVersion) -> &'static str {
+    match version {
+        PhpVersion::Php73 => "PHP 7.3",
+        PhpVersion::Php74 => "PHP 7.4",
+        PhpVersion::Php80 => "PHP 8.0",
+        PhpVersion::Php81 => "PHP 8.1",
+        PhpVersion::Php82 => "PHP 8.2",
+        PhpVersion::Php83 => "PHP 8.3",
+        PhpVersion::Php84 => "PHP 8.4",
+        PhpVersion::Php85 => "PHP 8.5",
+        PhpVersion::Php86 => "PHP 8.6",
+    }
+}
+
 impl WorkspaceView {
+    fn target_php_version(&self) -> PhpVersion {
+        self.php_version_override
+            .or_else(|| self.project.as_ref().map(Project::php_version))
+            .unwrap_or_default()
+    }
+
+    fn select_php_version(&mut self, version: PhpVersion, cx: &mut Context<Self>) {
+        self.php_version_override = Some(version);
+        if let Some(project) = &self.project {
+            let root = fs::canonicalize(project.root_path())
+                .unwrap_or_else(|_| project.root_path().to_path_buf());
+            self.php_version_overrides.insert(root, version);
+            self.persist_ui_settings();
+        }
+        self.php_version_picker_open = false;
+        for tab in &self.tabs {
+            tab.editor.update(cx, |editor, editor_cx| {
+                editor.set_target_php_version_and_reinspect(version, editor_cx);
+            });
+        }
+        cx.notify();
+    }
+
     fn set_agent_history(&mut self, loaded: Result<(PathBuf, AgentHistoryStore), String>) {
         let shutdown_error = self
             .agent_history_writer
@@ -3544,6 +3584,9 @@ impl WorkspaceView {
             recent_projects,
             recent_path,
             open_menu: None,
+            php_version_override: None,
+            php_version_overrides: ui_settings.php_version_overrides.iter().cloned().collect(),
+            php_version_picker_open: false,
             menu_anchor_x: px(0.),
             pending_operation: None,
             show_about: false,
@@ -5126,6 +5169,7 @@ impl WorkspaceView {
         self.semantic_update_sender = semantic_update_sender;
         self.semantic_update_receiver = semantic_update_receiver;
         let root = project.root_path().to_path_buf();
+        let project_key = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
         self.index_generation = self.index_generation.wrapping_add(1);
         let generation = self.index_generation;
         let (sender, receiver) = mpsc::channel();
@@ -5237,6 +5281,7 @@ impl WorkspaceView {
             .collect();
         self.expanded.clear();
         self.show_indexing_modal = false;
+        self.php_version_override = self.php_version_overrides.get(&project_key).copied();
         self.project = Some(project);
         self.set_memory_service(memory, cx);
         self.queue_agent_history_save(true);
@@ -5337,7 +5382,9 @@ impl WorkspaceView {
                 }
                 for tab in &self.tabs {
                     let updates = self.semantic_update_sender.clone();
+                    let php_version = self.target_php_version();
                     tab.editor.update(cx, |editor, editor_cx| {
+                        editor.set_target_php_version(php_version);
                         let root = self.project.as_ref().unwrap().root_path().to_path_buf();
                         let workspace_source =
                             axiom_index::is_workspace_source_lexical(&tab.path, &root);
@@ -5658,6 +5705,8 @@ impl WorkspaceView {
         self.queue_agent_history_save(true);
         self.set_agent_history(Err("Open a workspace to load Agent history".into()));
         self.project = None;
+        self.php_version_override = None;
+        self.php_version_picker_open = false;
         self.git_state = None;
         self.git_refresh_requested = false;
         self.version_control_visible = false;
@@ -6522,6 +6571,11 @@ impl WorkspaceView {
             document.set_file_path(path.clone());
             let editor = cx
                 .new(|cx| EditorView::from_document(path.clone(), document, self.lsp.clone(), cx));
+            editor.update(cx, |editor, _| {
+                editor.set_target_php_version(
+                    self.target_php_version(),
+                )
+            });
             if let Some(symbols) = &self._runtime_symbols {
                 editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
             }
@@ -7478,6 +7532,11 @@ impl WorkspaceView {
                     .thinking_level_preferences
                     .iter()
                     .map(|((provider, model), level)| (provider.clone(), model.clone(), *level))
+                    .collect(),
+                php_version_overrides: self
+                    .php_version_overrides
+                    .iter()
+                    .map(|(path, version)| (path.clone(), *version))
                     .collect(),
             }
             .save(path);
@@ -10005,6 +10064,11 @@ impl WorkspaceView {
         };
         let lsp = self.lsp.clone();
         let editor = cx.new(|cx| EditorView::from_document(path.clone(), document, lsp, cx));
+        editor.update(cx, |editor, _| {
+            editor.set_target_php_version(
+                self.target_php_version(),
+            )
+        });
         if let Some(offset) = caret_offset {
             editor.update(cx, |editor, cx| editor.set_cursor_offset(offset, cx));
         }
@@ -10082,6 +10146,11 @@ impl WorkspaceView {
         };
         let lsp = self.lsp.clone();
         let editor = cx.new(|cx| EditorView::from_document(path.clone(), document, lsp, cx));
+        editor.update(cx, |editor, _| {
+            editor.set_target_php_version(
+                self.target_php_version(),
+            )
+        });
         if let Some(symbols) = &self._runtime_symbols {
             editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
         }
@@ -10391,6 +10460,11 @@ impl WorkspaceView {
             let lsp = self.lsp.clone();
             let editor_started = Instant::now();
             let editor = cx.new(|cx| EditorView::from_document(path.clone(), document, lsp, cx));
+            editor.update(cx, |editor, _| {
+                editor.set_target_php_version(
+                    self.target_php_version(),
+                )
+            });
             let editor_create_us = editor_started.elapsed().as_micros();
             if let Some(symbols) = &self._runtime_symbols {
                 editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
@@ -10534,6 +10608,11 @@ impl WorkspaceView {
             };
             let editor = cx
                 .new(|cx| EditorView::from_document(path.clone(), document, self.lsp.clone(), cx));
+            editor.update(cx, |editor, _| {
+                editor.set_target_php_version(
+                    self.target_php_version(),
+                )
+            });
             if let Some(symbols) = &self._runtime_symbols {
                 editor.update(cx, |editor, _| editor.set_runtime_symbols(symbols.clone()));
             }
@@ -12811,6 +12890,17 @@ impl Render for WorkspaceView {
             Some(ServerStatus::NotFound) | None => "Not Found",
         };
         let runtime_stub_status = self.runtime_stubs.label();
+        let active_php_version = self.target_php_version();
+        let php_version_options = [
+            (PhpVersion::Php74, "PHP 7.4"),
+            (PhpVersion::Php80, "PHP 8.0"),
+            (PhpVersion::Php81, "PHP 8.1"),
+            (PhpVersion::Php82, "PHP 8.2"),
+            (PhpVersion::Php83, "PHP 8.3"),
+            (PhpVersion::Php84, "PHP 8.4"),
+            (PhpVersion::Php85, "PHP 8.5"),
+            (PhpVersion::Php86, "PHP 8.6"),
+        ];
         let git_status = self.git_state.as_ref().map(|state| {
             state
                 .branch
@@ -13016,10 +13106,40 @@ impl Render for WorkspaceView {
                     .text_size(m.ui_font_size)
                     .text_color(t.text_secondary)
                     .child(self.status.clone())
-                    .child(format!(
-                        "{}PHP  ·  Intelephense: {lsp_status}  ·  Runtime Stubs: {runtime_stub_status}  ·  UTF-8",
-                        git_status.map(|branch| format!("Git: {branch}  ·  ")).unwrap_or_default()
-                    )),
+                    .child(div().flex().items_center().gap_2()
+                        .when_some(git_status, |row, branch| row.child(format!("Git: {branch}  ·")))
+                        .child(div().relative()
+                            .id("php-target-version-picker")
+                            .px_2().py_1().rounded(m.border_radius_small)
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|style| style.bg(t.hover))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.php_version_picker_open = !this.php_version_picker_open;
+                                cx.notify();
+                            }))
+                            .child(format!("{}  ▾", php_version_label(active_php_version)))
+                            .when(self.php_version_picker_open, |badge| badge.child(
+                                gpui::deferred(
+                                    div().absolute().bottom(px(26.)).right(px(0.))
+                                        .w(px(112.)).p_1().flex().flex_col().gap_1()
+                                        .bg(t.window_background).border_1()
+                                        .border_color(t.border_subtle).rounded(m.border_radius_small)
+                                        .children(php_version_options.into_iter().map(|(version, label)| {
+                                            let selected = active_php_version == version;
+                                            div().id(SharedString::from(format!("php-version-{}", label.replace([' ', '.'], ""))))
+                                                .px_2().py_1().rounded(m.border_radius_small)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .when(selected, |item| item.bg(t.hover).text_color(t.text_primary))
+                                                .when(!selected, |item| item.text_color(t.text_secondary))
+                                                .hover(|item| item.bg(t.hover).text_color(t.text_primary))
+                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                    this.select_php_version(version, cx);
+                                                }))
+                                                .child(label)
+                                        }))
+                                )
+                            )))
+                        .child(format!("Intelephense: {lsp_status}  ·  Runtime Stubs: {runtime_stub_status}  ·  UTF-8"))),
             ))
             .when(self.open_menu.is_some(), |this| {
                 this.child(

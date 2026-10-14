@@ -53,6 +53,26 @@ o `Project`; essa transição encerra documentos LSP, descarta o bridge antigo e
 limpa explorer/tabs antes de inicializar a nova raiz. Stubs de runtime continuam
 globais e independentes do projeto.
 
+## Axiom AI Agent
+
+O painel Axiom AI e o Agent Runtime estão ativos. O runtime usa providers HTTP
+com respostas em streaming e executa doze grupos de capacidades: `read_file`,
+`list_directory`, `find_files`, `search_text`, `find_symbol`,
+`find_references`, `fetch_url`, `write_file`, `update_file`, `delete_file`,
+`execute_command` e memória persistente. O grupo de memória inclui
+`memory_search` e `memory_get`; `memory_remember` só é declarado quando a
+escrita está disponível. As operações de memória dependem da disponibilidade
+do backend.
+
+`StandardToolPolicy` permite operações de leitura seguras e exige aprovação
+para mutações de arquivos, comandos de terminal e gravação de memória.
+`ApprovalBridge` publica o pedido de aprovação para a UI, aguarda a decisão e
+retoma ou nega a execução do Agent.
+
+A memória local persistente mantém registros canônicos e um índice de busca
+SQLite FTS5. O índice usa WAL e `synchronous=NORMAL`; o serviço de memória
+executa o armazenamento fora do fluxo de renderização da UI.
+
 ## Editor visual
 
 As linhas são apresentadas por `uniform_list`, portanto somente o intervalo

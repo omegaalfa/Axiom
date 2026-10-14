@@ -1,0 +1,329 @@
+{
+    "schemaVersion": 2,
+    "phpVersion": "8.5.4",
+    "note": "This catalogue requires Rust completion-provider integration; the updater does not load it.",
+    "constructs": [
+        {
+            "token": "array",
+            "label": "array()",
+            "insertText": "array()",
+            "insertTextSnippet": "array(${1})",
+            "kind": "expression"
+        },
+        {
+            "token": "isset",
+            "label": "isset()",
+            "insertText": "isset($variable)",
+            "insertTextSnippet": "isset(${1:$variable})",
+            "kind": "expression"
+        },
+        {
+            "token": "empty",
+            "label": "empty()",
+            "insertText": "empty($value)",
+            "insertTextSnippet": "empty(${1:$value})",
+            "kind": "expression"
+        },
+        {
+            "token": "unset",
+            "label": "unset()",
+            "insertText": "unset($variable);",
+            "insertTextSnippet": "unset(${1:$variable});",
+            "kind": "statement"
+        },
+        {
+            "token": "list",
+            "label": "list()",
+            "insertText": "list($a, $b)",
+            "insertTextSnippet": "list(${1:$a}, ${2:$b})",
+            "kind": "destructuring"
+        },
+        {
+            "token": "eval",
+            "label": "eval()",
+            "insertText": "eval($code);",
+            "insertTextSnippet": "eval(${1:$code});",
+            "kind": "expression"
+        },
+        {
+            "token": "exit",
+            "label": "exit()",
+            "insertText": "exit(0);",
+            "insertTextSnippet": "exit(${1:0});",
+            "kind": "expression"
+        },
+        {
+            "token": "die",
+            "label": "die()",
+            "insertText": "die(0);",
+            "insertTextSnippet": "die(${1:0});",
+            "kind": "expression"
+        },
+        {
+            "token": "print",
+            "label": "print",
+            "insertText": "print $value;",
+            "insertTextSnippet": "print ${1:$value};",
+            "kind": "expression"
+        },
+        {
+            "token": "echo",
+            "label": "echo",
+            "insertText": "echo $value;",
+            "insertTextSnippet": "echo ${1:$value};",
+            "kind": "statement"
+        },
+        {
+            "token": "include",
+            "label": "include",
+            "insertText": "include $file;",
+            "insertTextSnippet": "include ${1:$file};",
+            "kind": "expression"
+        },
+        {
+            "token": "include_once",
+            "label": "include_once",
+            "insertText": "include_once $file;",
+            "insertTextSnippet": "include_once ${1:$file};",
+            "kind": "expression"
+        },
+        {
+            "token": "require",
+            "label": "require",
+            "insertText": "require $file;",
+            "insertTextSnippet": "require ${1:$file};",
+            "kind": "expression"
+        },
+        {
+            "token": "require_once",
+            "label": "require_once",
+            "insertText": "require_once $file;",
+            "insertTextSnippet": "require_once ${1:$file};",
+            "kind": "expression"
+        },
+        {
+            "token": "new",
+            "label": "new",
+            "insertText": "new ClassName()",
+            "insertTextSnippet": "new ${1:ClassName}(${2})",
+            "kind": "expression"
+        },
+        {
+            "token": "clone",
+            "label": "clone",
+            "insertText": "clone $object",
+            "insertTextSnippet": "clone ${1:$object}",
+            "kind": "expression"
+        },
+        {
+            "token": "match",
+            "label": "match",
+            "insertText": "match ($value) {\n    default => null,\n}",
+            "insertTextSnippet": "match (${1:$value}) {\n    ${2:default} => ${3:null},\n}",
+            "kind": "expression"
+        },
+        {
+            "token": "yield",
+            "label": "yield",
+            "insertText": "yield $value",
+            "insertTextSnippet": "yield ${1:$value}",
+            "kind": "expression"
+        },
+        {
+            "token": "yield from",
+            "label": "yield from",
+            "insertText": "yield from $iterable",
+            "insertTextSnippet": "yield from ${1:$iterable}",
+            "kind": "expression"
+        },
+        {
+            "token": "throw",
+            "label": "throw",
+            "insertText": "throw new Exception();",
+            "insertTextSnippet": "throw new ${1:Exception}(${2});",
+            "kind": "statement"
+        },
+        {
+            "token": "return",
+            "label": "return",
+            "insertText": "return $value;",
+            "insertTextSnippet": "return ${1:$value};",
+            "kind": "statement"
+        },
+        {
+            "token": "break",
+            "label": "break",
+            "insertText": "break;",
+            "insertTextSnippet": "break;",
+            "kind": "statement"
+        },
+        {
+            "token": "continue",
+            "label": "continue",
+            "insertText": "continue;",
+            "insertTextSnippet": "continue;",
+            "kind": "statement"
+        },
+        {
+            "token": "global",
+            "label": "global",
+            "insertText": "global $variable;",
+            "insertTextSnippet": "global ${1:$variable};",
+            "kind": "statement"
+        },
+        {
+            "token": "static",
+            "label": "static",
+            "insertText": "static $variable;",
+            "insertTextSnippet": "static ${1:$variable};",
+            "kind": "statement"
+        },
+        {
+            "token": "instanceof",
+            "label": "instanceof",
+            "insertText": "$value instanceof ClassName",
+            "insertTextSnippet": "${1:$value} instanceof ${2:ClassName}",
+            "kind": "operator"
+        },
+        {
+            "token": "fn",
+            "label": "fn",
+            "insertText": "fn($value) => $value",
+            "insertTextSnippet": "fn(${1:$value}) => ${2:$value}",
+            "kind": "expression"
+        },
+        {
+            "token": "function",
+            "label": "function",
+            "insertText": "function name(): void {\n    \n}",
+            "insertTextSnippet": "function ${1:name}(${2}): ${3:void} {\n    ${4}\n}",
+            "kind": "declaration"
+        },
+        {
+            "token": "use",
+            "label": "use",
+            "insertText": "use Vendor\\Package\\ClassName;",
+            "insertTextSnippet": "use ${1:Vendor\\Package\\ClassName};",
+            "kind": "declaration"
+        },
+        {
+            "token": "namespace",
+            "label": "namespace",
+            "insertText": "namespace App\\Example;",
+            "insertTextSnippet": "namespace ${1:App\\Example};",
+            "kind": "declaration"
+        },
+        {
+            "token": "class",
+            "label": "class",
+            "insertText": "class Name {\n    \n}",
+            "insertTextSnippet": "class ${1:Name} {\n    ${2}\n}",
+            "kind": "declaration"
+        },
+        {
+            "token": "interface",
+            "label": "interface",
+            "insertText": "interface Name {\n    \n}",
+            "insertTextSnippet": "interface ${1:Name} {\n    ${2}\n}",
+            "kind": "declaration"
+        },
+        {
+            "token": "trait",
+            "label": "trait",
+            "insertText": "trait Name {\n    \n}",
+            "insertTextSnippet": "trait ${1:Name} {\n    ${2}\n}",
+            "kind": "declaration"
+        },
+        {
+            "token": "enum",
+            "label": "enum",
+            "insertText": "enum Name {\n    \n}",
+            "insertTextSnippet": "enum ${1:Name} {\n    ${2}\n}",
+            "kind": "declaration"
+        },
+        {
+            "token": "if",
+            "label": "if",
+            "insertText": "if (condition) {\n    \n}",
+            "insertTextSnippet": "if (${1:condition}) {\n    ${2}\n}",
+            "kind": "control"
+        },
+        {
+            "token": "elseif",
+            "label": "elseif",
+            "insertText": "elseif (condition) {\n    \n}",
+            "insertTextSnippet": "elseif (${1:condition}) {\n    ${2}\n}",
+            "kind": "control"
+        },
+        {
+            "token": "else",
+            "label": "else",
+            "insertText": "else {\n    \n}",
+            "insertTextSnippet": "else {\n    ${1}\n}",
+            "kind": "control"
+        },
+        {
+            "token": "foreach",
+            "label": "foreach",
+            "insertText": "foreach ($items as $item) {\n    \n}",
+            "insertTextSnippet": "foreach (${1:$items} as ${2:$item}) {\n    ${3}\n}",
+            "kind": "control"
+        },
+        {
+            "token": "for",
+            "label": "for",
+            "insertText": "for ($i = 0; $i < 10; $i++) {\n    \n}",
+            "insertTextSnippet": "for (${1:$i = 0}; ${2:$i < 10}; ${3:$i++}) {\n    ${4}\n}",
+            "kind": "control"
+        },
+        {
+            "token": "while",
+            "label": "while",
+            "insertText": "while (condition) {\n    \n}",
+            "insertTextSnippet": "while (${1:condition}) {\n    ${2}\n}",
+            "kind": "control"
+        },
+        {
+            "token": "do",
+            "label": "do",
+            "insertText": "do {\n    \n} while (condition);",
+            "insertTextSnippet": "do {\n    ${1}\n} while (${2:condition});",
+            "kind": "control"
+        },
+        {
+            "token": "switch",
+            "label": "switch",
+            "insertText": "switch ($value) {\n    case 1:\n        break;\n}",
+            "insertTextSnippet": "switch (${1:$value}) {\n    case ${2:1}:\n        ${3:break;}\n}",
+            "kind": "control"
+        },
+        {
+            "token": "try",
+            "label": "try",
+            "insertText": "try {\n    \n} catch (\\Throwable $e) {\n    \n}",
+            "insertTextSnippet": "try {\n    ${1}\n} catch (${2:\\Throwable} ${3:$e}) {\n    ${4}\n}",
+            "kind": "control"
+        },
+        {
+            "token": "catch",
+            "label": "catch",
+            "insertText": "catch (\\Throwable $e) {\n    \n}",
+            "insertTextSnippet": "catch (${1:\\Throwable} ${2:$e}) {\n    ${3}\n}",
+            "kind": "control"
+        },
+        {
+            "token": "finally",
+            "label": "finally",
+            "insertText": "finally {\n    \n}",
+            "insertTextSnippet": "finally {\n    ${1}\n}",
+            "kind": "control"
+        },
+        {
+            "token": "declare",
+            "label": "declare",
+            "insertText": "declare(strict_types=1);",
+            "insertTextSnippet": "declare(strict_types=1);",
+            "kind": "statement"
+        }
+    ]
+}

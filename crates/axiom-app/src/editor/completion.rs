@@ -172,13 +172,25 @@ impl EditorView {
                 new_prefix: Some(tag_range),
             };
         }
+        if self.target_php_version.supports_property_hooks()
+            && let Some((range, items)) = php_property_hook_completions(text, cursor)
+        {
+            return NativeCompletionBatch {
+                items,
+                new_prefix: Some(range),
+            };
+        }
         if let Some((_, items)) = php_class_member_completions(text, cursor) {
             return NativeCompletionBatch {
                 items,
                 new_prefix: None,
             };
         }
-        if let Some((template_range, template_items)) = php_live_template_completions(text, cursor)
+        if let Some((template_range, template_items)) = php_live_template_completions(
+            text,
+            cursor,
+            self.target_php_version,
+        )
         {
             return NativeCompletionBatch {
                 items: template_items,
@@ -227,6 +239,17 @@ impl EditorView {
             .as_ref()
             .map(|site| site.context)
             .unwrap_or_else(|| type_completion_context(before, start, preceded_by_new));
+        let pipe_rhs_context = self.target_php_version.supports_pipe_operator()
+            && self.syntax.as_ref().is_some_and(|syntax| {
+                syntax
+                    .pipe_operator_ranges()
+                    .into_iter()
+                    .filter(|range| range.end <= cursor)
+                    .max_by_key(|range| range.end)
+                    .is_some_and(|range| {
+                        !text[range.end..cursor].contains([';', '{', '}'])
+                    })
+            });
         if prefix.starts_with('$') {
             return NativeCompletionBatch {
                 items: if before[..start].ends_with("::") || before[..start].ends_with("->") {
@@ -241,7 +264,8 @@ impl EditorView {
             || before.ends_with("extends ")
             || before.ends_with("implements ")
             || before.ends_with("use ")
-            || type_site.is_some();
+            || type_site.is_some()
+            || pipe_rhs_context;
         if prefix.is_empty() && member_operator.is_none() && !empty_prefix_context {
             return NativeCompletionBatch {
                 items: Vec::new(),
@@ -343,7 +367,7 @@ impl EditorView {
         }
         if let Some((operator_start, is_static)) = member_operator {
             let owner_end = operator_start;
-            let (_, owner_expression) = extract_owner_expression(&text, owner_end);
+            let (owner_start, owner_expression) = extract_owner_expression(&text, owner_end);
             let owner = owner_expression.trim_start_matches('$');
             let mut snapshot_receiver_type = None;
             let mut snapshot_binding_checked = false;
@@ -403,6 +427,49 @@ impl EditorView {
                                 new_prefix: None,
                             };
                         }
+                    }
+                }
+                if snapshot_receiver_type.is_none()
+                    && !owner_expression.is_empty()
+                    && let Some(syntax) = &self.syntax
+                    && let Some(scope) =
+                        snapshot.scope_id_at(&file_key, owner_end.saturating_sub(1))
+                    && let Some(mut node) = syntax.tree().root_node().descendant_for_byte_range(
+                        owner_end.saturating_sub(1),
+                        owner_end,
+                    )
+                {
+                    let mut expression = None;
+                    loop {
+                        if node.start_byte() >= owner_start
+                            && node.end_byte() == owner_end
+                            && matches!(
+                                node.kind(),
+                                "object_creation_expression"
+                                    | "member_call_expression"
+                                    | "nullsafe_member_call_expression"
+                                    | "parenthesized_expression"
+                                    | "function_call_expression"
+                            )
+                        {
+                            expression = Some(node);
+                        }
+                        let Some(parent) = node.parent() else { break };
+                        if parent.start_byte() < owner_start || parent.end_byte() != owner_end {
+                            break;
+                        }
+                        node = parent;
+                    }
+                    if let Some(expression) = expression {
+                        snapshot_receiver_type = axiom_index::ExpressionResolver::new(
+                            &snapshot,
+                            scope,
+                        )
+                        .infer_ast_expression_type(expression, &text)
+                        .and_then(|ty| match ty {
+                            DeclaredType::Named { resolved, .. } => Some(resolved),
+                            _ => None,
+                        });
                     }
                 }
             }
@@ -541,7 +608,13 @@ impl EditorView {
             self.runtime_symbols
                 .as_ref()
                 .map(|index| {
-                    let matches = if runtime_type_context {
+                    let matches = if pipe_rhs_context {
+                        index
+                            .search_prefix(prefix)
+                            .into_iter()
+                            .filter(|symbol| symbol.kind == RuntimeKind::Function)
+                            .collect()
+                    } else if runtime_type_context {
                         index.search_type_prefix(prefix)
                     } else {
                         index.search_prefix(prefix)
@@ -605,7 +678,11 @@ impl EditorView {
                                     RuntimeKind::Enum => CompletionItemKind::ENUM,
                                     _ => CompletionItemKind::VALUE,
                                 }),
-                                insert_text: runtime_call_insert_text(symbol),
+                                insert_text: if pipe_rhs_context {
+                                    Some(format!("{}(...) ", symbol.name).trim().to_owned())
+                                } else {
+                                    runtime_call_insert_text(symbol)
+                                },
                                 additional_text_edits: import.map(|edit| vec![edit]),
                                 ..Default::default()
                             }
@@ -631,10 +708,16 @@ impl EditorView {
                     project_matches
                         .into_iter()
                         .filter(|symbol| {
-                            type_site
-                                .as_ref()
-                                .map(|site| project_type_kind_for_site(site, symbol.kind))
-                                .unwrap_or_else(|| type_kind_allowed(type_context, symbol.kind))
+                            if pipe_rhs_context {
+                                symbol.kind == ProjectSymbolKind::Function
+                            } else {
+                                type_site
+                                    .as_ref()
+                                    .map(|site| project_type_kind_for_site(site, symbol.kind))
+                                    .unwrap_or_else(|| {
+                                        type_kind_allowed(type_context, symbol.kind)
+                                    })
+                            }
                         })
                         .map(|symbol| {
                             let import_started = Instant::now();
@@ -666,15 +749,21 @@ impl EditorView {
                                     ProjectSymbolKind::Enum => CompletionItemKind::ENUM,
                                     _ => CompletionItemKind::VALUE,
                                 }),
-                                insert_text: (current_namespace(text).is_empty()
-                                    && matches!(
-                                        symbol.kind,
-                                        ProjectSymbolKind::Class
-                                            | ProjectSymbolKind::Interface
-                                            | ProjectSymbolKind::Trait
-                                            | ProjectSymbolKind::Enum
-                                    ))
-                                .then(|| format!("\\{}", symbol.fully_qualified_name)),
+                                insert_text: if pipe_rhs_context
+                                    && symbol.kind == ProjectSymbolKind::Function
+                                {
+                                    Some(format!("{}(...) ", symbol.name).trim().to_owned())
+                                } else {
+                                    (current_namespace(text).is_empty()
+                                        && matches!(
+                                            symbol.kind,
+                                            ProjectSymbolKind::Class
+                                                | ProjectSymbolKind::Interface
+                                                | ProjectSymbolKind::Trait
+                                                | ProjectSymbolKind::Enum
+                                        ))
+                                    .then(|| format!("\\{}", symbol.fully_qualified_name))
+                                },
                                 additional_text_edits: import.map(|edit| vec![edit]),
                                 ..Default::default()
                             }
@@ -766,7 +855,7 @@ impl EditorView {
         });
         NativeCompletionBatch {
             items: items.into_iter().take(40).collect(),
-            new_prefix: preceded_by_new.then_some(start..cursor),
+            new_prefix: (preceded_by_new || pipe_rhs_context).then_some(start..cursor),
         }
     }
 
@@ -1027,6 +1116,16 @@ impl EditorView {
     }
     pub(super) fn resolve_native_type(&self, owner: &str, context: &str) -> Option<String> {
         let owner = owner.trim();
+        if let Some(instantiation) = owner.strip_prefix("new ") {
+            let class_name = instantiation
+                .trim_start()
+                .split(['(', ' ', '\t', '\r', '\n'])
+                .next()
+                .unwrap_or_default();
+            if !class_name.is_empty() {
+                return Some(self.qualify_type(class_name));
+            }
+        }
         if owner == "$this" {
             let resolved = declared_class_fqn(context);
             if std::env::var_os("AXIOM_DEBUG_DEFINITION").is_some() {
@@ -1186,6 +1285,11 @@ impl EditorView {
         let Some(item) = self.completions.get(self.completion_selected).cloned() else {
             return;
         };
+        let is_asymmetric_visibility = item
+            .insert_text
+            .as_deref()
+            .unwrap_or(&item.label)
+            .contains("(set)");
         let is_type_item = is_php_type_completion(
             &item,
             item.insert_text.as_deref().unwrap_or(&item.label),
@@ -1223,7 +1327,10 @@ impl EditorView {
         let auto_space_type_completion = item.insert_text_format != Some(InsertTextFormat::SNIPPET)
             && is_type_item
             && (parameter_type_context(&content, range.start, range.end)
-                || class_member_modifier_type_context(&content, range.start, range.end));
+                || class_member_modifier_type_context(&content, range.start, range.end))
+            || (item.insert_text_format != Some(InsertTextFormat::SNIPPET)
+                && is_asymmetric_visibility
+                && is_inside_class_body(&content[..range.start]));
         let caret_after_existing_space = auto_space_type_completion
             && content[range.end..].starts_with(' ');
         if auto_space_type_completion && !caret_after_existing_space {
@@ -1335,6 +1442,161 @@ impl EditorView {
         cx.notify();
     }
 
+}
+
+#[cfg(test)]
+mod completion_expression_tests {
+    use super::extract_owner_expression;
+
+    #[test]
+    fn extracts_new_and_chained_call_receivers_before_member_access() {
+        for source in [
+            "new PhpVersion()->",
+            "new PhpVersion()->getVersion()->",
+            "new PhpVersion->",
+        ] {
+            let end = source.rfind("->").unwrap();
+            let (start, owner) = extract_owner_expression(source, end);
+            assert_eq!(&source[start..end], owner);
+            assert!(owner.starts_with("new PhpVersion"));
+        }
+    }
+}
+
+fn php_property_hook_completions(
+    text: &str,
+    cursor: usize,
+) -> Option<(Range<usize>, Vec<CompletionItem>)> {
+    let before = text.get(..cursor)?;
+    let (open, _declaration, property_name) = before
+        .match_indices('{')
+        .rev()
+        .find_map(|(open, _)| {
+            let declaration = before[..open].trim_end();
+            let property_name = declaration.rsplit('$').next()?;
+            let valid_property = !property_name.is_empty()
+                && property_name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                && !declaration[declaration.rfind([';', '{', '}']).map_or(0, |i| i + 1)..]
+                    .contains("function");
+            valid_property.then_some((open, declaration, property_name))
+        })?;
+    let mut depth = 1usize;
+    for ch in before[open + 1..].chars() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let line = &before[line_start..];
+    let variable_start = line
+        .char_indices()
+        .rev()
+        .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '$')
+        .last()
+        .map_or(cursor, |(i, _)| line_start + i);
+    let token = &text[variable_start..cursor];
+    let hook_body = &before[open + 1..];
+    let latest_get = hook_body.rfind("get");
+    let latest_set = hook_body.rfind("set");
+    let in_set_hook = latest_set.is_some_and(|set| latest_get.is_none_or(|get| set > get));
+    if token.starts_with('$') {
+        let items = (in_set_hook && "$value".starts_with(token))
+            .then(|| CompletionItem {
+                label: "$value".into(),
+                detail: Some("PHP 8.4 implicit property-hook value".into()),
+                kind: Some(CompletionItemKind::VARIABLE),
+                insert_text: Some("$value".into()),
+                ..Default::default()
+            })
+            .into_iter()
+            .collect();
+        return Some((variable_start..cursor, items));
+    }
+    let start = token
+        .char_indices()
+        .rev()
+        .take_while(|(_, ch)| ch.is_ascii_alphabetic())
+        .last()
+        .map_or(cursor, |(i, _)| variable_start + i);
+    let prefix = &text[start..cursor];
+    let latest_hook = latest_get.into_iter().chain(latest_set).max();
+    let cursor_in_hook_body = latest_hook.is_some_and(|hook| {
+        let suffix = &hook_body[hook + 3..];
+        suffix.contains("=>") || suffix.contains('{') || suffix.contains('(')
+    });
+    if cursor_in_hook_body || prefix.is_empty() {
+        return None;
+    }
+    let indent = before[..line_start]
+        .rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .collect::<String>();
+    let nested_indent = format!("{indent}    ");
+    let snippets = [
+        ("get =>", format!("get => ${{1:$this->_{property_name}}}")),
+        ("set =>", "set => ${1:strtolower($value)}".into()),
+        (
+            "get { ... }",
+            format!("get {{\n{nested_indent}return ${{1}};\n{indent}}}"),
+        ),
+        (
+            "set { ... }",
+            format!("set {{\n{nested_indent}$this->${{1}} = $value;\n{indent}}}"),
+        ),
+    ];
+    let mut items = vec!["get", "set"]
+        .into_iter()
+        .filter(|label| label.starts_with(prefix))
+        .map(|label| CompletionItem {
+            label: label.into(),
+            detail: Some("PHP 8.4 property hook".into()),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some(label.into()),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    items.extend(
+        snippets
+            .into_iter()
+            .filter(|(label, _)| label.starts_with(prefix))
+            .map(|(label, insert_text)| CompletionItem {
+                label: label.into(),
+                detail: Some("PHP 8.4 property hook snippet".into()),
+                kind: Some(CompletionItemKind::SNIPPET),
+                insert_text: Some(insert_text),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            }),
+    );
+    (!items.is_empty()).then_some((start..cursor, items))
+}
+
+#[cfg(test)]
+mod property_hook_completion_tests {
+    use super::php_property_hook_completions;
+
+    #[test]
+    fn offers_hook_keywords_snippets_and_set_value() {
+        let source = "<?php class C { public string $name { ge";
+        let (_, items) = php_property_hook_completions(source, source.len()).unwrap();
+        assert!(items.iter().any(|item| item.label == "get"));
+        assert!(items.iter().any(|item| item.label == "get =>"));
+
+        let source = "<?php class C { public string $name { set { $v";
+        let (_, items) = php_property_hook_completions(source, source.len()).unwrap();
+        assert!(items.iter().any(|item| item.label == "$value"));
+    }
 }
 
 pub(super) fn php_type_completion_site(text: &str, cursor: usize) -> Option<PhpTypeCompletionSite> {
@@ -1494,6 +1756,9 @@ pub(super) fn class_member_modifier_type_context(text: &str, token_start: usize,
                 "public"
                     | "protected"
                     | "private"
+                    | "public(set)"
+                    | "protected(set)"
+                    | "private(set)"
                     | "readonly"
                     | "static"
                     | "final"
@@ -1515,7 +1780,15 @@ pub(super) fn property_type_prefix(line: &str) -> Option<&str> {
             .unwrap_or(remaining.len());
         if !matches!(
             &remaining[..word_end],
-            "public" | "protected" | "private" | "var" | "static" | "readonly"
+            "public"
+                | "protected"
+                | "private"
+                | "public(set)"
+                | "protected(set)"
+                | "private(set)"
+                | "var"
+                | "static"
+                | "readonly"
         ) {
             break;
         }
@@ -1744,12 +2017,14 @@ pub(super) fn php_class_member_completions(
         .last()
         .map_or(cursor, |(offset, _)| line_start + offset);
     let prefix = &text[prefix_start..cursor];
-    if prefix.is_empty() {
-        return None;
-    }
     let preceding_words = line[..prefix_start - line_start]
         .split_whitespace()
         .collect::<Vec<_>>();
+    // An empty prefix after a modifier (for example `protected |`) is still a
+    // useful member-completion context: offer the next asymmetric modifier.
+    if prefix.is_empty() && preceding_words.is_empty() {
+        return None;
+    }
     if preceding_words.iter().any(|word| {
         !matches!(
             *word,
@@ -1870,6 +2145,58 @@ pub(super) fn php_class_member_completions(
                     ..Default::default()
                 });
             }
+        }
+    }
+    let asymmetric_variants = [
+        ("private(set)", "pri"),
+        ("protected(set)", "pro"),
+        ("public(set)", "pub"),
+        ("public private(set)", "pub"),
+        ("public protected(set)", "pub"),
+        ("protected private(set)", "pro"),
+    ];
+    for (label, alias) in asymmetric_variants {
+        let visible_prefix = !prefix.is_empty()
+            && (starts_with_ascii_case_insensitive(label, prefix)
+                || prefix.eq_ignore_ascii_case(alias));
+        if visible_prefix
+            && (preceding_words.is_empty() || !label.contains(' '))
+        {
+            items.push(CompletionItem {
+                label: label.to_owned(),
+                detail: Some("PHP 8.4 asymmetric property visibility".to_owned()),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some(label.to_owned()),
+                ..Default::default()
+            });
+        }
+    }
+    // Offer only a legal write-visibility continuation after the read
+    // visibility already present on the line.
+    let read_visibility = preceding_words.last().copied();
+    let write_visibility = match read_visibility {
+        Some("public") => [
+            Some(("public private(set)", "private(set)")),
+            Some(("public protected(set)", "protected(set)")),
+            Some(("public(set)", "public(set)")),
+        ],
+        Some("protected") => [
+            Some(("protected private(set)", "private(set)")),
+            Some(("protected(set)", "protected(set)")),
+            None,
+        ],
+        Some("private") => [Some(("private(set)", "private(set)")), None, None],
+        _ => [None, None, None],
+    };
+    for (label, insert_text) in write_visibility.into_iter().flatten() {
+        if prefix.is_empty() || starts_with_ascii_case_insensitive(insert_text, prefix) {
+            items.push(CompletionItem {
+                label: label.to_owned(),
+                detail: Some("PHP 8.4 asymmetric property write visibility".to_owned()),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some(insert_text.to_owned()),
+                ..Default::default()
+            });
         }
     }
     (!items.is_empty()).then_some((prefix_start..cursor, items))
@@ -2270,11 +2597,32 @@ pub(super) fn has_import(context: &str, fqn: &str) -> bool {
 pub(super) fn extract_owner_expression(text: &str, owner_end: usize) -> (usize, String) {
     let prefix = &text[..owner_end];
     let mut start = owner_end;
+    let mut paren_depth = 0usize;
     for (index, ch) in prefix.char_indices().rev() {
-        if ch.is_alphanumeric() || matches!(ch, '_' | '$' | '\\' | '-' | '>') {
-            start = index;
-        } else {
-            break;
+        match ch {
+            ')' => {
+                paren_depth += 1;
+                start = index;
+            }
+            '(' if paren_depth > 0 => {
+                paren_depth -= 1;
+                start = index;
+            }
+            '(' => break,
+            ch if paren_depth > 0
+                || ch.is_alphanumeric()
+                || matches!(ch, '_' | '$' | '\\' | '-' | '>' | '?') =>
+            {
+                start = index;
+            }
+            ch if ch.is_whitespace() && paren_depth == 0 => {
+                let preceding = prefix[..index].trim_end();
+                if preceding.ends_with("new") {
+                    start = preceding.len() - "new".len();
+                }
+                break;
+            }
+            _ => break,
         }
     }
     (start, prefix[start..].trim().to_owned())

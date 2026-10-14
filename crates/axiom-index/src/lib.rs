@@ -72,6 +72,14 @@ pub struct ProjectSymbol {
     pub name_position: Option<(usize, usize)>,
     pub namespace: String,
     pub visibility: Visibility,
+    #[serde(default)]
+    pub write_visibility: Option<Visibility>,
+    #[serde(default)]
+    pub has_get_hook: bool,
+    #[serde(default)]
+    pub has_set_hook: bool,
+    #[serde(default)]
+    pub is_virtual: bool,
     pub modifiers: Vec<String>,
     pub parameters: Option<String>,
     pub return_type: Option<String>,
@@ -603,6 +611,10 @@ impl VendorSymbolIndex {
                             name_position: None,
                             namespace: namespace.clone(),
                             visibility: Visibility::Unknown,
+                            write_visibility: None,
+                            has_get_hook: false,
+                            has_set_hook: false,
+                            is_virtual: false,
                             modifiers: vec!["composer".into()],
                             parameters: None,
                             return_type: None,
@@ -638,6 +650,10 @@ impl VendorSymbolIndex {
                         name_position: None,
                         namespace: namespace.clone(),
                         visibility: Visibility::Public,
+                        write_visibility: None,
+                        has_get_hook: false,
+                        has_set_hook: false,
+                        is_virtual: false,
                         modifiers: if trimmed[..pos].contains("static") {
                             vec!["static".into()]
                         } else {
@@ -681,13 +697,11 @@ impl VendorSymbolIndex {
                             range: start..start + name.len(),
                             name_position: None,
                             namespace: namespace.clone(),
-                            visibility: if trimmed.contains("private") {
-                                Visibility::Private
-                            } else if trimmed.contains("protected") {
-                                Visibility::Protected
-                            } else {
-                                Visibility::Public
-                            },
+                            visibility: property_read_visibility(trimmed),
+                            write_visibility: property_write_visibility(trimmed),
+                            has_get_hook: false,
+                            has_set_hook: false,
+                            is_virtual: false,
                             modifiers: vec!["composer".into()],
                             parameters: None,
                             return_type: None,
@@ -1690,7 +1704,7 @@ fn walk(
     if let Some((kind, name_node)) = symbol_node(node) {
         if let Ok(name) = name_node.utf8_text(text.as_bytes()) {
             let name = name.to_owned();
-            let (visibility, modifiers) = declaration_modifiers(node, text);
+            let (visibility, write_visibility, modifiers) = declaration_modifiers(node, text);
             let parameters = node.child_by_field_name("parameters").map(|node| {
                 node.utf8_text(text.as_bytes())
                     .unwrap_or_default()
@@ -1705,9 +1719,18 @@ fn walk(
                 })
                 .or_else(|| {
                     (kind == ProjectSymbolKind::Property)
-                        .then(|| property_declared_type(node, name_node, text))
+                        .then(|| {
+                            property_declared_type(node, name_node, text).or_else(|| {
+                                infer_property_hook_type(&text[node.start_byte()..node.end_byte()])
+                            })
+                        })
                         .flatten()
                 });
+            let (has_get_hook, has_set_hook, is_virtual) = if kind == ProjectSymbolKind::Property {
+                property_hook_metadata(node, text)
+            } else {
+                (false, false, false)
+            };
             let (docblock_range, declared_throws) = if matches!(
                 kind,
                 ProjectSymbolKind::Function | ProjectSymbolKind::Method
@@ -1748,6 +1771,10 @@ fn walk(
                 )),
                 namespace: namespace.to_owned(),
                 visibility,
+                write_visibility,
+                has_get_hook,
+                has_set_hook,
+                is_virtual,
                 modifiers,
                 parameters,
                 return_type: return_type.clone(),
@@ -1845,16 +1872,70 @@ fn indexed_declared_type(raw: &str) -> DeclaredType {
 
 fn property_declared_type(node: Node<'_>, name: Node<'_>, text: &str) -> Option<String> {
     let source = &text[node.start_byte()..name.start_byte().min(text.len())];
-    let ty = source.split_whitespace().last()?.trim_matches(['?', '&']);
+    let ty = source
+        .split_whitespace()
+        .rev()
+        .find(|word| !matches!(*word, "public" | "protected" | "private" | "readonly" | "static" | "var"))?
+        .trim_matches(['?', '&']);
     (ty.chars()
         .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '\\' | '|'))
         && !ty.is_empty())
     .then(|| ty.to_owned())
 }
 
-fn declaration_modifiers(node: Node<'_>, text: &str) -> (Visibility, Vec<String>) {
+fn property_hook_metadata(node: Node<'_>, text: &str) -> (bool, bool, bool) {
+    let source = &text[node.start_byte()..node.end_byte().min(text.len())];
+    let mut get = false;
+    let mut set = false;
+    for word in source.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
+        match word {
+            "get" => get = true,
+            "set" => set = true,
+            _ => {}
+        }
+    }
+    (get, set, (get || set) && !source.contains("$this->"))
+}
+
+fn infer_property_hook_type(source: &str) -> Option<String> {
+    if let Some(setter) = source.find("set") {
+        let after_set = &source[setter + 3..];
+        if let Some(open) = after_set.find('(') {
+            let parameter = after_set[open + 1..].split(['$', ')']).next()?.trim();
+            if !parameter.is_empty() {
+                return Some(parameter.trim_start_matches('?').to_owned());
+            }
+        }
+    }
+    let expression = source
+        .split_once("=>")
+        .map(|(_, expression)| expression)
+        .or_else(|| source.split_once("return").map(|(_, expression)| expression))?
+        .trim_start();
+    if expression.starts_with(['\'', '"']) {
+        Some("string".into())
+    } else if expression.starts_with("true") || expression.starts_with("false") {
+        Some("bool".into())
+    } else if expression.starts_with('[') {
+        Some("array".into())
+    } else if expression.chars().next().is_some_and(|ch| ch.is_ascii_digit() || ch == '-') {
+        let literal = expression
+            .split(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '.' | '-')))
+            .next()?;
+        Some(if literal.contains('.') { "float" } else { "int" }.into())
+    } else {
+        None
+    }
+}
+
+fn declaration_modifiers(
+    node: Node<'_>,
+    text: &str,
+) -> (Visibility, Option<Visibility>, Vec<String>) {
     let source = &text[node.start_byte()..node.end_byte().min(text.len())];
     let mut modifiers = Vec::new();
+    let tokens = source.split_whitespace().collect::<Vec<_>>();
+    let mut write_visibility = None;
     for word in [
         "public",
         "protected",
@@ -1864,23 +1945,48 @@ fn declaration_modifiers(node: Node<'_>, text: &str) -> (Visibility, Vec<String>
         "final",
         "readonly",
     ] {
-        if source
-            .split_whitespace()
-            .any(|part| part.trim_matches(|c: char| !c.is_ascii_alphabetic()) == word)
-        {
+        if tokens.iter().any(|part| *part == word) {
             modifiers.push(word.to_owned());
         }
+        let setter = format!("{word}(set)");
+        if tokens.iter().any(|part| *part == setter) {
+            modifiers.push(setter);
+            write_visibility = match word {
+                "public" => Some(Visibility::Public),
+                "protected" => Some(Visibility::Protected),
+                "private" => Some(Visibility::Private),
+                _ => write_visibility,
+            };
+        }
     }
-    let visibility = if modifiers.iter().any(|m| m == "private") {
+    let visibility = [
+        ("private", Visibility::Private),
+        ("protected", Visibility::Protected),
+        ("public", Visibility::Public),
+    ]
+    .into_iter()
+    .find_map(|(word, visibility)| tokens.iter().any(|part| *part == word).then_some(visibility))
+    .unwrap_or(Visibility::Unknown);
+    (visibility, write_visibility, modifiers)
+}
+
+fn property_read_visibility(source: &str) -> Visibility {
+    if source.split_whitespace().any(|word| word == "private") {
         Visibility::Private
-    } else if modifiers.iter().any(|m| m == "protected") {
+    } else if source.split_whitespace().any(|word| word == "protected") {
         Visibility::Protected
-    } else if modifiers.iter().any(|m| m == "public") {
-        Visibility::Public
     } else {
-        Visibility::Unknown
-    };
-    (visibility, modifiers)
+        Visibility::Public
+    }
+}
+
+fn property_write_visibility(source: &str) -> Option<Visibility> {
+    source.split_whitespace().find_map(|word| match word {
+        "public(set)" => Some(Visibility::Public),
+        "protected(set)" => Some(Visibility::Protected),
+        "private(set)" => Some(Visibility::Private),
+        _ => None,
+    })
 }
 
 fn symbol_node(node: Node<'_>) -> Option<(ProjectSymbolKind, Node<'_>)> {
@@ -2070,6 +2176,74 @@ mod tests {
             .find(|symbol| symbol.kind == ProjectSymbolKind::Property)
             .unwrap();
         assert_eq!(property.return_type.as_deref(), Some("FiberEventLoop"));
+    }
+
+    #[test]
+    fn indexes_php84_read_and_write_property_visibility() {
+        let mut index = ProjectSymbolIndex::new();
+        index
+            .index_file_text(
+                "Asymmetric.php",
+                "<?php class Asymmetric { public private(set) string $name; protected private(set) ?int $id; public(set) private string $title; public readonly private(set) string $code; }",
+            )
+            .unwrap();
+        for (name, read, write) in [
+            ("$name", Visibility::Public, Visibility::Private),
+            ("$id", Visibility::Protected, Visibility::Private),
+            ("$title", Visibility::Private, Visibility::Public),
+            ("$code", Visibility::Public, Visibility::Private),
+        ] {
+            let property = index
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind == ProjectSymbolKind::Property && symbol.name == name)
+                .unwrap();
+            assert_eq!(property.visibility, read, "property {name}");
+            assert_eq!(property.write_visibility, Some(write), "property {name}");
+            assert!(property.modifiers.iter().any(|modifier| modifier.ends_with("(set)")));
+        }
+        assert_eq!(
+            index
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == "$name")
+                .unwrap()
+                .return_type
+                .as_deref(),
+            Some("string")
+        );
+        let semantic = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let semantic_property = semantic
+            .symbols_for_fqn("Asymmetric::$name")
+            .first()
+            .and_then(|id| semantic.symbol(*id))
+            .unwrap();
+        assert_eq!(semantic_property.visibility, Visibility::Public);
+        assert_eq!(
+            semantic_property.write_visibility,
+            Some(Visibility::Private)
+        );
+    }
+
+    #[test]
+    fn indexes_property_hook_flags_virtuality_and_inferred_type() {
+        let mut index = ProjectSymbolIndex::new();
+        index.index_file_text(
+            "Hooks.php",
+            "<?php class Hooks { public string $name { get => $this->_name; set => strtolower($value); } public $title { get { return 'title'; } } public $count { set(int $value) { $this->_count = $value; } } }",
+        ).unwrap();
+        let find = |name| index.symbols().iter().find(|symbol| symbol.name == name).unwrap();
+        let name = find("$name");
+        assert!(name.has_get_hook && name.has_set_hook && !name.is_virtual);
+        let title = find("$title");
+        assert!(title.has_get_hook && title.is_virtual);
+        assert_eq!(title.return_type.as_deref(), Some("string"));
+        let count = find("$count");
+        assert!(count.has_set_hook && !count.has_get_hook);
+        assert_eq!(count.return_type.as_deref(), Some("int"));
+        let snapshot = SemanticSnapshot::from_project_index(&index, SemanticRevision(1));
+        let semantic = snapshot.symbols_for_fqn("Hooks::$name").first().and_then(|id| snapshot.symbol(*id)).unwrap();
+        assert!(semantic.has_get_hook && semantic.has_set_hook);
     }
 
     #[test]

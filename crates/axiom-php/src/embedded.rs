@@ -7,9 +7,11 @@ use std::{
 };
 
 use crate::{
-    EmbeddedStubArtifact, LoadReport, RuntimeSymbolIndex, STUB_PARSER_VERSION, StubProvider,
-    StubProviderError,
+    Availability, EmbeddedStubArtifact, LoadReport, PhpDoc, RuntimeSymbolIndex, Signature,
+    SourceLocation, StubProvider, StubProviderError, Symbol, SymbolKind, SymbolOrigin,
+    STUB_PARSER_VERSION,
 };
+use serde::Deserialize;
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/embedded_stub_artifact.rs"));
@@ -64,15 +66,36 @@ impl EmbeddedStubProvider {
 
     pub fn load(&self) -> Result<(RuntimeSymbolIndex, LoadReport), EmbeddedStubError> {
         let started = Instant::now();
-        let artifact: EmbeddedStubArtifact = bincode::deserialize(self.artifact)
-            .map_err(|error| EmbeddedStubError::InvalidArtifact(error.to_string()))?;
+        let (artifact, legacy_format): (EmbeddedStubArtifact, bool) =
+            match bincode::deserialize(self.artifact) {
+                Ok(artifact) => (artifact, false),
+                Err(current_error) => {
+                    let legacy: LegacyArtifact = bincode::deserialize(self.artifact).map_err(
+                        |legacy_error| {
+                            EmbeddedStubError::InvalidArtifact(format!(
+                                "{current_error}; legacy format: {legacy_error}"
+                            ))
+                        },
+                    )?;
+                    (
+                        EmbeddedStubArtifact {
+                            schema_version: legacy.schema_version,
+                            parser_version: legacy.parser_version,
+                            symbols: legacy.symbols.into_iter().map(Into::into).collect(),
+                        },
+                        true,
+                    )
+                }
+            };
         if artifact.schema_version != EMBEDDED_STUB_SCHEMA_VERSION {
             return Err(EmbeddedStubError::UnsupportedSchema {
                 expected: EMBEDDED_STUB_SCHEMA_VERSION,
                 actual: artifact.schema_version,
             });
         }
-        if artifact.parser_version != STUB_PARSER_VERSION {
+        if artifact.parser_version != STUB_PARSER_VERSION
+            && !(legacy_format && artifact.parser_version == 3)
+        {
             return Err(EmbeddedStubError::UnsupportedParser {
                 expected: STUB_PARSER_VERSION,
                 actual: artifact.parser_version,
@@ -91,6 +114,54 @@ impl EmbeddedStubProvider {
         }
         report.elapsed = started.elapsed();
         Ok((index, report))
+    }
+}
+
+// The checked-in embedded artifact predates the property visibility fields.
+// Keep its original bincode layout readable; serde defaults cannot make
+// positional bincode structs backward compatible.
+#[derive(Deserialize)]
+struct LegacyArtifact {
+    schema_version: u32,
+    parser_version: u32,
+    symbols: Vec<LegacySymbol>,
+}
+
+#[derive(Deserialize)]
+struct LegacySymbol {
+    name: String,
+    fqn: String,
+    kind: SymbolKind,
+    origin: SymbolOrigin,
+    extension: String,
+    location: SourceLocation,
+    declared_type: Option<String>,
+    signature: Option<Signature>,
+    documentation: Option<PhpDoc>,
+    availability: Availability,
+    is_static: bool,
+}
+
+impl From<LegacySymbol> for Symbol {
+    fn from(symbol: LegacySymbol) -> Self {
+        Self {
+            name: symbol.name,
+            fqn: symbol.fqn,
+            kind: symbol.kind,
+            origin: symbol.origin,
+            extension: symbol.extension,
+            location: symbol.location,
+            declared_type: symbol.declared_type,
+            read_visibility: None,
+            write_visibility: None,
+            has_get_hook: false,
+            has_set_hook: false,
+            is_virtual: false,
+            signature: symbol.signature,
+            documentation: symbol.documentation,
+            availability: symbol.availability,
+            is_static: symbol.is_static,
+        }
     }
 }
 
