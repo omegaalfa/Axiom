@@ -1,0 +1,13 @@
+{
+    "name": "axiom/php-version-playground",
+    "description": "Structured PHP Version Syntax Playground",
+    "type": "project",
+    "require": {
+        "php": ">=8.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "PhpPlayground\\": "."
+        }
+    }
+}

@@ -31,8 +31,8 @@ namespace Probe\Traits {
     trait RunA
     {
         /**
-         *
-         */
+        *
+        */
         public function run(): void
         {
         }
@@ -41,8 +41,8 @@ namespace Probe\Traits {
     trait RunB
     {
         /**
-         * @return void
-         */
+        * @return void
+        */
         public function run(): void
         {
         }
@@ -76,6 +76,16 @@ namespace Probe\Models {
     // 1. Faltam run() e save()
     class MissingService extends AbstractService implements Runner, Saver
     {
+        // Publicly accessible, writable internally only
+        public private(set) string $message;
+        // Equivalent
+        private(set) string $message;
+        // Publicly accessible, writable from instance and extending classes
+        public protected(set) string $message;
+        // Equivalent
+        protected(set) string $message;
+        // Accessible within instance and exensions, writable only within defining instance
+        protected private(set) string $message;
     }
 
     // 2. Métodos locais
@@ -87,7 +97,9 @@ namespace Probe\Models {
 
         public function save(): void
         {
-            for
+            foreach ($items as $item) {
+
+            }
         }
     }
 
@@ -138,7 +150,7 @@ namespace Probe\Models {
         public function run(): void
         {
         }
-        
+
 
         public function save(string $name): void
         {

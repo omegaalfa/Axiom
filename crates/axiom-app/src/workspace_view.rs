@@ -468,7 +468,7 @@ mod git_changes_tests {
     }
 
     #[test]
-    fn staged_and_unstaged_sections_keep_a_file_in_both_when_needed() {
+    fn staged_and_unstaged_statuses_remain_distinguishable_for_diff_viewer() {
         let state = GitRepositoryState {
             repository_root: "/workspace".into(),
             worktree_root: "/workspace".into(),
@@ -485,12 +485,110 @@ mod git_changes_tests {
         };
         assert_eq!(git_staged_indices(&state), vec![0, 1]);
         assert_eq!(git_unstaged_indices(&state), vec![0, 2]);
+        assert!(git_file_has_both_diff_targets(&state.files[0]));
+        assert_eq!(git_file_primary_diff_target(&state.files[0]), GitDiffTarget::IndexToWorktree);
+        assert_eq!(git_file_display_status(&state.files[0]), GitChangeState::Modified);
+        assert_eq!(git_file_primary_diff_target(&state.files[1]), GitDiffTarget::HeadToIndex);
+        assert_eq!(git_file_primary_diff_target(&state.files[2]), GitDiffTarget::IndexToWorktree);
         assert_eq!(git_status_marker_for_state(GitChangeState::Untracked), "?");
     }
 
     #[test]
-    fn grouped_rows_preserve_section_identity_and_all_changes() {
-        let files = (0..64)
+    fn explorer_git_status_maps_nested_files_and_aggregates_changed_directories() {
+        let state = GitRepositoryState {
+            repository_root: "workspace".into(),
+            worktree_root: "workspace".into(),
+            head: None,
+            branch: None,
+            detached: false,
+            files: vec![
+                axiom_git::GitFileStatus {
+                    path: "crate/src/modified.php".into(),
+                    old_path: None,
+                    index: GitChangeState::Unmodified,
+                    worktree: GitChangeState::Modified,
+                },
+                axiom_git::GitFileStatus {
+                    path: "crate/staged.php".into(),
+                    old_path: None,
+                    index: GitChangeState::Added,
+                    worktree: GitChangeState::Unmodified,
+                },
+                axiom_git::GitFileStatus {
+                    path: "crate/new.php".into(),
+                    old_path: None,
+                    index: GitChangeState::Unmodified,
+                    worktree: GitChangeState::Untracked,
+                },
+                axiom_git::GitFileStatus {
+                    path: "crate/src/conflict.php".into(),
+                    old_path: None,
+                    index: GitChangeState::Conflicted,
+                    worktree: GitChangeState::Modified,
+                },
+                axiom_git::GitFileStatus {
+                    path: "outside/ignored-like.php".into(),
+                    old_path: None,
+                    index: GitChangeState::Unmodified,
+                    worktree: GitChangeState::Untracked,
+                },
+            ],
+            remotes: Vec::new(),
+            identity: Default::default(),
+        };
+
+        let (files, directories) = explorer_git_status(Path::new("workspace/crate"), Some(&state));
+        assert_eq!(files.get(Path::new("src/modified.php")), Some(&GitChangeState::Modified));
+        assert_eq!(files.get(Path::new("staged.php")), Some(&GitChangeState::Added));
+        assert_eq!(files.get(Path::new("new.php")), Some(&GitChangeState::Untracked));
+        assert_eq!(files.get(Path::new("src/conflict.php")), Some(&GitChangeState::Conflicted));
+        assert!(!files.contains_key(Path::new("ignored-like.php")));
+        assert!(directories.contains(Path::new("src")));
+        assert!(!directories.contains(Path::new("")));
+    }
+
+    #[test]
+    fn git_context_path_selection_is_exact_for_files_and_component_scoped_for_folders() {
+        let state = GitRepositoryState {
+            repository_root: "workspace".into(),
+            worktree_root: "workspace".into(),
+            head: None,
+            branch: None,
+            detached: false,
+            files: vec![
+                axiom_git::GitFileStatus {
+                    path: "src/File.php".into(), old_path: None,
+                    index: GitChangeState::Unmodified, worktree: GitChangeState::Modified,
+                },
+                axiom_git::GitFileStatus {
+                    path: "src/Staged.php".into(), old_path: None,
+                    index: GitChangeState::Added, worktree: GitChangeState::Unmodified,
+                },
+                axiom_git::GitFileStatus {
+                    path: "src-other/Sibling.php".into(), old_path: None,
+                    index: GitChangeState::Unmodified, worktree: GitChangeState::Untracked,
+                },
+            ],
+            remotes: Vec::new(),
+            identity: Default::default(),
+        };
+        assert_eq!(
+            git_context_paths(&state, Path::new("src/File.php"), EntryKind::File, GitContextPathFilter::Changed),
+            vec![PathBuf::from("src/File.php")],
+        );
+        assert_eq!(
+            git_context_paths(&state, Path::new("src"), EntryKind::Directory, GitContextPathFilter::Changed),
+            vec![PathBuf::from("src/File.php"), PathBuf::from("src/Staged.php")],
+        );
+        assert_eq!(
+            git_context_paths(&state, Path::new("src"), EntryKind::Directory, GitContextPathFilter::Unstage),
+            vec![PathBuf::from("src/Staged.php")],
+        );
+    }
+
+    #[test]
+    fn grouped_rows_show_one_checkbox_row_per_unique_file_even_with_both_diffs() {
+        let files = (0..500)
             .map(|index| axiom_git::GitFileStatus {
                 path: format!("src/File{index}.php").into(),
                 old_path: None,
@@ -509,25 +607,87 @@ mod git_changes_tests {
             identity: Default::default(),
         };
         let rows = git_section_rows(&state);
-        assert_eq!(git_unstaged_indices(&state).len(), 64);
-        assert_eq!(rows.len(), 65);
+        assert_eq!(git_unstaged_indices(&state).len(), 500);
+        assert_eq!(rows.len(), 501);
 
         let both = GitRepositoryState {
             files: vec![file(GitChangeState::Modified, GitChangeState::Modified)],
             ..state
         };
         let rows = git_section_rows(&both);
-        assert_eq!(
-            rows.iter()
-                .filter(|row| matches!(row, GitSectionRow::File { .. }))
-                .count(),
-            2
-        );
-        assert_ne!(
-            rows[1],
-            rows[3],
-            "the same path must have distinct semantic section row identities"
-        );
+        assert_eq!(rows[0], GitSectionRow::Directory("App".into()));
+        assert_eq!(rows.iter().filter(|row| matches!(row, GitSectionRow::File { .. })).count(), 1);
+    }
+
+    #[test]
+    fn git_directory_groups_are_sorted_and_keep_nested_paths() {
+        let state = GitRepositoryState {
+            repository_root: "/workspace".into(),
+            worktree_root: "/workspace".into(),
+            head: Some("head".into()),
+            branch: Some("main".into()),
+            detached: false,
+            files: vec![
+                axiom_git::GitFileStatus { path: "z/deep/File.php".into(), old_path: None, index: GitChangeState::Unmodified, worktree: GitChangeState::Modified },
+                axiom_git::GitFileStatus { path: "A/File.php".into(), old_path: None, index: GitChangeState::Unmodified, worktree: GitChangeState::Modified },
+                axiom_git::GitFileStatus { path: "A/inner/File.php".into(), old_path: Some("A/old.php".into()), index: GitChangeState::Renamed, worktree: GitChangeState::Unmodified },
+            ],
+            remotes: Vec::new(),
+            identity: Default::default(),
+        };
+        let directories = git_section_rows(&state).into_iter().filter_map(|row| match row { GitSectionRow::Directory(path) => Some(path), _ => None }).collect::<Vec<_>>();
+        assert_eq!(directories, vec![PathBuf::from("A"), PathBuf::from("A/inner"), PathBuf::from("z/deep")]);
+        assert!(state.files.iter().any(|file| file.old_path.as_deref() == Some(Path::new("A/old.php"))));
+    }
+
+    #[test]
+    fn git_selection_refresh_keeps_existing_choices_and_selects_new_paths() {
+        let state = GitRepositoryState {
+            repository_root: "/workspace".into(), worktree_root: "/workspace".into(), head: None,
+            branch: None, detached: false,
+            files: vec![file(GitChangeState::Modified, GitChangeState::Unmodified), axiom_git::GitFileStatus {
+                path: "new.php".into(), old_path: None, index: GitChangeState::Unmodified, worktree: GitChangeState::Untracked,
+            }], remotes: Vec::new(), identity: Default::default(),
+        };
+        let mut selection = HashSet::from([PathBuf::from("newly-removed.php")]);
+        preserve_git_commit_selection(&mut selection, Some(&state));
+        assert_eq!(selection, HashSet::from([PathBuf::from("App/Service.php"), PathBuf::from("new.php")]));
+        assert_eq!(selected_git_paths(&state, &selection), vec![PathBuf::from("App/Service.php"), PathBuf::from("new.php")]);
+        assert_eq!(git_master_checkbox_marker(0, 2), "☐");
+        assert_eq!(git_master_checkbox_marker(1, 2), "☒");
+        assert_eq!(git_master_checkbox_marker(2, 2), "☑");
+    }
+
+    #[test]
+    fn git_master_checkbox_selects_and_deselects_unique_paths() {
+        let state = GitRepositoryState {
+            repository_root: "/workspace".into(), worktree_root: "/workspace".into(), head: None,
+            branch: None, detached: false,
+            files: vec![file(GitChangeState::Modified, GitChangeState::Modified), axiom_git::GitFileStatus {
+                path: "other.php".into(), old_path: None, index: GitChangeState::Unmodified, worktree: GitChangeState::Untracked,
+            }], remotes: Vec::new(), identity: Default::default(),
+        };
+        let mut selection = HashSet::new();
+        toggle_git_master_selection(&mut selection, &state);
+        assert_eq!(selection.len(), 2);
+        assert_eq!(git_master_checkbox_marker(selection.len(), state.files.len()), "☑");
+        toggle_git_master_selection(&mut selection, &state);
+        assert!(selection.is_empty());
+        assert_eq!(git_master_checkbox_marker(selection.len(), state.files.len()), "☐");
+    }
+
+    #[test]
+    fn duplicate_status_entries_produce_one_row_and_one_selected_path() {
+        let repeated = file(GitChangeState::Modified, GitChangeState::Modified);
+        let state = GitRepositoryState {
+            repository_root: "/workspace".into(), worktree_root: "/workspace".into(), head: None,
+            branch: None, detached: false, files: vec![repeated.clone(), repeated],
+            remotes: Vec::new(), identity: Default::default(),
+        };
+        assert_eq!(git_section_rows(&state).iter().filter(|row| matches!(row, GitSectionRow::File { .. })).count(), 1);
+        let selection = HashSet::from([PathBuf::from("App/Service.php")]);
+        assert_eq!(git_selected_count(&state, &selection), 1);
+        assert_eq!(selected_git_paths(&state, &selection).len(), 1);
     }
 
     #[test]
@@ -1932,13 +2092,50 @@ type ExplorerStructureResult = (u64, Result<Vec<ProjectEntry>, String>);
 type GitRefreshResult = (u64, Result<Option<GitRepositoryState>, String>);
 type GitDiffResult = (u64, PathBuf, GitDiffTarget, Result<GitFileDiff, String>);
 type GitMutationResult = (u64, PathBuf, GitIndexMutation, Result<(), String>);
-type GitCommitUiResult = (u64, Result<axiom_git::GitCommitResult, String>);
+type GitCommitUiResult = (u64, usize, Result<axiom_git::GitCommitResult, String>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum GitIndexMutation {
     Stage,
     Unstage,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitContextPathFilter {
+    Add,
+    Unstage,
+    Changed,
+}
+
+fn git_context_paths(
+    state: &GitRepositoryState,
+    path: &Path,
+    kind: EntryKind,
+    filter: GitContextPathFilter,
+) -> Vec<PathBuf> {
+    state
+        .files
+        .iter()
+        .filter(|file| {
+            let targets_file = if kind == EntryKind::Directory {
+                file.path.starts_with(path)
+            } else {
+                file.path == path
+            };
+            let applicable = match filter {
+                GitContextPathFilter::Add => file.worktree != GitChangeState::Unmodified,
+                GitContextPathFilter::Unstage => file.index != GitChangeState::Unmodified,
+                GitContextPathFilter::Changed => {
+                    file.index != GitChangeState::Unmodified
+                        || file.worktree != GitChangeState::Unmodified
+                }
+            };
+            targets_file && applicable
+        })
+        .map(|file| file.path.clone())
+        .collect()
+}
+
 type RuntimeLoadResult = (
     u64,
     Result<(RuntimeStubStatus, Arc<RuntimeSymbolIndex>), String>,
@@ -2000,37 +2197,130 @@ fn git_unstaged_indices(state: &GitRepositoryState) -> Vec<usize> {
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum GitSection {
-    Staged,
-    Changes,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum GitSectionRow {
-    Header(GitSection),
-    File { section: GitSection, file_index: usize },
+    Directory(PathBuf),
+    File { file_index: usize },
 }
 
 fn git_section_rows(state: &GitRepositoryState) -> Vec<GitSectionRow> {
-    let mut rows = Vec::new();
-    let staged = git_staged_indices(state);
-    if !staged.is_empty() {
-        rows.push(GitSectionRow::Header(GitSection::Staged));
-        rows.extend(staged.into_iter().map(|file_index| GitSectionRow::File {
-            section: GitSection::Staged,
-            file_index,
-        }));
+    let mut groups = std::collections::BTreeMap::<PathBuf, Vec<GitSectionRow>>::new();
+    let mut seen = HashSet::new();
+    for (file_index, file) in state.files.iter().enumerate() {
+        if !seen.insert(file.path.clone()) {
+            continue;
+        }
+        let directory = file.path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("")).to_path_buf();
+        if file.index != GitChangeState::Unmodified || file.worktree != GitChangeState::Unmodified {
+            groups.entry(directory).or_default().push(GitSectionRow::File { file_index });
+        }
     }
-    let changes = git_unstaged_indices(state);
-    if !changes.is_empty() {
-        rows.push(GitSectionRow::Header(GitSection::Changes));
-        rows.extend(changes.into_iter().map(|file_index| GitSectionRow::File {
-            section: GitSection::Changes,
-            file_index,
-        }));
+    let mut rows = Vec::new();
+    for (directory, files) in groups {
+        rows.push(GitSectionRow::Directory(directory));
+        let mut files = files;
+        files.sort_by_key(|row| match row { GitSectionRow::File { file_index } => state.files[*file_index].path.clone(), GitSectionRow::Directory(_) => PathBuf::new() });
+        rows.extend(files);
     }
     rows
+}
+
+fn git_file_primary_diff_target(file: &axiom_git::GitFileStatus) -> GitDiffTarget {
+    if file.worktree != GitChangeState::Unmodified {
+        GitDiffTarget::IndexToWorktree
+    } else {
+        GitDiffTarget::HeadToIndex
+    }
+}
+
+fn git_file_has_both_diff_targets(file: &axiom_git::GitFileStatus) -> bool {
+    file.index != GitChangeState::Unmodified && file.worktree != GitChangeState::Unmodified
+}
+
+fn git_file_display_status(file: &axiom_git::GitFileStatus) -> GitChangeState {
+    if file.index == GitChangeState::Conflicted || file.worktree == GitChangeState::Conflicted {
+        GitChangeState::Conflicted
+    } else if file.worktree != GitChangeState::Unmodified {
+        file.worktree
+    } else {
+        file.index
+    }
+}
+
+fn explorer_git_status(
+    project_root: &Path,
+    state: Option<&GitRepositoryState>,
+) -> (HashMap<PathBuf, GitChangeState>, HashSet<PathBuf>) {
+    let Some(state) = state else {
+        return (HashMap::new(), HashSet::new());
+    };
+    let Ok(project_prefix) = project_root.strip_prefix(&state.worktree_root) else {
+        return (HashMap::new(), HashSet::new());
+    };
+    let mut files = HashMap::new();
+    let mut directories = HashSet::new();
+    for file in &state.files {
+        let Some(relative) = file.path.strip_prefix(project_prefix).ok() else {
+            continue;
+        };
+        files.insert(relative.to_path_buf(), git_file_display_status(file));
+        let mut parent = relative.parent();
+        while let Some(path) = parent {
+            if path.as_os_str().is_empty() {
+                break;
+            }
+            directories.insert(path.to_path_buf());
+            parent = path.parent();
+        }
+    }
+    (files, directories)
+}
+
+impl WorkspaceView {
+    fn refresh_explorer_git_status(&mut self) {
+        let Some(project_root) = self.project.as_ref().map(Project::root_path) else {
+            self.explorer_git_files.clear();
+            self.explorer_git_directories.clear();
+            return;
+        };
+        (self.explorer_git_files, self.explorer_git_directories) =
+            explorer_git_status(project_root, self.git_state.as_ref());
+    }
+}
+
+fn preserve_git_commit_selection(
+    previous: &mut HashSet<PathBuf>,
+    state: Option<&GitRepositoryState>,
+) {
+    let current = state.map(|state| state.files.iter().map(|file| file.path.clone()).collect::<HashSet<_>>()).unwrap_or_default();
+    previous.retain(|path| current.contains(path));
+    previous.extend(current);
+}
+
+fn selected_git_paths(state: &GitRepositoryState, selection: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    state.files.iter().filter(|file| selection.contains(&file.path) && seen.insert(file.path.clone())).map(|file| file.path.clone()).collect()
+}
+
+fn git_changed_paths(state: &GitRepositoryState) -> HashSet<PathBuf> {
+    state.files.iter().map(|file| file.path.clone()).collect()
+}
+
+fn git_selected_count(state: &GitRepositoryState, selection: &HashSet<PathBuf>) -> usize {
+    git_changed_paths(state).intersection(selection).count()
+}
+
+fn git_master_checkbox_marker(selected: usize, total: usize) -> &'static str {
+    if selected == 0 { "☐" } else if selected == total { "☑" } else { "☒" }
+}
+
+fn toggle_git_master_selection(selection: &mut HashSet<PathBuf>, state: &GitRepositoryState) {
+    let paths = git_changed_paths(state);
+    if !paths.is_empty() && paths.iter().all(|path| selection.contains(path)) {
+        selection.retain(|path| !paths.contains(path));
+    } else {
+        selection.extend(paths);
+    }
 }
 
 fn git_refresh_matches(current_generation: u64, result_generation: u64) -> bool {
@@ -2119,6 +2409,7 @@ pub struct WorkspaceView {
     context_submenu_selected: usize,
     selected_path: Option<PathBuf>,
     explorer_new_menu_open: bool,
+    explorer_git_menu_open: bool,
     explorer_operation: Option<ExplorerOperation>,
     explorer_input: String,
     explorer_file: String,
@@ -2314,6 +2605,11 @@ pub struct WorkspaceView {
     project_load_generation: u64,
     project_load_results: Option<Receiver<(u64, Result<ProjectLoadPayload, String>)>>,
     git_state: Option<GitRepositoryState>,
+    explorer_git_files: HashMap<PathBuf, GitChangeState>,
+    explorer_git_directories: HashSet<PathBuf>,
+    git_commit_selection: HashSet<PathBuf>,
+    git_commit_notice: Option<SharedString>,
+    git_commit_warning: Option<SharedString>,
     git_scan_inflight: Arc<AtomicBool>,
     git_refresh_generation: u64,
     git_refresh_last_scan: Instant,
@@ -3597,6 +3893,7 @@ impl WorkspaceView {
             context_submenu_selected: 0,
             selected_path: None,
             explorer_new_menu_open: false,
+            explorer_git_menu_open: false,
             explorer_operation: None,
             explorer_input: String::new(),
             explorer_file: String::new(),
@@ -3871,6 +4168,11 @@ impl WorkspaceView {
             project_load_generation: 0,
             project_load_results: None,
             git_state: None,
+            explorer_git_files: HashMap::new(),
+            explorer_git_directories: HashSet::new(),
+            git_commit_selection: HashSet::new(),
+            git_commit_notice: None,
+            git_commit_warning: None,
             git_scan_inflight: Arc::new(AtomicBool::new(false)),
             git_refresh_generation: 0,
             git_refresh_last_scan: Instant::now(),
@@ -4448,7 +4750,9 @@ impl WorkspaceView {
                                     duration_ms = started.elapsed().as_millis(),
                                 );
                             }
+                            preserve_git_commit_selection(&mut self.git_commit_selection, state.as_ref());
                             self.git_state = state;
+                            self.refresh_explorer_git_status();
                             if let Some(state) = self.git_state.as_ref() {
                                 if self.git_identity_name.text.is_empty() {
                                     self.git_identity_name.text =
@@ -4582,7 +4886,13 @@ impl WorkspaceView {
         }
     }
 
-    fn request_git_mutation(&mut self, relative: PathBuf, operation: GitIndexMutation) {
+    fn request_git_mutation_paths(
+        &mut self,
+        relative: PathBuf,
+        paths: Vec<PathBuf>,
+        operation: GitIndexMutation,
+        cx: &mut Context<Self>,
+    ) {
         if self.git_mutation_inflight || self.git_commit_inflight {
             return;
         }
@@ -4593,6 +4903,12 @@ impl WorkspaceView {
         self.git_mutation_inflight = true;
         self.git_mutation_pending = Some((relative.clone(), operation));
         self.git_mutation_started_at = Some(click_started_at);
+        self.project_panel_visible = true;
+        self.version_control_visible = true;
+        self.status = match operation {
+            GitIndexMutation::Stage => "Staging Git changes...".into(),
+            GitIndexMutation::Unstage => "Unstaging Git changes...".into(),
+        };
         self.git_mutation_generation = self.git_mutation_generation.wrapping_add(1);
         let generation = self.git_mutation_generation;
         if operation == GitIndexMutation::Stage {
@@ -4636,8 +4952,8 @@ impl WorkspaceView {
                     );
                 }
                 let result = match operation {
-                    GitIndexMutation::Stage => GitRepositoryService::default().stage_file(&root, &relative),
-                    GitIndexMutation::Unstage => GitRepositoryService::default().unstage_file(&root, &relative),
+                    GitIndexMutation::Stage => GitRepositoryService::default().stage_paths(&root, &paths),
+                    GitIndexMutation::Unstage => GitRepositoryService::default().unstage_paths(&root, &paths),
                 }
                 .map_err(|error| format!("{error:?}"));
                 if operation == GitIndexMutation::Unstage {
@@ -4657,7 +4973,9 @@ impl WorkspaceView {
             self.git_mutation_results = None;
             self.git_mutation_started_at = None;
             self.git_diff_error = Some("Unable to update Git index".into());
+            self.status = "Unable to update Git index".into();
         }
+        cx.notify();
     }
 
     fn poll_git_mutation(&mut self, cx: &mut Context<Self>) {
@@ -4679,6 +4997,7 @@ impl WorkspaceView {
                 if let Err(error) = result {
                     tracing::warn!(operation = ?operation, path = %relative.display(), %error, "Git index mutation failed");
                     self.git_diff_error = Some(git_mutation_error_message(operation, &error).to_string());
+                    self.status = git_mutation_error_message(operation, &error);
                     cx.notify();
                     return;
                 }
@@ -4691,6 +5010,10 @@ impl WorkspaceView {
                     self.git_stage_refresh_started_at = Some(Instant::now());
                 }
                 self.git_diff_error = None;
+                self.status = match operation {
+                    GitIndexMutation::Stage => "Git changes staged".into(),
+                    GitIndexMutation::Unstage => "Git changes unstaged".into(),
+                };
                 self.git_refresh_generation = self.git_refresh_generation.wrapping_add(1);
                 self.git_refresh_requested = true;
                 if operation == GitIndexMutation::Unstage {
@@ -4724,6 +5047,13 @@ impl WorkspaceView {
             return;
         };
         let message = message.trim().to_owned();
+        self.git_commit_notice = None;
+        self.git_commit_warning = None;
+        let paths = self.git_state.as_ref().map(|state| selected_git_paths(state, &self.git_commit_selection)).unwrap_or_default();
+        if paths.is_empty() {
+            self.git_commit_error = Some("Select at least one changed file".into());
+            return;
+        }
         if message.is_empty() {
             self.git_commit_error = Some("Commit message is required".into());
             return;
@@ -4736,15 +5066,16 @@ impl WorkspaceView {
         self.git_diff_loading = false;
         self.git_diff_results = None;
         let root = project.root_path().to_path_buf();
+        let selected_count = paths.len();
         let (sender, receiver) = mpsc::channel();
         self.git_commit_results = Some(receiver);
         if thread::Builder::new()
             .name("axiom-git-commit".into())
             .spawn(move || {
                 let result = GitRepositoryService::default()
-                    .commit(&root, message)
+                    .commit_selected(&root, message, paths)
                     .map_err(|error| format!("{error:?}"));
-                let _ = sender.send((generation, result));
+                let _ = sender.send((generation, selected_count, result));
             })
             .is_err()
         {
@@ -4759,7 +5090,7 @@ impl WorkspaceView {
             return;
         };
         match receiver.try_recv() {
-            Ok((generation, result)) => {
+            Ok((generation, selected_count, result)) => {
                 self.git_commit_results = None;
                 self.git_commit_inflight = false;
                 if generation != self.git_commit_generation {
@@ -4771,6 +5102,8 @@ impl WorkspaceView {
                         self.git_commit_message.selection_anchor = 0;
                         self.git_commit_message.selection_active = 0;
                         self.git_commit_error = None;
+                        self.git_commit_notice = Some(format!("Committed {selected_count} files").into());
+                        self.git_commit_warning = commit.warning.map(Into::into);
                         self.git_refresh_generation = self.git_refresh_generation.wrapping_add(1);
                         self.git_refresh_requested = true;
                         self.git_refresh_last_scan = Instant::now() - Duration::from_secs(5);
@@ -4783,6 +5116,8 @@ impl WorkspaceView {
                         );
                     }
                     Err(error) => {
+                        self.git_commit_notice = None;
+                        self.git_commit_warning = None;
                         self.git_commit_error = Some(commit_error_message(&error).into());
                     }
                 }
@@ -5291,7 +5626,14 @@ impl WorkspaceView {
         self.git_refresh_requested = true;
         self.git_refresh_inflight = false;
         self.git_refresh_results = None;
+        self.git_commit_selection = git_state.as_ref().map(|state| state.files.iter().map(|file| file.path.clone()).collect()).unwrap_or_default();
+        self.git_mutation_generation = self.git_mutation_generation.wrapping_add(1);
+        self.git_mutation_inflight = false;
+        self.git_mutation_pending = None;
+        self.git_mutation_results = None;
+        self.git_mutation_started_at = None;
         self.git_state = git_state;
+        self.refresh_explorer_git_status();
         self.git_diff_generation = self.git_diff_generation.wrapping_add(1);
         self.git_diff_path = None;
         self.git_diff_status = None;
@@ -5693,6 +6035,7 @@ impl WorkspaceView {
         self.expanded.clear();
         self.explorer_context = None;
         self.explorer_new_menu_open = false;
+        self.explorer_git_menu_open = false;
         self.explorer_operation = None;
         self.explorer_input.clear();
         self.explorer_namespace.clear();
@@ -5708,6 +6051,13 @@ impl WorkspaceView {
         self.php_version_override = None;
         self.php_version_picker_open = false;
         self.git_state = None;
+        self.explorer_git_files.clear();
+        self.explorer_git_directories.clear();
+        self.git_mutation_generation = self.git_mutation_generation.wrapping_add(1);
+        self.git_mutation_inflight = false;
+        self.git_mutation_pending = None;
+        self.git_mutation_results = None;
+        self.git_mutation_started_at = None;
         self.git_refresh_requested = false;
         self.version_control_visible = false;
         self.git_refresh_inflight = false;
@@ -7311,8 +7661,9 @@ impl WorkspaceView {
         }
         if self.explorer_context.is_some() {
             if key == "escape" {
-                if self.explorer_new_menu_open {
+                if self.explorer_new_menu_open || self.explorer_git_menu_open {
                     self.explorer_new_menu_open = false;
+                    self.explorer_git_menu_open = false;
                     if debug_input_enabled() {
                         tracing::info!(selected_path = ?self.selected_path, reason = "escape", "[SUBMENU CLOSE]");
                     }
@@ -7325,7 +7676,6 @@ impl WorkspaceView {
                 }
                 return;
             }
-            let submenu_count = 7;
             let new_index = if self
                 .explorer_context
                 .as_ref()
@@ -7335,10 +7685,28 @@ impl WorkspaceView {
             } else {
                 1
             };
-            if self.explorer_new_menu_open {
+            let git_index = new_index + 1;
+            let menu_count: usize = if self
+                .explorer_context
+                .as_ref()
+                .is_some_and(|context| context.kind == EntryKind::File)
+            {
+                8
+            } else if self
+                .explorer_context
+                .as_ref()
+                .zip(self.project.as_ref())
+                .is_some_and(|(context, project)| context.path == project.root_path())
+            {
+                5
+            } else {
+                7
+            };
+            if self.explorer_new_menu_open || self.explorer_git_menu_open {
                 match key.as_str() {
                     "left" => {
                         self.explorer_new_menu_open = false;
+                        self.explorer_git_menu_open = false;
                         if debug_input_enabled() {
                             tracing::info!(selected_path = ?self.selected_path, reason = "left", "[SUBMENU CLOSE]");
                         }
@@ -7350,9 +7718,15 @@ impl WorkspaceView {
                         cx.notify();
                     }
                     "down" => {
+                        let submenu_count = if self.explorer_git_menu_open {
+                            if self.explorer_context.as_ref().is_some_and(|context| context.kind == EntryKind::File) { 4 } else { 3 }
+                        } else { 7 };
                         self.context_submenu_selected =
                             (self.context_submenu_selected + 1).min(submenu_count - 1);
                         cx.notify();
+                    }
+                    "enter" if self.explorer_git_menu_open => {
+                        self.execute_git_context_item(window, cx)
                     }
                     "enter" => self.execute_new_submenu_item(window, cx),
                     _ => {}
@@ -7365,7 +7739,8 @@ impl WorkspaceView {
                     cx.notify();
                 }
                 "down" => {
-                    self.context_menu_selected = (self.context_menu_selected + 1).min(7);
+                    self.context_menu_selected =
+                        (self.context_menu_selected + 1).min(menu_count.saturating_sub(1));
                     cx.notify();
                 }
                 "right" if self.context_menu_selected == new_index => {
@@ -7373,6 +7748,12 @@ impl WorkspaceView {
                 }
                 "enter" if self.context_menu_selected == new_index => {
                     self.open_context_submenu(cx);
+                }
+                "right" if self.context_menu_selected == git_index => {
+                    self.open_git_context_submenu(cx);
+                }
+                "enter" if self.context_menu_selected == git_index => {
+                    self.open_git_context_submenu(cx);
                 }
                 _ => {}
             }
@@ -11195,28 +11576,16 @@ impl WorkspaceView {
             .map(git_section_rows)
             .unwrap_or_default();
         let row_count = rows.len();
-        let staged_count = self
-            .git_state
-            .as_ref()
-            .map(|state| git_staged_indices(state).len())
-            .unwrap_or_default();
-        let changes_count = self
-            .git_state
-            .as_ref()
-            .map(|state| git_unstaged_indices(state).len())
-            .unwrap_or_default();
-        let total = self
-            .git_state
-            .as_ref()
-            .map(|state| git_staged_indices(state).len() + git_unstaged_indices(state).len())
-            .unwrap_or_default();
+        let changed_paths = self.git_state.as_ref().map(git_changed_paths).unwrap_or_default();
+        let total = changed_paths.len();
+        let selected_count = self.git_state.as_ref().map(|state| git_selected_count(state, &self.git_commit_selection)).unwrap_or_default();
+        let master_checkbox = git_master_checkbox_marker(selected_count, changed_paths.len());
         let branch = self.git_state.as_ref().map(|state| {
             state.branch.clone().unwrap_or_else(|| "DETACHED".to_owned())
         });
         let root = self.project.as_ref().map(|project| project.root_path().to_path_buf());
         let selected_path = self.git_diff_path.clone();
-        let selected_target = self.git_diff_target;
-        let pending = self.git_mutation_pending.clone();
+        let commit_selection = self.git_commit_selection.clone();
         let workspace = cx.entity().clone();
         div()
             .id("version-control-sidebar")
@@ -11243,12 +11612,19 @@ impl WorkspaceView {
             )
             .child(
                 div()
+                    .id("git-master-checkbox")
                     .h(m.toolbar_height)
                     .px_3()
                     .flex()
                     .items_center()
                     .text_color(t.text_primary)
-                    .child(format!("Changes ({total})")),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(state) = this.git_state.as_ref() {
+                            toggle_git_master_selection(&mut this.git_commit_selection, state);
+                        }
+                        cx.notify();
+                    }))
+                    .child(format!("{master_checkbox} Changes ({total})")),
             )
             .child(
                 div()
@@ -11270,16 +11646,9 @@ impl WorkspaceView {
                                 cx.processor(move |this, range: std::ops::Range<usize>, _, _cx| {
                                     range
                                         .filter_map(|display_index| {
-                                            let row = *rows.get(display_index)?;
-                                            if let GitSectionRow::Header(section) = row {
-                                                let label = match section {
-                                                    GitSection::Staged => {
-                                                        format!("STAGED CHANGES · {staged_count}")
-                                                    }
-                                                    GitSection::Changes => {
-                                                        format!("CHANGES · {changes_count}")
-                                                    }
-                                                };
+                                            let row = rows.get(display_index)?.clone();
+                                            if let GitSectionRow::Directory(directory) = row {
+                                                let label = if directory.as_os_str().is_empty() { "(root)".to_owned() } else { directory.display().to_string() };
                                                 if display_index < 2 {
                                                     tracing::debug!(
                                                         target: "axiom.git_ui_diag",
@@ -11293,55 +11662,41 @@ impl WorkspaceView {
                                                     div()
                                                         .id(("git-section-header", display_index))
                                                         .w_full()
-                                                        .h(px(26.))
+                                                        .h(px(23.))
                                                         .px_3()
                                                         .flex()
                                                         .items_center()
                                                         .text_size(px(11.))
                                                         .text_color(theme().text_secondary)
-                                                        .child(label),
+                                                        .child(format!("▾  {label}")),
                                                 );
                                             }
-                                            let GitSectionRow::File { section, file_index } = row else {
+                                            let GitSectionRow::File { file_index } = row else {
                                                 return None;
                                             };
                                             let file = this.git_state.as_ref()?.files.get(file_index).cloned()?;
                                             let relative = file.path.clone();
                                             let path = root.as_ref().map(|root| root.join(&relative));
                                             let path_for_open = path.clone();
-                                            let target = match section {
-                                                GitSection::Staged => GitDiffTarget::HeadToIndex,
-                                                GitSection::Changes => GitDiffTarget::IndexToWorktree,
-                                            };
-                                            let operation = match section {
-                                                GitSection::Staged => GitIndexMutation::Unstage,
-                                                GitSection::Changes => GitIndexMutation::Stage,
-                                            };
-                                            let state = match section {
-                                                GitSection::Staged => file.index,
-                                                GitSection::Changes => file.worktree,
-                                            };
-                                            let is_selected = selected_target == target
-                                                && selected_path.as_ref() == Some(&relative);
+                                            let target = git_file_primary_diff_target(&file);
+                                            let status = git_file_display_status(&file);
+                                            let has_staged_diff = git_file_has_both_diff_targets(&file);
+                                            let is_selected = selected_path.as_ref() == Some(&relative);
                                             let can_open = file.worktree != GitChangeState::Deleted;
+                                            let icon = crate::ui::icons::file_icon(&relative, false, false).glyph();
                                             let filename = relative
                                                 .file_name()
                                                 .and_then(|name| name.to_str())
                                                 .unwrap_or("(unknown)")
                                                 .to_owned();
-                                            let parent = relative
-                                                .parent()
-                                                .filter(|parent| !parent.as_os_str().is_empty())
-                                                .map(|parent| parent.display().to_string());
-                                            let pending_row = pending.as_ref() == Some(&(relative.clone(), operation));
+                                            let checked = commit_selection.contains(&relative);
+                                            let selection_workspace = workspace.clone();
+                                            let selection_path = relative.clone();
                                             let row_workspace = workspace.clone();
-                                            let action_workspace = workspace.clone();
-                                            let action_relative = relative.clone();
-                                            let action_pending = pending.clone();
-                                            let action_label = match operation {
-                                                GitIndexMutation::Stage => "Stage",
-                                                GitIndexMutation::Unstage => "Unstage",
-                                            };
+                                            let staged_diff_workspace = workspace.clone();
+                                            let staged_diff_path = relative.clone();
+                                            let staged_diff_root = root.clone();
+                                            let full_path = file.old_path.as_ref().map(|old| format!("{} ← {}", relative.display(), old.display())).unwrap_or_else(|| relative.display().to_string());
                                             if display_index < 2 {
                                                 tracing::debug!(
                                                     target: "axiom.git_ui_diag",
@@ -11365,6 +11720,7 @@ impl WorkspaceView {
                                                     .text_color(theme().text_primary)
                                                     .bg(if is_selected { theme().pressed } else { theme().sidebar_background })
                                                     .hover(|style| style.bg(theme().hover))
+                                                    .tooltip(move |_, cx| tooltip(full_path.clone(), cx))
                                                     .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                                                         row_workspace.update(cx, |this, cx| {
                                                             if let Some(path) = path_for_open.clone() {
@@ -11377,7 +11733,10 @@ impl WorkspaceView {
                                                             cx.notify();
                                                         });
                                                     })
-                                                    .child(div().w(px(18.)).text_color(theme().accent).child(git_status_marker_for_state(state)))
+                                                    .child(div().id(("git-file-checkbox", display_index)).w(px(18.)).text_color(theme().accent).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).on_click(move |_, _, cx| {
+                                                        selection_workspace.update(cx, |this, cx| { if !this.git_commit_selection.remove(&selection_path) { this.git_commit_selection.insert(selection_path.clone()); } cx.notify(); });
+                                                    }).child(if checked { "☑" } else { "☐" }))
+                                                    .child(div().w(px(14.)).text_color(theme().text_secondary).child(icon))
                                                     .child(
                                                         div()
                                                             .flex_1()
@@ -11385,45 +11744,27 @@ impl WorkspaceView {
                                                             .flex()
                                                             .flex_col()
                                                             .overflow_hidden()
-                                                            .child(filename)
-                                                            .when_some(parent, |this, parent| {
-                                                                this.text_size(px(11.)).text_color(theme().text_muted).child(parent)
-                                                            }),
+                                                            .child(filename),
                                                     )
-                                                    .child(
-                                                        div()
-                                                            .id(("git-file-action", display_index))
-                                                            .px_2()
-                                                            .py(px(2.))
-                                                            .text_size(px(11.))
-                                                            .text_color(if pending_row { theme().text_muted } else { theme().accent })
-                                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                                cx.stop_propagation();
-                                                            })
-                                                            .on_click(move |_, _, cx| {
-                                                                if action_pending.is_none() {
-                                                                    if operation == GitIndexMutation::Unstage {
-                                                                        tracing::debug!(
-                                                                            target: "axiom.git_ui_diag",
-                                                                            event = "unstage_click",
-                                                                            path = %action_relative.display(),
-                                                                        );
-                                                                    }
-                                                                    action_workspace.update(cx, |this, cx| {
-                                                                        this.request_git_mutation(action_relative.clone(), operation);
+                                                    .when(has_staged_diff, |row| {
+                                                        row.child(
+                                                            div()
+                                                                .id(("git-staged-diff", display_index))
+                                                                .px_1()
+                                                                .text_size(px(10.))
+                                                                .text_color(theme().accent)
+                                                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                                                .on_click(move |_, _, cx| {
+                                                                    staged_diff_workspace.update(cx, |this, cx| {
+                                                                        this.selected_path = staged_diff_root.as_ref().map(|root| root.join(&staged_diff_path));
+                                                                        this.request_git_diff(staged_diff_path.clone(), GitDiffTarget::HeadToIndex);
                                                                         cx.notify();
                                                                     });
-                                                                }
-                                                            })
-                                                            .child(if pending_row {
-                                                                match operation {
-                                                                    GitIndexMutation::Stage => "Staging…",
-                                                                    GitIndexMutation::Unstage => "Unstaging…",
-                                                                }
-                                                            } else {
-                                                                action_label
-                                                            }),
-                                                    ),
+                                                                })
+                                                                .child("Staged"),
+                                                        )
+                                                    })
+                                                    .child(div().w(px(22.)).text_color(theme().accent).text_size(px(11.)).child(git_status_marker_for_state(status))),
                                             )
                                         })
                                         .collect()
@@ -11519,27 +11860,36 @@ impl WorkspaceView {
                 let can_commit = self
                     .git_state
                     .as_ref()
-                    .is_some_and(|state| {
-                        state.identity.is_configured() && !git_staged_indices(state).is_empty()
-                    })
+                    .is_some_and(|state| state.identity.is_configured() && selected_count > 0)
                     && !self.git_commit_message.text.trim().is_empty()
                     && !self.git_mutation_inflight
                     && self.git_mutation_pending.is_none()
                     && !self.git_commit_inflight;
                 let message = self.git_commit_message.text.clone();
+                let message_empty = message.is_empty();
                 div()
                     .id("git-commit-area")
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .p_2()
+                    .gap_2()
+                    .p_3()
                     .border_t_1()
-                    .border_color(t.border_subtle)
+                    .border_color(t.border)
+                    .bg(t.panel_background)
                     .when_some(self.git_commit_error.clone(), |this, error| {
                         this.child(div().text_size(px(11.)).text_color(t.error).child(error))
                     })
+                    .when_some(self.git_commit_notice.clone(), |this, notice| {
+                        this.child(div().text_size(px(11.)).text_color(t.success).child(notice))
+                    })
+                    .when_some(self.git_commit_warning.clone(), |this, warning| {
+                        this.child(div().text_size(px(11.)).text_color(t.warning).child(warning))
+                    })
+                    .child(div().text_size(px(12.)).text_color(t.text_secondary).child(format!("{selected_count} of {total} selected")))
                     .child(
                         div()
+                            .relative()
+                            .id("git-commit-input")
                             .key_context("SingleLineInput")
                             .cursor(CursorStyle::IBeam)
                             .on_action(cx.listener(Self::input_backspace))
@@ -11571,16 +11921,23 @@ impl WorkspaceView {
                             }))
                             .on_mouse_move(cx.listener(Self::provider_base_url_drag_move))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::provider_base_url_drag_end))
-                            .child(crate::ui::input_line::render_state(cx.entity(), &self.git_commit_message)),
+                            .child(crate::ui::input_line::render_state(cx.entity(), &self.git_commit_message))
+                            .when(message_empty, |this| {
+                                this.child(div().absolute().left(px(8.)).top(px(7.)).text_size(px(12.)).text_color(t.text_muted).child("Commit message..."))
+                            }),
                     )
                     .child(
                         div()
                             .id("git-commit-button")
-                            .px_2()
-                            .py_1()
+                            .w_full()
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .text_size(px(12.))
                             .text_color(if can_commit { t.text_primary } else { t.text_muted })
-                            .bg(if can_commit { t.accent } else { t.menu_background })
+                            .bg(if can_commit { t.accent } else { t.elevated_surface })
+                            .when(can_commit, |this| this.hover(|style| style.bg(t.accent_hover)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if can_commit {
                                     this.request_git_commit(message.clone());

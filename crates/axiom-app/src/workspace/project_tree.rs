@@ -128,6 +128,7 @@ impl WorkspaceView {
                         this.expanded = expanded;
                         if let Ok(git_state) = git_state {
                             this.git_state = git_state;
+                            this.refresh_explorer_git_status();
                         }
                         this.status = "Project Explorer refreshed".into();
                     }
@@ -152,6 +153,7 @@ impl WorkspaceView {
     pub(super) fn close_context_menu(&mut self, reason: &'static str, cx: &mut Context<Self>) {
         if self.explorer_context.take().is_some() {
             self.explorer_new_menu_open = false;
+            self.explorer_git_menu_open = false;
             if debug_input_enabled() {
                 tracing::info!(
                     selected_path = ?self.selected_path,
@@ -176,6 +178,7 @@ impl WorkspaceView {
         self.context_menu_selected = 0;
         self.context_submenu_selected = 0;
         self.explorer_new_menu_open = false;
+        self.explorer_git_menu_open = false;
         self.explorer_context = Some(ExplorerContext { path, kind });
         if debug_input_enabled() {
             tracing::info!(selected_path = ?self.selected_path, "[CONTEXT MENU OPEN]");
@@ -186,10 +189,20 @@ impl WorkspaceView {
     pub(super) fn open_context_submenu(&mut self, cx: &mut Context<Self>) {
         if self.explorer_context.is_some() {
             self.explorer_new_menu_open = true;
+            self.explorer_git_menu_open = false;
             self.context_submenu_selected = 0;
             if debug_input_enabled() {
                 tracing::info!(selected_path = ?self.selected_path, "[SUBMENU OPEN]");
             }
+            cx.notify();
+        }
+    }
+
+    pub(super) fn open_git_context_submenu(&mut self, cx: &mut Context<Self>) {
+        if self.explorer_context.is_some() {
+            self.explorer_new_menu_open = false;
+            self.explorer_git_menu_open = true;
+            self.context_submenu_selected = 0;
             cx.notify();
         }
     }
@@ -285,6 +298,7 @@ impl WorkspaceView {
             kind: EntryKind::Directory,
         });
         self.explorer_new_menu_open = true;
+        self.explorer_git_menu_open = false;
         if debug_input_enabled() {
             tracing::info!("[EXPLORER TOOLBAR CLICK] button=new");
             tracing::info!(command = "project.new", "[ACTION]");
@@ -1457,6 +1471,21 @@ impl WorkspaceView {
                             let context_item = item.clone();
                             let is_expanded = self.expanded.contains(&item.path);
                             let is_active = active_path.as_ref() == Some(&item.path);
+                            let item_relative = project_root
+                                .as_deref()
+                                .and_then(|root| item.path.strip_prefix(root).ok());
+                            let file_git_status = item_relative
+                                .and_then(|path| self.explorer_git_files.get(path).copied());
+                            let file_git_color = file_git_status.map(|state| match state {
+                                GitChangeState::Modified => t.info,
+                                GitChangeState::Added | GitChangeState::Renamed => t.success,
+                                GitChangeState::Deleted | GitChangeState::Conflicted => t.error,
+                                GitChangeState::Untracked => t.warning,
+                                GitChangeState::Unmodified => t.text_muted,
+                            });
+                            let directory_has_changes = item.kind == EntryKind::Directory
+                                && item_relative
+                                    .is_some_and(|path| self.explorer_git_directories.contains(path));
                             let icon = file_icon(
                                 &item.path,
                                 item.kind == EntryKind::Directory,
@@ -1475,7 +1504,7 @@ impl WorkspaceView {
                                 .text_color(if is_active {
                                     t.text_primary
                                 } else {
-                                    t.text_secondary
+                                    file_git_color.unwrap_or(t.text_secondary)
                                 })
                                 .bg(if is_active {
                                     t.pressed
@@ -1510,10 +1539,27 @@ impl WorkspaceView {
                                 .child(
                                     div()
                                         .w(m.icon_size)
-                                        .text_color(if is_active { t.accent } else { t.text_muted })
+                                        .text_color(file_git_color.unwrap_or(if directory_has_changes {
+                                            t.warning
+                                        } else if is_active {
+                                            t.accent
+                                        } else {
+                                            t.text_muted
+                                        }))
                                         .child(icon),
                                 )
                                 .child(item.name)
+                                .when_some(file_git_status, |this, state| {
+                                        let color = file_git_color.unwrap_or(t.text_muted);
+                                        this.child(
+                                            div()
+                                                .text_color(color)
+                                                .child(git_status_marker_for_state(state)),
+                                        )
+                                    })
+                                .when(directory_has_changes, |this| {
+                                        this.child(div().text_color(t.warning).child("•"))
+                                    })
                         }),
                     ))
                     .when(scroll_max > 0.0 && self.explorer_scroll_hovered, |this| {
@@ -1634,7 +1680,7 @@ impl WorkspaceView {
             .context_menu_position
             .y
             .max(px(0.))
-            .min((window.viewport_size().height - px(360.)).max(px(0.)));
+            .min((window.viewport_size().height - px(390.)).max(px(0.)));
         div()
             .absolute()
             .left(menu_left)
@@ -1695,6 +1741,7 @@ impl WorkspaceView {
                     .hover(move |style| style.bg(theme().hover))
                     .on_mouse_move(move |_, _, cx| {
                         workspace.update(cx, |this, cx| {
+                            this.explorer_git_menu_open = false;
                             this.explorer_new_menu_open = true;
                             if debug_input_enabled() {
                                 tracing::info!("[SUBMENU] open=New");
@@ -1710,6 +1757,34 @@ impl WorkspaceView {
                     .child("New")
                     .child("▶")
                     .when(self.explorer_new_menu_open, |this| this.child(submenu))
+            })
+            .child({
+                let workspace = workspace.clone();
+                let click_workspace = workspace.clone();
+                let git_submenu = self.render_git_context_submenu(context.clone(), opens_left, cx);
+                div()
+                    .relative()
+                    .id("explorer-git-submenu-trigger")
+                    .h(metrics().toolbar_height)
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded(metrics().border_radius_small)
+                    .hover(move |style| style.bg(theme().hover))
+                    .on_mouse_move(move |_, _, cx| {
+                        workspace.update(cx, |this, cx| {
+                            this.explorer_new_menu_open = false;
+                            this.explorer_git_menu_open = true;
+                            cx.notify();
+                        });
+                    })
+                    .on_click(move |_, _, cx| {
+                        click_workspace.update(cx, |this, cx| this.open_git_context_submenu(cx));
+                    })
+                    .child("Git")
+                    .child("›")
+                    .when(self.explorer_git_menu_open, |this| this.child(git_submenu))
             })
             .when(!is_root, |this| {
                 let rename_workspace = workspace.clone();
@@ -1741,6 +1816,147 @@ impl WorkspaceView {
                     workspace.update(cx, |this, cx| this.refresh_explorer(cx));
                 })
             })
+    }
+
+    fn render_git_context_submenu(
+        &self,
+        context: ExplorerContext,
+        opens_left: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let workspace = cx.entity();
+        let state = self.git_state.as_ref();
+        let relative = state.and_then(|state| context.path.strip_prefix(&state.worktree_root).ok());
+        let add_enabled = relative.is_some_and(|path| {
+            state.is_some_and(|state| {
+                !git_context_paths(state, path, context.kind, GitContextPathFilter::Add).is_empty()
+            })
+        }) && !self.git_mutation_inflight && !self.git_commit_inflight;
+        let unstage_enabled = relative.is_some_and(|path| {
+            state.is_some_and(|state| {
+                !git_context_paths(state, path, context.kind, GitContextPathFilter::Unstage).is_empty()
+            })
+        }) && !self.git_mutation_inflight && !self.git_commit_inflight;
+        let changed_enabled = relative.is_some_and(|path| {
+            state.is_some_and(|state| {
+                !git_context_paths(state, path, context.kind, GitContextPathFilter::Changed).is_empty()
+            })
+        }) && !self.git_mutation_inflight && !self.git_commit_inflight;
+        let t = theme();
+        let m = metrics();
+        let mut menu = div()
+            .absolute()
+            .left(if opens_left { px(-256.) } else { px(256.) })
+            .top(px(0.))
+            .w(px(250.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .bg(t.menu_background)
+            .border_1()
+            .border_color(t.border)
+            .rounded(m.border_radius_medium)
+            .shadow_lg()
+            .on_mouse_move(|_, _, _| {});
+        let add_label = if context.kind == EntryKind::Directory { "Add All Changes in Folder" } else { "Add" };
+        let unstage_label = if context.kind == EntryKind::Directory { "Unstage All Changes in Folder" } else { "Unstage" };
+        let add_workspace = workspace.clone();
+        menu = menu.child(Self::explorer_menu_item_enabled(add_label, add_enabled, move |window, cx| {
+            add_workspace.update(cx, |this, cx| {
+                this.context_submenu_selected = 0;
+                this.execute_git_context_item(window, cx);
+            });
+        }));
+        let unstage_workspace = workspace.clone();
+        menu = menu.child(Self::explorer_menu_item_enabled(unstage_label, unstage_enabled, move |window, cx| {
+            unstage_workspace.update(cx, |this, cx| {
+                this.context_submenu_selected = 1;
+                this.execute_git_context_item(window, cx);
+            });
+        }));
+        if context.kind == EntryKind::File {
+            let diff_workspace = workspace.clone();
+            menu = menu.child(Self::explorer_menu_item_enabled(
+                "Show Diff",
+                changed_enabled && !self.git_mutation_inflight,
+                move |window, cx| {
+                    diff_workspace.update(cx, |this, cx| {
+                        this.context_submenu_selected = 2;
+                        this.execute_git_context_item(window, cx);
+                    });
+                },
+            ));
+        }
+        let commit_workspace = workspace;
+        menu.child(Self::explorer_menu_item_enabled(
+            if context.kind == EntryKind::Directory { "Commit Changes in Folder..." } else { "Commit Selected..." },
+            changed_enabled,
+            move |window, cx| {
+                commit_workspace.update(cx, |this, cx| {
+                    this.context_submenu_selected = if context.kind == EntryKind::Directory { 2 } else { 3 };
+                    this.execute_git_context_item(window, cx);
+                });
+            },
+        ))
+    }
+
+    pub(super) fn execute_git_context_item(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(context) = self.explorer_context.clone() else { return };
+        let Some(state) = self.git_state.as_ref() else {
+            self.close_context_menu("git_action_without_repository", cx);
+            return;
+        };
+        let Ok(relative) = context.path.strip_prefix(&state.worktree_root) else {
+            self.status = "Selected path is outside the Git worktree".into();
+            self.close_context_menu("git_path_outside_repository", cx);
+            return;
+        };
+        let action_index = self.context_submenu_selected;
+        let (filter, operation) = match (context.kind, action_index) {
+            (_, 0) => (GitContextPathFilter::Add, Some(GitIndexMutation::Stage)),
+            (_, 1) => (GitContextPathFilter::Unstage, Some(GitIndexMutation::Unstage)),
+            (EntryKind::File, 2) => (GitContextPathFilter::Changed, None),
+            (EntryKind::File, 3) | (EntryKind::Directory, 2) => (GitContextPathFilter::Changed, None),
+            _ => return,
+        };
+        let paths = git_context_paths(state, relative, context.kind, filter);
+        let diff_file = if context.kind == EntryKind::File && action_index == 2 {
+            state.files.iter().find(|file| file.path == relative).cloned()
+        } else { None };
+        let diff_target = diff_file.as_ref().map(git_file_primary_diff_target);
+        let anchor = relative.to_path_buf();
+        self.close_context_menu("git_action", cx);
+        match operation {
+            Some(operation) if !paths.is_empty() => {
+                self.request_git_mutation_paths(anchor, paths, operation, cx);
+            }
+            Some(_) => {}
+            None if action_index == 2 && context.kind == EntryKind::File => {
+                if let (Some(_file), Some(target)) = (diff_file, diff_target) {
+                    self.project_panel_visible = true;
+                    self.version_control_visible = true;
+                    self.request_git_diff(anchor, target);
+                    window.focus(&self.focus);
+                } else {
+                    self.status = "File has no Git changes".into();
+                    cx.notify();
+                }
+            }
+            None if !paths.is_empty() => {
+                self.git_commit_selection = paths.into_iter().collect();
+                self.project_panel_visible = true;
+                self.version_control_visible = true;
+                self.status = format!("Selected {} Git file(s) for commit", self.git_commit_selection.len()).into();
+                window.focus(&self.focus);
+                cx.notify();
+            }
+            None => {}
+        }
     }
 
     pub(super) fn render_new_submenu(
@@ -2186,6 +2402,14 @@ impl WorkspaceView {
         label: &'static str,
         handler: impl Fn(&mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
+        Self::explorer_menu_item_enabled(label, true, handler)
+    }
+
+    fn explorer_menu_item_enabled(
+        label: &'static str,
+        enabled: bool,
+        handler: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
         let t = theme();
         let m = metrics();
         div()
@@ -2194,22 +2418,23 @@ impl WorkspaceView {
             .px_2()
             .flex()
             .items_center()
+            .text_color(if enabled { t.text_primary } else { t.text_muted })
             .rounded(m.border_radius_small)
-            .hover(move |style| style.bg(t.hover))
+            .when(enabled, move |this| this.hover(move |style| style.bg(t.hover)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 if debug_input_enabled() {
                     tracing::info!("[SUBMENU ITEM MOUSE DOWN]");
                 }
                 cx.stop_propagation();
             })
-            .on_click(move |_, window, cx| {
+            .when(enabled, move |this| this.on_click(move |_, window, cx| {
                 if debug_input_enabled() {
                     tracing::info!(item = %label, "[CONTEXT MENU ACTION]");
                     tracing::info!(item = %label, "[SUBMENU ITEM CLICK]");
                 }
                 handler(window, cx);
                 cx.stop_propagation();
-            })
+            }))
             .child(label)
     }
 }

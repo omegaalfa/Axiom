@@ -300,8 +300,28 @@ impl GitRepositoryService {
         workspace: impl AsRef<Path>,
         path: impl AsRef<Path>,
     ) -> Result<(), GitError> {
+        self.stage_paths(workspace, [path.as_ref().to_path_buf()])
+    }
+
+    /// Stage changed paths, applying all index updates in one locked write.
+    /// Directory paths expand to changed descendants reported by Git status.
+    pub fn stage_paths<I, P>(
+        &self,
+        workspace: impl AsRef<Path>,
+        paths: I,
+    ) -> Result<(), GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         let repo = discover_repository(workspace.as_ref())?;
-        let path = repository_relative_path(path.as_ref())?;
+        let paths = paths
+            .into_iter()
+            .map(|path| repository_relative_path(path.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if paths.is_empty() {
+            return Err(GitError::RepositoryError("No paths selected".into()));
+        }
         let mutation_lock = index_mutation_lock(&repo);
         let _guard = mutation_lock.lock().map_err(|_| {
             GitError::RepositoryError("index mutation lock poisoned".into())
@@ -309,23 +329,55 @@ impl GitRepositoryService {
         let worktree = repo
             .workdir()
             .ok_or_else(|| GitError::RepositoryError("repository has no worktree".into()))?;
+        let changes = status(&repo)?;
+        let mut selected = std::collections::BTreeMap::<PathBuf, Option<PathBuf>>::new();
+        for path in paths {
+            let disk_path = worktree.join(&path);
+            if disk_path.is_dir() {
+                if is_nested_repository_path(worktree, &path) {
+                    continue;
+                }
+                for change in changes.iter().filter(|change| change.path.starts_with(&path)) {
+                    if !is_nested_repository_path(worktree, &change.path) {
+                        selected.insert(change.path.clone(), change.old_path.clone());
+                    }
+                }
+            } else {
+                if is_nested_repository_path(worktree, &path) {
+                    continue;
+                }
+                let old_path = changes
+                    .iter()
+                    .find(|change| change.path == path)
+                    .and_then(|change| change.old_path.clone());
+                selected.insert(path, old_path);
+            }
+        }
+        if selected.is_empty() {
+            return Err(GitError::RepositoryError("No eligible changed paths".into()));
+        }
         let mut index = mutable_index(&repo)?;
-        let disk_path = worktree.join(&path);
-        remove_index_path(&mut index, &path);
-        if disk_path.is_file() {
-            let bytes = std::fs::read(&disk_path)
-                .map_err(|error| GitError::RepositoryError(error.to_string()))?;
-            let blob = repo
-                .write_blob(&bytes)
-                .map_err(|error| GitError::RepositoryError(error.to_string()))?
-                .detach();
-            index.dangerously_push_entry(
-                Default::default(),
-                blob,
-                gix::index::entry::Flags::empty(),
-                gix::index::entry::Mode::FILE,
-                path.to_string_lossy().replace('\\', "/").as_bytes().as_bstr(),
-            );
+        for (path, old_path) in selected {
+            if let Some(old_path) = old_path {
+                remove_index_path(&mut index, &old_path);
+            }
+            remove_index_path(&mut index, &path);
+            let disk_path = worktree.join(&path);
+            if disk_path.is_file() {
+                let bytes = std::fs::read(&disk_path)
+                    .map_err(|error| GitError::RepositoryError(error.to_string()))?;
+                let blob = repo
+                    .write_blob(&bytes)
+                    .map_err(|error| GitError::RepositoryError(error.to_string()))?
+                    .detach();
+                index.dangerously_push_entry(
+                    Default::default(),
+                    blob,
+                    gix::index::entry::Flags::empty(),
+                    gix::index::entry::Mode::FILE,
+                    path.to_string_lossy().replace('\\', "/").as_bytes().as_bstr(),
+                );
+            }
         }
         index.sort_entries();
         index
@@ -339,44 +391,88 @@ impl GitRepositoryService {
         workspace: impl AsRef<Path>,
         path: impl AsRef<Path>,
     ) -> Result<(), GitError> {
+        self.unstage_paths(workspace, [path.as_ref().to_path_buf()])
+    }
+
+    /// Restore selected index paths to HEAD without changing working-tree files.
+    /// Directory paths expand to staged descendants; an unborn HEAD is supported.
+    pub fn unstage_paths<I, P>(
+        &self,
+        workspace: impl AsRef<Path>,
+        paths: I,
+    ) -> Result<(), GitError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         let repo = discover_repository(workspace.as_ref())?;
-        let path = repository_relative_path(path.as_ref())?;
+        let paths = paths
+            .into_iter()
+            .map(|path| repository_relative_path(path.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if paths.is_empty() {
+            return Err(GitError::RepositoryError("No paths selected".into()));
+        }
         tracing::debug!(
             target: "axiom.git_ui_diag",
             event = "unstage_backend_entered",
-            path = %path.display(),
+            paths = paths.len(),
         );
         let mutation_lock = index_mutation_lock(&repo);
         let _guard = mutation_lock.lock().map_err(|_| {
             GitError::RepositoryError("index mutation lock poisoned".into())
         })?;
-        tracing::debug!(
-            target: "axiom.git_ui_diag",
-            event = "unstage_index_lock_acquired",
-            path = %path.display(),
-        );
         let mut index = mutable_index(&repo)?;
-        tracing::debug!(
-            target: "axiom.git_ui_diag",
-            event = "unstage_index_opened",
-            path = %path.display(),
-        );
-        remove_index_path(&mut index, &path);
-        let head_entry = head_entry(&repo, &path)?;
-        tracing::debug!(
-            target: "axiom.git_ui_diag",
-            event = "unstage_head_entry_found",
-            path = %path.display(),
-            found = head_entry.is_some(),
-        );
-        if let Some((blob, mode)) = head_entry {
-            index.dangerously_push_entry(
-                Default::default(),
-                blob,
-                gix::index::entry::Flags::empty(),
-                mode,
-                path.to_string_lossy().replace('\\', "/").as_bytes().as_bstr(),
-            );
+        let worktree = repo
+            .workdir()
+            .ok_or_else(|| GitError::RepositoryError("repository has no worktree".into()))?;
+        let changes = status(&repo)?;
+        let mut selected = std::collections::BTreeSet::new();
+        for path in paths {
+            if worktree.join(&path).is_dir() {
+                if is_nested_repository_path(worktree, &path) {
+                    continue;
+                }
+                for change in changes.iter().filter(|change| {
+                    change.path.starts_with(&path) && change.index != GitChangeState::Unmodified
+                }) {
+                    if !is_nested_repository_path(worktree, &change.path) {
+                        selected.insert(change.path.clone());
+                        if let Some(old_path) = &change.old_path {
+                            selected.insert(old_path.clone());
+                        }
+                    }
+                }
+            } else {
+                if is_nested_repository_path(worktree, &path) {
+                    continue;
+                }
+                if let Some(change) = changes
+                    .iter()
+                    .find(|change| change.path == path && change.index != GitChangeState::Unmodified)
+                {
+                    selected.insert(change.path.clone());
+                    if let Some(old_path) = &change.old_path {
+                        selected.insert(old_path.clone());
+                    }
+                }
+            }
+        }
+        if selected.is_empty() {
+            return Err(GitError::RepositoryError("No staged paths selected".into()));
+        }
+        let selected_count = selected.len();
+        for path in selected {
+            remove_index_path(&mut index, &path);
+            if let Some((blob, mode)) = head_entry(&repo, &path)? {
+                index.dangerously_push_entry(
+                    Default::default(),
+                    blob,
+                    gix::index::entry::Flags::empty(),
+                    mode,
+                    path.to_string_lossy().replace('\\', "/").as_bytes().as_bstr(),
+                );
+            }
         }
         index.sort_entries();
         let result = index
@@ -385,7 +481,7 @@ impl GitRepositoryService {
         tracing::debug!(
             target: "axiom.git_ui_diag",
             event = "unstage_index_write_result",
-            path = %path.display(),
+            paths = selected_count,
             result = if result.is_ok() { "ok" } else { "err" },
         );
         result
@@ -456,7 +552,92 @@ impl GitRepositoryService {
         Ok(GitCommitResult {
             oid: commit.to_string(),
             branch,
+            warning: None,
         })
+    }
+
+    /// Commit the current worktree version of selected paths, starting from HEAD.
+    /// The real index is not used to construct the commit, so unselected staged
+    /// and unstaged changes remain untouched. A selected partially staged file
+    /// commits its full current worktree contents.
+    pub fn commit_selected(
+        &self,
+        workspace: impl AsRef<Path>,
+        message: String,
+        paths: Vec<PathBuf>,
+    ) -> Result<GitCommitResult, GitError> {
+        let message = message.trim();
+        if message.is_empty() {
+            return Err(GitError::RepositoryError("Commit message is required".into()));
+        }
+        if paths.is_empty() {
+            return Err(GitError::RepositoryError("No files selected".into()));
+        }
+        let repo = discover_repository(workspace.as_ref())?;
+        let lock = index_mutation_lock(&repo);
+        let _guard = lock.lock().map_err(|_| GitError::RepositoryError("index mutation lock poisoned".into()))?;
+        let worktree = repo.workdir().ok_or_else(|| GitError::RepositoryError("repository has no worktree".into()))?;
+        let head = repo.head().map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        let branch = head.referent_name().ok_or_else(|| GitError::RepositoryError("detached HEAD is not supported".into()))?.to_string();
+        let parents = head.id().map(|id| id.detach()).into_iter().collect::<Vec<_>>();
+        let mut index = if let Some(parent) = parents.first() {
+            let head_tree = repo.find_commit(*parent).map_err(|error| GitError::RepositoryError(error.to_string()))?.tree_id().map_err(|error| GitError::RepositoryError(error.to_string()))?;
+            repo.index_from_tree(&head_tree).map_err(|error| GitError::RepositoryError(error.to_string()))?
+        } else {
+            gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
+        };
+        let changes = status(&repo)?;
+        let mut unique = std::collections::HashSet::new();
+        let mut selected_paths = Vec::new();
+        for input in paths {
+            let path = repository_relative_path(&input)?;
+            let path_key = path.to_string_lossy().replace('\\', "/");
+            if !unique.insert(path_key.clone()) { continue; }
+            selected_paths.push(path.clone());
+            let old_path = changes.iter().find(|file| file.path == path).and_then(|file| file.old_path.as_deref());
+            if let Some(old_path) = old_path { remove_index_path(&mut index, old_path); }
+            remove_index_path(&mut index, &path);
+            let disk_path = worktree.join(&path);
+            if disk_path.is_file() {
+                let bytes = std::fs::read(&disk_path).map_err(|error| GitError::RepositoryError(error.to_string()))?;
+                let blob = repo.write_blob(&bytes).map_err(|error| GitError::RepositoryError(error.to_string()))?.detach();
+                index.dangerously_push_entry(Default::default(), blob, gix::index::entry::Flags::empty(), gix::index::entry::Mode::FILE, path_key.as_bytes().as_bstr());
+            }
+        }
+        index.sort_entries();
+        let mut editor = repo.empty_tree().edit().map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        for (path, id, kind) in index.entries_with_paths_by_filter_map(|path, entry| Some((path.to_owned(), entry.id, gix::object::tree::EntryKind::from(entry.mode.to_tree_entry_mode()?)))).map(|(_, value)| value) {
+            editor.upsert(path.as_bstr(), kind, id).map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        }
+        let tree = editor.write().map_err(|error| GitError::RepositoryError(error.to_string()))?.detach();
+        if parents.first().and_then(|parent| repo.find_commit(*parent).ok()).and_then(|commit| commit.tree_id().ok()).is_some_and(|head_tree| head_tree == tree) {
+            return Err(GitError::RepositoryError("No selected changes to commit".into()));
+        }
+        let commit = repo.commit("HEAD", message, tree, parents).map_err(|error| GitError::RepositoryError(error.to_string()))?;
+        // Advance only selected index entries to the committed worktree state;
+        // unrelated staged entries retain their original blobs and metadata.
+        let reconcile = (|| -> Result<(), GitError> {
+            let mut real_index = mutable_index(&repo)?;
+            for path in &selected_paths {
+                if let Some(old_path) = changes.iter().find(|file| file.path == *path).and_then(|file| file.old_path.as_deref()) {
+                    remove_index_path(&mut real_index, old_path);
+                }
+                remove_index_path(&mut real_index, path);
+                let disk_path = worktree.join(path);
+                if disk_path.is_file() {
+                    let bytes = std::fs::read(&disk_path).map_err(|error| GitError::RepositoryError(error.to_string()))?;
+                    let blob = repo.write_blob(&bytes).map_err(|error| GitError::RepositoryError(error.to_string()))?.detach();
+                    real_index.dangerously_push_entry(Default::default(), blob, gix::index::entry::Flags::empty(), gix::index::entry::Mode::FILE, path.to_string_lossy().replace('\\', "/").as_bytes().as_bstr());
+                }
+            }
+            real_index.sort_entries();
+            real_index.write(Default::default()).map_err(|error| GitError::RepositoryError(error.to_string()))
+        })();
+        let warning = if let Err(error) = reconcile {
+            tracing::warn!(error = ?error, "Commit succeeded but selected index entries could not be reconciled");
+            Some(format!("Commit succeeded, but Git index reconciliation failed: {error:?}"))
+        } else { None };
+        Ok(GitCommitResult { oid: commit.to_string(), branch, warning })
     }
 }
 
@@ -464,6 +645,7 @@ impl GitRepositoryService {
 pub struct GitCommitResult {
     pub oid: String,
     pub branch: String,
+    pub warning: Option<String>,
 }
 
 fn discover_repository(workspace: &Path) -> Result<gix::Repository, GitError> {
@@ -501,6 +683,17 @@ fn repository_relative_path(path: &Path) -> Result<PathBuf, GitError> {
         return Err(GitError::RepositoryError("path must be repository-relative".into()));
     }
     Ok(path.to_path_buf())
+}
+
+fn is_nested_repository_path(worktree: &Path, path: &Path) -> bool {
+    let mut current = worktree.to_path_buf();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if current.join(".git").exists() {
+            return true;
+        }
+    }
+    false
 }
 
 fn mutable_index(repo: &gix::Repository) -> Result<gix::index::File, GitError> {
@@ -890,6 +1083,32 @@ mod tests {
         dir
     }
 
+    fn committed_repo_with_files(entries: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let (dir, repo) = initialized_repo();
+        for (path, content) in entries {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        commit_entries(&repo, entries);
+        let head = fs::read_to_string(dir.path().join(".git/HEAD")).unwrap();
+        fs::create_dir_all(dir.path().join(".git/refs/heads")).unwrap();
+        fs::write(dir.path().join(".git/refs/heads/main"), head.trim().as_bytes()).unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(".git/config"))
+            .unwrap()
+            .write_all(b"\n[user]\n\tname = Axiom Test\n\temail = axiom@example.test\n")
+            .unwrap();
+        let entries = entries
+            .iter()
+            .map(|(path, content)| (path.as_bytes(), *content))
+            .collect::<Vec<_>>();
+        write_index_entries(&repo, &entries);
+        dir
+    }
+
     fn add_index_entry(repo: &gix::Repository, path: &[u8], content: &[u8]) {
         let blob = repo.write_blob(content).unwrap().detach();
         if repo.index_path().exists() {
@@ -1108,6 +1327,116 @@ mod tests {
     }
 
     #[test]
+    fn stage_paths_directory_includes_changes_but_not_ignored_or_sibling_paths() {
+        let dir = committed_repo_with_files(&[
+            ("src/modified.txt", b"before\n"),
+            ("src/deleted.txt", b"delete me\n"),
+            ("src-other/sibling.txt", b"sibling\n"),
+        ]);
+        fs::write(dir.path().join(".gitignore"), "src/ignored.txt\n").unwrap();
+        fs::write(dir.path().join("src/modified.txt"), "after\n").unwrap();
+        fs::remove_file(dir.path().join("src/deleted.txt")).unwrap();
+        fs::write(dir.path().join("src/new.txt"), "new\n").unwrap();
+        fs::write(dir.path().join("src/ignored.txt"), "ignored\n").unwrap();
+        fs::write(dir.path().join("src-other/sibling.txt"), "changed\n").unwrap();
+
+        GitRepositoryService.stage_paths(dir.path(), [Path::new("src")]).unwrap();
+        let state = GitRepositoryService.load(dir.path()).unwrap();
+        for path in ["src/modified.txt", "src/deleted.txt", "src/new.txt"] {
+            let file = state.files.iter().find(|file| file.path == Path::new(path)).unwrap();
+            assert_ne!(file.index, GitChangeState::Unmodified, "{path}");
+        }
+        let sibling = state.files.iter().find(|file| file.path == Path::new("src-other/sibling.txt")).unwrap();
+        assert_eq!(sibling.index, GitChangeState::Unmodified);
+        assert_eq!(sibling.worktree, GitChangeState::Modified);
+        assert!(!state.files.iter().any(|file| file.path == Path::new("src/ignored.txt")));
+    }
+
+    #[test]
+    fn stage_paths_skips_nested_repository_contents() {
+        let dir = committed_repo_with_files(&[("src/tracked.txt", b"before\n")]);
+        fs::write(dir.path().join("src/tracked.txt"), "after\n").unwrap();
+        let nested_root = dir.path().join("src/nested");
+        fs::create_dir_all(&nested_root).unwrap();
+        gix::init(&nested_root).unwrap();
+        fs::write(nested_root.join("inner.txt"), "nested\n").unwrap();
+
+        GitRepositoryService
+            .stage_paths(
+                dir.path(),
+                [Path::new("src/nested"), Path::new("src/tracked.txt")],
+            )
+            .unwrap();
+        let index = gix::open(dir.path()).unwrap().open_index().unwrap();
+        let visible_count = index
+            .entries_with_paths_by_filter_map(|path, _| {
+                (path.to_str() == Ok("src/tracked.txt")).then_some(())
+            })
+            .count();
+        assert_eq!(visible_count, 1);
+        let nested_count = index
+            .entries_with_paths_by_filter_map(|path, _| {
+                path.to_str()
+                    .is_ok_and(|path| path == "src/nested" || path.starts_with("src/nested/"))
+                    .then_some(())
+            })
+            .count();
+        assert_eq!(nested_count, 0);
+    }
+
+    #[test]
+    fn unstage_paths_directory_preserves_worktree_and_other_staged_files() {
+        let dir = committed_repo_with_files(&[
+            ("src/inside.txt", b"before\n"),
+            ("outside.txt", b"outside\n"),
+        ]);
+        fs::write(dir.path().join("src/inside.txt"), "inside change\n").unwrap();
+        fs::write(dir.path().join("outside.txt"), "outside change\n").unwrap();
+        GitRepositoryService.stage_paths(
+            dir.path(),
+            [Path::new("src/inside.txt"), Path::new("outside.txt")],
+        )
+        .unwrap();
+
+        GitRepositoryService.unstage_paths(dir.path(), [Path::new("src")]).unwrap();
+        let state = GitRepositoryService.load(dir.path()).unwrap();
+        let inside = state.files.iter().find(|file| file.path == Path::new("src/inside.txt")).unwrap();
+        let outside = state.files.iter().find(|file| file.path == Path::new("outside.txt")).unwrap();
+        assert_eq!(inside.index, GitChangeState::Unmodified);
+        assert_eq!(inside.worktree, GitChangeState::Modified);
+        assert_eq!(outside.index, GitChangeState::Modified);
+        assert_eq!(fs::read(dir.path().join("src/inside.txt")).unwrap(), b"inside change\n");
+    }
+
+    #[test]
+    fn stage_and_unstage_paths_handle_unusual_names_and_unborn_head() {
+        let (dir, _) = initialized_repo();
+        let unusual = PathBuf::from("- space ü.txt");
+        fs::write(dir.path().join(&unusual), "new\n").unwrap();
+        GitRepositoryService.stage_paths(dir.path(), [unusual.clone()]).unwrap();
+        let file = GitRepositoryService.load(dir.path()).unwrap().files.remove(0);
+        assert_eq!(file.path, unusual);
+        assert_eq!(file.index, GitChangeState::Added);
+        GitRepositoryService.unstage_paths(dir.path(), [Path::new("- space ü.txt")]).unwrap();
+        let file = GitRepositoryService.load(dir.path()).unwrap().files.remove(0);
+        assert_eq!(file.index, GitChangeState::Unmodified);
+        assert_eq!(file.worktree, GitChangeState::Untracked);
+        assert_eq!(fs::read(dir.path().join("- space ü.txt")).unwrap(), b"new\n");
+    }
+
+    #[test]
+    fn stage_paths_reject_outside_and_traversal_paths() {
+        let dir = committed_tracked_repo();
+        assert!(GitRepositoryService.stage_paths(dir.path(), [Path::new("../outside.txt")]).is_err());
+        assert!(GitRepositoryService.stage_paths(
+            dir.path(),
+            [dir.path().join("tracked.txt")],
+        )
+        .is_err());
+        assert_eq!(GitRepositoryService.load(dir.path()).unwrap().files.len(), 0);
+    }
+
+    #[test]
     fn unstage_restores_head_index_and_preserves_worktree() {
         let dir = committed_tracked_repo();
         fs::write(dir.path().join("tracked.txt"), "local\n").unwrap();
@@ -1205,6 +1534,107 @@ mod tests {
             .unwrap();
         assert_eq!(file.index, GitChangeState::Unmodified);
         assert_eq!(file.worktree, GitChangeState::Modified);
+    }
+
+    #[test]
+    fn commit_selected_excludes_unselected_staged_and_unstaged_changes() {
+        let dir = committed_tracked_repo();
+        let repo = gix::open(dir.path()).unwrap();
+        commit_entries(&repo, &[("tracked.txt", b"a0\n"), ("b.txt", b"b0\n"), ("c.txt", b"c0\n")]);
+        let head = fs::read_to_string(dir.path().join(".git/HEAD")).unwrap();
+        fs::write(dir.path().join(".git/refs/heads/main"), head.trim()).unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        add_index_entry(&repo, b"b.txt", b"b0\n");
+        add_index_entry(&repo, b"c.txt", b"c0\n");
+        fs::write(dir.path().join("tracked.txt"), "a1\n").unwrap();
+        fs::write(dir.path().join("b.txt"), "b1\n").unwrap();
+        GitRepositoryService.stage_file(dir.path(), "b.txt").unwrap();
+        fs::write(dir.path().join("c.txt"), "c1\n").unwrap();
+
+        GitRepositoryService.commit_selected(dir.path(), "selected A".into(), vec!["tracked.txt".into()]).unwrap();
+
+        let repo = gix::open(dir.path()).unwrap();
+        assert_eq!(head_bytes(&repo, Path::new("tracked.txt")).unwrap(), Some(b"a1\n".to_vec()));
+        assert_eq!(head_bytes(&repo, Path::new("b.txt")).unwrap(), Some(b"b0\n".to_vec()));
+        assert_eq!(head_bytes(&repo, Path::new("c.txt")).unwrap(), Some(b"c0\n".to_vec()));
+        let state = GitRepositoryService.load(dir.path()).unwrap();
+        let b = state.files.iter().find(|file| file.path == Path::new("b.txt")).unwrap();
+        let c = state.files.iter().find(|file| file.path == Path::new("c.txt")).unwrap();
+        assert_eq!(b.index, GitChangeState::Modified);
+        assert_eq!(c.worktree, GitChangeState::Modified);
+        let a = state.files.iter().find(|file| file.path == Path::new("tracked.txt"));
+        assert!(a.is_none_or(|file| file.index == GitChangeState::Unmodified && file.worktree == GitChangeState::Unmodified));
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"b1\n");
+        assert_eq!(fs::read(dir.path().join("c.txt")).unwrap(), b"c1\n");
+    }
+
+    #[test]
+    fn commit_selected_uses_full_worktree_version_and_supports_unusual_new_path() {
+        let dir = committed_tracked_repo();
+        fs::write(dir.path().join("tracked.txt"), "staged version\n").unwrap();
+        GitRepositoryService.stage_file(dir.path(), "tracked.txt").unwrap();
+        fs::write(dir.path().join("tracked.txt"), "worktree version\n").unwrap();
+        let unusual = PathBuf::from("- name ü.txt");
+        fs::write(dir.path().join(&unusual), "new\n").unwrap();
+
+        GitRepositoryService.commit_selected(dir.path(), "selected files".into(), vec!["tracked.txt".into(), unusual.clone()]).unwrap();
+
+        let repo = gix::open(dir.path()).unwrap();
+        assert_eq!(head_bytes(&repo, Path::new("tracked.txt")).unwrap(), Some(b"worktree version\n".to_vec()));
+        assert_eq!(head_bytes(&repo, &unusual).unwrap(), Some(b"new\n".to_vec()));
+        let selected_status = GitRepositoryService.load(dir.path()).unwrap().files;
+        assert!(selected_status.iter().all(|file| file.path != Path::new("tracked.txt") && file.path != unusual));
+    }
+
+    #[test]
+    fn commit_selected_rejects_empty_selection_and_message() {
+        let dir = committed_tracked_repo();
+        assert!(GitRepositoryService.commit_selected(dir.path(), "message".into(), Vec::new()).is_err());
+        assert!(GitRepositoryService.commit_selected(dir.path(), " ".into(), vec!["tracked.txt".into()]).is_err());
+        assert!(GitRepositoryService.load(dir.path()).unwrap().head.is_some());
+    }
+
+    #[test]
+    fn commit_selected_deletion_is_written_to_head() {
+        let dir = committed_tracked_repo();
+        fs::remove_file(dir.path().join("tracked.txt")).unwrap();
+        GitRepositoryService.commit_selected(dir.path(), "delete".into(), vec!["tracked.txt".into()]).unwrap();
+        assert_eq!(head_bytes(&gix::open(dir.path()).unwrap(), Path::new("tracked.txt")).unwrap(), None);
+    }
+
+    #[test]
+    fn commit_selected_uses_rename_source_when_status_detects_it() {
+        let dir = committed_tracked_repo();
+        fs::rename(dir.path().join("tracked.txt"), dir.path().join("renamed ü.txt")).unwrap();
+        let repo = gix::open(dir.path()).unwrap();
+        let mut index = repo.open_index().unwrap();
+        remove_index_path(&mut index, Path::new("tracked.txt"));
+        index.write(Default::default()).unwrap();
+        GitRepositoryService.stage_file(dir.path(), "renamed ü.txt").unwrap();
+        let state = GitRepositoryService.load(dir.path()).unwrap();
+        let rename = state.files.iter().find(|file| file.path == Path::new("renamed ü.txt")).unwrap();
+        assert_eq!(rename.old_path.as_deref(), Some(Path::new("tracked.txt")));
+        GitRepositoryService.commit_selected(dir.path(), "rename".into(), vec!["renamed ü.txt".into()]).unwrap();
+        let repo = gix::open(dir.path()).unwrap();
+        assert_eq!(head_bytes(&repo, Path::new("tracked.txt")).unwrap(), None);
+        assert_eq!(head_bytes(&repo, Path::new("renamed ü.txt")).unwrap(), Some(b"one\n".to_vec()));
+    }
+
+    #[test]
+    fn commit_selected_failure_leaves_unselected_state_untouched() {
+        let dir = committed_tracked_repo();
+        fs::remove_file(dir.path().join("tracked.txt")).unwrap();
+        fs::write(dir.path().join("other.txt"), "other\n").unwrap();
+        GitRepositoryService.stage_file(dir.path(), "other.txt").unwrap();
+        let repo = gix::open(dir.path()).unwrap();
+        let head = repo.head().unwrap().id().unwrap().detach();
+        fs::write(dir.path().join(".git/HEAD"), format!("{head}\n")).unwrap();
+        let before_index = fs::read(repo.index_path()).unwrap();
+
+        assert!(GitRepositoryService.commit_selected(dir.path(), "delete".into(), vec!["tracked.txt".into()]).is_err());
+        assert_eq!(fs::read(repo.index_path()).unwrap(), before_index);
+        assert!(!dir.path().join("tracked.txt").exists());
+        assert_eq!(fs::read(dir.path().join("other.txt")).unwrap(), b"other\n");
     }
 
     #[test]
